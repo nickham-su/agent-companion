@@ -132,9 +132,10 @@ class VoiceOutput:
     def __init__(self, tts: StreamingTTS, settings: VoiceSettings) -> None:
         self._tts = tts
         self._settings = settings
-        self._bytes_per_second = 2 * settings.playback_rate
+        sample_rate = settings.output_sample_rate
+        self._bytes_per_second = 2 * sample_rate
         self._prefetch = max(1, round(settings.prefetch_seconds * self._bytes_per_second))
-        self._pcm = _PcmQueue(2 * round(settings.buffer_seconds * settings.playback_rate))
+        self._pcm = _PcmQueue(2 * round(settings.buffer_seconds * sample_rate))
         self._active: _PlaybackReply | None = None
         self._workers: set[asyncio.Task[None]] = set()
         self._closed = False
@@ -223,7 +224,7 @@ class VoiceOutput:
                 await asyncio.sleep(_TICK)
             if state.signal.done() or reply.abandoned:
                 return
-            async with aclosing(self._tts.synthesize(spoken, sample_rate=self._settings.playback_rate)) as pcm:
+            async with aclosing(self._tts.synthesize(spoken, sample_rate=self._settings.output_sample_rate)) as pcm:
                 async for chunk in pcm:
                     if not chunk or len(chunk) % 2 or len(chunk) > _MAX_PCM_CHUNK:
                         raise TtsError("tts_invalid_pcm_chunk")

@@ -15,7 +15,8 @@ import wave
 from agent_companion.app import run_feishu
 from agent_companion.channels.feishu.channel import FeishuPoller
 from agent_companion.channels.feishu.cli import CommandResult, FeishuCLI
-from agent_companion.config import FeishuSettings, RuntimeSettings, Settings, VoiceSettings
+from agent_companion.config import (ASRSettings, FeishuSettings, MiniMaxConnection, RuntimeSettings, Settings,
+                                    VoiceSettings)
 from agent_companion.protocol import DeliveryStatus, TextDelta, ToolCall, ToolReady
 from agent_companion.runtime.subtasks import DELEGATE_TOOL_NAME, RESULT_PREFIX
 from agent_companion.speech.audio import AudioFormat
@@ -227,7 +228,8 @@ class MVPIntegrationTest(unittest.IsolatedAsyncioTestCase):
             database=database, main_session_id="mvp-main",
             feishu=FeishuSettings(_CHAT, _PEER, _OWN, cli_timeout=1),
             runtime=RuntimeSettings(model_timeout=3, delivery_timeout=3),
-            voice=VoiceSettings(playback_rate=INPUT_RATE, silence_seconds=0.06, delivery_timeout=2),
+            asr=ASRSettings(MiniMaxConnection("synthetic"), max_audio_seconds=500),
+            voice=VoiceSettings(output_sample_rate=INPUT_RATE, silence_seconds=0.06, delivery_timeout=2),
         )
         session = settings.main_session_id
         transport, model, asr = _CLITransport(), _ScriptedModel(), _ASR()

@@ -10,9 +10,9 @@ from math import ceil
 from threading import Lock
 import wave
 
-from ..config import VoiceSettings
+from ..config import VoiceSettings, require_asr_audio_seconds
 from ..protocol import DeliveryStatus, Receipt, ReplyStream
-from .asr import AudioFile, FileASR
+from .asr import MAX_AUDIO_BYTES, AudioFile, FileASR
 from .audio import AudioDevice, AudioFormat
 from .playback import VoiceOutput
 from .tts import StreamingTTS
@@ -20,6 +20,7 @@ from .vad import INPUT_BYTES, INPUT_FRAMES, INPUT_RATE, SAMPLE_BYTES, VoiceDetec
 
 _LOG = logging.getLogger(__name__)
 _SAMPLE_SECONDS = INPUT_FRAMES / INPUT_RATE
+_WAV_HEADER_BYTES = 44  # wave 为本通道的单声道 16-bit PCM 写出的固定头长
 _MAX_INPUT_FRAMES = 32  # 约 1 秒设备缓冲，溢出时丢弃不完整话轮
 _MAX_ASR_TURNS = 2  # 含在途请求；不无限累积录音
 _VAD_BATCH = 8
@@ -67,7 +68,19 @@ class VoiceChannel:
     """只对当前语音生命周期投递；不因为打断取消主 Runtime。"""
 
     def __init__(self, asr: FileASR, tts: StreamingTTS, vad: VoiceDetector, settings: VoiceSettings, *,
-                 asr_timeout: float) -> None:
+                 asr_timeout: float, max_audio_seconds: float) -> None:
+        require_asr_audio_seconds(max_audio_seconds)
+        file_samples = (MAX_AUDIO_BYTES - _WAV_HEADER_BYTES) // SAMPLE_BYTES
+        if max_audio_seconds >= file_samples / INPUT_RATE:
+            max_samples = file_samples
+        else:
+            # 用与 WAV 校验相同的时长比较，找到不超过上限的最大整样本数。
+            max_samples = round(max_audio_seconds * INPUT_RATE)
+            if max_samples / INPUT_RATE > max_audio_seconds:
+                max_samples -= 1
+        if max_samples < 1:
+            raise VoiceSetupError("voice_asr_max_audio_seconds_below_one_sample")
+        self._max_recording_bytes = max_samples * SAMPLE_BYTES
         self._asr, self._vad = asr, vad
         self._settings = settings
         self._asr_timeout = asr_timeout
@@ -78,13 +91,12 @@ class VoiceChannel:
         self._asr_task: asyncio.Task[str] | None = None
         self._asr_worker: asyncio.Task[None] | None = None
         self._speaking = False
+        self._ignoring_tail = False
         self._obsolete_until = -float("inf")
         self._record: bytearray | None = None
         self._hot_frames = self._quiet_frames = 0
         self._discard_gap = False
         self._preroll: deque[bytes] = deque(maxlen=settings.speech_frames + 3)
-        self._max_turn_frames = int(settings.max_turn_seconds / _SAMPLE_SECONDS)
-        self._turn_frames = 0
         self._end_frames = ceil(settings.silence_seconds / _SAMPLE_SECONDS)
         self._last_sequence = 0
         self._opened = self._closed = False
@@ -99,24 +111,41 @@ class VoiceChannel:
             return Receipt(reply.info.reply_id, DeliveryStatus.ZERO)
         return await self._output.deliver(reply)
 
-    def _begin_turn(self, record: bytearray | None) -> None:
+    def _begin_turn(self) -> None:
         self._speaking = True
         self._quiet_frames = 0
-        self._turn_frames = self._hot_frames
         self._obsolete_until = asyncio.get_running_loop().time()
-        self._record = record
-        self._preroll.clear()
         self._output.interrupt()
+        if not self._discard_gap:
+            preroll = b"".join(self._preroll)
+            speech_bytes = self._hot_frames * INPUT_BYTES
+            # 上限太短时先放入已确认的人声，不让开口前的静默占满。
+            first_speech = len(preroll) - speech_bytes
+            lead_in = min(first_speech, max(0, self._max_recording_bytes - speech_bytes))
+            self._record = bytearray()
+            self._record_audio(preroll[first_speech - lead_in:])
+        self._preroll.clear()
+
+    def _record_audio(self, pcm: bytes) -> None:
+        if self._record is None:
+            return
+        remaining = self._max_recording_bytes - len(self._record)
+        self._record.extend(pcm[:remaining])
+        if len(self._record) == self._max_recording_bytes:
+            self._finish_turn(ignore_tail=True)
 
     def _release_if_idle(self) -> None:
         if not self._speaking and not self._pending:
             # 在 ASR 等待窗口内开始的请求也不能因识别结束而恢复旧回复。
             self._obsolete_until = asyncio.get_running_loop().time()
 
-    def _finish_turn(self) -> None:
+    def _finish_turn(self, *, ignore_tail: bool = False) -> None:
         self._speaking = False
+        self._ignoring_tail = ignore_tail
         self._discard_gap = False
-        self._hot_frames = self._quiet_frames = 0
+        self._hot_frames = 0
+        if not ignore_tail:
+            self._quiet_frames = 0
         recording, self._record = self._record, None
         if recording and self._pending < _MAX_ASR_TURNS:
             self._pending += 1
@@ -136,6 +165,17 @@ class VoiceChannel:
         return result
 
     def _process(self, missed: bool, hot: bool, pcm: bytes) -> None:
+        if self._ignoring_tail:
+            # 尾音只参与静默判定，不算作正在说话，也不进入下一轮预录。
+            if missed:
+                # 溢出丢样可能发生在本帧内部，这一帧不算可信静默。
+                self._quiet_frames = 0
+                return
+            self._quiet_frames = 0 if hot else self._quiet_frames + 1
+            if self._quiet_frames >= self._end_frames:
+                self._ignoring_tail = False
+                self._quiet_frames = 0
+            return
         if missed:
             # 采集溢出不能拼接成假的完整话轮；静默后再接纳下一轮。
             if not self._discard_gap:
@@ -152,19 +192,13 @@ class VoiceChannel:
                 if self._quiet_frames >= self._end_frames:
                     self._discard_gap = False
             if self._hot_frames >= self._settings.speech_frames:
-                self._begin_turn(None if self._discard_gap else bytearray(b"".join(self._preroll)))
+                self._begin_turn()
             return
-        self._turn_frames += 1
         self._quiet_frames = 0 if hot else self._quiet_frames + 1
         if self._quiet_frames >= self._end_frames:
             self._finish_turn()
             return
-        if self._record is not None:
-            if hot and self._turn_frames > self._max_turn_frames:
-                self._record = None
-                _LOG.warning("voice turn dropped (recording limit)")
-            else:
-                self._record.extend(pcm)
+        self._record_audio(pcm)
 
     async def _listen(self, device: AudioDevice) -> None:
         loop = asyncio.get_running_loop()
@@ -214,10 +248,12 @@ class VoiceChannel:
         if self._asr_task is not None and not self._asr_task.done() and not self._asr_task.cancelling():
             self._asr_task.cancel()  # 不等待在途请求的取消清理
 
-    @staticmethod
-    def _reap(task: asyncio.Task[str]) -> None:
+    def _reap(self, task: asyncio.Task[str]) -> None:
         if not task.cancelled():
             task.exception()
+        # 只在任务真正结束后释放（异常回溯可能持有 WAV），不清掉后继任务。
+        if self._asr_task is task:
+            self._asr_task = None
 
     async def _recognize(self, recording: bytes) -> str:
         if self._asr_task is not None and not self._asr_task.done():
@@ -242,6 +278,8 @@ class VoiceChannel:
                 _LOG.warning("voice transcription failed")
                 text = ""
             finally:
+                # 等待下一轮入队期间不保留本轮 PCM。
+                del recording
                 self._pending -= 1
                 self._release_if_idle()
             if text and not self._failed:
@@ -253,7 +291,7 @@ class VoiceChannel:
             raise VoiceSetupError("voice_already_started")
         if device.input_format != AudioFormat(INPUT_RATE):
             raise VoiceSetupError("voice_input_device_format_mismatch")
-        if device.output_format != AudioFormat(self._settings.playback_rate):
+        if device.output_format != AudioFormat(self._settings.output_sample_rate):
             raise VoiceSetupError("voice_output_device_format_mismatch")
         self._opened = True
         try:
@@ -268,6 +306,8 @@ class VoiceChannel:
                     self._stop_transcription()
         finally:
             self._closed = True
+            self._record = None
+            self._preroll.clear()
             self._capture.close()
             # 关闭音频 I/O，再收尾未交付的输出与仍在清理的请求。
             try:

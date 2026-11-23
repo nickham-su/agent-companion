@@ -13,12 +13,10 @@ asr = 30  # 单次转写总时限
 tts = 25  # 单次网络读写、等待响应的时限
 
 [runtime]
-delivery_timeout = 120
-# 上下文预算为估算值，不是供应商实际 token 计数。
-context_budget = 64000
-tail_budget = 16000
-summary_budget = 4000
-max_tool_rounds = 8
+delivery_timeout = 120  # 模型输出结束后，等待回复投递完成的最长时间（秒）
+context_budget = 64000  # 模型输入的总预算（本地估算，不是实际 token 数）
+tail_budget = 16000  # 压缩历史时保留最近消息原文的预算，须小于 context_budget
+max_tool_rounds = 8  # 一次运行的模型请求轮数上限，含首轮
 
 # 正式启动必须显式选择适配器及推理强度。
 [providers.deepseek_default]
@@ -44,7 +42,8 @@ api_key = "your-minimax-api-key"
 region = "cn"  # cn 或 global（应与 MiniMax API 账号的区域一致）
 
 [providers.minimax_cn.asr]
-model = "asr-1.0"  # 可省略；当前适配器只支持原有的 asr-1.0 请求
+model = "asr-1.0"  # 可省略，默认 asr-1.0；所选模型须兼容 MiniMax 文件转写接口
+max_audio_seconds = 500  # 必填；按所选模型的单文件时长上限填写（秒）
 
 [providers.minimax_cn.tts]
 model = "speech-2.8-turbo"
@@ -61,14 +60,13 @@ voice_id = "male-qn-qingse"
 
 # 仅 [feishu].mode = "voice" 时打开设备。需要两条不同的虚拟线路。
 # [voice]
-# input_device = "Feishu to Agent"   # 设备精确名称或 sounddevice 索引
-# output_device = "Agent to Feishu"
-# vad_model = "models/silero_vad.onnx"  # 相对配置目录；不自动下载
-# vad_threshold = 0.5
-# speech_frames = 3      # 3 个 32 ms 窗口确认人声
-# silence_seconds = 1
-# max_turn_seconds = 60
-# playback_rate = 44100  # MiniMax 与 PortAudio 共同使用；输入固定 16000
-# prefetch_seconds = 0.4
-# buffer_seconds = 2
-# delivery_timeout = 90  # 必须小于 runtime.delivery_timeout，与 timeouts.llm 无关
+# input_device = "Feishu to Agent"  # 飞书扬声器 → Agent；填设备精确名称或 sounddevice 索引
+# output_device = "Agent to Feishu"  # Agent → 飞书麦克风；填设备精确名称或 sounddevice 索引
+# vad_model = "models/silero_vad.onnx"  # VAD 模型路径，相对配置文件所在目录；不自动下载
+# vad_threshold = 0.5  # 判定人声的概率门槛，须大于 0 且小于 1
+# speech_frames = 3  # 连续多少个 32 毫秒的人声帧才确认开口
+# silence_seconds = 1  # 连续静默多久后结束本轮录音（秒）
+# output_sample_rate = 44100  # TTS 合成与本机播放共用的采样率（Hz）；录音固定 16000 Hz
+# prefetch_seconds = 0.4  # 待播音频少于此时长才合成下一段（秒）
+# buffer_seconds = 2  # 待播音频缓存上限（秒），须大于 prefetch_seconds
+# delivery_timeout = 90  # 单条语音回复的合成与播放总时限（秒），须小于 runtime.delivery_timeout

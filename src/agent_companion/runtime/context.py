@@ -38,11 +38,6 @@ def _cost(message: Message) -> int:
 _SUMMARY_FRAME_COST = _cost(Message("system", _SUMMARY_PREFIX))
 
 
-def _trim(text: str, budget: int) -> str:
-    raw = text.strip().encode("utf-8")[:3 * budget]
-    return raw.decode("utf-8", errors="ignore").strip()
-
-
 @dataclass(frozen=True, slots=True)
 class _Block:
     end_id: int
@@ -108,10 +103,10 @@ def _summary_prompt(previous: Summary | None, blocks: Sequence[_Block], *,
 
 
 def _summary_message(summary: Summary | None, budget: int) -> list[Message]:
-    if summary is None or budget <= _SUMMARY_FRAME_COST:
+    if summary is None or not summary.text:
         return []
-    content = _trim(summary.text, budget - _SUMMARY_FRAME_COST)
-    return [Message("system", _SUMMARY_PREFIX + content)] if content else []
+    message = Message("system", _SUMMARY_PREFIX + summary.text)
+    return [message] if _cost(message) <= budget else []
 
 
 def _protocol_messages(blocks: Sequence[_Block], with_reasoning: bool) -> list[Message]:
@@ -392,10 +387,20 @@ class Context:
                         high = mid
                 end = low
             if start == end:
+                if summary is not None:
+                    # 摘要挤占预算时，不把本来放得下的旧块标为已覆盖。
+                    block = (blocks[start],)
+                    prompt = _summary_prompt(None, block)
+                    if sum(map(_cost, prompt)) <= self._settings.context_budget and (
+                        self._fits(prompt) or self._fits(_summary_prompt(None, block, omit_images=True))
+                    ):
+                        raise ModelError("summary_context_too_large")
                 # 单独也放不进摘要请求的旧块不能卡死后续输入，不截断工具块或修改原文。
                 end += 1
                 previous = summary.text if summary is not None else ""
-                content = previous if previous.startswith(_OMITTED) else _trim(_OMITTED + "\n" + previous, self._settings.summary_budget)
+                content = previous
+                if not previous.startswith(_OMITTED):
+                    content = f"{_OMITTED}\n{previous}" if previous else _OMITTED
             else:
                 prefix = blocks[start:end]
                 if any((message.role != "assistant" or message.content or message.tool_calls)
@@ -410,10 +415,7 @@ class Context:
 
     async def _summarize_prefix(self, messages: Sequence[Message]) -> str:
         async with aclosing(self._summarize(messages)) as events:
-            content = _trim(
-                "".join([event.text async for event in events if isinstance(event, TextDelta)]),
-                self._settings.summary_budget,
-            )
-        if not content:
+            content = "".join([event.text async for event in events if isinstance(event, TextDelta)])
+        if not content.strip():
             raise ModelError("empty_summary")
         return content

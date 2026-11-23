@@ -64,6 +64,8 @@ async def run_feishu(settings: Settings, history: History, model: Model, asr: Fi
     local_voice = None
     if feishu.mode == "voice" and voice_output is None and tts is not None:
         voice = settings.voice
+        if settings.asr is None:
+            raise VoiceSetupError("voice_asr_settings_required")
         require_delivery_timeout(voice.delivery_timeout, settings.runtime.delivery_timeout, "voice.delivery_timeout",
                                  error_type=VoiceSetupError)
         if audio is None:
@@ -71,12 +73,13 @@ async def run_feishu(settings: Settings, history: History, model: Model, asr: Fi
                 raise VoiceSetupError("voice_input_and_output_devices_required")
             from .channels.audio.macos import MacAudioDevice
 
-            audio = MacAudioDevice(voice.input_device, voice.output_device, voice.playback_rate)
+            audio = MacAudioDevice(voice.input_device, voice.output_device, voice.output_sample_rate)
         if vad is None:
             if voice.vad_model is None:
                 raise VoiceSetupError("voice_vad_model_required")
             vad = SileroVAD(voice.vad_model)
-        local_voice = VoiceChannel(asr, tts, vad, voice, asr_timeout=settings.asr_timeout)
+        local_voice = VoiceChannel(asr, tts, vad, voice, asr_timeout=settings.asr_timeout,
+                                   max_audio_seconds=settings.asr.max_audio_seconds)
         voice_output = local_voice
 
     cli = cli if cli is not None else FeishuCLI(feishu.cli, feishu.chat_id, timeout=feishu.cli_timeout)

@@ -195,7 +195,7 @@ class DeepSeekTest(unittest.IsolatedAsyncioTestCase):
                 delivered.append(body)
                 return Receipt(reply.info.reply_id, DeliveryStatus.FULL, body)
 
-        settings = RuntimeSettings(context_budget=4096, tail_budget=1024, summary_budget=512)
+        settings = RuntimeSettings(context_budget=4096, tail_budget=1024)
         with TemporaryDirectory(dir=Path.cwd()) as folder:
             path = Path(folder) / "history.sqlite"
             with closing(History(path)) as history:
@@ -236,7 +236,7 @@ class DeepSeekTest(unittest.IsolatedAsyncioTestCase):
             ("独立图片", [head, *([old_image] * 136), latest, tail],
              [head, Message("user", OMITTED_INPUT_IMAGE.text), latest, tail]),
         )
-        settings = RuntimeSettings(context_budget=4096, tail_budget=1024, summary_budget=512)
+        settings = RuntimeSettings(context_budget=4096, tail_budget=1024)
         fixed = Message("system", "保留图文顺序")
 
         for label, original, projected in cases:
@@ -301,7 +301,7 @@ class DeepSeekTest(unittest.IsolatedAsyncioTestCase):
 
         first = Message("user", (Text("历史图文"), Image("data:image/png;base64," + "A" * 6000)))
         old_text = Message("user", "旧文本" * 650)
-        settings = RuntimeSettings(context_budget=3000, tail_budget=300, summary_budget=100)
+        settings = RuntimeSettings(context_budget=3000, tail_budget=300)
         with closing(History(":memory:")) as history:
             history.append("child", [first, old_text])
             async with httpx.AsyncClient(transport=httpx.MockTransport(endpoint)) as client:

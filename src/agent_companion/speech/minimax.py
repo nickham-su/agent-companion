@@ -5,7 +5,7 @@ import json
 
 import httpx
 
-from ..config import MINIMAX_ASR_MODEL, require_seconds
+from ..config import MINIMAX_ASR_MODEL, require_asr_audio_seconds, require_seconds
 from .asr import AsrError, AudioFile
 
 
@@ -17,19 +17,23 @@ _RESPONSE_LIMIT = 1024 * 1024
 
 
 class MiniMaxASR:
-    def __init__(self, client: httpx.AsyncClient, *, region: str, timeout: float,
+    def __init__(self, client: httpx.AsyncClient, *, region: str, timeout: float, max_audio_seconds: float,
                  model: str = MINIMAX_ASR_MODEL) -> None:
         if region not in _ENDPOINTS:
             raise ValueError("invalid MiniMax region")
-        if model != MINIMAX_ASR_MODEL:
-            raise ValueError("unsupported MiniMax ASR model")
+        if not isinstance(model, str) or not model.strip():
+            raise ValueError("ASR model must be a non-empty string")
         require_seconds(timeout, "ASR timeout")
+        require_asr_audio_seconds(max_audio_seconds)
         self._client = client
         self._model = model
         self._endpoint = _ENDPOINTS[region]
         self._timeout = timeout
+        self._max_audio_seconds = max_audio_seconds
 
     async def transcribe(self, file: AudioFile) -> str:
+        if file.duration_seconds is not None and file.duration_seconds > self._max_audio_seconds:
+            raise AsrError("invalid_audio_duration")
         try:
             async with asyncio.timeout(self._timeout):
                 async with self._client.stream(

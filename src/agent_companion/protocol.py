@@ -116,6 +116,7 @@ _MODEL_DIAGNOSTICS = frozenset({
     "invalid_tool_delta", "invalid_tool_id", "missing_reasoning", "transport_error", "truncated_stream",
     "unsupported_tool_type", "request_body_too_large", "responses_output_limit", "responses_event_limit",
     "responses_unsupported_encoding", "responses_unsupported_output", "responses_unexpected_response",
+    "summary_context_too_large",
 })
 
 

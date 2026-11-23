@@ -647,7 +647,7 @@ print(json.dumps({"ok": True, "identity": "user", "data": page}))
         cli = FeishuCLI("lark-cli", _CHAT, timeout=2, runner=runner)
         identity = FeishuSettings(_CHAT, _PEER, _SELF)
         settings = Settings(feishu=identity, llm=LLMSettings("deepseek", "disabled", api_key="synthetic"),
-                            asr=ASRSettings(MiniMaxConnection("synthetic")))
+                            asr=ASRSettings(MiniMaxConnection("synthetic"), max_audio_seconds=500))
         with TemporaryDirectory(dir=Path.cwd()) as temp:
             path = Path(temp) / "synthetic.sqlite"
             with closing(History(path)) as history, patch.object(FeishuPoller, "run") as run:
@@ -722,7 +722,8 @@ class FeishuProductionBindingTests(unittest.IsolatedAsyncioTestCase):
         speech = MiniMaxConnection("synthetic")
         return Settings(database=path, feishu=FeishuSettings(_CHAT, _PEER, _SELF, mode=mode),
                         llm=LLMSettings("deepseek", "disabled", api_key="synthetic"),
-                        asr=ASRSettings(speech), tts=TTSSettings(speech) if mode == "voice" else None,
+                        asr=ASRSettings(speech, max_audio_seconds=500),
+                        tts=TTSSettings(speech) if mode == "voice" else None,
                         voice=VoiceSettings(input_device=1, output_device=2, vad_model=Path("synthetic.onnx")))
 
     def create_legacy_db(self, path, *, used=False):

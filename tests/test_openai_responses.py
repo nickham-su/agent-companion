@@ -403,7 +403,7 @@ class OpenAIResponsesTests(unittest.IsolatedAsyncioTestCase):
         tool.assert_awaited_once()
 
     async def test_continuation_reprojects_tools_and_adds_queued_input_at_safe_boundary(self):
-        settings = RuntimeSettings(context_budget=240, tail_budget=75, summary_budget=45)
+        settings = RuntimeSettings(context_budget=240, tail_budget=75)
         result = "r" * 285
         fixture = _Fixture(self, [_completed(_reason(), _call())], [_completed(_answer("done"))])
         channel = _Channel()
@@ -445,7 +445,7 @@ class OpenAIResponsesTests(unittest.IsolatedAsyncioTestCase):
                 if mode == "compact":
                     history.append("main", [Message("user", "x" * 360)])
                     fixture = _Fixture(self, initial, [_completed(_answer("summary"))], final)
-                    settings = RuntimeSettings(context_budget=240, tail_budget=75, summary_budget=45)
+                    settings = RuntimeSettings(context_budget=240, tail_budget=75)
                     self.assertIsNone(await _complete(fixture, history, settings=settings,
                                                       tools=Tools([Tool(_SPEC, tool)])))
                     self.assertIsNotNone(history.summary("main"))
@@ -511,7 +511,7 @@ class OpenAIResponsesTests(unittest.IsolatedAsyncioTestCase):
         ])
 
     async def test_protected_tool_group_over_either_budget_never_sends_or_reruns_tools(self):
-        settings = RuntimeSettings(context_budget=240, tail_budget=75, summary_budget=45)
+        settings = RuntimeSettings(context_budget=240, tail_budget=75)
         for limit, result_size, failure in [(2000, 1500, "protected_context_too_large"),
                                             (700, 285, "protected_request_too_large")]:
             with self.subTest(failure=failure), closing(History(":memory:")) as history:
@@ -579,7 +579,7 @@ class OpenAIResponsesTests(unittest.IsolatedAsyncioTestCase):
                            [_completed(_answer("compressed"))], [_completed(_answer("new response"))])
         with closing(History(":memory:")) as history:
             self.assertIsNone(await _complete(fixture, history, prompt=Message("user", "prior " + "x" * 330)))
-            settings = RuntimeSettings(context_budget=220, tail_budget=55, summary_budget=45)
+            settings = RuntimeSettings(context_budget=220, tail_budget=55)
             self.assertIsNone(await _complete(fixture, history, settings=settings,
                                               prompt=Message("user", "current " + "y" * 290)))
             self.assertEqual(len(fixture.requests), 3)
@@ -705,6 +705,7 @@ own_open_id = "ou_self"
 adapter = "minimax"
 api_key = "synthetic-speech-test"
 [providers.speech.asr]
+max_audio_seconds = 500
 """
         for name, (key, address, model, effort) in profiles.items():
             tables += (f'[providers.{name}]\nadapter = "openai_responses"\napi_key = "{key}"\nbase_url = "{address}"\n'

@@ -86,7 +86,8 @@ async def _serve(settings: Settings) -> None:
             model_client = await client(llm.api_key if llm.adapter == "deepseek" else None)
             speech = asr_settings.connection
             asr_client = await client(speech.api_key)
-            asr = MiniMaxASR(asr_client, region=speech.region, model=asr_settings.model, timeout=settings.asr_timeout)
+            asr = MiniMaxASR(asr_client, region=speech.region, model=asr_settings.model, timeout=settings.asr_timeout,
+                             max_audio_seconds=asr_settings.max_audio_seconds)
             tts = None
             if tts_settings is not None:
                 speech_out = tts_settings.connection

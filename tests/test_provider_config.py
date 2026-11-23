@@ -30,7 +30,7 @@ asr_provider = "speech"
 tts_provider = "speech"
 ''' + _FEISHU + f'''
 [voice]
-playback_rate = 24000
+output_sample_rate = 24000
 
 [providers.chat]
 adapter = "deepseek"
@@ -42,6 +42,7 @@ reasoning_effort = "disabled"
 adapter = "minimax"
 api_key = "synthetic-speech-value"
 [providers.speech.asr]
+max_audio_seconds = 500
 [providers.speech.tts]
 model = "synthetic-tts-model"
 voice_id = "synthetic-shared-voice"
@@ -87,6 +88,7 @@ class ProviderConfigTests(unittest.TestCase):
                 self.assertEqual(settings.asr_timeout, 30)
                 self.assertEqual(settings.tts_timeout, 25)
                 self.assertEqual(settings.asr.model, "asr-1.0")
+                self.assertEqual(settings.asr.max_audio_seconds, 500)
                 self.assertEqual(settings.tts.model, "speech-2.8-turbo")
                 self.assertIs(settings.asr.connection, settings.tts.connection)
 
@@ -98,7 +100,7 @@ class ProviderConfigTests(unittest.TestCase):
             ('asr_provider = "speech"', 'asr_provider = "absent"', 'asr_provider 引用的 Provider 不存在'),
             ('asr_provider = "speech"', 'asr_provider = "chat"', '支持 asr 的 adapter'),
             ('llm_provider = "chat"', 'llm_provider = "speech"', '支持 llm 的 adapter'),
-            ('[providers.speech.asr]', '', '缺少 asr 能力配置表'),
+            ('[providers.speech.asr]\nmax_audio_seconds = 500\n', '', '缺少 asr 能力配置表'),
         ):
             with self.subTest(error=error):
                 self.assert_startup_error(_CONFIG.replace(before, after), error)
@@ -143,7 +145,7 @@ api_key = 123
                 self.assertIsNone(settings.tts)
 
     def test_formal_text_ignores_invalid_voice_values_and_table_shape(self):
-        voice_table = '[voice]\nplayback_rate = 24000'
+        voice_table = '[voice]\noutput_sample_rate = 24000'
         variants = (
             (_CONFIG.replace(voice_table, '[voice]\ninput_device = false\nvad_model = false'), 'voice.vad_model'),
             (_CONFIG.replace(voice_table, '[voice]\ninput_device = false'), 'voice.input_device'),
@@ -169,7 +171,7 @@ api_key = 123
                              encoding="utf-8")
         settings = load_settings(self.path)
         self.assertEqual(settings.voice.input_device, 2)
-        self.assertEqual(settings.voice.playback_rate, 24000)
+        self.assertEqual(settings.voice.output_sample_rate, 24000)
         self.assertEqual(settings.voice.vad_model, self.path.parent / 'models/synthetic.onnx')
         self.path.write_text(_CONFIG.replace('[voice]', '[voice]\nvad_model = false'), encoding="utf-8")
         with self.assertRaisesRegex(ValueError, r"voice\.vad_model"):
@@ -186,7 +188,8 @@ api_key = 123
             (_CONFIG + '\n[runtime]\ndelivery_timeout = 0\n', 'runtime.delivery_timeout 必须是有限正数'),
             (_CONFIG + f'\n[runtime]\ndelivery_timeout = {10 ** 320}\n', 'runtime.delivery_timeout 必须是有限正数'),
             (_CONFIG + '\n[runtime]\ncontext_budget = 42\n',
-             'runtime.tail_budget 与 runtime.summary_budget 之和必须小于 runtime.context_budget'),
+             'runtime.tail_budget 必须小于 runtime.context_budget'),
+            (_CONFIG + '\n[runtime]\nsummary_budget = 4000\n', 'runtime 配置字段无效'),
             (_CONFIG + f'\n[runtime]\n{_KEY} = 42\n', 'runtime 配置字段无效'),
             ('database = false\n' + _CONFIG, 'database 必须是非空且不含 NUL 字符的路径'),
             ('database = ":memory:"\n' + _CONFIG, '正式启动的 database 必须是持久化 SQLite 文件路径'),
@@ -200,7 +203,7 @@ api_key = 123
         for setting, diagnostic in (
             ('vad_threshold = 1', 'voice.vad_threshold 必须小于 1'),
             ('speech_frames = false', 'voice.speech_frames 必须是 1–15 之间的整数'),
-            ('max_turn_seconds = 0.01', 'voice.max_turn_seconds 不得短于 voice.speech_frames 对应时长'),
+            ('max_turn_seconds = 60', 'voice 配置字段无效'),
             ('silence_seconds = 11', 'voice.silence_seconds 不得超过 10 秒'),
             ('buffer_seconds = 8', 'voice.buffer_seconds 必须在 0.032–5 秒之间'),
             ('prefetch_seconds = 3', 'voice.prefetch_seconds 必须小于 voice.buffer_seconds'),
@@ -208,8 +211,9 @@ api_key = 123
         ):
             with self.subTest(diagnostic=diagnostic):
                 self.assert_startup_error(voice.replace('[voice]', f'[voice]\n{setting}'), diagnostic)
-        self.assert_startup_error(voice.replace('playback_rate = 24000', f'playback_rate = "{_KEY}"'),
-                                  'voice.playback_rate 必须是 16000、24000、32000 或 44100')
+        self.assert_startup_error(voice.replace('output_sample_rate = 24000', f'output_sample_rate = "{_KEY}"'),
+                                  'voice.output_sample_rate 必须是 16000、24000、32000 或 44100')
+        self.assert_startup_error(voice.replace('output_sample_rate', 'playback_rate'), 'voice 配置字段无效')
 
     def test_delivery_timeout_diagnostics_apply_before_startup_in_active_modes(self):
         common = _CONFIG + '\n[runtime]\ndelivery_timeout = 20\n'
@@ -232,10 +236,20 @@ api_key = 123
             ('adapter = "deepseek"', 'adapter = "openai_responses"', '必须设置 llm.model'),
             ('adapter = "deepseek"', 'adapter = "deepseek"\nbase_url = "https://example.invalid"', 'base_url'),
             ('adapter = "minimax"', 'adapter = "minimax"\nbase_url = "https://example.invalid"', 'base_url'),
-            ('[providers.speech.asr]', '[providers.speech.asr]\nmodel = "asr-unknown"', 'asr-1.0'),
+            ('[providers.speech.asr]', '[providers.speech.asr]\nmodel = " "', 'asr.model 必须是非空字符串'),
         ):
             with self.subTest(message=message):
                 self.assert_startup_error(_CONFIG.replace(before, after), message)
+
+    def test_selected_asr_audio_seconds_must_be_explicit_and_positive_in_both_modes(self):
+        for mode in ('text', 'voice'):
+            text = _CONFIG.replace('mode = "text"', f'mode = "{mode}"')
+            for value in (None, '0', '-0.01', 'inf', 'nan', 'true', '"500"'):
+                with self.subTest(mode=mode, value=value):
+                    setting = '' if value is None else f'max_audio_seconds = {value}'
+                    diagnostic = ('asr.max_audio_seconds 必须显式设置' if value is None
+                                  else 'asr.max_audio_seconds 必须是有限正数')
+                    self.assert_startup_error(text.replace('max_audio_seconds = 500', setting), diagnostic)
 
     def test_shared_timeouts_default_when_no_table_is_configured(self):
         for mode in ('text', 'voice'):
@@ -341,10 +355,13 @@ class ProviderCompositionTests(unittest.IsolatedAsyncioTestCase):
             wav.writeframes(bytes(320))
         audio = AudioFile(buf.getvalue())
         actual_client = httpx.AsyncClient
+        asr_model = "未来/ASR + 预览"
 
         for mode in ("text", "shared", "separate"):
             with self.subTest(mode=mode), TemporaryDirectory(dir=Path.cwd()) as folder:
                 text = _CONFIG if mode == "text" else _CONFIG.replace('mode = "text"', 'mode = "voice"')
+                text = text.replace('max_audio_seconds = 500',
+                                    f'max_audio_seconds = 600.5\nmodel = "{asr_model}"')
                 text += '\n[timeouts]\nllm = 0.75\nasr = 2\ntts = 3\n'
                 if mode == "separate":
                     text = text.replace('tts_provider = "speech"', 'tts_provider = "speaker"') + '''
@@ -384,12 +401,14 @@ voice_id = "synthetic-other-voice"
                 async def drive(settings, history, model, asr, *, tts):
                     self.assertEqual(settings.runtime.model_timeout, 0.75)
                     self.assertEqual(asr._timeout, 2)
+                    self.assertEqual(settings.asr.max_audio_seconds, asr._max_audio_seconds)
+                    self.assertEqual(settings.asr.max_audio_seconds, 600.5)
                     _ = [event async for event in model.stream([Message("user", "合成输入")], (), thinking=False)]
                     self.assertEqual(await asr.transcribe(audio), "合成识别文本")
                     if mode == "text":
                         self.assertIsNone(tts)
                     else:
-                        chunks = tts.synthesize("合成输出", sample_rate=settings.voice.playback_rate)
+                        chunks = tts.synthesize("合成输出", sample_rate=settings.voice.output_sample_rate)
                         self.assertEqual([chunk async for chunk in chunks], [b"\x01\x00"])
 
                 with (patch("agent_companion.__main__.httpx.AsyncClient", side_effect=client),
@@ -406,7 +425,7 @@ voice_id = "synthetic-other-voice"
                 self.assertEqual(json.loads(model.content)["model"], "deepseek-flash")
                 self.assertEqual(str(asr.url), "https://api.minimax.cn/v1/speech_to_text")
                 self.assertTrue(asr.headers["Authorization"] == "Bearer synthetic-speech-value")
-                self.assertIn(b'name="model"\r\n\r\nasr-1.0', asr.content)
+                self.assertIn(f'name="model"\r\n\r\n{asr_model}\r\n'.encode(), asr.content)
                 if rest:
                     tts, = rest
                     body = json.loads(tts.content)

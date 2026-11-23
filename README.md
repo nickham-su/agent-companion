@@ -45,7 +45,9 @@ python -m venv .venv
 | --- | --- |
 | `deepseek` | `.llm.model` 可省略，默认 `deepseek-flash`。`reasoning_effort = "disabled"` 显式关闭思考；其他值由所选模型解释。历史切到思考开启时，如有不兼容旧记录，用摘要承接，原文仍可查。 |
 | `openai_responses` | `.llm.model` 必填。可选 Provider 层 `base_url`，默认 `https://api.openai.com/v1`，请求时在其后追加 `/responses`。`reasoning_effort` 原样传给 Responses，例如 `low`，或选用明确支持 `none` 的模型来关闭推理。 |
-| `minimax` | Provider 层 `region` 选 `cn`（默认）或 `global`。`.asr` 默认并仅支持原有 `asr-1.0` 请求；`.tts` 配置模型和音色。ASR、TTS 可以共用一套 Provider，也可以分别使用不同区域和 Key。 |
+| `minimax` | Provider 层 `region` 选 `cn`（默认）或 `global`。`.asr.model` 默认 `asr-1.0`，也可填写其他兼容同一文件转写接口的模型名；`.asr.max_audio_seconds` 必填，无默认值。`.tts` 配置模型和音色。ASR、TTS 可以共用一套 Provider，也可以分别使用不同区域和 Key。 |
+
+升级旧配置时，删除 `[voice]` 的 `max_turn_seconds`，在 `asr_provider` 选中的 `[providers.<名称>.asr]` 中明确设置 `max_audio_seconds`（有限正数，单位为秒）。正式的 `text` 和 `voice` 模式都要填写；示例中的 `500` 是 `asr-1.0` 的参考值，使用其他模型时请按其接口限制填写。
 
 **只配置可信的 HTTPS 地址**：自定义服务会收到所选 Provider 的 API Key 和发送给模型的输入。地址不要包含凭据、查询参数或片段；客户端不跟随重定向。其他适配器不支持 `base_url`。
 
@@ -82,7 +84,7 @@ python scripts/build_source_zip.py
 
 每个新窗口默认每页 50 条。列表 CLI 标准输出超过 4 MiB 时，将页大小减半（最低 1 条），丢弃该窗口未提交的消息及游标，下次轮询从同一时间窗口的第一页重读。每页仅 1 条仍超限时报告 `cli_single_result_output_limit`，不提交部分结果、不推进水位，也不跳过消息。
 
-图片按文件头识别（JPEG、PNG、GIF、WebP；单张本机上限 8 MiB）；语音条下载后验证容器，使用 `asr-1.0` 提交一次完整文件（50 MB、500 秒；非 WAV 时移交服务端检查时长）。飞书入口按原处理顺序执行现有单图和同批媒体限额，受限图片用文字占位，不挤掉同批可用文本；不会为了找更新的图片突破下载限额。macOS/Linux 的 CLI 下载子进程在写文件前已设置相应文件大小硬上限。富文本链接保留为普通文字，不发起下载。语音条失败或超时不重试，原对话尝试发送一次「语音接收失败，请重新发送。」，通知不走模型、不阻塞同批成功输入，崩溃后不补发。文字回复发送成功才写入确认正文；只有已知明确未送达的错误才记失败，通用 API 错误或无法确认的结果记未知，不重发。
+图片按文件头识别（JPEG、PNG、GIF、WebP；单张本机上限 8 MiB）；语音条下载后验证容器和 50 MB 文件上限，提交一次完整文件，不做截断。WAV 超过 `max_audio_seconds` 时在本机拒绝；非 WAV 时长仍由服务端检查。飞书入口按原处理顺序执行现有单图和同批媒体限额，受限图片用文字占位，不挤掉同批可用文本；不会为了找更新的图片突破下载限额。macOS/Linux 的 CLI 下载子进程在写文件前已设置相应文件大小硬上限。富文本链接保留为普通文字，不发起下载。语音条失败或超时不重试，原对话尝试发送一次「语音接收失败，请重新发送。」，通知不走模型、不阻塞同批成功输入，崩溃后不补发。文字回复发送成功才写入确认正文；只有已知明确未送达的错误才记失败，通用 API 错误或无法确认的结果记未知，不重发。
 
 如果在轮询批次落库前进程中断，下次会重新查询窗口；未落库的内容可能重新下载或转写。此时没有已接受的输入或失败通知需要恢复。命令兼容性还依赖于 [raw API 的 `--data -` stdin 支持](https://github.com/larksuite/cli/blob/v1.0.100/cmd/api/api.go)与[资源下载快捷命令](https://github.com/larksuite/cli/blob/v1.0.100/skills/lark-im/references/lark-im-messages-resources-download.md)。
 
@@ -101,7 +103,13 @@ python scripts/build_source_zip.py
 
 程序在启动时检查两路设备是否支持所需流格式。输入为 16 kHz 单声道有符号 16-bit PCM（512 样本一帧），直接供 Silero 和 WAV 文件转写使用。输出为 MiniMax 相同采样率的单声道 16-bit PCM，默认 44.1 kHz，可配 16/24/32/44.1 kHz。CoreAudio 在需要且支持时转换设备格式，程序不更改设备全局采样率、不再做第二次重采样。若报 `voice_input_pcm_16khz_mono_not_supported` 或 `voice_output_pcm_rate_or_channels_not_supported`，在「音频 MIDI 设置」和 `sounddevice` 列表核对两条线路；输出可选一个双方支持的采样率，输入需选择能提供 16 kHz 单声道流的设备或系统转换。若通话对端无声，核对虚拟设备首个单声道的路由、飞书麦克风/扬声器选项和设备权限。
 
-VAD 默认连续 3 个 32 ms 人声窗口触发打断，默认静默 1 秒结束话轮，随后提交一次 16 kHz WAV；录音长度、转写等待和录音队列有上限。实时通话录音超限、空白、识别失败或超时不入队，也不发送飞书语音条式失败通知。MiniMax TTS 用 [`/v1/t2a_v2` HTTP SSE](https://platform.minimax.cn/docs/api-reference/speech-t2a-http)逐段发送，首块到达即可播放；每段流结束且待播放低于 `prefetch_seconds` 时才提交下一段。默认首次输出起 `voice.delivery_timeout = 90` 秒，低于 Runtime 的投递看门狗，独立于 LLM 请求的 60 秒默认时限。
+输出采样率由 `[voice]` 中的 `output_sample_rate` 设置，单位为 Hz。升级旧配置时，把 `playback_rate` 改为 `output_sample_rate`，数值不变。
+
+VAD 默认连续 3 个 32 ms 人声窗口触发打断，默认静默 1 秒结束话轮。实时录音按实际样本数计时（含预录和已录停顿），以 `max_audio_seconds` 和含 WAV 文件头的 50 MB 字节保护中先到的上限为准。达到上限时立即将保留的前段送入转写队列，不等用户停下。之后的声音只用于检测静默，不录音、不打断也不阻止回复播报；连续静默达到 `silence_seconds` 后，再次开口才恢复正常录音和打断。ASR 仍串行处理，队列满时仍丢弃新录音；空转写结果、识别失败或超时不会提交给 Runtime，也不发送飞书语音条式失败通知。
+
+若 `max_audio_seconds` 短到放不下一个 16 kHz 采样点，实时语音无法启动，并报告 `voice_asr_max_audio_seconds_below_one_sample`。
+
+MiniMax TTS 用 [`/v1/t2a_v2` HTTP SSE](https://platform.minimax.cn/docs/api-reference/speech-t2a-http)逐段发送，首块到达即可播放；每段流结束且待播放低于 `prefetch_seconds` 时才提交下一段。默认首次输出起 `voice.delivery_timeout = 90` 秒，低于 Runtime 的投递看门狗，独立于 LLM 请求的 60 秒默认时限。
 
 运行时若设备流断开或 VAD 推理出错，实时语音停用并记日志：丢弃尚未提交的录音，取消在途实时转写，忽略迟到结果，不等待取消清理。当前播报仍保留已交设备的确认前缀。模型、工具、飞书输入轮询和飞书语音条转写不受影响。不会自动切成文字输出或重连设备；排查后需重启。
 
@@ -118,6 +126,8 @@ MiniMax 流式合成也可能以 HTTP 200 返回 JSON 业务错误而不是 SSE�
 
 用 `History.subtask_run(child_session_id, run_id)` 可追溯受理、开始、完成和回投入队时间。`enqueued_at` 只表示已入内存队列，不代表已被主会话处理。终态写入最多尝试三次，不重跑模型；持续失败会记录运行 ID、异常类型和未回投，不写假终态，数据库可能保留最后一次状态。退出开始时同步停止接收新委派和回投；可写时将未结束的记录标为中断，异常退出后由下次启动标记。不补跑、不重放；原有子会话 ID 仍可用于新委派。
 
-历史查找可叠加时间范围和 FTS5 关键词筛选，默认使用 SQLite 的分词规则，不承诺中文短词的子串查找。上下文 token 预算为本地估算。DeepSeek 请求另有 40 MiB 正文硬上限，OpenAI Responses 有 32 MiB 本机请求上限（不是供应商的协议承诺）；包括摘要请求。Runtime 只在本轮请求需要裁剪图片时，从批次中位置靠后的图片开始尝试（同一富文本内也一样）；某张放不下就继续尝试更早的图。选定后仍按原顺序发送图文，并保留省略提示、普通文字及完整工具组，不改 SQLite 原文。不根据“第一张”等自然语言改变选择，也不会补下载在飞书入口已被省略的图片。旧历史或摘要可按预算缩减；若本轮文字和完整工具块仍放不下，结束该次运行，后续输入照常处理。实际发送前检查序列化后的字节数。
+历史查找可叠加时间范围和 FTS5 关键词筛选，默认使用 SQLite 的分词规则，不承诺中文短词的子串查找。上下文 token 预算为本地估算。DeepSeek 请求另有 40 MiB 正文硬上限，OpenAI Responses 有 32 MiB 本机请求上限（不是供应商的协议承诺）；包括摘要请求。Runtime 只在本轮请求需要裁剪图片时，从批次中位置靠后的图片开始尝试（同一富文本内也一样）；某张放不下就继续尝试更早的图。选定后仍按原顺序发送图文，并保留省略提示、普通文字及完整工具组，不改 SQLite 原文。不根据“第一张”等自然语言改变选择，也不会补下载在飞书入口已被省略的图片。旧历史可按预算缩减；若本轮文字和完整工具块仍放不下，结束该次运行，后续输入照常处理。实际发送前检查序列化后的字节数。
+
+会话摘要完整保存到 SQLite。回复请求放不下完整摘要时，整条省略，不修改已保存摘要；如果完整旧摘要挤占了原本可摘要的历史，压缩不推进覆盖点。升级时请从本机配置的 `[runtime]` 移除旧的 `summary_budget`。
 
 方案见 [首版架构方案](<docs/design/0001-MVP方案/飞书多模态 Agent 首版架构方案.md>)和[首版实施与验收计划](<docs/design/0001-MVP方案/飞书多模态 Agent 首版实施与验收计划.md>)。

@@ -8,10 +8,10 @@ from ...speech.vad import INPUT_FRAMES, INPUT_RATE, VoiceSetupError
 
 
 class MacAudioDevice:
-    def __init__(self, input_device: str | int, output_device: str | int, playback_rate: int) -> None:
+    def __init__(self, input_device: str | int, output_device: str | int, output_sample_rate: int) -> None:
         self._input_device = input_device
         self._output_device = output_device
-        self._playback_rate = playback_rate
+        self._output_sample_rate = output_sample_rate
         self._streams = []
 
     @property
@@ -20,7 +20,7 @@ class MacAudioDevice:
 
     @property
     def output_format(self) -> AudioFormat:
-        return AudioFormat(self._playback_rate)
+        return AudioFormat(self._output_sample_rate)
 
     @staticmethod
     def _resolve(sd, selection: str | int, direction: str) -> int:
@@ -74,8 +74,8 @@ class MacAudioDevice:
             render(memoryview(outdata))
 
         try:
-            self._streams.append(sd.RawOutputStream(**output_format, blocksize=round(self._playback_rate / 50),
-                                                     callback=output_callback))
+            self._streams.append(sd.RawOutputStream(
+                **output_format, blocksize=round(self._output_sample_rate / 50), callback=output_callback))
             self._streams.append(sd.RawInputStream(**input_format, blocksize=INPUT_FRAMES, callback=input_callback))
             for stream in self._streams:
                 stream.start()

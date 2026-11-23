@@ -7,9 +7,8 @@ from typing import Protocol
 import wave
 
 
-# MiniMax 文件接口的上限。WAV 可在本地校验时长，其它容器由服务端校验。
+# 本地单文件字节保护；非 WAV 的时长仍由服务端校验。
 MAX_AUDIO_BYTES = 50_000_000
-MAX_AUDIO_SECONDS = 500
 
 
 class AsrError(Exception):
@@ -22,48 +21,52 @@ class AudioFile:
     data: bytes = field(repr=False)
     extension: str = field(init=False)
     content_type: str = field(init=False)
+    duration_seconds: float | None = field(init=False)
 
     def __post_init__(self) -> None:
         data = self.data
         if not 0 < len(data) <= MAX_AUDIO_BYTES:
             raise AsrError("invalid_audio_size")
-        extension, content_type = _audio_format(data)
+        extension, content_type, duration = _audio_format(data)
         object.__setattr__(self, "extension", extension)
         object.__setattr__(self, "content_type", content_type)
+        object.__setattr__(self, "duration_seconds", duration)
 
 
-def _audio_format(data: bytes) -> tuple[str, str]:
+def _audio_format(data: bytes) -> tuple[str, str, float | None]:
     if data.startswith(b"RIFF") and data[8:12] == b"WAVE":
         try:
             with wave.open(io.BytesIO(data), "rb") as file:
                 frames = file.getnframes()
-                if frames <= 0 or frames > MAX_AUDIO_SECONDS * file.getframerate():
+                sample_rate = file.getframerate()
+                if frames <= 0 or sample_rate <= 0:
                     raise AsrError("invalid_audio_duration")
                 # seek 到最后一帧，避免只认头部或为文件内容分配第二个完整副本。
                 file.setpos(frames - 1)
                 if len(file.readframes(1)) != file.getnchannels() * file.getsampwidth():
                     raise AsrError("invalid_wav")
+                duration = frames / sample_rate
         except (wave.Error, EOFError, ValueError, RuntimeError, OverflowError, struct.error):
             # 标准库 wave 读取损坏的 chunk 时也可能直接抛 EOFError 或 RuntimeError。
             raise AsrError("invalid_wav") from None
-        return "wav", "audio/wav"
+        return "wav", "audio/wav", duration
     if len(data) >= 36 and data.startswith(b"OggS\x00") and data[26]:
         # 实际容器是 Ogg；飞书的 Opus 语音通常封装在此容器中。
         packet_start = 27 + data[26]
         if data.startswith((b"OpusHead", b"\x01vorbis", b"\x7fFLAC"), packet_start):
-            return "ogg", "audio/ogg"
+            return "ogg", "audio/ogg", None
     if len(data) >= 42 and data.startswith(b"fLaC"):
-        return "flac", "audio/flac"
+        return "flac", "audio/flac", None
     if len(data) >= 16 and data.startswith(b"FORM") and data[8:12] in (b"AIFF", b"AIFC"):
-        return "aiff", "audio/aiff"
+        return "aiff", "audio/aiff", None
     if len(data) >= 16 and data[4:8] == b"ftyp" and data[8:12] in (b"M4A ", b"M4B "):
-        return "m4a", "audio/mp4"
+        return "m4a", "audio/mp4", None
     if len(data) >= 7 and data[0] == 0xFF and data[1] & 0xF6 == 0xF0:
-        return "aac", "audio/aac"
+        return "aac", "audio/aac", None
     if len(data) >= 10 and (data.startswith(b"ID3") or (
         data[0] == 0xFF and data[1] & 0xE0 == 0xE0 and data[1] & 0x06 and data[2] >> 4 not in (0, 15)
     )):
-        return "mp3", "audio/mpeg"
+        return "mp3", "audio/mpeg", None
     raise AsrError("unsupported_audio_format")
 
 

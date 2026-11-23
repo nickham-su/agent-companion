@@ -143,7 +143,7 @@ class ProjectionTest(unittest.IsolatedAsyncioTestCase):
         async def tool(args, context):
             return "tool result " + "b" * 72
 
-        settings = RuntimeSettings(context_budget=240, tail_budget=65, summary_budget=35)
+        settings = RuntimeSettings(context_budget=240, tail_budget=65)
         model = BusyModel()
         with closing(History(":memory:")) as history:
             older = [Message("user", "old material " + "x" * 247) for _ in range(2)]
@@ -181,7 +181,7 @@ class ProjectionTest(unittest.IsolatedAsyncioTestCase):
             return "b" * 600
 
         model = BigToolModel()
-        settings = RuntimeSettings(context_budget=140, tail_budget=65, summary_budget=30)
+        settings = RuntimeSettings(context_budget=140, tail_budget=65)
         with closing(History(":memory:")) as history:
             runtime = Runtime("main", history, model, Sink(), settings=settings, tools=Tools([Tool(SPEC, tool)]))
             try:
@@ -218,7 +218,7 @@ class ProjectionTest(unittest.IsolatedAsyncioTestCase):
             return "已完成测试工具"
 
         model = FailingSummary()
-        settings = RuntimeSettings(context_budget=240, tail_budget=150, summary_budget=35)
+        settings = RuntimeSettings(context_budget=240, tail_budget=150)
         with closing(History(":memory:")) as history:
             covered, = history.append("main", [Message("user", "此前信息")])
             saved = Summary(covered, "已保存摘要")
@@ -264,7 +264,7 @@ class ProjectionTest(unittest.IsolatedAsyncioTestCase):
             return "已完成测试工具"
 
         model = ToolModel()
-        settings = RuntimeSettings(context_budget=240, tail_budget=150, summary_budget=35)
+        settings = RuntimeSettings(context_budget=240, tail_budget=150)
         with tempfile.TemporaryDirectory(dir=Path.cwd()) as folder:
             path = Path(folder) / "summary.sqlite"
             with (closing(History(path)) as history, closing(sqlite3.connect(path)) as fault,
@@ -334,7 +334,7 @@ class ProjectionTest(unittest.IsolatedAsyncioTestCase):
                     yield TextDelta("正文继续")
 
         model = LaterFailure()
-        settings = RuntimeSettings(context_budget=230, tail_budget=70, summary_budget=40)
+        settings = RuntimeSettings(context_budget=230, tail_budget=70)
         with closing(History(":memory:")) as history:
             covered, = history.append("main", [Message("user", "此前信息")])
             saved = Summary(covered, "旧摘要")
@@ -348,8 +348,44 @@ class ProjectionTest(unittest.IsolatedAsyncioTestCase):
             self.assertIn("旧摘要", model.requests[0][0].content)
             self.assertEqual(model.requests[0][-1].content, "新文本")
 
-    async def test_summary_is_shrunk_for_request_but_not_in_storage(self):
-        settings = RuntimeSettings(context_budget=180, tail_budget=70, summary_budget=70)
+    async def test_long_generated_summary_is_saved_in_full_and_does_not_mark_more_history_covered(self):
+        chunks = ("\n摘要开头\n" + "长" * 4_001, "摘要结尾\n")
+
+        class LongSummaryModel(CapturingModel):
+            async def stream(self, messages, tools, *, thinking):
+                async for event in super().stream(messages, tools, thinking=thinking):
+                    if isinstance(event, TextDelta) and event.text == "summary-material":
+                        for chunk in chunks:
+                            yield TextDelta(chunk)
+                    else:
+                        yield event
+
+        settings = RuntimeSettings(context_budget=500, tail_budget=200)
+        old = Message("user", "旧消息 " + "x" * 800)
+        current = "新消息 " + "y" * 800
+        with tempfile.TemporaryDirectory(dir=Path.cwd()) as folder:
+            path = Path(folder) / "test.sqlite"
+            with closing(History(path)) as history:
+                covered, = history.append("main", [old])
+                model = LongSummaryModel()
+                await self.turn(history, model, current, settings=settings)
+                self.assertEqual(len(model.summaries), 1)
+                self.assertEqual(model.requests[0][0], [Message("user", current)])
+            with closing(History(path)) as history:
+                saved = Summary(covered, "".join(chunks))
+                self.assertEqual(history.summary("main"), saved)
+                self.assertEqual(history.read_after("main")[0].message, old)
+
+                model = CapturingModel()
+                with self.assertLogs("agent_companion.runtime.context", level="WARNING") as logs:
+                    await self.turn(history, model, current, settings=settings)
+                self.assertIn("summary_context_too_large", logs.output[0])
+                self.assertEqual(model.summaries, [])
+                self.assertEqual(history.summary("main"), saved)
+                self.assertEqual(history.read_after("main", covered)[0].message, Message("user", current))
+
+    async def test_summary_that_does_not_fit_request_is_omitted_but_not_changed_in_storage(self):
+        settings = RuntimeSettings(context_budget=180, tail_budget=70)
         model = CapturingModel()
         newest = "x" * 450
         with closing(History(":memory:")) as history:
@@ -357,18 +393,11 @@ class ProjectionTest(unittest.IsolatedAsyncioTestCase):
             original_summary = Summary(covered, "previous summary " * 12)
             history.save_summary("main", original_summary)
             await self.turn(history, model, newest, settings=settings)
-            messages = model.requests[0][0]
-            self.assertEqual(messages[-1], Message("user", newest))
-            self.assertEqual(messages[0].role, "system")
-            prefix, projected = messages[0].content.split("\n", 1)
-            self.assertEqual(prefix, "此前会话摘要：")
-            self.assertTrue(projected)
-            self.assertTrue(original_summary.text.startswith(projected))
-            self.assertLess(len(projected), len(original_summary.text))
+            self.assertEqual(model.requests[0][0], [Message("user", newest)])
             self.assertEqual(history.summary("main"), original_summary)
 
     async def test_no_room_for_summary_uses_existing_tail_without_marking_old_history_covered(self):
-        settings = RuntimeSettings(context_budget=180, tail_budget=70, summary_budget=70)
+        settings = RuntimeSettings(context_budget=180, tail_budget=70)
         model = CapturingModel()
         newest = "x" * 510
         with closing(History(":memory:")) as history:
@@ -383,7 +412,7 @@ class ProjectionTest(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(history.read_after("main", covered)[0].message_id, prior)
 
     async def test_one_oversized_input_does_not_prevent_later_turns(self):
-        settings = RuntimeSettings(context_budget=180, tail_budget=90, summary_budget=40)
+        settings = RuntimeSettings(context_budget=180, tail_budget=90)
         model = CapturingModel()
         oversized = "q" * 2000
         with closing(History(":memory:")) as history:
@@ -405,7 +434,7 @@ class ProjectionTest(unittest.IsolatedAsyncioTestCase):
                 await runtime.close()
 
     async def test_context_compaction_keeps_blocks_raw_history_and_previous_summary(self):
-        settings = RuntimeSettings(context_budget=275, tail_budget=125, summary_budget=40)
+        settings = RuntimeSettings(context_budget=275, tail_budget=125)
         model = CapturingModel()
         with tempfile.TemporaryDirectory(dir=Path.cwd()) as folder:
             path = Path(folder) / "test.sqlite"

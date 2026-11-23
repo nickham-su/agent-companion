@@ -78,18 +78,17 @@ class RuntimeSettings:
     delivery_timeout: float = 120
     context_budget: int = 64_000
     tail_budget: int = 16_000
-    summary_budget: int = 4_000
     max_tool_rounds: int = 8
 
     def __post_init__(self) -> None:
         _config_seconds(self.model_timeout, "timeouts.llm")
         _config_seconds(self.delivery_timeout, "runtime.delivery_timeout")
-        for name in ("context_budget", "tail_budget", "summary_budget", "max_tool_rounds"):
+        for name in ("context_budget", "tail_budget", "max_tool_rounds"):
             value = getattr(self, name)
             if type(value) is not int or value <= 0:
                 raise ConfigError(f"runtime.{name} 必须是正整数")
-        if self.tail_budget + self.summary_budget >= self.context_budget:
-            raise ConfigError("runtime.tail_budget 与 runtime.summary_budget 之和必须小于 runtime.context_budget")
+        if self.tail_budget >= self.context_budget:
+            raise ConfigError("runtime.tail_budget 必须小于 runtime.context_budget")
 
 
 @dataclass(frozen=True, slots=True)
@@ -155,14 +154,22 @@ class MiniMaxConnection:
             raise ConfigError("MiniMax Provider 的 region 必须是 cn 或 global")
 
 
+def require_asr_audio_seconds(value: float) -> None:
+    # 整数不必转成 float：很大的有限整数同样是合法配置。
+    if not ((type(value) is int and value > 0) or (type(value) is float and 0 < value < math.inf)):
+        raise ConfigError("asr.max_audio_seconds 必须是有限正数")
+
+
 @dataclass(frozen=True, slots=True)
 class ASRSettings:
     connection: MiniMaxConnection
+    max_audio_seconds: float
     model: str = MINIMAX_ASR_MODEL
 
     def __post_init__(self) -> None:
-        if self.model != MINIMAX_ASR_MODEL:
-            raise ConfigError(f"当前 MiniMax ASR 只支持 asr.model = {MINIMAX_ASR_MODEL}")
+        require_asr_audio_seconds(self.max_audio_seconds)
+        if not isinstance(self.model, str) or not self.model.strip():
+            raise ConfigError("asr.model 必须是非空字符串")
 
 
 @dataclass(frozen=True, slots=True)
@@ -187,8 +194,7 @@ class VoiceSettings:
     vad_threshold: float = 0.5
     speech_frames: int = 3  # 每帧 32 ms
     silence_seconds: float = 1
-    max_turn_seconds: float = 60
-    playback_rate: int = 44_100
+    output_sample_rate: int = 44_100
     prefetch_seconds: float = 0.4
     buffer_seconds: float = 2
     delivery_timeout: float = 90
@@ -200,19 +206,17 @@ class VoiceSettings:
                 isinstance(value, str) and value.strip() and "\x00" not in value
             )):
                 raise ConfigError(f"voice.{name} 必须是有效的设备名称或非负整数索引")
-        for name in ("vad_threshold", "silence_seconds", "max_turn_seconds", "prefetch_seconds",
+        for name in ("vad_threshold", "silence_seconds", "prefetch_seconds",
                      "buffer_seconds", "delivery_timeout"):
             _config_seconds(getattr(self, name), f"voice.{name}")
         if self.vad_threshold >= 1:
             raise ConfigError("voice.vad_threshold 必须小于 1")
         if type(self.speech_frames) is not int or not 1 <= self.speech_frames <= 15:
             raise ConfigError("voice.speech_frames 必须是 1–15 之间的整数")
-        if not self.speech_frames * 0.032 <= self.max_turn_seconds <= 120:
-            raise ConfigError("voice.max_turn_seconds 不得短于 voice.speech_frames 对应时长，且不得超过 120 秒")
         if self.silence_seconds > 10:
             raise ConfigError("voice.silence_seconds 不得超过 10 秒")
-        if type(self.playback_rate) is not int or self.playback_rate not in {16_000, 24_000, 32_000, 44_100}:
-            raise ConfigError("voice.playback_rate 必须是 16000、24000、32000 或 44100")
+        if type(self.output_sample_rate) is not int or self.output_sample_rate not in {16_000, 24_000, 32_000, 44_100}:
+            raise ConfigError("voice.output_sample_rate 必须是 16000、24000、32000 或 44100")
         if not 0.032 <= self.buffer_seconds <= 5:
             raise ConfigError("voice.buffer_seconds 必须在 0.032–5 秒之间")
         if self.prefetch_seconds >= self.buffer_seconds:
