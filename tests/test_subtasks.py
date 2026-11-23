@@ -134,7 +134,7 @@ class SubtaskTests(unittest.IsolatedAsyncioTestCase):
 
         with patch.object(self.history, "accept_subtask", side_effect=accept_job):
             async with running_agent(self.settings, self.history, _Model(answer), self.channel,
-                                     retry_sqlite_locks=True) as (_, subtasks):
+                                     session_id="main", retry_sqlite_locks=True) as (_, subtasks):
                 tasks = [asyncio.create_task(self._delegate(subtasks, f"call-{i}", "job")) for i in range(10)]
                 try:
                     await _wait(saturated.wait())
@@ -177,7 +177,8 @@ class SubtaskTests(unittest.IsolatedAsyncioTestCase):
             else:
                 yield TextDelta("已处理")
 
-        async with running_agent(self.settings, self.history, _Model(answer), self.channel) as (main, subtasks):
+        async with running_agent(self.settings, self.history, _Model(answer), self.channel,
+                                 session_id="main") as (main, subtasks):
             main.submit_batch([Message("user", "fan-out")])
             await _wait(saturated.wait())
             await _wait(main.wait_idle())
@@ -218,7 +219,8 @@ class SubtaskTests(unittest.IsolatedAsyncioTestCase):
                 yield TextDelta("main-used-result")
 
         model = _Model(answer)
-        async with running_agent(self.settings, self.history, model, self.channel) as (main, subtasks):
+        async with running_agent(self.settings, self.history, model, self.channel,
+                                 session_id="main") as (main, subtasks):
             main.submit_batch((Message("user", "delegate"),))
             await _wait(child_started.wait())
             await _wait(main.wait_idle())
@@ -284,7 +286,8 @@ class SubtaskTests(unittest.IsolatedAsyncioTestCase):
                 yield TextDelta("continued")
 
         model = _Model(answer)
-        async with running_agent(self.settings, self.history, model, self.channel) as (main, subtasks):
+        async with running_agent(self.settings, self.history, model, self.channel,
+                                 session_id="main") as (main, subtasks):
             accepted = await self._delegate(subtasks, "background", "child-task")
             main.submit_batch((Message("user", "mixed"),))
             await _wait(self.channel.blocked.wait())
@@ -305,7 +308,7 @@ class SubtaskTests(unittest.IsolatedAsyncioTestCase):
             yield TextDelta("完成")
 
         async with running_agent(self.settings, self.history, _Model(answer), self.channel,
-                                 retry_sqlite_locks=True) as (main, subtasks):
+                                 session_id="main", retry_sqlite_locks=True) as (main, subtasks):
             first = await self._delegate(subtasks, "first", "job")
             child = first["child_session_id"]
             await _wait(subtasks.wait_idle())
@@ -347,7 +350,8 @@ class SubtaskTests(unittest.IsolatedAsyncioTestCase):
                 yield TextDelta(f"answer-{prompt}")
 
         model = _Model(answer)
-        async with running_agent(self.settings, self.history, model, self.channel) as (main, subtasks):
+        async with running_agent(self.settings, self.history, model, self.channel,
+                                 session_id="main") as (main, subtasks):
             first = await self._delegate(subtasks, "first-call", "first")
             await _wait(first_started.wait())
             child = first["child_session_id"]
@@ -384,7 +388,8 @@ class SubtaskTests(unittest.IsolatedAsyncioTestCase):
 
         model = _Model(answer)
         with closing(_AcceptUnavailable(":memory:")) as history:
-            async with running_agent(self.settings, history, model, self.channel) as (main, subtasks):
+            async with running_agent(self.settings, history, model, self.channel,
+                                     session_id="main") as (main, subtasks):
                 main.submit_batch((Message("user", "delegate"),))
                 await _wait(main.wait_idle())
                 await _wait(subtasks.wait_idle())
@@ -411,7 +416,8 @@ class SubtaskTests(unittest.IsolatedAsyncioTestCase):
                 raise ModelError("simulated_disconnect")
 
         model = _Model(answer)
-        async with running_agent(self.settings, self.history, model, self.channel) as (main, subtasks):
+        async with running_agent(self.settings, self.history, model, self.channel,
+                                 session_id="main") as (main, subtasks):
             accepted = [await self._delegate(subtasks, prompt, prompt)
                         for prompt in ("fail", "attempt-recursion")]
             await _wait(subtasks.wait_idle())
@@ -435,7 +441,8 @@ class SubtaskTests(unittest.IsolatedAsyncioTestCase):
 
         model = _Model(answer)
         with closing(_FinishUnavailable(failures)) as history:
-            async with running_agent(self.settings, history, model, self.channel) as (main, subtasks):
+            async with running_agent(self.settings, history, model, self.channel,
+                                     session_id="main") as (main, subtasks):
                 accepted = await self._delegate(subtasks, "finish", "run this once")
                 run_id, child = accepted["run_id"], accepted["child_session_id"]
                 if completed:
@@ -481,7 +488,8 @@ class SubtaskTests(unittest.IsolatedAsyncioTestCase):
             await release.wait()
             yield TextDelta("finishes-as-app-exits")
 
-        async with running_agent(self.settings, self.history, _Model(answer), self.channel) as (main, subtasks):
+        async with running_agent(self.settings, self.history, _Model(answer), self.channel,
+                                 session_id="main") as (main, subtasks):
             accepted = await self._delegate(subtasks, "first", "pending")
             await _wait(started.wait())
 
@@ -514,7 +522,8 @@ class SubtaskTests(unittest.IsolatedAsyncioTestCase):
                 yield TextDelta("main-used-result")
 
         model = _Model(answer)
-        async with running_agent(self.settings, self.history, model, self.channel) as (main, subtasks):
+        async with running_agent(self.settings, self.history, model, self.channel,
+                                 session_id="main") as (main, subtasks):
             await self._delegate(subtasks, "initial", "original child")
             await _wait(subtasks.wait_idle())
             await _wait(main.wait_idle())
@@ -544,7 +553,8 @@ class SubtaskTests(unittest.IsolatedAsyncioTestCase):
                 yield TextDelta("main-finished")
 
         model = _Model(answer)
-        async with running_agent(self.settings, self.history, model, self.channel) as (main, subtasks):
+        async with running_agent(self.settings, self.history, model, self.channel,
+                                 session_id="main") as (main, subtasks):
             await self._delegate(subtasks, "initial", "initial")
             await _wait(result_started.wait())
             main.submit_batch((Message("user", "new-user-input"),))
@@ -578,7 +588,8 @@ class SubtaskTests(unittest.IsolatedAsyncioTestCase):
         with TemporaryDirectory(dir=Path.cwd()) as temp:
             path = Path(temp) / "history.sqlite3"
             with closing(History(path)) as history:
-                async with running_agent(self.settings, history, _Model(blocked), self.channel) as (_, subtasks):
+                async with running_agent(self.settings, history, _Model(blocked), self.channel,
+                                         session_id="main") as (_, subtasks):
                     first = await self._delegate(subtasks, "first", "active")
                     await _wait(started.wait())
                     child = first["child_session_id"]
@@ -596,7 +607,8 @@ class SubtaskTests(unittest.IsolatedAsyncioTestCase):
 
             model = _Model(resumed)
             with closing(History(path)) as history:
-                async with running_agent(self.settings, history, model, self.channel) as (main, subtasks):
+                async with running_agent(self.settings, history, model, self.channel,
+                                         session_id="main") as (main, subtasks):
                     await _wait(subtasks.wait_idle())
                     await _wait(main.wait_idle())
                     self.assertFalse(model.requests)

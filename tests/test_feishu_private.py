@@ -159,13 +159,13 @@ class FeishuPrivateTests(unittest.IsolatedAsyncioTestCase):
             config = Path(tmp) / "synthetic.toml"
             config.write_text(f'[feishu]\nown_open_id = "{_OWN}"\n', encoding="utf-8")
             self.assertEqual(load_settings(config).feishu, self.settings.feishu)
-            self.assertIsNone(self.settings.feishu.peer_open_id)
-            for kwargs, diagnostic in (
-                ({"peer_open_id": "invalid"}, "peer_open_id"), ({"peer_open_id": _OWN}, "必须不同"),
-                ({"mode": "voice"}, "voice 模式必须设置"), ({"own_open_id": "invalid"}, "own_open_id"),
-            ):
-                with self.subTest(diagnostic=diagnostic), self.assertRaisesRegex(ConfigError, diagnostic):
-                    FeishuSettings(**({"own_open_id": _OWN} | kwargs))
+            self.assertEqual(self.settings.feishu.mode, "text")
+            config.write_text(f'[feishu]\nown_open_id = "{_OWN}"\nmode = "text"\n', encoding="utf-8")
+            self.assertEqual(load_settings(config).feishu, self.settings.feishu)
+            config.write_text(f'[feishu]\nown_open_id = "{_OWN}"\nmode = "voice"\n', encoding="utf-8")
+            self.assertEqual(load_settings(config).feishu, FeishuSettings(own_open_id=_OWN, mode="voice"))
+            with self.assertRaisesRegex(ConfigError, "own_open_id"):
+                FeishuSettings(own_open_id="invalid")
 
             owner = private_feishu_identity(self.settings.feishu)
             with closing(History(Path(tmp) / "private.db", feishu_private_owner=owner)) as history:
@@ -174,25 +174,18 @@ class FeishuPrivateTests(unittest.IsolatedAsyncioTestCase):
                 with self.assertRaisesRegex(FeishuBindingError, "服务账号与数据库绑定不一致"):
                     await run_feishu(other, history, _Model(), object(), discovery=self.runner.discovery())
                 self.assertEqual(self.runner.commands, [])
-                with self.assertRaisesRegex(FeishuBindingError, "不能共用"):
-                    history.bind_feishu("main", "synthetic_fixed")
                 self.runner.account = "ou_unexpected_account"
                 with self.assertRaisesRegex(FeishuBindingError, "CLI 当前登录账号"):
                     await run_feishu(self.settings, history, _Model(), object(), discovery=self.runner.discovery())
                 self.assertEqual(self.runner.queries, [])
                 self.assertEqual(self.runner.sent, {})
-            with closing(History(Path(tmp) / "fixed.db", feishu_binding=("main", "synthetic_fixed"))):
-                pass
-            fixed = Path(tmp) / "fixed.db"
-            original = fixed.read_bytes()
-            with self.assertRaisesRegex(FeishuBindingError, "不能共用"):
-                History(fixed, feishu_private_owner=owner)
-            self.assertEqual(fixed.read_bytes(), original)
             unbound = Path(tmp) / "unbound.db"
             with closing(History(unbound)) as history:
                 history.append("main", [Message("user", "unbound history")])
+            original = unbound.read_bytes()
             with self.assertRaisesRegex(FeishuBindingError, "现有数据库有历史"):
                 History(unbound, feishu_private_owner=owner)
+            self.assertEqual(unbound.read_bytes(), original)
 
     async def test_lazy_sessions_parallel_delivery_and_restart(self):
         a, b, c = _CHATS

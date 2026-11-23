@@ -1,15 +1,14 @@
-"""飞书按固定窗口轮询；通知独立发送，模型输出按启动模式路由。"""
+"""飞书私聊按时间窗口轮询，文字回复和通知独立发送。"""
 
 import asyncio
 from collections import deque
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
-import json
 import logging
 from sqlite3 import OperationalError
 from time import time
 
-from ...protocol import Channel, DeliveryStatus, Message, Receipt, ReplyInfo, ReplyStream
+from ...protocol import DeliveryStatus, Message, Receipt, ReplyInfo, ReplyStream
 from ...speech.asr import FileASR
 from ...storage.sqlite import History, is_sqlite_lock_error
 from .cli import MAX_PAGE_SIZE, MIN_PAGE_SIZE, CliError, CliStdoutLimit, FeishuCLI
@@ -28,19 +27,14 @@ _MAX_PENDING_REPLIES = 8
 
 
 class FeishuChannel:
-    def __init__(self, cli: FeishuCLI, *, mode: str, voice_output: Channel | None = None) -> None:
-        if mode not in ("text", "voice") or (mode == "voice" and voice_output is None):
-            raise ValueError("voice mode requires an audio output")
+    def __init__(self, cli: FeishuCLI) -> None:
         self._cli = cli
-        self._voice_output = voice_output if mode == "voice" else None
         self._pending: deque[tuple[str, str]] = deque()
         self._sender: asyncio.Task[None] | None = None
         self._closed = False
 
     async def deliver(self, reply: ReplyStream) -> Receipt:
-        if self._voice_output is None:
-            raise RuntimeError("Feishu text replies require background delivery")
-        return await self._voice_output.deliver(reply)
+        raise RuntimeError("Feishu text replies require background delivery")
 
     def enqueue(self, info: ReplyInfo, text: str) -> None:
         """将已落库的文字正文交给发送队列，也可用于语音确认正文的副本。"""
@@ -122,8 +116,8 @@ class _ScanWindow:
 class FeishuPoller:
     def __init__(self, cli: FeishuCLI, asr: FileASR, channel: FeishuChannel, *,
                  chat_id: str, sender_id: str, own_id: str, session_id: str, history: History,
-                 submit: Callable[[int], Awaitable[None] | None], clock: Callable[[], float] = time,
-                 private_started_ms: int | None = None,
+                 submit: Callable[[int], Awaitable[None] | None], private_started_ms: int,
+                 clock: Callable[[], float] = time,
                  batch_budget: int = MAX_BATCH_BYTES, before_close: Callable[[], None] | None = None) -> None:
         self._cli = cli
         self._normalizer = MessageNormalizer(cli, asr)
@@ -134,8 +128,7 @@ class FeishuPoller:
         self._own_id = own_id
         self._session_id = session_id
         self._private_started_ms = private_started_ms
-        self._source = ("feishu-private" if private_started_ms is not None else
-                        json.dumps(["feishu", chat_id, sender_id, own_id]))
+        self._source = "feishu-private"
         self._history = history
         self._submit = submit
         self._before_close = before_close
@@ -184,7 +177,7 @@ class FeishuPoller:
             for item in items:
                 message = incoming(item, chat_id=self._chat_id, sender_id=self._sender_id, own_id=self._own_id)
                 if (message is not None and window.start * 1000 <= message.created_ms < window.end * 1000
-                        and (self._private_started_ms is None or message.created_ms >= self._private_started_ms)
+                        and message.created_ms >= self._private_started_ms
                         and message.message_id not in window.messages
                         and not self._history.inbound_seen(self._session_id, self._source, message.message_id)):
                     size = 4 * len(message.content)  # Python 字符串每个码点至多占 4 字节。
@@ -225,7 +218,7 @@ class FeishuPoller:
             await self._submit_pending()
             if self._window is None:
                 now = int(self._clock())
-                initial = now if self._private_started_ms is None else self._private_started_ms // 1000
+                initial = self._private_started_ms // 1000
                 floor, through = self._history.inbound_window(self._session_id, self._source, initial)
                 start = max(floor, through - _OVERLAP_SECONDS)
                 if now <= start:
@@ -272,8 +265,6 @@ class FeishuPoller:
                 except CliError as exc:
                     _LOG.warning("Feishu poll failed (%s)", exc)
                 except OperationalError as exc:
-                    if self._private_started_ms is None:
-                        raise
                     if not is_sqlite_lock_error(exc):
                         _LOG.error("Feishu private inbox storage failed; sqlite_code=%s",
                                    getattr(exc, "sqlite_errorcode", None))

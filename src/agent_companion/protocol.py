@@ -288,3 +288,13 @@ class BackgroundChannel(Protocol):
     def enqueue(self, info: ReplyInfo, text: str) -> None:
         """落库后尽力交给通道后台发送；不得阻塞或产生投递回执。"""
         ...
+
+
+@dataclass(frozen=True, eq=False, slots=True)
+class ReplyRoute:
+    """一个短期投递目标；对象身份贯穿输入队列、工具续轮和子任务。"""
+
+    channel: Channel
+    active: Callable[[], bool]
+    idle_timeout: float
+    on_confirmed: Callable[[ReplyInfo, str], None] | None = None

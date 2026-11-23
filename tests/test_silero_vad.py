@@ -98,11 +98,14 @@ class SileroVADTest(unittest.TestCase):
         # 新解释器可检查入口和组装阶段的导入，而不是只检查已经导入模块后的路径。
         code = textwrap.dedent('''
             import asyncio
-            from contextlib import closing
+            from contextlib import closing, suppress
             import sys
             from unittest.mock import patch
 
-            sys.modules.update(sounddevice=None, numpy=None, onnxruntime=None)
+            unavailable = ("sounddevice", "numpy", "onnxruntime", "agent_companion.speech.voice",
+                           "agent_companion.speech.minimax_tts", "agent_companion.channels.audio.macos",
+                           "agent_companion.channels.feishu.macos_calls")
+            sys.modules.update(dict.fromkeys(unavailable))
             from agent_companion import __main__
             from agent_companion.app import run_feishu
             from agent_companion.channels.feishu.channel import FeishuPoller
@@ -110,14 +113,27 @@ class SileroVADTest(unittest.TestCase):
             from agent_companion.storage.sqlite import History
 
             sys.path.insert(0, "tests")
-            from feishu_test_support import fixed_discovery
+            from feishu_test_support import private_discovery
 
-            async def poll(poller):
-                assert poller._channel._voice_output is None
+            async def run(settings):
+                started = asyncio.Event()
 
-            settings = Settings(feishu=FeishuSettings(own_open_id="ou_self", peer_open_id="ou_peer", mode="text"))
-            discovery = fixed_discovery("oc_fake", "ou_peer", "ou_self")
-            with closing(History(":memory:")) as history, patch.object(FeishuPoller, "run", poll):
-                asyncio.run(run_feishu(settings, history, object(), object(), discovery=discovery))
+                async def poll(poller):
+                    started.set()
+                    await asyncio.Future()
+
+                discovery = private_discovery("oc_fake", "ou_peer", "ou_self")
+                with closing(History(":memory:")) as history, patch.object(FeishuPoller, "run", poll):
+                    task = asyncio.create_task(run_feishu(settings, history, object(), object(), discovery=discovery))
+                    try:
+                        await asyncio.wait_for(started.wait(), 1)
+                        assert not task.done()
+                    finally:
+                        task.cancel()
+                        with suppress(asyncio.CancelledError):
+                            await task
+
+            for mode in ({}, {"mode": "text"}):
+                asyncio.run(run(Settings(feishu=FeishuSettings(own_open_id="ou_self", **mode))))
         ''')
         subprocess.run([sys.executable, "-c", code], check=True, timeout=5, capture_output=True)

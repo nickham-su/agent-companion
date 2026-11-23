@@ -9,10 +9,10 @@ import unittest
 from unittest.mock import AsyncMock, patch
 
 import httpx
-from feishu_test_support import fixed_discovery
+from feishu_test_support import private_discovery
 
 from agent_companion.__main__ import _serve
-from agent_companion.app import running_agent
+from agent_companion.app import prepare_private_feishu, running_agent
 from agent_companion.config import LLMSettings, RuntimeSettings, load_settings
 from agent_companion.models.deepseek import CHAT_COMPLETIONS, DeepSeek
 from agent_companion.models.openai_responses import OpenAIResponses
@@ -769,7 +769,6 @@ asr_provider = "speech"
 [timeouts]
 llm = 0.75
 [feishu]
-peer_open_id = "ou_peer"
 own_open_id = "ou_self"
 [providers.speech]
 adapter = "minimax"
@@ -781,14 +780,22 @@ max_audio_seconds = 500
             tables += (f'[providers.{name}]\nadapter = "openai_responses"\napi_key = "{key}"\nbase_url = "{address}"\n'
                        f'[providers.{name}.llm]\nmodel = "{model}"\nreasoning_effort = "{effort}"\n')
 
-        async def exercise(settings, history, model, asr, route, *, tts):
+        async def exercise(settings, history, model, asr, tts):
             self.assertIsInstance(model, OpenAIResponses)
             self.assertIsNone(tts)
-            async with running_agent(settings, history, model, _Channel()) as (runtime, _):
+            async with running_agent(settings, history, model, _Channel(), session_id="test-openai") as (runtime, _):
                 self.assertEqual(runtime._settings.model_timeout, 0.75)
                 runtime.submit_batch([Message("user", "synthetic prompt")])
                 await asyncio.wait_for(runtime.wait_idle(), 2)
                 self.assertIsNone(runtime.last_failure)
+
+        async def prepare(settings, history, *, discovery):
+            await prepare_private_feishu(settings, history, discovery=discovery)
+
+            async def run(model, asr, tts):
+                await exercise(settings, history, model, asr, tts)
+
+            return run
 
         actual_client = httpx.AsyncClient
         with TemporaryDirectory(dir=Path.cwd()) as folder:
@@ -800,10 +807,10 @@ max_audio_seconds = 500
                     answer = (_reason(), _answer("old confirmed")) if name == "initial" else (_answer("follow-up"),)
                     target = "https://other.example.invalid/api/responses" if name == "other_address" else endpoint
                     fixture = _Fixture(self, [_completed(*answer)], api_key=key, endpoint=target)
-                    with (patch("agent_companion.__main__.run_fixed_feishu", side_effect=exercise),
+                    with (patch("agent_companion.__main__.prepare_private_feishu", side_effect=prepare),
                           patch("agent_companion.__main__.httpx.AsyncClient",
                                 side_effect=lambda **opts: actual_client(transport=fixture.transport, **opts))):
-                        await _serve(settings, discovery=fixed_discovery("oc_fixture", "ou_peer", "ou_self"))
+                        await _serve(settings, discovery=private_discovery("oc_fixture", "ou_peer", "ou_self"))
                     request, = fixture.requests
                     self.assertEqual(request["model"], model)
                     self.assertEqual(request["reasoning"]["effort"], effort)

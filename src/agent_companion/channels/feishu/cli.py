@@ -176,6 +176,12 @@ class PrivateChat:
     sender_id: str = field(repr=False)
 
 
+@dataclass(frozen=True, slots=True, repr=False)
+class RingingCaller:
+    meeting_id: str
+    sender_open_id: str
+
+
 def _valid_id(value: Any, prefix: str) -> bool:
     return isinstance(value, str) and re.fullmatch(rf"{prefix}_[\w-]{{1,160}}", value, flags=re.ASCII) is not None
 
@@ -236,6 +242,35 @@ class FeishuDiscovery(_UserCLI):
             tokens.add(token)
             token_args = ("--page-token", token)
 
+    async def ringing_caller(self, own_open_id: str) -> RingingCaller | None:
+        """只接受当前实测的一对一响铃形态，不将其当作会议来源的证明。"""
+        data = _success_data(await self._run(("vc", "+meeting-list-active")))
+        meetings = data.get("meetings")
+        if meetings is None and "meetings" in data:
+            return None
+        if not isinstance(meetings, list):
+            raise CliError("cli_invalid_active_meetings")
+        if len(meetings) != 1:
+            return None
+        row = meetings[0]
+        meeting_id = row.get("meeting_id") if isinstance(row, dict) else None
+        if not isinstance(meeting_id, str) or re.fullmatch(r"[0-9]{1,32}", meeting_id) is None:
+            raise CliError("cli_invalid_meeting_id")
+        data = _success_data(await self._run(("vc", "meeting", "get", "--meeting-id", meeting_id,
+                                              "--with-participants", "--user-id-type", "open_id")))
+        meeting = data.get("meeting")
+        if not isinstance(meeting, dict) or meeting.get("id") != meeting_id:
+            raise CliError("cli_invalid_meeting_detail")
+        status, host, participants = meeting.get("status"), meeting.get("host_user"), meeting.get("participants")
+        if type(status) is not int or status != 1 or not isinstance(participants, list) or len(participants) != 1:
+            return None
+        caller = host.get("id") if isinstance(host, dict) else None
+        participant = participants[0]
+        if (not _valid_id(caller, "ou") or caller == own_open_id
+                or not isinstance(participant, dict) or participant.get("id") != caller):
+            return None
+        return RingingCaller(meeting_id, caller)
+
     def for_chat(self, chat_id: str) -> "FeishuCLI":
         return FeishuCLI(self._executable, chat_id, timeout=self._timeout, runner=self._runner)
 
@@ -244,11 +279,6 @@ class FeishuCLI(_UserCLI):
     def __init__(self, executable: str, chat_id: str, *, timeout: float, runner: CommandRunner = run_command) -> None:
         super().__init__(executable, timeout=timeout, runner=runner)
         self._chat_id = chat_id
-
-    @property
-    def chat_id(self) -> str:
-        """当前实际用于拉取消息和发送回复的地址。"""
-        return self._chat_id
 
     async def list_page(self, start: int, end: int, token: str | None, *,
                         page_size: int = MAX_PAGE_SIZE) -> tuple[list, str | None]:

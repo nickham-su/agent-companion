@@ -117,22 +117,14 @@ class LLMSettings:
 @dataclass(frozen=True, slots=True)
 class FeishuSettings:
     own_open_id: str = field(repr=False)
-    peer_open_id: str | None = field(default=None, repr=False)
     mode: str = "text"
     cli: str = "lark-cli"
     cli_timeout: float = 20
     voice_text_copy: bool = True
 
     def __post_init__(self) -> None:
-        if self.mode == "voice" and self.peer_open_id is None:
-            raise ConfigError("飞书 voice 模式必须设置 feishu.peer_open_id")
-        for value, name in ((self.own_open_id, "own_open_id"), (self.peer_open_id, "peer_open_id")):
-            if value is None and name == "peer_open_id":
-                continue
-            if not isinstance(value, str) or not re.fullmatch(r"ou_[\w-]{1,160}", value, flags=re.ASCII):
-                raise ConfigError(f"feishu.{name} 必须是以 ou_ 开头的有效飞书 ID")
-        if self.peer_open_id == self.own_open_id:
-            raise ConfigError("feishu.peer_open_id 与 feishu.own_open_id 必须不同")
+        if not isinstance(self.own_open_id, str) or not re.fullmatch(r"ou_[\w-]{1,160}", self.own_open_id, flags=re.ASCII):
+            raise ConfigError("feishu.own_open_id 必须是以 ou_ 开头的有效飞书 ID")
         if self.mode not in ("text", "voice"):
             raise ConfigError("feishu.mode 必须是 text 或 voice")
         if type(self.voice_text_copy) is not bool:
@@ -225,7 +217,6 @@ class VoiceSettings:
 @dataclass(frozen=True, slots=True)
 class Settings:
     database: Path = Path("db.sqlite3")
-    main_session_id: str = "main"
     runtime: RuntimeSettings = field(default_factory=RuntimeSettings)
     llm: LLMSettings | None = None
     feishu: FeishuSettings | None = None
@@ -352,14 +343,11 @@ def _parse_settings(data: dict[str, Any], path: Path, *, for_run: bool) -> Setti
     if (data.keys() & {"deepseek", "llm", "minimax"}
             or isinstance(runtime_data, dict) and "model_timeout" in runtime_data):
         raise ConfigError(_LEGACY_CONFIG_ERROR)
-    _table(data, {"database", "main_session_id", "log_level", "runtime", "feishu", "voice", "providers", "timeouts",
+    _table(data, {"database", "log_level", "runtime", "feishu", "voice", "providers", "timeouts",
                   "llm_provider", "asr_provider", "tts_provider"}, "顶层")
     database = data.get("database", "db.sqlite3")
-    session_id = data.get("main_session_id", "main")
     if not isinstance(database, str) or not database.strip() or "\x00" in database:
         raise ConfigError("database 必须是非空且不含 NUL 字符的路径")
-    if not isinstance(session_id, str) or not session_id.strip():
-        raise ConfigError("main_session_id 必须是非空字符串")
     if for_run and database == ":memory:":
         raise ConfigError("正式启动的 database 必须是持久化 SQLite 文件路径")
     if database != ":memory:":
@@ -379,7 +367,6 @@ def _parse_settings(data: dict[str, Any], path: Path, *, for_run: bool) -> Setti
         llm, asr, tts = _load_providers(data, voice=use_voice)
     return Settings(
         database=Path(database),
-        main_session_id=session_id,
         runtime=runtime,
         llm=llm,
         feishu=feishu,

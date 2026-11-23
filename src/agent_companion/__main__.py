@@ -10,8 +10,7 @@ from pathlib import Path
 
 import httpx
 
-from .app import (feishu_settings, prepare_fixed_feishu, prepare_private_feishu, private_feishu_identity,
-                  run_fixed_feishu, running_agent)
+from .app import feishu_settings, prepare_private_feishu, private_feishu_identity, running_agent
 from .channels.feishu.cli import CliError, FeishuDiscovery
 from .config import ConfigError, Settings, load_settings
 from .logging_setup import stdout_logging
@@ -21,13 +20,13 @@ from .protocol import (DeliveryStatus, Message, ModelEvent, ReasoningDelta, Rece
                        TextDelta, ToolCall, ToolReady, ToolSpec)
 from .runtime.subtasks import DELEGATE_TOOL_NAME, RESULT_PREFIX
 from .speech.minimax import MiniMaxASR
-from .speech.minimax_tts import MiniMaxTTS
 from .speech.vad import VoiceSetupError
 from .storage.sqlite import FeishuBindingError, History
 
 
 # 用固定名称，保证 python -m 启动时也走应用的日志配置。
 _LOG = logging.getLogger("agent_companion.__main__")
+_DEMO_SESSION_ID = "demo"
 _DEMO_DELEGATION = "离线模拟：委派一个后台任务"
 
 
@@ -66,7 +65,7 @@ class _Console:
 async def run_demo(settings: Settings, *, delegate: bool = False) -> bool:
     model = _DemoModel()
     with closing(History(":memory:")) as history:
-        async with running_agent(settings, history, model, _Console()) as (runtime, subtasks):
+        async with running_agent(settings, history, model, _Console(), session_id=_DEMO_SESSION_ID) as (runtime, subtasks):
             runtime.submit_batch([Message("user", _DEMO_DELEGATION if delegate else "离线模拟输入")])
             await runtime.wait_idle()
             await subtasks.wait_idle()
@@ -80,14 +79,8 @@ async def _serve(settings: Settings, *, discovery: FeishuDiscovery | None = None
     tts_settings = settings.tts if feishu.mode == "voice" else None
     if llm is None or asr_settings is None or (feishu.mode == "voice" and tts_settings is None):
         raise ConfigError("正式启动缺少已选中的 Provider 配置")
-    if feishu.peer_open_id is None:
-        route = None
-        binding = {"feishu_private_owner": private_feishu_identity(feishu)}
-    else:
-        route = await prepare_fixed_feishu(feishu, discovery=discovery)
-        binding = {"feishu_binding": (settings.main_session_id, route.checked_fingerprint(feishu))}
-    with closing(History(settings.database, **binding)) as history:
-        run_private = await prepare_private_feishu(settings, history, discovery=discovery) if route is None else None
+    with closing(History(settings.database, feishu_private_owner=private_feishu_identity(feishu))) as history:
+        run_private = await prepare_private_feishu(settings, history, discovery=discovery)
         # 独立客户端，避免任一平台收到另一平台的凭据。不接受网络重定向。
         async with AsyncExitStack() as stack:
             async def client(key: str | None) -> httpx.AsyncClient:
@@ -102,6 +95,8 @@ async def _serve(settings: Settings, *, discovery: FeishuDiscovery | None = None
                              max_audio_seconds=asr_settings.max_audio_seconds)
             tts = None
             if tts_settings is not None:
+                from .speech.minimax_tts import MiniMaxTTS
+
                 speech_out = tts_settings.connection
                 tts_client = asr_client if speech_out is speech else await client(speech_out.api_key)
                 tts = MiniMaxTTS(tts_client, region=speech_out.region, model=tts_settings.model,
@@ -114,11 +109,7 @@ async def _serve(settings: Settings, *, discovery: FeishuDiscovery | None = None
                 model = OpenAIResponses(model_client, model=llm.model, api_key=llm.api_key,
                                          base_url=llm.base_url, reasoning_effort=llm.reasoning_effort,
                                          replay_salt=history.replay_salt())
-            if route is not None:
-                await run_fixed_feishu(settings, history, model, asr, route, tts=tts)
-            else:
-                assert run_private is not None
-                await run_private(model, asr)
+            await run_private(model, asr, tts)
 
 
 def main() -> int:

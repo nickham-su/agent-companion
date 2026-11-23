@@ -268,7 +268,7 @@ class VoiceOutput:
             self._pcm.detach(state)
             self._active = None
             reply.abandon()
-            if not worker.done():
+            if not worker.done() and not worker.cancelling():
                 worker.cancel()
             if not state.signal.done():
                 state.signal.cancel()
@@ -316,11 +316,12 @@ class VoiceOutput:
         if reply.overflowed:
             raise TtsError("voice_reply_text_limit")
 
-    async def close(self) -> None:
+    async def close(self, *, wait_for_cleanup: bool = True) -> None:
         self._closed = True
         self.interrupt()
         workers = tuple(self._workers)
         for task in workers:
-            task.cancel()
-        if workers:
+            if not task.cancelling():
+                task.cancel()
+        if wait_for_cleanup and workers:
             await asyncio.wait(workers, timeout=1)

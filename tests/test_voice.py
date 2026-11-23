@@ -7,13 +7,7 @@ from unittest.mock import patch
 import wave
 from weakref import ref
 
-from feishu_test_support import fixed_discovery
-
-from agent_companion.app import run_feishu
-from agent_companion.channels.feishu.channel import FeishuPoller
-from agent_companion.channels.feishu.cli import FeishuCLI
-from agent_companion.config import (ASRSettings, FeishuSettings, MiniMaxConnection, RuntimeSettings, Settings,
-                                    VoiceSettings)
+from agent_companion.config import VoiceSettings
 from agent_companion.protocol import (DeliveryStatus, Message, ReplyInfo, ReplyStream, TextDelta,
                                       ToolCall, ToolReady, ToolSpec)
 from agent_companion.runtime.engine import Runtime
@@ -877,96 +871,3 @@ class VoiceInputTest(unittest.IsolatedAsyncioTestCase):
                                      [DeliveryStatus.PARTIAL, DeliveryStatus.ZERO])
             finally:
                 await runtime.close()
-
-    async def test_app_voice_keeps_feishu_input_and_voice_playback_then_cleans_device(self):
-        asr, tts, vad, device = _ASR(), _TTS(), _Vad(), _Device()
-        samples = 3 * INPUT_FRAMES + 19
-        settings = Settings(feishu=FeishuSettings(own_open_id="ou_self", peer_open_id="ou_peer", mode="voice"),
-                            voice=_SETTINGS,
-                            asr=ASRSettings(MiniMaxConnection("synthetic"), max_audio_seconds=samples / _RATE),
-                            runtime=RuntimeSettings())
-        called = asyncio.Event()
-        sending, send_cancelled = asyncio.Event(), asyncio.Event()
-        poll_cleaning, release_poll = asyncio.Event(), asyncio.Event()
-        messages = []
-        copies = []
-
-        class Model:
-            async def stream(self, prompt, tools, *, thinking):
-                messages.extend(prompt)
-                called.set()
-                yield TextDelta("飞书回复。")
-
-        # 用真实 poll_once／持久化移交流程，不等待真实 10 秒轮询栅格。
-        original = FeishuPoller.poll_once
-
-        async def run(poller):
-            ticks = iter((100, 102))
-            poller._clock = lambda: next(ticks)
-            await original(poller)
-            await original(poller)
-            try:
-                await asyncio.Future()
-            finally:
-                poll_cleaning.set()
-                await release_poll.wait()
-
-        class FakeCli(FeishuCLI):
-            async def list_page(self, start, end, token, *, page_size):
-                msg = {"message_id": "om_text", "create_time": "101000", "msg_type": "text",
-                       "chat_id": "oc_test", "sender": {"id": "ou_peer", "id_type": "open_id", "sender_type": "user"},
-                       "body": {"content": '{"text":"飞书输入"}'}}
-                return [msg], None
-
-            async def send_text(self, text):
-                copies.append(text)
-                sending.set()
-                try:
-                    await asyncio.Future()
-                finally:
-                    send_cancelled.set()
-
-        with closing(History(":memory:")) as history:
-            with patch.object(FeishuPoller, "run", run):
-                cli = FakeCli("lark-cli", "oc_test", timeout=2)
-                discovery = fixed_discovery("oc_test", "ou_peer", "ou_self", cli=cli)
-                task = asyncio.create_task(run_feishu(settings, history, Model(), asr, tts=tts, vad=vad,
-                                                     audio=device, discovery=discovery))
-                await asyncio.wait_for(device.started.wait(), 1)
-                try:
-                    await asyncio.wait_for(called.wait(), 1)
-                    await _until(lambda: bool(tts.calls))
-                    self.assertEqual(messages[-1].content, "飞书输入")
-                    self.assertEqual(device.pull(4), _A * 4)
-                    await _until(lambda: len(history.outcomes("main")) == 1)
-                    self.assertEqual(history.tail("main", 1)[0].message.content, "飞书回复。")
-                    await asyncio.wait_for(sending.wait(), 1)
-                    device.frame(True, 4)  # 未静默也已达到选中的 ASR 上限
-                    await _until(lambda: len(tts.calls) == 2)
-                    self.assertEqual(messages[-1].content, "转写结果")
-                    self.assertEqual([file.duration_seconds for file in asr.files], [samples / _RATE])
-                    self.assertEqual(device.pull(4), _A * 4)
-                    # 首条副本的 CLI 未完成，不会阻塞第二轮语音落库。
-                    await _until(lambda: len(history.outcomes("main")) == 2)
-                    self.assertEqual(copies, ["飞书回复。"])
-
-                    # 第三轮的转写在应用停止接收后才返回，不应打断关停。
-                    asr.release.clear()
-                    asr.finished.clear()
-                    device.frame(False, 4)
-                    device.frame(True, 4)
-                    await _until(lambda: len(asr.files) == 2)
-                    task.cancel()
-                    await asyncio.wait_for(poll_cleaning.wait(), 1)
-                    self.assertTrue(send_cancelled.is_set())
-                    asr.release.set()
-                    await asyncio.wait_for(asr.finished.wait(), 1)
-                finally:
-                    if not task.cancelling():
-                        task.cancel()
-                    release_poll.set()
-                    with self.assertRaises(asyncio.CancelledError):
-                        await asyncio.wait_for(task, 1)
-                self.assertEqual(copies, ["飞书回复。"])
-                self.assertEqual(len(tts.calls), 2)
-        self.assertTrue(device.closed)

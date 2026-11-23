@@ -2,8 +2,8 @@
 
 import asyncio
 from collections import deque
-from collections.abc import AsyncGenerator, Callable, Sequence
-from contextlib import aclosing
+from collections.abc import AsyncGenerator, AsyncIterator, Sequence
+from contextlib import aclosing, asynccontextmanager
 from dataclasses import dataclass
 import logging
 from pathlib import Path
@@ -12,7 +12,7 @@ from uuid import uuid4
 from ..config import RuntimeSettings
 from ..protocol import (BackgroundChannel, Channel, DeliveryStatus, InputUsage, Message, Model, ModelError,
                         ModelEvent, ReasoningDelta, Receipt, ReplayReady, ReplayScope, ReplyInfo,
-                        ReplyStream, TextDelta, ToolCall, ToolReady, ToolSpec)
+                        ReplyRoute, ReplyStream, TextDelta, ToolCall, ToolReady, ToolSpec)
 from ..storage.sqlite import History, ReplyOutcome
 from .context import Context
 from .instructions import InstructionsError
@@ -30,6 +30,7 @@ class _InputBatch:
     has_user_input: bool
     wait_for_delivery: bool
     persisted_id: int | None = None
+    reply_route: ReplyRoute | None = None
 
 
 class Runtime:
@@ -38,7 +39,6 @@ class Runtime:
     def __init__(self, session_id: str, history: History, model: Model, channel: Channel | None, *,
                  tools: Tools | None = None, settings: RuntimeSettings | None = None,
                  thinking: bool = False, instructions: str = "", delivery_idle_timeout: float | None = None,
-                 on_confirmed_reply: Callable[[ReplyInfo, str], None] | None = None,
                  retry_sqlite_locks: bool = False) -> None:
         if not session_id:
             raise ValueError("session_id must be non-empty")
@@ -46,7 +46,6 @@ class Runtime:
         self.history = history
         self._model = model
         self._channel = channel
-        self._on_confirmed_reply = on_confirmed_reply
         self._delivery_idle_timeout = delivery_idle_timeout
         self._tools = tools if tools is not None else Tools()
         self._settings = settings if settings is not None else RuntimeSettings()
@@ -58,6 +57,8 @@ class Runtime:
         self._queued_inbound: set[int] = set()
         self._worker: asyncio.Task[None] | None = None
         self._retired_deliveries: set[asyncio.Task[Receipt]] = set()
+        self._active_reply_route: ReplyRoute | None = None
+        self._active_model_deadline: asyncio.Timeout | None = None
         self._closed = False
         self._sqlite = SQLiteAccess(retry_locks=retry_sqlite_locks, stopped=lambda: self._closed)
         self._context = Context(history, self._settings, self._summary_stream, sqlite=self._sqlite,
@@ -66,13 +67,21 @@ class Runtime:
         self._idle.set()
         self.last_failure: str | None = None
 
-    def submit_batch(self, messages: Sequence[Message], *, wait_for_delivery: bool = True) -> None:
+    def submit_batch(self, messages: Sequence[Message], *, wait_for_delivery: bool = True,
+                     reply_route: ReplyRoute | None = None) -> None:
         """在事件循环内整批追加用户输入；不阻塞当前响应。"""
-        self._submit(messages, has_user_input=True, wait_for_delivery=wait_for_delivery)
+        self._submit(messages, has_user_input=True, wait_for_delivery=wait_for_delivery, reply_route=reply_route)
 
-    def submit_subtask_result(self, message: Message, *, wait_for_delivery: bool = True) -> None:
+    def submit_subtask_result(self, message: Message, *, wait_for_delivery: bool = True,
+                              reply_route: ReplyRoute | None = None) -> None:
         """后台回投也走同一个队列，但不会被当成新用户输入授权委派。"""
-        self._submit((message,), has_user_input=False, wait_for_delivery=wait_for_delivery)
+        self._submit((message,), has_user_input=False, wait_for_delivery=wait_for_delivery, reply_route=reply_route)
+
+    def stop_reply_route(self, route: ReplyRoute) -> None:
+        """缩短本通的模型流截止；不取消投递回执、工具和整个 Runtime。"""
+        deadline = self._active_model_deadline
+        if self._active_reply_route is route and deadline is not None and not deadline.expired():
+            deadline.reschedule(asyncio.get_running_loop().time())
 
     def _check_user_channel(self, wait_for_delivery: bool) -> None:
         if self._closed:
@@ -82,8 +91,11 @@ class Runtime:
         if not wait_for_delivery and not isinstance(self._channel, BackgroundChannel):
             raise ValueError("channel does not support background delivery")
 
-    def _submit(self, messages: Sequence[Message], *, has_user_input: bool, wait_for_delivery: bool) -> None:
+    def _submit(self, messages: Sequence[Message], *, has_user_input: bool, wait_for_delivery: bool,
+                reply_route: ReplyRoute | None = None) -> None:
         self._check_user_channel(wait_for_delivery)
+        if reply_route is not None and not wait_for_delivery:
+            raise ValueError("reply route requires foreground delivery")
         batch = tuple(messages)
         if not batch:
             return
@@ -91,7 +103,7 @@ class Runtime:
                or item.replay is not None
                for item in batch):
             raise ValueError("runtime inputs must be plain user messages")
-        self._enqueue(_InputBatch(batch, has_user_input, wait_for_delivery))
+        self._enqueue(_InputBatch(batch, has_user_input, wait_for_delivery, reply_route=reply_route))
 
     def submit_persisted_batch(self, batch_id: int, *, wait_for_delivery: bool = True) -> None:
         """由持久化入口移交批次；不在安全边界之前改变模型可读历史。"""
@@ -144,7 +156,13 @@ class Runtime:
 
     async def _record_input(self, batch: _InputBatch, run_id: str) -> list[int]:
         if batch.persisted_id is None:
-            ids = await self._sqlite(self.history.append, self.session_id, batch.messages)
+            def append() -> list[int]:
+                # 每次重试写入前重新核对，不能在等待 SQLite 解锁时跨过通话边界。
+                if batch.reply_route is not None and not batch.reply_route.active():
+                    return []
+                return self.history.append(self.session_id, batch.messages)
+
+            ids = await self._sqlite(append)
         else:
             try:
                 ids = await self._sqlite(self.history.consume_inbound, self.session_id, batch.persisted_id)
@@ -161,8 +179,12 @@ class Runtime:
         try:
             message_ids = await self._record_input(batch, run_id)
             if message_ids:
-                await self._run(run_id, message_ids[0], has_user_input=batch.has_user_input,
-                                wait_for_delivery=batch.wait_for_delivery)
+                self._active_reply_route = batch.reply_route
+                try:
+                    await self._run(run_id, message_ids[0], has_user_input=batch.has_user_input,
+                                    wait_for_delivery=batch.wait_for_delivery, reply_route=batch.reply_route)
+                finally:
+                    self._active_reply_route = None
         except asyncio.CancelledError:
             _LOG.debug("runtime run cancelled; run=%s", run_id)
             raise
@@ -181,15 +203,19 @@ class Runtime:
                    run_id, self.last_failure or "complete", (clock() - started) * 1000)
 
     async def _run(self, run_id: str, protected_from: int, *, has_user_input: bool,
-                   wait_for_delivery: bool) -> None:
+                   wait_for_delivery: bool, reply_route: ReplyRoute | None) -> None:
         for index in range(self._settings.max_tool_rounds):
+            if reply_route is not None and not reply_route.active():
+                return
             last_input_tokens = await self._sqlite(self.history.last_input_tokens, self.session_id)
             messages = await self._context.prepare(self.session_id, thinking=self._thinking,
                                                     tools=self._tools.specs, instructions=self._instructions,
                                                     protected_from=protected_from,
                                                     last_input_tokens=last_input_tokens)
+            if reply_route is not None and not reply_route.active():
+                return
             model_status, has_calls = await self._reply(run_id, messages, has_user_input=has_user_input,
-                                                       wait_for_delivery=wait_for_delivery)
+                                                       wait_for_delivery=wait_for_delivery, reply_route=reply_route)
             if model_status != "complete":
                 self.last_failure = model_status
                 return
@@ -198,22 +224,37 @@ class Runtime:
             if index + 1 == self._settings.max_tool_rounds:
                 self.last_failure = "tool_round_limit"
                 return
-            if self._closed:
+            if self._closed or (reply_route is not None and not reply_route.active()):
                 return
-            while self._pending:
+            # 不跨通话或文字通道吸收输入；剩余批次保持原队列顺序。
+            while (self._pending and self._pending[0].reply_route is reply_route
+                   and self._pending[0].wait_for_delivery == wait_for_delivery):
                 batch = self._pending.popleft()
                 if await self._record_input(batch, run_id):
                     has_user_input = has_user_input or batch.has_user_input
 
+    @asynccontextmanager
+    async def _model_deadline(self) -> AsyncIterator[None]:
+        async with asyncio.timeout(self._settings.model_timeout) as deadline:
+            route = self._active_reply_route
+            if route is not None and not route.active():
+                raise TimeoutError
+            self._active_model_deadline = deadline
+            try:
+                yield
+            finally:
+                self._active_model_deadline = None
+
     async def _summary_stream(self, messages: Sequence[Message], tools: Sequence[ToolSpec],
                               thinking: bool) -> AsyncGenerator[ModelEvent, None]:
-        async with asyncio.timeout(self._settings.model_timeout):
+        async with self._model_deadline():
             async with aclosing(self._model.stream(messages, tools, thinking=thinking)) as stream:
                 async for event in stream:
                     yield event
 
     async def _reply(self, run_id: str, messages: Sequence[Message], *,
-                     has_user_input: bool, wait_for_delivery: bool) -> tuple[str, bool]:
+                     has_user_input: bool, wait_for_delivery: bool,
+                     reply_route: ReplyRoute | None) -> tuple[str, bool]:
         loop = asyncio.get_running_loop()
         info = ReplyInfo(uuid4().hex, self.session_id, run_id, loop.time())
         text: list[str] = []
@@ -232,13 +273,17 @@ class Runtime:
                     return True
             return False
 
-        validate_progress = is_generated_prefix if wait_for_delivery and self._delivery_idle_timeout is not None else None
+        idle_timeout = self._delivery_idle_timeout if reply_route is None else reply_route.idle_timeout
+        validate_progress = is_generated_prefix if wait_for_delivery and idle_timeout is not None else None
         reply = ReplyStream(info, validate_progress=validate_progress)
-        channel = self._channel
+        channel = self._channel if reply_route is None else reply_route.channel
 
         async def deliver() -> Receipt:
             assert channel is not None
             try:
+                if reply_route is not None and not reply_route.active():
+                    reply.abandon()
+                    return Receipt(info.reply_id, DeliveryStatus.ZERO)
                 return await channel.deliver(reply)
             finally:
                 reply.delivery_finished_at = loop.time()
@@ -251,7 +296,7 @@ class Runtime:
                    run_id, info.reply_id, len(messages), len(self._tools.specs), self._thinking)
         try:
             try:
-                async with asyncio.timeout(self._settings.model_timeout):
+                async with self._model_deadline():
                     async with aclosing(self._model.stream(messages, self._tools.specs,
                                                            thinking=self._thinking)) as events:
                         async for event in events:
@@ -279,11 +324,14 @@ class Runtime:
                                 call = event.call
                                 if call.id in scheduled:
                                     raise ModelError("duplicate_tool_id")
-                                context = ToolContext(self.session_id, run_id, call.id, has_user_input=has_user_input)
+                                context = ToolContext(self.session_id, run_id, call.id, has_user_input, reply_route)
                                 scheduled[call.id] = (call, loop.create_task(self._tools.execute(call, context)))
             except TimeoutError:
                 model_status = "model_timeout"
-                _LOG.warning("model request timed out; reply=%s", info.reply_id)
+                if reply_route is not None and not reply_route.active():
+                    _LOG.debug("model stream stopped after call ended; reply=%s", info.reply_id)
+                else:
+                    _LOG.warning("model request timed out; reply=%s", info.reply_id)
             except ModelError as exc:
                 model_status = "model_failed"
                 model_error = exc.diagnostic
@@ -293,7 +341,7 @@ class Runtime:
                 _LOG.error("model adapter failed")
             finally:
                 if delivery is not None:
-                    reply.start_delivery_wait(self._delivery_idle_timeout, _DELIVERY_TIMEOUT)
+                    reply.start_delivery_wait(idle_timeout, _DELIVERY_TIMEOUT)
                 reply.close()
 
             generated = "".join(text)
@@ -301,7 +349,7 @@ class Runtime:
                        info.reply_id, model_status, input_tokens, len(generated), len(scheduled),
                        (loop.time() - info.started_at) * 1000)
             # 工具和投递一直独立运行；这个汇合点只提交成套的终态数据。
-            receipt = await self._delivery_result(reply, delivery, generated)
+            receipt = await self._delivery_result(reply, delivery, generated, idle_timeout=idle_timeout)
             # 内部会话与后台发送都只保存成功生成的全文，不制造回执。
             generated_text = generated if not wait_for_delivery and model_status == "complete" else ""
             confirmed_text = receipt.confirmed if receipt else ""
@@ -326,8 +374,9 @@ class Runtime:
                        (loop.time() - info.started_at) * 1000)
             # 外部副本与主投递状态无关，只在历史事务成功后尽力入队。
             try:
-                if confirmed_text and self._on_confirmed_reply is not None:
-                    self._on_confirmed_reply(info, confirmed_text)
+                on_confirmed = reply_route.on_confirmed if reply_route is not None else None
+                if confirmed_text and on_confirmed is not None:
+                    on_confirmed(info, confirmed_text)
                 elif generated_text and isinstance(self._channel, BackgroundChannel):
                     self._channel.enqueue(info, generated_text)
             except Exception:
@@ -371,7 +420,7 @@ class Runtime:
             await asyncio.wait((delivery,), timeout=max(0, deadline - clock()))
 
     async def _delivery_result(self, reply: ReplyStream, delivery: asyncio.Task[Receipt] | None,
-                               generated: str) -> Receipt | None:
+                               generated: str, *, idle_timeout: float | None) -> Receipt | None:
         if delivery is None:
             return None
         info = reply.info
@@ -379,7 +428,7 @@ class Runtime:
         timeout_prefix = await self._wait_delivery(reply, delivery)
         if timeout_prefix is not None:
             self._abandon_delivery(reply, delivery)
-            if self._delivery_idle_timeout is not None:
+            if idle_timeout is not None:
                 _LOG.warning("reply delivery idle deadline reached; reply=%s", info.reply_id)
             return Receipt(info.reply_id, DeliveryStatus.UNKNOWN, timeout_prefix if generated.startswith(timeout_prefix) else "")
         if delivery.cancelled():

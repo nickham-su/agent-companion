@@ -10,7 +10,7 @@ from typing import Any
 from uuid import uuid4
 
 from ..config import RuntimeSettings
-from ..protocol import Message, Model, ToolSpec
+from ..protocol import Message, Model, ReplyRoute, ToolSpec
 from ..storage.sqlite import History
 from .engine import Runtime
 from .sqlite_access import SQLiteAccess
@@ -43,6 +43,7 @@ _DELEGATE = ToolSpec(
 class _Job:
     run_id: str
     prompt: str = field(repr=False)
+    reply_route: ReplyRoute | None
 
 
 class Subtasks:
@@ -50,11 +51,13 @@ class Subtasks:
 
     def __init__(self, parent_session_id: str, history: History, model: Model,
                  submit_result: Callable[[Message], None], *, settings: RuntimeSettings,
-                 thinking: bool, retry_sqlite_locks: bool = False) -> None:
+                 thinking: bool, retry_sqlite_locks: bool = False,
+                 submit_routed_result: Callable[[Message, ReplyRoute], bool] | None = None) -> None:
         self._parent = parent_session_id
         self._history = history
         self._model = model
         self._submit_result = submit_result
+        self._submit_routed_result = submit_routed_result
         self._settings = settings
         self._thinking = thinking
         self._queues: dict[str, deque[_Job]] = {}
@@ -100,7 +103,7 @@ class Subtasks:
             self._accepting -= 1
         self._outstanding += 1
         queue = self._queues.setdefault(child, deque())
-        queue.append(_Job(run_id, prompt))
+        queue.append(_Job(run_id, prompt, context.reply_route))
         _LOG.debug("subtask accepted; run=%s parent_run=%s outstanding=%d",
                    run_id, context.run_id, self._outstanding)
         if child not in self._workers:
@@ -154,7 +157,11 @@ class Subtasks:
             else:
                 payload.update(status="completed", result=result)
             # 走主队列，而不是在历史中伪造 tool 结果或直接触碰通道。
-            self._submit_result(Message("user", RESULT_PREFIX + json.dumps(payload, ensure_ascii=False)))
+            message = Message("user", RESULT_PREFIX + json.dumps(payload, ensure_ascii=False))
+            if job.reply_route is None:
+                self._submit_result(message)
+            elif self._submit_routed_result is None or not self._submit_routed_result(message, job.reply_route):
+                return  # 保留子任务终态，但不把已挂断的回投转送文字或新通话。
             await self._sqlite(self._history.mark_subtask_enqueued, job.run_id)
             _LOG.debug("subtask result queued; run=%s", job.run_id)
 

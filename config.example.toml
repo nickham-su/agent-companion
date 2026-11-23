@@ -1,6 +1,5 @@
 # 相对路径以配置文件所在目录为准。
 database = "db.sqlite3"
-main_session_id = "main"
 # 日志只写标准输出，部署默认 WARNING；排查时改为 DEBUG，修改后重启。
 log_level = "WARNING"
 # 切换时只改对应引用，再重启；真实 Key 请只填写在本机私有配置中。
@@ -55,14 +54,12 @@ voice_id = "male-qn-qingse"
 # 默认文字模式自动发现真人私聊，每人独立会话；own_open_id 与 CLI 登录账号一致。
 # [feishu]
 # own_open_id = "ou_self_example"
-# mode = "text"
-# voice 必填，text 可选；填入后启动时查找该对端已可发现的唯一真人私聊。
-# peer_open_id = "ou_peer_example"
-# voice_text_copy = true  # 仅 voice：将已确认并入库的正文另发到固定私聊
+# mode = "text"  # 默认 text；voice 保留文字，并自动接听符合条件的飞书来电
+# voice_text_copy = true  # 仅 voice：已确认并入库的正文另发到原对端私聊
 # cli = "lark-cli"
 # cli_timeout = 20  # 单次飞书 CLI 调用时限（秒）
 
-# 仅 [feishu].mode = "voice" 时打开设备。需要两条不同的虚拟线路。
+# 仅 [feishu].mode = "voice" 时使用音频设备。需要两条不同的虚拟线路。
 # [voice]
 # input_device = "Feishu to Agent"  # 飞书扬声器 → Agent；填设备精确名称或 sounddevice 索引
 # output_device = "Agent to Feishu"  # Agent → 飞书麦克风；填设备精确名称或 sounddevice 索引

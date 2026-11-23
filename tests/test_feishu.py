@@ -1,9 +1,7 @@
 import asyncio
 from base64 import b64decode
-from contextlib import asynccontextmanager, closing
-from dataclasses import replace
+from contextlib import closing
 from functools import partial
-from hashlib import sha256
 import io
 import json
 from pathlib import Path
@@ -14,18 +12,16 @@ import unittest
 from unittest.mock import patch
 import wave
 
-from feishu_test_support import fixed_discovery
+from feishu_test_support import private_discovery
 
-from agent_companion.__main__ import _serve
-from agent_companion.app import prepare_fixed_feishu, run_feishu, run_fixed_feishu, running_agent
+from agent_companion.app import run_feishu, running_agent
 from agent_companion.channels.feishu.channel import FeishuChannel, FeishuPoller
-from agent_companion.channels.feishu.cli import CliError, CliStdoutLimit, CommandResult, FeishuCLI, FeishuDiscovery, run_command
-from agent_companion.config import (ASRSettings, FeishuSettings, LLMSettings, MiniMaxConnection, Settings, TTSSettings,
-                                    VoiceSettings, load_settings)
-from agent_companion.protocol import (OMITTED_INPUT_IMAGE, DeliveryStatus, Image, Message, Receipt, ReplyInfo,
+from agent_companion.channels.feishu.cli import CliError, CliStdoutLimit, CommandResult, FeishuCLI, run_command
+from agent_companion.config import FeishuSettings, Settings, load_settings
+from agent_companion.protocol import (OMITTED_INPUT_IMAGE, DeliveryStatus, Image, Message, Receipt, ReplyInfo, ReplyRoute,
                                       Text, TextDelta)
 from agent_companion.speech.asr import AsrError
-from agent_companion.storage.sqlite import FeishuBindingError, History
+from agent_companion.storage.sqlite import History
 
 
 _CHAT, _PEER, _SELF = "oc_synthetic", "ou_peer", "ou_self"
@@ -91,40 +87,6 @@ class _Runner:
         return self.send_result
 
 
-def _private_chat(chat_id=_CHAT, peer=_PEER, *, mode="p2p", target_type="user"):
-    return {"chat_id": chat_id, "chat_mode": mode, "p2p_target_type": target_type, "p2p_target_id": peer}
-
-
-class _StartupRunner(_Runner):
-    def __init__(self, discovery_pages, *, account=_SELF):
-        super().__init__()
-        self.discovery_pages = discovery_pages
-        self.account = account
-        self.startup = []
-        self.inbound_addresses = []
-        self.outbound = asyncio.Queue()
-
-    async def __call__(self, argv, data, timeout):
-        assert argv[-4:] == ("--as", "user", "--format", "json")
-        if argv[1:4] == ("api", "GET", "/open-apis/authen/v1/user_info"):
-            self.startup.append(("account", None))
-            return _success({"open_id": self.account})
-        if argv[1:5] == ("im", "+chat-list", "--types", "p2p"):
-            assert argv[argv.index("--user-id-type") + 1] == "open_id"
-            token = argv[argv.index("--page-token") + 1] if "--page-token" in argv else None
-            self.startup.append(("chats", token))
-            return _success(self.discovery_pages[token])
-        if argv[1:3] == ("api", "GET"):
-            self.inbound_addresses.append(json.loads(argv[argv.index("--params") + 1])["container_id"])
-        result = await super().__call__(argv, data, timeout)
-        if argv[1:3] == ("api", "POST"):
-            self.outbound.put_nowait((json.loads(data)["receive_id"], self.sent[-1]))
-        return result
-
-    def discovery(self):
-        return FeishuDiscovery("lark-cli", timeout=2, runner=self)
-
-
 class _ASR:
     def __init__(self):
         self.calls = 0
@@ -152,15 +114,10 @@ class _Model:
         yield TextDelta("模拟回复")
 
 
-class _Voice:
-    async def deliver(self, reply):
-        raise AssertionError("notification must not use the voice output")
-
-
-def _poller(history, main, cli, asr, clock, mode="text"):
-    return FeishuPoller(cli, asr, FeishuChannel(cli, mode=mode, voice_output=_Voice() if mode == "voice" else None),
-                        chat_id=_CHAT, sender_id=_PEER, own_id=_SELF, session_id="main", history=history,
-                        submit=main, clock=lambda: clock[0])
+def _poller(history, main, cli, asr, clock):
+    return FeishuPoller(cli, asr, FeishuChannel(cli), chat_id=_CHAT, sender_id=_PEER, own_id=_SELF,
+                        session_id="main", history=history, submit=main, private_started_ms=clock[0] * 1000,
+                        clock=lambda: clock[0])
 
 
 class FeishuCLITests(unittest.IsolatedAsyncioTestCase):
@@ -323,10 +280,10 @@ class FeishuBackgroundDeliveryTests(unittest.IsolatedAsyncioTestCase):
             async def stream(self, messages, tools, *, thinking):
                 yield TextDelta(f"回复 {messages[-1].content}")
 
-        channel = FeishuChannel(CLI(), mode="text")
+        channel = FeishuChannel(CLI())
         self.addAsyncCleanup(channel.close)
         with closing(History(":memory:")) as history:
-            async with running_agent(Settings(), history, Echo(), channel) as (main, _):
+            async with running_agent(Settings(), history, Echo(), channel, session_id="main") as (main, _):
                 main.submit_batch([Message("user", "0")], wait_for_delivery=False)
                 await asyncio.wait_for(first_started.wait(), 1)
                 with self.assertLogs("agent_companion.channels.feishu.channel", level="WARNING") as logs:
@@ -360,7 +317,7 @@ class FeishuBackgroundDeliveryTests(unittest.IsolatedAsyncioTestCase):
                     await release.wait()
                     cleaned.set()
 
-        channel = FeishuChannel(CLI(), mode="text")
+        channel = FeishuChannel(CLI())
         info = ReplyInfo("simulated", "main", "run", 0)
         channel.enqueue(info, "当前")
         await asyncio.wait_for(entered.wait(), 1)
@@ -393,11 +350,7 @@ class FeishuBackgroundDeliveryTests(unittest.IsolatedAsyncioTestCase):
         )
         for case, status, confirmed, saved in cases:
             with self.subTest(case=case), closing(History(":memory:")) as history:
-                voice = FeishuSettings(own_open_id=_SELF, peer_open_id=_PEER, mode="voice")
-                if case == "disabled":
-                    voice = replace(voice, voice_text_copy=False)
-                settings = Settings(feishu=voice, voice=VoiceSettings(idle_timeout=0.05))
-                finalized, sent = asyncio.Event(), asyncio.Event()
+                sent = asyncio.Event()
                 outbound = []
 
                 class Model:
@@ -424,32 +377,31 @@ class FeishuBackgroundDeliveryTests(unittest.IsolatedAsyncioTestCase):
                         return result
 
                 runner = Runner()
-                runner.pages[None]["items"] = [_raw("om_input", 101_000, "text", {"text": "测试输入"})]
                 cli = FeishuCLI("lark-cli", _CHAT, timeout=2, runner=runner)
                 finalize_reply = history.finalize_reply
 
                 def finalize(outcome, messages):
-                    finalized.set()
                     if case == "commit failed":
                         raise sqlite3.OperationalError("synthetic write failure")
                     return finalize_reply(outcome, messages)
 
                 expected_to_send = bool(saved) and case not in ("disabled", "commit failed")
 
-                async def poll(poller):
-                    ticks = iter((100, 110))
-                    poller._clock = lambda: next(ticks)
-                    await poller.poll_once()
-                    await poller.poll_once()
-                    await asyncio.wait_for(finalized.wait(), 1)
-                    if expected_to_send:
-                        await asyncio.wait_for(sent.wait(), 1)
-                    else:
-                        await asyncio.sleep(0)  # 若错误入队，给发送器执行机会。
-
-                with patch.object(FeishuPoller, "run", poll), patch.object(history, "finalize_reply", finalize):
-                    await run_feishu(settings, history, Model(), _ASR(), voice_output=Voice(),
-                                     discovery=fixed_discovery(_CHAT, _PEER, _SELF, cli=cli))
+                channel = FeishuChannel(cli)
+                route = ReplyRoute(Voice(), lambda: True, 0.05,
+                                   channel.enqueue if case != "disabled" else None)
+                try:
+                    with patch.object(history, "finalize_reply", finalize):
+                        async with running_agent(Settings(), history, Model(), channel,
+                                                 session_id="main") as (main, _):
+                            main.submit_batch([Message("user", "测试输入")], reply_route=route)
+                            await asyncio.wait_for(main.wait_idle(), 1)
+                            if expected_to_send:
+                                await asyncio.wait_for(sent.wait(), 1)
+                            else:
+                                await asyncio.sleep(0)  # 若错误入队，给发送器执行机会。
+                finally:
+                    await channel.close()
                 self.assertEqual(outbound, [(_CHAT, saved, Message("assistant", saved))] if expected_to_send else [])
                 assistant = [entry.message for entry in history.read_after("main") if entry.message.role == "assistant"]
                 outcomes = history.outcomes("main")
@@ -491,8 +443,8 @@ class FeishuBackgroundDeliveryTests(unittest.IsolatedAsyncioTestCase):
                 poll_cleaning.set()
                 await release_poll.wait()
 
-        settings = Settings(feishu=FeishuSettings(own_open_id=_SELF, peer_open_id=_PEER))
-        discovery = fixed_discovery(_CHAT, _PEER, _SELF, cli=CLI("lark-cli", _CHAT, timeout=2))
+        settings = Settings(feishu=FeishuSettings(own_open_id=_SELF))
+        discovery = private_discovery(_CHAT, _PEER, _SELF, cli=CLI("lark-cli", _CHAT, timeout=2))
         with (closing(History(":memory:")) as history, patch.object(FeishuPoller, "run", poll),
               self.assertLogs("agent_companion.channels.feishu.channel", level="WARNING")):
             app = asyncio.create_task(run_feishu(settings, history, _Model(), _ASR(), discovery=discovery))
@@ -501,8 +453,7 @@ class FeishuBackgroundDeliveryTests(unittest.IsolatedAsyncioTestCase):
                 app.cancel()
                 await asyncio.wait_for(poll_cleaning.wait(), 1)
                 self.assertTrue(send_cancelled.is_set())
-                with self.assertRaisesRegex(RuntimeError, "runtime is closed"):
-                    submit(-1)
+                self.assertIsNone(await submit(-1))
                 release_send.set()
                 await asyncio.wait_for(send_cleaned.wait(), 1)
                 self.assertFalse(app.done())
@@ -513,12 +464,7 @@ class FeishuBackgroundDeliveryTests(unittest.IsolatedAsyncioTestCase):
                 with self.assertRaises(asyncio.CancelledError):
                     await asyncio.wait_for(app, 1)
 
-    async def test_poll_failure_stops_replies_before_fixed_notice_cleanup(self):
-        for mode in ("text", "voice"):
-            with self.subTest(mode=mode):
-                await self._check_poll_failure_stops_replies(mode)
-
-    async def _check_poll_failure_stops_replies(self, mode):
+    async def test_poll_failure_stops_replies_before_audio_notice_cleanup(self):
         active, release_send, send_cleaned = (asyncio.Event() for _ in range(3))
         send_cancelled, notice_cleaning = asyncio.Event(), asyncio.Event()
         sent = []
@@ -570,12 +516,12 @@ class FeishuBackgroundDeliveryTests(unittest.IsolatedAsyncioTestCase):
             await runner.notice_entered.wait()
             raise RuntimeError("synthetic poll failure")
 
-        settings = Settings(feishu=FeishuSettings(own_open_id=_SELF, peer_open_id=_PEER, mode=mode))
-        discovery = fixed_discovery(_CHAT, _PEER, _SELF, cli=cli)
+        settings = Settings(feishu=FeishuSettings(own_open_id=_SELF))
+        discovery = private_discovery(_CHAT, _PEER, _SELF, cli=cli)
         with (closing(History(":memory:")) as history, patch.object(FeishuPoller, "poll_once", poll_once),
-              patch("agent_companion.app.FeishuPoller", partial(FeishuPoller, clock=lambda: clock[0]))):
-            app = asyncio.create_task(run_feishu(settings, history, _Model(), asr, discovery=discovery,
-                                                 voice_output=_Voice() if mode == "voice" else None))
+              patch("agent_companion.app.time", return_value=clock[0]),
+              patch("agent_companion.feishu_private.FeishuPoller", partial(FeishuPoller, clock=lambda: clock[0]))):
+            app = asyncio.create_task(run_feishu(settings, history, _Model(), asr, discovery=discovery))
             try:
                 await asyncio.wait_for(notice_cleaning.wait(), 1)
                 release_send.set()
@@ -583,13 +529,13 @@ class FeishuBackgroundDeliveryTests(unittest.IsolatedAsyncioTestCase):
                 self.assertFalse(app.done())
                 self.assertEqual(sent, ["当前"])
                 self.assertTrue(send_cancelled.is_set())
-                with self.assertRaisesRegex(RuntimeError, "runtime is closed"):
-                    submit(-1)
+                self.assertIsNone(await submit(-1))
             finally:
                 release_send.set()
                 runner.release_notice.set()
-                with self.assertRaisesRegex(RuntimeError, "synthetic poll failure"):
+                with self.assertRaises(ExceptionGroup) as raised:
                     await asyncio.wait_for(app, 1)
+                self.assertEqual([str(exc) for exc in raised.exception.exceptions], ["synthetic poll failure"])
 
 
 class FeishuPollingTests(unittest.IsolatedAsyncioTestCase):
@@ -613,9 +559,9 @@ class FeishuPollingTests(unittest.IsolatedAsyncioTestCase):
                                  "has_more": False}}
         asr.release.clear()
         with closing(History(":memory:")) as history:
-            channel = FeishuChannel(cli, mode="text")
+            channel = FeishuChannel(cli)
             self.addAsyncCleanup(channel.close)
-            async with running_agent(Settings(), history, model, channel) as (main, _):
+            async with running_agent(Settings(), history, model, channel, session_id="main") as (main, _):
                 submit = partial(main.submit_persisted_batch, wait_for_delivery=False)
                 poller = _poller(history, submit, cli, asr, clock)
                 await poller.poll_once()
@@ -642,9 +588,9 @@ class FeishuPollingTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(runner.sent, ["模拟回复"])
                 await poller.close()
 
-    async def test_failed_audio_never_retried_or_added_in_both_modes(self):
-        for mode, error in (("text", AsrError("asr_transport")), ("voice", TimeoutError())):
-            with self.subTest(mode=mode):
+    async def test_failed_audio_never_retried_or_added(self):
+        for error in (AsrError("asr_transport"), TimeoutError()):
+            with self.subTest(error=type(error).__name__):
                 clock = [100]
                 runner, asr = _Runner(), _ASR()
                 runner.pages[None] = {"items": [_raw("om_before", 100_001, "text", {"text": "前"}),
@@ -662,7 +608,7 @@ class FeishuPollingTests(unittest.IsolatedAsyncioTestCase):
                         accepted.append(batch)
                         submitted.set()
 
-                    poller = _poller(history, submit, cli, asr, clock, mode)
+                    poller = _poller(history, submit, cli, asr, clock)
                     await poller.poll_once()
                     clock[0] = 110
                     await poller.poll_once()
@@ -707,7 +653,7 @@ class FeishuPollingTests(unittest.IsolatedAsyncioTestCase):
         runner.pages = {None: {"items": [one], "has_more": True, "page_token": "next"},
                         "next": {"items": [one, two], "has_more": True, "page_token": "last"},
                         "last": {"items": [three], "has_more": False}}
-        source = json.dumps(["feishu", _CHAT, _PEER, _SELF])
+        source = "feishu-private"
         with closing(History(":memory:")) as history, patch("agent_companion.channels.feishu.channel._MAX_PAGES", 1):
             accepted = []
             poller = _poller(history, accepted.append, cli, _ASR(), clock)
@@ -730,7 +676,7 @@ class FeishuPollingTests(unittest.IsolatedAsyncioTestCase):
     @unittest.skipUnless(sys.platform in ("linux", "darwin"), "POSIX executable CLI substitute")
     async def test_large_list_stdout_restarts_fixed_window_and_commits_one_ordered_batch(self):
         clock = [100]
-        source = json.dumps(["feishu", _CHAT, _PEER, _SELF])
+        source = "feishu-private"
         with TemporaryDirectory(dir=Path.cwd()) as root, closing(History(":memory:")) as history:
             worker = Path(root) / "synthetic-cli"
             audit = Path(root) / "queries.jsonl"
@@ -796,7 +742,7 @@ print(json.dumps({"ok": True, "identity": "user", "data": page}))
 
     async def test_single_result_stdout_limit_does_not_skip_or_commit(self):
         clock = [100]
-        source = json.dumps(["feishu", _CHAT, _PEER, _SELF])
+        source = "feishu-private"
         queries = []
         first = _raw("om_first", 101_000, "text", {"text": "可读取"})
 
@@ -848,7 +794,7 @@ print(json.dumps({"ok": True, "identity": "user", "data": page}))
 
     async def test_total_window_state_limit_can_narrow_without_skipping_history(self):
         clock = [100]
-        source = json.dumps(["feishu", _CHAT, _PEER, _SELF])
+        source = "feishu-private"
         early = _raw("om_early", 105_000, "text", {"text": "第一段"})
         late = _raw("om_late", 130_000, "text", {"text": "第二段"})
         queries = []
@@ -902,9 +848,9 @@ print(json.dumps({"ok": True, "identity": "user", "data": page}))
         runner.pages[None] = {"items": [_raw("om_next", 101_000, "text", {"text": "稍后处理"})],
                               "has_more": False}
         with closing(History(":memory:")) as history:
-            channel = FeishuChannel(cli, mode="text")
+            channel = FeishuChannel(cli)
             self.addAsyncCleanup(channel.close)
-            async with running_agent(Settings(), history, model, channel) as (main, _):
+            async with running_agent(Settings(), history, model, channel, session_id="main") as (main, _):
                 submit = partial(main.submit_persisted_batch, wait_for_delivery=False)
                 poller = _poller(history, submit, cli, asr, clock)
                 await poller.poll_once()
@@ -939,9 +885,9 @@ print(json.dumps({"ok": True, "identity": "user", "data": page}))
             for expected_calls in (1, 1):
                 clock[0] += 1
                 with closing(History(path)) as history:
-                    channel = FeishuChannel(cli, mode="text")
+                    channel = FeishuChannel(cli)
                     self.addAsyncCleanup(channel.close)
-                    async with running_agent(Settings(), history, model, channel) as (main, _):
+                    async with running_agent(Settings(), history, model, channel, session_id="main") as (main, _):
                         submit = partial(main.submit_persisted_batch, wait_for_delivery=False)
                         await _poller(history, submit, cli, asr, clock).poll_once()
                         await main.wait_idle()
@@ -958,13 +904,13 @@ print(json.dumps({"ok": True, "identity": "user", "data": page}))
             {"tag": "img", "image_key": "img_a"}, {"tag": "text", "text": "后"},
         ]]})
         with closing(History(":memory:")) as history:
-            channel = FeishuChannel(cli, mode="text")
+            channel = FeishuChannel(cli)
             self.addAsyncCleanup(channel.close)
-            async with running_agent(Settings(), history, model, channel) as (main, _):
+            async with running_agent(Settings(), history, model, channel, session_id="main") as (main, _):
                 submit = partial(main.submit_persisted_batch, wait_for_delivery=False)
                 poller = FeishuPoller(cli, asr, channel, chat_id=_CHAT, sender_id=_PEER, own_id=_SELF,
                                       session_id="main", history=history, submit=submit,
-                                      clock=lambda: clock[0], batch_budget=470)
+                                      private_started_ms=100_000, clock=lambda: clock[0], batch_budget=470)
                 await poller.poll_once()
                 runner.pages[None]["items"] = [post, _raw("om_text_budget", 101_000, "text", {"text": "同批文字"})]
                 clock[0] = 110
@@ -976,78 +922,6 @@ print(json.dumps({"ok": True, "identity": "user", "data": page}))
             self.assertEqual((before, omitted, after), (Text("前"), OMITTED_INPUT_IMAGE, Text("后")))
             self.assertIsInstance(image, Image)
 
-    async def test_binding_rejects_changed_identities_and_unbound_history_before_startup(self):
-        model, asr = _Model(), _ASR()
-        runner = _Runner()
-        cli = FeishuCLI("lark-cli", _CHAT, timeout=2, runner=runner)
-        discovery = fixed_discovery(_CHAT, _PEER, _SELF, cli=cli)
-        identity = FeishuSettings(own_open_id=_SELF, peer_open_id=_PEER)
-        settings = Settings(feishu=identity, llm=LLMSettings("deepseek", "disabled", api_key="synthetic"),
-                            asr=ASRSettings(MiniMaxConnection("synthetic"), max_audio_seconds=500))
-        with TemporaryDirectory(dir=Path.cwd()) as temp:
-            path = Path(temp) / "synthetic.sqlite"
-            with closing(History(path)) as history, patch.object(FeishuPoller, "run") as run:
-                await run_feishu(settings, history, model, asr, discovery=discovery)
-                run.assert_awaited_once()
-                history.append("main", [Message("user", "旧会话标记")])
-                history.accept_subtask("child", "queued", "main", "run", "call")
-            with closing(History(path)) as history, patch("agent_companion.app.running_agent") as start:
-                for field, chat, peer, own in (("地址", "oc_other", _PEER, _SELF),
-                                               ("对端", _CHAT, "ou_other", _SELF),
-                                               ("账号", _CHAT, _PEER, "ou_other")):
-                    with self.subTest(field=field):
-                        wrong = replace(settings, feishu=FeishuSettings(own_open_id=own, peer_open_id=peer, mode="voice"))
-                        with self.assertRaisesRegex(FeishuBindingError, "新的数据库路径"):
-                            await run_feishu(wrong, history, model, asr, tts=object(),
-                                             discovery=fixed_discovery(chat, peer, own))
-                start.assert_not_called()
-                self.assertEqual(history.subtask_run("child", "queued").status, "queued")
-                self.assertEqual(model.calls, [])
-                self.assertEqual(runner.calls, [])
-            before_bytes = path.read_bytes()
-            with patch("agent_companion.__main__.httpx.AsyncClient") as open_client:
-                with self.assertRaises(FeishuBindingError):
-                    await _serve(replace(settings, database=path), discovery=fixed_discovery("oc_other", _PEER, _SELF))
-                open_client.assert_not_called()
-            self.assertEqual(path.read_bytes(), before_bytes)
-            with closing(History(path)) as history, patch.object(FeishuPoller, "run") as run:
-                voice = replace(settings, feishu=replace(identity, mode="voice"))
-                await run_feishu(voice, history, model, asr, voice_output=_Voice(), discovery=discovery)
-                run.assert_awaited_once()
-                self.assertEqual(history.read_after("main")[0].message.content, "旧会话标记")
-        with closing(History(":memory:")) as old, patch("agent_companion.app.running_agent") as start:
-            old.append("main", [Message("user", "未绑定历史")])
-            with self.assertRaisesRegex(FeishuBindingError, "保留旧数据库"):
-                await run_feishu(settings, old, model, asr, discovery=discovery)
-            start.assert_not_called()
-
-    async def test_text_composition_and_voice_requires_injection(self):
-        runner, asr, model = _Runner(), _ASR(), _Model()
-        cli = FeishuCLI("lark-cli", _CHAT, timeout=2, runner=runner)
-        clock = [100]
-        runner.pages[None] = {"items": [_raw("om_startup", 100_300, "text", {"text": "验证组装"})],
-                              "has_more": False}
-
-        async def exercise(poller):
-            poller._clock = lambda: clock[0]
-            await poller.poll_once()
-            clock[0] = 110
-            await poller.poll_once()
-            for _ in range(50):
-                if runner.sent:
-                    return
-                await asyncio.sleep(0)
-            self.fail("composed text channel did not send")
-
-        with closing(History(":memory:")) as history, patch.object(FeishuPoller, "run", exercise):
-            settings = Settings(feishu=FeishuSettings(own_open_id=_SELF, peer_open_id=_PEER))
-            discovery = fixed_discovery(_CHAT, _PEER, _SELF, cli=cli)
-            await run_feishu(settings, history, model, asr, discovery=discovery)
-            self.assertEqual(runner.sent, ["模拟回复"])
-            with self.assertRaisesRegex(ValueError, "requires an audio output"):
-                voice = replace(settings, feishu=replace(settings.feishu, mode="voice"))
-                await run_feishu(voice, history, model, asr, discovery=discovery)
-
     def test_sample_config_offline_and_id_validation(self):
         settings = load_settings(Path("config.example.toml"))
         self.assertIsNone(settings.feishu)
@@ -1055,208 +929,7 @@ print(json.dumps({"ok": True, "identity": "user", "data": page}))
         self.assertIsNone(settings.asr)
         self.assertIsNone(settings.tts)
         with self.assertRaises(ValueError):
-            FeishuSettings(own_open_id=_SELF, peer_open_id=_SELF)
-
-
-class FeishuProductionBindingTests(unittest.IsolatedAsyncioTestCase):
-    def settings(self, path, *, mode="text"):
-        speech = MiniMaxConnection("synthetic")
-        return Settings(database=path, feishu=FeishuSettings(own_open_id=_SELF, peer_open_id=_PEER, mode=mode),
-                        llm=LLMSettings("deepseek", "disabled", api_key="synthetic"),
-                        asr=ASRSettings(speech, max_audio_seconds=500),
-                        tts=TTSSettings(speech) if mode == "voice" else None,
-                        voice=VoiceSettings(input_device=1, output_device=2, vad_model=Path("synthetic.onnx")))
-
-    def create_legacy_db(self, path, *, used=False):
-        # Deliberately missing both newer tables and newer outcome columns.
-        with closing(sqlite3.connect(path)) as legacy, legacy:
-            legacy.execute("CREATE TABLE reply_outcomes (reply_id TEXT PRIMARY KEY, session_id TEXT NOT NULL,"
-                           " run_id TEXT NOT NULL, model_status TEXT NOT NULL, delivery_status TEXT)")
-            if used:
-                legacy.execute("INSERT INTO reply_outcomes VALUES ('old', 'other', 'run', 'complete', 'full')")
-
-    async def assert_rejected_before_startup(self, settings, message):
-        with (patch("agent_companion.__main__.httpx.AsyncClient") as client,
-              patch("agent_companion.channels.audio.macos.MacAudioDevice") as audio,
-              patch("agent_companion.app.running_agent") as start):
-            with self.assertRaisesRegex(FeishuBindingError, message):
-                await _serve(settings, discovery=fixed_discovery(_CHAT, _PEER, _SELF))
-            client.assert_not_called()
-            audio.assert_not_called()
-            start.assert_not_called()
-
-    async def test_fixed_execution_rejects_crossed_config_route_and_history_before_startup(self):
-        peer_b, chat_b = "ou_second_peer", "oc_second_chat"
-        runner_a = _StartupRunner({None: {"chats": [_private_chat()], "has_more": False}})
-        runner_b = _StartupRunner({None: {"chats": [_private_chat(chat_b, peer_b)], "has_more": False}})
-        with TemporaryDirectory(dir=Path.cwd()) as folder:
-            path = Path(folder) / "fixed_a.sqlite"
-            settings_a = self.settings(path, mode="voice")
-            settings_b = replace(settings_a, feishu=replace(settings_a.feishu, peer_open_id=peer_b))
-            route_a = await prepare_fixed_feishu(settings_a.feishu, discovery=runner_a.discovery())
-            route_b = await prepare_fixed_feishu(settings_b.feishu, discovery=runner_b.discovery())
-            wrong_account = replace(settings_a, feishu=replace(settings_a.feishu, own_open_id="ou_second_account"))
-            cases = (
-                ("配置与路由交叉", settings_a, route_b, "对端不匹配"),
-                ("配对正确但传入别人的数据库", settings_b, route_b, "数据库绑定不一致"),
-                ("该数据库的主会话不匹配", replace(settings_a, main_session_id="other"), route_a, "数据库绑定不一致"),
-                ("配置账号不是解析账号", wrong_account, route_a, "登录账号或私聊身份不匹配"),
-                ("路由指纹被换", settings_a, replace(route_a, fingerprint=route_b.fingerprint), "私聊身份不匹配"),
-                ("收发 CLI 指向别的私聊", settings_a, replace(route_a, cli=route_b.cli), "收发地址.*不匹配"),
-            )
-            model, asr = _Model(), _ASR()
-            with closing(History(path, feishu_binding=(settings_a.main_session_id, route_a.fingerprint))) as history:
-                history.append(settings_a.main_session_id, [Message("user", "原会话历史")])
-                before_bytes = path.read_bytes()
-                with (patch("agent_companion.channels.audio.macos.MacAudioDevice") as audio,
-                      patch("agent_companion.app.FeishuChannel") as channel,
-                      patch("agent_companion.app.running_agent") as start,
-                      patch.object(FeishuPoller, "run") as poll):
-                    for label, settings, route, diagnostic in cases:
-                        with self.subTest(label=label), self.assertRaisesRegex(FeishuBindingError, diagnostic):
-                            await run_fixed_feishu(settings, history, model, asr, route, tts=object())
-                    audio.assert_not_called()
-                    channel.assert_not_called()
-                    start.assert_not_called()
-                    poll.assert_not_awaited()
-                self.assertEqual(path.read_bytes(), before_bytes)
-            self.assertFalse(model.calls)
-            for runner in (runner_a, runner_b):
-                self.assertEqual(runner.startup, [("account", None), ("chats", None)])
-                self.assertFalse(runner.calls)
-
-    async def test_fixed_modes_resolve_across_pages_once_and_reuse_transport_for_each_turn(self):
-        class Voice:
-            @asynccontextmanager
-            async def connected(self, _audio, _submit):
-                yield
-
-            async def deliver(self, reply):
-                full = "".join([delta async for delta in reply])
-                return Receipt(reply.info.reply_id, DeliveryStatus.PARTIAL, full[:2])
-
-        pages = {None: {"chats": [_private_chat("oc_other", "ou_other")], "has_more": True, "page_token": "next"},
-                 "next": {"chats": [_private_chat()], "has_more": False}}
-        for mode, text in (("text", "模拟回复"), ("voice", "模拟")):
-            with self.subTest(mode=mode), TemporaryDirectory(dir=Path.cwd()) as folder:
-                runner, model = _StartupRunner(pages), _Model()
-
-                async def poll(poller):
-                    ticks = iter((100, 110, 120))
-                    poller._clock = lambda: next(ticks)
-                    await poller.poll_once()
-                    for stamp in (105_000, 115_000):
-                        runner.pages[None]["items"] = [
-                            _raw(f"om_text_{stamp}", stamp, "text", {"text": "合格消息"}),
-                            _raw(f"om_peer_{stamp}", stamp, "text", {"text": "其他发送者"}, sender="ou_other"),
-                            _raw(f"om_chat_{stamp}", stamp, "text", {"text": "其他对话"}, chat="oc_other"),
-                        ]
-                        await poller.poll_once()
-                        self.assertEqual(await asyncio.wait_for(runner.outbound.get(), 1), (_CHAT, text))
-
-                settings = self.settings(Path(folder) / "fixed.sqlite", mode=mode)
-                with (patch("agent_companion.__main__.httpx.AsyncClient"),
-                      patch("agent_companion.__main__.DeepSeek", return_value=model),
-                      patch("agent_companion.channels.audio.macos.MacAudioDevice"),
-                      patch("agent_companion.app.SileroVAD"), patch("agent_companion.app.VoiceChannel", return_value=Voice()),
-                      patch.object(FeishuPoller, "run", poll)):
-                    await _serve(settings, discovery=runner.discovery())
-
-                self.assertEqual(runner.startup, [("account", None), ("chats", None), ("chats", "next")])
-                self.assertEqual(runner.inbound_addresses, [_CHAT, _CHAT])
-                self.assertEqual(runner.sent, [text, text])
-                self.assertEqual([[msg.content for msg in call if msg.role == "user"] for call in model.calls],
-                                 [["合格消息"], ["合格消息", "合格消息"]])
-
-    async def test_fixed_voice_rejects_unverified_or_ambiguous_peer_before_opening_db_or_clients(self):
-        cases = (
-            ("wrong account", "ou_other_account", [], FeishuBindingError, "CLI 当前登录账号", 1),
-            ("missing", _SELF, [], FeishuBindingError, "没有找到", 3),
-            ("group", _SELF, [_private_chat(mode="group")], FeishuBindingError, "没有找到", 3),
-            ("bot", _SELF, [_private_chat(target_type="bot")], FeishuBindingError, "没有找到", 3),
-            ("self", _SELF, [_private_chat(peer=_SELF)], FeishuBindingError, "没有找到", 3),
-            ("two chats", _SELF, [_private_chat(), _private_chat("oc_alternative")], FeishuBindingError, "无法唯一", 3),
-            ("shared chat", _SELF, [_private_chat(), _private_chat(peer="ou_different")], FeishuBindingError, "地址冲突", 3),
-            ("bad page", _SELF, [_private_chat(), _private_chat(peer="malformed")], CliError, "cli_invalid_chat_page", 3),
-        )
-        with TemporaryDirectory(dir=Path.cwd()) as folder:
-            for index, (label, account, chats, error, diagnostic, calls) in enumerate(cases):
-                with self.subTest(label=label):
-                    pages = {None: {"chats": chats[:1], "has_more": True, "page_token": "next"},
-                             "next": {"chats": chats[1:], "has_more": False}}
-                    runner = _StartupRunner(pages, account=account)
-                    path = Path(folder) / f"invalid_{index}.sqlite"
-                    settings = self.settings(path, mode="voice")
-                    with (patch("agent_companion.__main__.httpx.AsyncClient") as client,
-                          patch("agent_companion.channels.audio.macos.MacAudioDevice") as audio,
-                          patch("agent_companion.app.running_agent") as start,
-                          patch.object(FeishuPoller, "run") as poll):
-                        with self.assertRaisesRegex(error, diagnostic) as failure:
-                            await _serve(settings, discovery=runner.discovery())
-                        for ident in (_CHAT, _PEER, _SELF, account):
-                            self.assertNotIn(ident, str(failure.exception))
-                        client.assert_not_called()
-                        audio.assert_not_called()
-                        start.assert_not_called()
-                        poll.assert_not_awaited()
-                    self.assertFalse(path.exists())
-                    self.assertEqual(len(runner.startup), calls)
-                    self.assertEqual(runner.calls, [])
-
-    async def test_unbound_legacy_history_in_any_session_rejects_without_mutating_db(self):
-        with TemporaryDirectory(dir=Path.cwd()) as folder:
-            path = Path(folder) / "legacy.sqlite"
-            self.create_legacy_db(path, used=True)
-            before_bytes = path.read_bytes()
-            with closing(sqlite3.connect(path)) as legacy:
-                before_dump = list(legacy.iterdump())
-            await self.assert_rejected_before_startup(self.settings(path, mode="voice"), "保留旧数据库")
-            self.assertEqual(path.read_bytes(), before_bytes)
-            with closing(sqlite3.connect(path)) as legacy:
-                self.assertEqual(list(legacy.iterdump()), before_dump)
-
-    async def test_changed_main_session_cannot_bind_even_if_original_has_no_messages(self):
-        with TemporaryDirectory(dir=Path.cwd()) as folder:
-            path = Path(folder) / "bound.sqlite"
-            settings = self.settings(path)
-            with (patch("agent_companion.__main__.httpx.AsyncClient"), patch.object(FeishuPoller, "run") as poll):
-                await _serve(settings, discovery=fixed_discovery(_CHAT, _PEER, _SELF))
-                poll.assert_awaited_once()
-            with closing(sqlite3.connect(path)) as db:
-                original = db.execute("SELECT * FROM feishu_bindings").fetchall()
-                self.assertEqual([session_id for session_id, _ in original], [settings.main_session_id])
-                self.assertEqual(db.execute("SELECT COUNT(*) FROM messages").fetchone(), (0,))
-            await self.assert_rejected_before_startup(replace(settings, main_session_id="other"), "主会话或飞书身份")
-            with closing(sqlite3.connect(path)) as db:
-                self.assertEqual(db.execute("SELECT * FROM feishu_bindings").fetchall(), original)
-
-    async def test_empty_legacy_db_migrates_and_restarts_across_modes(self):
-        with TemporaryDirectory(dir=Path.cwd()) as folder:
-            path = Path(folder) / "legacy.sqlite"
-            self.create_legacy_db(path)
-            settings = self.settings(path)
-            with (patch("agent_companion.__main__.httpx.AsyncClient"),
-                  patch("agent_companion.channels.audio.macos.MacAudioDevice") as audio,
-                  patch("agent_companion.app.SileroVAD"), patch("agent_companion.app.VoiceChannel") as voice_channel,
-                  patch.object(FeishuPoller, "run") as poll):
-                await _serve(settings, discovery=fixed_discovery(_CHAT, _PEER, _SELF))
-                audio.assert_not_called()
-                with closing(sqlite3.connect(path)) as db:
-                    original = db.execute("SELECT * FROM feishu_bindings").fetchall()
-                    fingerprint = sha256(json.dumps([_CHAT, _PEER, _SELF], separators=(",", ":")).encode()).hexdigest()
-                    self.assertEqual(original, [(settings.main_session_id, fingerprint)])
-                    self.assertTrue({"assistant_message_id", "model_error"} <= {
-                        row[1] for row in db.execute("PRAGMA table_info(reply_outcomes)")})
-                await _serve(replace(self.settings(path, mode="voice"), asr_timeout=4.5),
-                             discovery=fixed_discovery(_CHAT, _PEER, _SELF))
-                await _serve(settings, discovery=fixed_discovery(_CHAT, _PEER, _SELF))
-                self.assertEqual(poll.await_count, 3)
-                audio.assert_called_once()
-                voice_channel.return_value.connected.assert_called_once()
-                self.assertEqual(voice_channel.call_args.kwargs["asr_timeout"], 4.5)
-            with closing(sqlite3.connect(path)) as db:
-                self.assertEqual(db.execute("SELECT * FROM feishu_bindings").fetchall(), original)
-
+            FeishuSettings(own_open_id="invalid")
 
 if __name__ == "__main__":
     unittest.main()

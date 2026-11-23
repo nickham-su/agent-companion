@@ -8,9 +8,10 @@ from unittest.mock import AsyncMock, patch
 import wave
 
 import httpx
-from feishu_test_support import fixed_discovery
+from feishu_test_support import private_discovery
 
 from agent_companion.__main__ import _serve, main
+from agent_companion.app import prepare_private_feishu
 from agent_companion.config import ConfigError, VoiceSettings, load_settings
 from agent_companion.models.deepseek import CHAT_COMPLETIONS
 from agent_companion.protocol import Message
@@ -21,7 +22,6 @@ from agent_companion.speech.minimax_tts import MiniMaxTTS
 _KEY = "synthetic-private-config-value"
 _FEISHU = '''
 [feishu]
-peer_open_id = "ou_peer"
 own_open_id = "ou_self"
 mode = "text"
 '''
@@ -179,14 +179,11 @@ api_key = 123
 
     def test_known_common_config_errors_name_safe_fields(self):
         for config, diagnostic in (
-            (_CONFIG.replace('peer_open_id = "ou_peer"', f'peer_open_id = "{_KEY}"'),
-             'feishu.peer_open_id 必须是以 ou_ 开头的有效飞书 ID'),
+            (_CONFIG.replace('own_open_id = "ou_self"', f'own_open_id = "{_KEY}"'),
+             'feishu.own_open_id 必须是以 ou_ 开头的有效飞书 ID'),
             (_CONFIG.replace('[feishu]', '[feishu]\nchat_id = "oc_fixture"'), 'feishu 配置字段无效'),
-            (_CONFIG.replace('peer_open_id = "ou_peer"', 'sender_open_id = "ou_peer"'), 'feishu 配置字段无效'),
-            (_CONFIG.replace('peer_open_id = "ou_peer"', '').replace('mode = "text"', 'mode = "voice"'),
-             '飞书 voice 模式必须设置 feishu.peer_open_id'),
+            (_CONFIG.replace('[feishu]', '[feishu]\nsender_open_id = "ou_peer"'), 'feishu 配置字段无效'),
             (_CONFIG.replace('own_open_id = "ou_self"', ''), 'feishu.own_open_id'),
-            (_CONFIG.replace('"ou_self"', '"ou_peer"'), 'feishu.peer_open_id 与 feishu.own_open_id 必须不同'),
             (_CONFIG.replace('mode = "text"', f'mode = "{_KEY}"'), 'feishu.mode 必须是 text 或 voice'),
             (_CONFIG.replace('mode = "text"', 'mode = "text"\ncli_timeout = false'), 'feishu.cli_timeout 必须是有限正数'),
             (_CONFIG + '\n[runtime]\ndelivery_timeout = 120\n', 'runtime 配置字段无效'),
@@ -196,10 +193,22 @@ api_key = 123
             (_CONFIG + f'\n[runtime]\n{_KEY} = 42\n', 'runtime 配置字段无效'),
             ('database = false\n' + _CONFIG, 'database 必须是非空且不含 NUL 字符的路径'),
             ('database = ":memory:"\n' + _CONFIG, '正式启动的 database 必须是持久化 SQLite 文件路径'),
-            ('main_session_id = false\n' + _CONFIG, 'main_session_id 必须是非空字符串'),
         ):
             with self.subTest(diagnostic=diagnostic):
                 self.assert_startup_error(config, diagnostic)
+
+    def test_removed_keys_are_rejected_in_text_and_voice(self):
+        for mode in ("text", "voice"):
+            config = _CONFIG.replace('mode = "text"', f'mode = "{mode}"')
+            for key, old, diagnostic in (
+                ("main_session_id", f'main_session_id = "{_KEY}"\n' + config, "顶层 配置字段无效"),
+                ("peer_open_id", config.replace('[feishu]', f'[feishu]\npeer_open_id = "{_KEY}"'),
+                 "feishu 配置字段无效"),
+                ("auto_answer", config.replace('[feishu]', '[feishu]\nauto_answer = false'),
+                 "feishu 配置字段无效"),
+            ):
+                with self.subTest(mode=mode, key=key):
+                    self.assert_startup_error(old, diagnostic)
 
     def test_known_voice_config_errors_report_the_field_and_constraint(self):
         voice = _CONFIG.replace('mode = "text"', 'mode = "voice"')
@@ -384,6 +393,8 @@ class ProviderCompositionTests(unittest.IsolatedAsyncioTestCase):
                 text = text.replace('max_audio_seconds = 500',
                                     f'max_audio_seconds = 600.5\nmodel = "{asr_model}"')
                 text += '\n[timeouts]\nllm = 0.75\nasr = 2\ntts = 3\n'
+                text = text.replace('[voice]', '[voice]\ninput_device = "mock-in"\n'
+                                    'output_device = "mock-out"\nvad_model = "synthetic.onnx"')
                 if mode == "separate":
                     text = text.replace('tts_provider = "speech"', 'tts_provider = "speaker"') + '''
 [providers.speaker]
@@ -419,7 +430,7 @@ voice_id = "synthetic-other-voice"
                     clients.append(handle)
                     return handle
 
-                async def drive(settings, history, model, asr, route, *, tts):
+                async def drive(model, asr, tts):
                     self.assertEqual(settings.runtime.model_timeout, 0.75)
                     self.assertEqual(asr._timeout, 2)
                     self.assertEqual(settings.asr.max_audio_seconds, asr._max_audio_seconds)
@@ -432,11 +443,24 @@ voice_id = "synthetic-other-voice"
                         chunks = tts.synthesize("合成输出", sample_rate=settings.voice.output_sample_rate)
                         self.assertEqual([chunk async for chunk in chunks], [b"\x01\x00"])
 
+                async def prepare(settings, history, *, discovery):
+                    run = await prepare_private_feishu(settings, history, discovery=discovery)
+
+                    async def exercise(model, asr, tts):
+                        await drive(model, asr, tts)
+                        await run(model, asr, tts)
+
+                    return exercise
+
                 with (patch("agent_companion.__main__.httpx.AsyncClient", side_effect=client),
-                      patch("agent_companion.__main__.MiniMaxTTS", wraps=MiniMaxTTS) as open_tts,
-                      patch("agent_companion.__main__.run_fixed_feishu", side_effect=drive) as run):
-                    await _serve(settings, discovery=fixed_discovery("oc_fixture", "ou_peer", "ou_self"))
-                run.assert_awaited_once()
+                      patch("agent_companion.speech.minimax_tts.MiniMaxTTS", wraps=MiniMaxTTS) as open_tts,
+                      patch("agent_companion.__main__.prepare_private_feishu", side_effect=prepare),
+                      patch("agent_companion.channels.feishu.macos_calls.MacCallDesktop") as desktop,
+                      patch("agent_companion.app.run_private_chats", new_callable=AsyncMock) as run_chats):
+                    await _serve(settings, discovery=private_discovery("oc_fixture", "ou_peer", "ou_self"))
+                run_chats.assert_awaited_once()
+                self.assertEqual(desktop.call_count, int(mode != "text"))
+                self.assertEqual(run_chats.await_args.kwargs["incoming"] is not None, mode != "text")
                 self.assertEqual(open_tts.call_count, int(mode != "text"))
                 self.assertEqual(len(clients), 3 if mode == "separate" else 2)
                 self.assertTrue(all(c.is_closed for c in clients))

@@ -1,5 +1,7 @@
 """飞书真人私聊发现与每个对端的运行时生命周期。"""
 
+from __future__ import annotations
+
 import asyncio
 from collections import defaultdict
 from collections.abc import Callable
@@ -8,13 +10,18 @@ from hashlib import sha256
 import logging
 from sqlite3 import OperationalError
 from time import time
+from typing import TYPE_CHECKING
 
 from .channels.feishu.channel import FeishuChannel, FeishuPoller
 from .channels.feishu.cli import CliError, FeishuDiscovery, PrivateChat
+from .protocol import ReplyInfo
 from .runtime.engine import Runtime
 from .runtime.subtasks import Subtasks
 from .speech.asr import FileASR
 from .storage.sqlite import History, is_sqlite_lock_error
+
+if TYPE_CHECKING:
+    from .feishu_calls import IncomingCalls
 
 
 _LOG = logging.getLogger(__name__)
@@ -32,21 +39,48 @@ class _Route:
         self._session_id = session_id
         self._stack = AsyncExitStack()
         self._agent: tuple[Runtime, Subtasks] | None = None
+        self._agent_lock = asyncio.Lock()
+        self._closed = False
+        self._stop_call: Callable[[], None] | None = None
         self._open_agent = open_agent
         cli = discovery.for_chat(chat.chat_id)
-        self._channel = FeishuChannel(cli, mode="text")
+        self._channel = FeishuChannel(cli)
         self._poller = FeishuPoller(cli, asr, self._channel, chat_id=chat.chat_id, sender_id=chat.sender_id,
                                     own_id=own_id, session_id=session_id, history=history, clock=time,
                                     private_started_ms=started_ms, submit=self._submit,
                                     before_close=self.stop_accepting)
 
+    async def runtime(self) -> Runtime | None:
+        async with self._agent_lock:
+            if self._closed:
+                return None
+            if self._agent is None:
+                # 文字批次和来电使用同一个入口；发现私聊时尚不创建 Runtime。
+                self._agent = await self._stack.enter_async_context(self._open_agent(self._session_id, self._channel))
+            return self._agent[0] if not self._closed else None
+
     async def _submit(self, batch_id: int) -> None:
-        if self._agent is None:
-            # 发现私聊只会建轮询。真正收到输入（含崩溃前的持久待处理批次）才建 Runtime。
-            self._agent = await self._stack.enter_async_context(self._open_agent(self._session_id, self._channel))
-        self._agent[0].submit_persisted_batch(batch_id, wait_for_delivery=False)
+        main = await self.runtime()
+        if main is not None:
+            main.submit_persisted_batch(batch_id, wait_for_delivery=False)
+
+    def watch_call(self, stop: Callable[[], None]) -> bool:
+        if self._closed or self._stop_call is not None:
+            return False
+        self._stop_call = stop
+        return True
+
+    def unwatch_call(self, stop: Callable[[], None]) -> None:
+        if self._stop_call == stop:
+            self._stop_call = None
+
+    def copy_confirmed(self, info: ReplyInfo, text: str) -> None:
+        self._channel.enqueue(info, text)
 
     def stop_accepting(self) -> None:
+        self._closed = True
+        if self._stop_call is not None:
+            self._stop_call()
         if self._agent is not None:
             main, subtasks = self._agent
             main.stop_accepting()
@@ -57,7 +91,13 @@ class _Route:
         try:
             async with self._stack:
                 self._stack.push_async_callback(self._channel.close)
-                await self._poller.run()
+                try:
+                    await self._poller.run()
+                finally:
+                    self.stop_accepting()
+                    # 不让最后一个懒建的 Runtime 注册到已退出的栈。
+                    async with self._agent_lock:
+                        pass
         except OperationalError as exc:
             if not is_sqlite_lock_error(exc):
                 raise
@@ -75,10 +115,12 @@ def _conflicts(chats: set[PrivateChat]) -> tuple[set[str], set[str]]:
 
 
 async def run_private_chats(discovery: FeishuDiscovery, history: History, asr: FileASR, *, own_id: str,
-                            started_ms: int, open_agent: _OpenAgent) -> None:
+                            started_ms: int, open_agent: _OpenAgent, incoming: IncomingCalls | None = None) -> None:
     active: dict[PrivateChat, tuple[_Route, asyncio.Task[None]]] = {}
+    by_sender: dict[str, _Route] = {}
     retiring: list[asyncio.Task[None]] = []
     async with asyncio.TaskGroup() as group:
+        calls = group.create_task(incoming.run(by_sender.get)) if incoming is not None else None
         try:
             while True:
                 try:
@@ -97,6 +139,7 @@ async def run_private_chats(discovery: FeishuDiscovery, history: History, asr: F
                 # 只有成功读完的快照会撤销信任；在注册或等待收尾之前同步关闭旧入口。
                 for chat in active.keys() - verified:
                     route, task = active.pop(chat)
+                    by_sender.pop(chat.sender_id)
                     route.stop_accepting()
                     task.cancel()
                     retiring.append(task)
@@ -116,6 +159,7 @@ async def run_private_chats(discovery: FeishuDiscovery, history: History, asr: F
                         continue
                     route = _Route(discovery, chat, session_id, history=history, asr=asr, own_id=own_id,
                                    started_ms=started_ms, open_agent=open_agent)
+                    by_sender[chat.sender_id] = route
                     active[chat] = route, group.create_task(route.run())
                 if retiring:
                     # 父任务退出时不能再次向正在清理的路由传播取消。
@@ -124,6 +168,8 @@ async def run_private_chats(discovery: FeishuDiscovery, history: History, asr: F
                 await asyncio.sleep(_DISCOVERY_SECONDS)
         finally:
             # 在等待任一子任务收尾前，同步关闭全部路由入口与发送队列。
+            if calls is not None:
+                calls.cancel()
             for route, task in active.values():
                 route.stop_accepting()
                 if not task.cancelling():

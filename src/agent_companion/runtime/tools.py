@@ -5,7 +5,7 @@ from dataclasses import dataclass
 import json
 from typing import Any
 
-from ..protocol import ToolCall, ToolSpec
+from ..protocol import ReplyRoute, ToolCall, ToolSpec
 
 
 @dataclass(frozen=True, slots=True)
@@ -14,6 +14,7 @@ class ToolContext:
     run_id: str
     call_id: str
     has_user_input: bool
+    reply_route: ReplyRoute | None = None
 
 
 @dataclass(frozen=True, slots=True)

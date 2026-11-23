@@ -33,13 +33,24 @@ class _CaptureQueue:
         self._frames: deque[tuple[int, bytes]] = deque(maxlen=_MAX_INPUT_FRAMES)
         self._sequence = 0  # 只有一个设备输入线程写入
         self._closed = False
+        self._enabled = True
+
+    def enable(self) -> None:
+        with self._lock:
+            self._enabled = True
+
+    def mute(self) -> None:
+        with self._lock:
+            self._enabled = False
 
     def push(self, pcm: memoryview, overflow: bool = False) -> None:
+        if not self._enabled:
+            return  # 接通前不计入帧序，第一帧不能被当作采集缺口。
         self._sequence += 2 if overflow else 1
         if pcm.nbytes != INPUT_BYTES or not self._lock.acquire(blocking=False):
             return
         try:
-            if not self._closed:
+            if not self._closed and self._enabled:
                 self._frames.append((self._sequence, bytes(pcm)))
         finally:
             self._lock.release()
@@ -100,9 +111,12 @@ class VoiceChannel:
         self._end_frames = ceil(settings.silence_seconds / _SAMPLE_SECONDS)
         self._last_sequence = 0
         self._opened = self._closed = False
-        self._failed = False
+        self._failed = self._io_stopped = False
 
     async def deliver(self, reply: ReplyStream) -> Receipt:
+        if self._io_stopped:
+            reply.abandon()
+            return Receipt(reply.info.reply_id, DeliveryStatus.ZERO)
         if self._failed:
             reply.abandon()
             return Receipt(reply.info.reply_id, DeliveryStatus.FAILED)
@@ -110,6 +124,22 @@ class VoiceChannel:
             reply.abandon()
             return Receipt(reply.info.reply_id, DeliveryStatus.ZERO)
         return await self._output.deliver(reply)
+
+    @property
+    def failed(self) -> bool:
+        return self._failed
+
+    def enable_capture(self) -> None:
+        self._capture.enable()
+
+    def stop_io(self) -> None:
+        """同步关闭输入和清除待播；设备和网络请求由 connected 收尾。"""
+        self._io_stopped = True
+        self._capture.close()
+        self._record = None
+        self._preroll.clear()
+        self._output.interrupt()
+        self._stop_transcription()
 
     def _begin_turn(self) -> None:
         self._speaking = True
@@ -206,7 +236,7 @@ class VoiceChannel:
     async def _listen(self, device: AudioDevice) -> None:
         loop = asyncio.get_running_loop()
         check_at = loop.time()
-        while True:
+        while not self._io_stopped:
             now = loop.time()
             if now >= check_at:
                 try:
@@ -225,8 +255,9 @@ class VoiceChannel:
             except Exception:
                 self._disable_device(device, "VAD inference failed")
                 return
-            for decision in decisions:
-                self._process(*decision)
+            if not self._io_stopped:
+                for decision in decisions:
+                    self._process(*decision)
 
     def _disable_device(self, device: AudioDevice, reason: str) -> None:
         # 不改走文字，不取消模型或工具；当前回复按已发进度失败收尾。
@@ -236,7 +267,7 @@ class VoiceChannel:
         self._capture.close()
         self._stop_transcription()
         self._output.fail()
-        _LOG.error("voice device disabled (%s); restart is required", reason)
+        _LOG.error("voice device disabled (%s)", reason)
         try:
             device.close()
         except Exception:
@@ -274,7 +305,7 @@ class VoiceChannel:
 
     async def _transcribe(self, submit: Callable[[str], None]) -> None:
         clock = asyncio.get_running_loop().time
-        while not self._failed:
+        while not self._failed and not self._io_stopped:
             recording = await self._turns.get()
             started = clock()
             try:
@@ -287,12 +318,13 @@ class VoiceChannel:
                 del recording
                 self._pending -= 1
                 self._release_if_idle()
-            if text and not self._failed:
+            if text and not self._failed and not self._io_stopped:
                 _LOG.debug("voice transcription ready; chars=%d elapsed_ms=%.0f", len(text), (clock() - started) * 1000)
                 submit(text)
 
     @asynccontextmanager
-    async def connected(self, device: AudioDevice, submit: Callable[[str], None]) -> AsyncIterator[None]:
+    async def connected(self, device: AudioDevice, submit: Callable[[str], None], *,
+                        capture_enabled: bool = True, wait_for_cleanup: bool = True) -> AsyncIterator[None]:
         if self._opened or self._closed:
             raise VoiceSetupError("voice_already_started")
         if device.input_format != AudioFormat(INPUT_RATE):
@@ -300,6 +332,8 @@ class VoiceChannel:
         if device.output_format != AudioFormat(self._settings.output_sample_rate):
             raise VoiceSetupError("voice_output_device_format_mismatch")
         self._opened = True
+        if not capture_enabled:
+            self._capture.mute()
         try:
             device.start(self._capture.push, self._output.render)
             async with asyncio.TaskGroup() as group:
@@ -308,8 +342,8 @@ class VoiceChannel:
                 try:
                     yield
                 finally:
+                    self.stop_io()
                     listener.cancel()
-                    self._stop_transcription()
         finally:
             self._closed = True
             self._record = None
@@ -319,6 +353,7 @@ class VoiceChannel:
             try:
                 device.close()
             finally:
-                await self._output.close()
-                if self._asr_task is not None and not self._asr_task.done():
+                # 动态来电不等待旧网络适配器退出；任务保留自己的结果回收回调。
+                await self._output.close(wait_for_cleanup=wait_for_cleanup)
+                if wait_for_cleanup and self._asr_task is not None and not self._asr_task.done():
                     await asyncio.wait((self._asr_task,), timeout=1)
