@@ -2,6 +2,7 @@ import asyncio
 from contextlib import closing
 from io import StringIO
 import json
+import logging
 from pathlib import Path
 import sqlite3
 from tempfile import TemporaryDirectory
@@ -13,14 +14,17 @@ import httpx
 from agent_companion.__main__ import _serve, main
 from agent_companion.config import FeishuSettings, LLMSettings, RuntimeSettings, Settings, load_settings
 from agent_companion.models.deepseek import CHAT_COMPLETIONS, DeepSeek
-from agent_companion.models.openai_responses import RESPONSES, OpenAIResponses
-from agent_companion.protocol import (OMITTED_INPUT_IMAGE, DeliveryStatus, Image, Message, Receipt,
+from agent_companion.models.openai_responses import OpenAIResponses
+from agent_companion.protocol import (OMITTED_INPUT_IMAGE, DeliveryStatus, Image, Message, ModelError, Receipt,
                                       ReplayReady, Text, ToolSpec)
 from agent_companion.runtime.engine import Runtime
 from agent_companion.runtime.tools import Tool, Tools
 from agent_companion.storage.sqlite import History, ReplyOutcome, Summary
 
 
+_RESPONSES = "https://api.openai.com/v1/responses"
+_KEY = "synthetic-model-test"
+_TEST_SALT = bytes(32)
 _CIPHER = "synthetic-opaque-block"
 _PRIVATE_SUMMARY = "synthetic-provider-summary"
 _IMAGE = "data:image/png;base64,YQ=="
@@ -72,20 +76,25 @@ class _Wire(httpx.AsyncByteStream):
 
 
 class _Fixture:
-    def __init__(self, testcase, *responses):
+    def __init__(self, testcase, *responses, endpoint=_RESPONSES, api_key=_KEY):
         self._test = testcase
         self._responses = iter(responses)
+        self._endpoint = endpoint
+        self._api_key = api_key
         self.requests = []
         self.transport = httpx.MockTransport(self._request)
 
     async def _request(self, request):
-        self._test.assertEqual((request.method, str(request.url)), ("POST", RESPONSES))
+        self._test.assertEqual((request.method, str(request.url)), ("POST", self._endpoint))
+        self._test.assertTrue(request.headers["authorization"] == f"Bearer {self._api_key}")
         self._test.assertEqual(request.headers["accept-encoding"], "identity")
         payload = json.loads(request.content)
         self.requests.append(payload)
         response = next(self._responses)
         if callable(response):
             response = response(payload)
+        if isinstance(response, httpx.Response):
+            return response
         if not isinstance(response, _Wire):
             response = _Wire(response)
         return httpx.Response(200, headers={"Content-Type": "text/event-stream; charset=utf-8"}, stream=response)
@@ -111,14 +120,15 @@ class _Channel:
         return Receipt(reply.info.reply_id, DeliveryStatus.FULL, generated)
 
 
-def _model(client, *, profile="local-a", model="fixture-model", effort="custom-effort", **kwargs):
-    return OpenAIResponses(client, model=model, replay_profile=profile, reasoning_effort=effort, **kwargs)
+def _model(client, *, history=None, api_key=_KEY, model="fixture-model", effort="custom-effort", **kwargs):
+    salt = _TEST_SALT if history is None else history.replay_salt()
+    return OpenAIResponses(client, model=model, api_key=api_key, replay_salt=salt, reasoning_effort=effort, **kwargs)
 
 
 async def _complete(fixture, history, *, prompt=None, channel=None, tools=None, settings=None, session_id="main",
                     **model_settings):
     async with httpx.AsyncClient(transport=fixture.transport) as client:
-        runtime = Runtime(session_id, history, _model(client, **model_settings), channel or _Channel(),
+        runtime = Runtime(session_id, history, _model(client, history=history, **model_settings), channel or _Channel(),
                           tools=tools, settings=settings)
         try:
             runtime.submit_batch([prompt or Message("user", "synthetic prompt")])
@@ -150,7 +160,7 @@ class OpenAIResponsesTests(unittest.IsolatedAsyncioTestCase):
         prompt = Message("user", (Text("读图"), Image(_IMAGE), Text("使用工具")))
         with closing(History(":memory:")) as history:
             async with httpx.AsyncClient(transport=fixture.transport) as client:
-                runtime = Runtime("main", history, _model(client), channel, tools=tools)
+                runtime = Runtime("main", history, _model(client, history=history), channel, tools=tools)
                 try:
                     runtime.submit_batch([prompt])
                     await asyncio.wait_for(channel.first_text.wait(), 1)
@@ -189,43 +199,70 @@ class OpenAIResponsesTests(unittest.IsolatedAsyncioTestCase):
             {"type": "function_call_output", "call_id": "call_2", "output": "result call_2"},
         ])
 
-    async def test_reasoning_only_reopens_same_profile_but_not_other_scopes(self):
-        for profile, model, should_replay in [("local-a", "fixture-model", True),
-                                              ("local-b", "fixture-model", False),
-                                              ("local-a", "other-model", False)]:
-            with self.subTest(profile=profile, model=model), TemporaryDirectory(dir=Path.cwd()) as folder:
-                path = Path(folder) / "fixture.sqlite"
-                native = _reason(summary=(_PRIVATE_SUMMARY,))
-                added = {"type": "response.output_item.added", "output_index": 0,
-                         "item": _reason(cipher="must-not-return-added")}
-                done = {"type": "response.output_item.done", "output_index": 0, "item": native}
-                first = _Fixture(self, [added, done, _completed(_reason(cipher=None, summary=(_PRIVATE_SUMMARY,)))])
-                channel = _Channel()
-                with closing(History(path)) as history:
-                    self.assertIsNone(await _complete(first, history, channel=channel))
-                    self.assertEqual(channel.replies, [])
-                    self.assertEqual(len(history.read_after("main")), 2)
-                    outcome = history.outcomes("main")[0]
-                    self.assertIsNone(history.run_text("main", outcome.run_id))
-                    self.assertIsNone(outcome.delivery_status)
-                second = _Fixture(self, [_completed(_answer("完成"))])
-                with closing(History(path)) as history:
-                    self.assertIsNone(await _complete(second, history, profile=profile, model=model))
-                expected = ([native] if should_replay else [])
-                self.assertEqual(second.requests[0]["input"], [first.requests[0]["input"][0], *expected,
-                                                               {"role": "user", "content": "synthetic prompt"}])
+    async def test_reasoning_only_reopens_with_equivalent_base_url(self):
+        with TemporaryDirectory(dir=Path.cwd()) as folder:
+            path = Path(folder) / "fixture.sqlite"
+            native = _reason(summary=(_PRIVATE_SUMMARY,))
+            added = {"type": "response.output_item.added", "output_index": 0,
+                     "item": _reason(cipher="must-not-return-added")}
+            done = {"type": "response.output_item.done", "output_index": 0, "item": native}
+            first = _Fixture(self, [added, done, _completed(_reason(cipher=None, summary=(_PRIVATE_SUMMARY,)))])
+            channel = _Channel()
+            with closing(History(path)) as history:
+                salt = history.replay_salt()
+                self.assertIsNone(await _complete(first, history, channel=channel))
+                self.assertEqual(channel.replies, [])
+                self.assertEqual(len(history.read_after("main")), 2)
+                outcome = history.outcomes("main")[0]
+                self.assertIsNone(history.run_text("main", outcome.run_id))
+                self.assertIsNone(outcome.delivery_status)
+                row = history._db.execute("SELECT fingerprint, items FROM model_replays").fetchone()
+                self.assertEqual(len(row["fingerprint"]), 32)
+                self.assertTrue(_KEY not in row["items"])
+            self.assertTrue(_KEY.encode() not in path.read_bytes())
+            second = _Fixture(self, [_completed(_answer("完成"))])
+            with closing(History(path)) as history:
+                self.assertTrue(history.replay_salt() == salt)
+                self.assertIsNone(await _complete(second, history, base_url="HTTPS://API.OpenAI.COM:443/v1///"))
+            self.assertEqual(second.requests[0]["input"], [first.requests[0]["input"][0], native,
+                                                           {"role": "user", "content": "synthetic prompt"}])
 
-    async def test_effort_change_keeps_common_history_without_old_native_items(self):
-        fixture = _Fixture(self, [_completed(_reason(), _answer("confirmed"))], [_completed(_answer("next"))])
-        with closing(History(":memory:")) as history:
-            self.assertIsNone(await _complete(fixture, history, effort="low"))
-            self.assertIsNone(await _complete(fixture, history, effort="another-valid-for-fixture"))
-        first, second = fixture.requests
-        self.assertEqual(first["reasoning"], {"effort": "low"})
-        self.assertEqual(second["reasoning"], {"effort": "another-valid-for-fixture"})
-        self.assertEqual(second["input"], first["input"] + [
-            {"role": "assistant", "content": "confirmed"}, {"role": "user", "content": "synthetic prompt"},
-        ])
+    async def test_key_url_model_or_effort_change_only_sends_common_history(self):
+        base = "https://responses.example.invalid/gateway/v1"
+        other_path = "https://responses.example.invalid/other/v1"
+        variants = ({"api_key": "synthetic-rotated"}, {"base_url": other_path},
+                    {"model": "other-model"}, {"effort": "another-valid-for-fixture"})
+        for change in variants:
+            with self.subTest(field=next(iter(change))), closing(History(":memory:")) as history:
+                first = _Fixture(self, [_completed(_reason(), _answer("confirmed"))], endpoint=base + "/responses")
+                self.assertIsNone(await _complete(first, history, base_url=base))
+                settings = {"base_url": base, **change}
+                second = _Fixture(self, [_completed(_answer("next"))], endpoint=settings["base_url"] + "/responses",
+                                  api_key=settings.get("api_key", _KEY))
+                self.assertIsNone(await _complete(second, history, **settings))
+                payload = second.requests[0]
+                self.assertEqual(payload["reasoning"], {"effort": settings.get("effort", "custom-effort")})
+                self.assertEqual(payload["model"], settings.get("model", "fixture-model"))
+                self.assertEqual(payload["input"], first.requests[0]["input"] + [
+                    {"role": "assistant", "content": "confirmed"}, {"role": "user", "content": "synthetic prompt"},
+                ])
+
+    async def test_sidecar_copied_to_different_database_does_not_match(self):
+        with (TemporaryDirectory(dir=Path.cwd()) as folder,
+              closing(History(Path(folder) / "first.sqlite")) as first,
+              closing(History(Path(folder) / "second.sqlite")) as second):
+            self.assertTrue(first.replay_salt() != second.replay_salt())
+            source = _Fixture(self, [_completed(_reason(), _answer("confirmed"))])
+            self.assertIsNone(await _complete(source, first))
+            second.append("main", [row.message for row in first.read_after("main")])
+            with second._db:
+                row = first._db.execute("SELECT * FROM model_replays").fetchone()
+                second._db.execute("INSERT INTO model_replays VALUES (?, ?, ?, ?, ?)", tuple(row))
+            dest = _Fixture(self, [_completed(_answer("next"))])
+            self.assertIsNone(await _complete(dest, second))
+            self.assertEqual(dest.requests[0]["input"], source.requests[0]["input"] + [
+                {"role": "assistant", "content": "confirmed"}, {"role": "user", "content": "synthetic prompt"},
+            ])
 
     async def test_corrupt_replay_and_cross_provider_use_only_common_history(self):
         for corrupt in (True, False):
@@ -236,7 +273,7 @@ class OpenAIResponsesTests(unittest.IsolatedAsyncioTestCase):
                     self.assertIsNone(await _complete(fixture, history))
                 if corrupt:
                     with closing(sqlite3.connect(path)) as conn, conn:
-                        conn.execute("UPDATE provider_replays SET items = ?", ('{"malformed":"' + _CIPHER + '"}',))
+                        conn.execute("UPDATE model_replays SET items = ?", ('{"malformed":"' + _CIPHER + '"}',))
                     second = _Fixture(self, [_completed(_answer("完成"))])
                     with closing(History(path)) as history:
                         self.assertIsNone(await _complete(second, history))
@@ -264,7 +301,7 @@ class OpenAIResponsesTests(unittest.IsolatedAsyncioTestCase):
                 self.assertNotIn(_CIPHER, json.dumps(inputs))
                 self.assertNotIn(_PRIVATE_SUMMARY, json.dumps(inputs))
 
-    async def test_partial_and_zero_delivery_retain_required_tool_replay_without_unseen_text(self):
+    async def test_partial_and_zero_delivery_keep_native_text_only_when_fully_confirmed(self):
         async def tool(_arguments, _ctx):
             return "accepted"
 
@@ -294,7 +331,7 @@ class OpenAIResponsesTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(later["input"][:len(inputs)], inputs)
                 self.assertNotIn("未播出", json.dumps(later, ensure_ascii=False))
 
-    async def test_text_rewrite_cuts_later_reasoning_in_tool_group(self):
+    async def test_partial_and_zero_delivery_keep_both_reasoning_items_and_tool_pairs(self):
         early, late = _reason(), _reason("rs_2", "synthetic-late-opaque")
         answer = _answer("ABCDEF")
         for confirmed in ("ABC", "", None):
@@ -302,29 +339,22 @@ class OpenAIResponsesTests(unittest.IsolatedAsyncioTestCase):
                 tool = AsyncMock(return_value="accepted")
                 tools = Tools([Tool(_SPEC, tool)])
                 channel = _Channel(first_confirmed=confirmed)
-                packet = [_completed(early, answer, _call(), late, _call(2))]
-                if confirmed is None:
-                    packet_fixture = _Fixture(self, packet, [_completed(_answer("continued", "msg_done"))])
-                    self.assertIsNone(await _complete(packet_fixture, history, channel=channel, tools=tools))
-                else:
-                    packet_fixture = _Fixture(self, packet)
-                    self.assertEqual(await _complete(packet_fixture, history, channel=channel, tools=tools), "model_failed")
-                    self.assertEqual(history.outcomes("main")[-1].model_error, "responses_required_replay_unavailable")
-                    self.assertEqual(len(packet_fixture.requests), 1)
+                fixture = _Fixture(self, [_completed(early, answer, _call(), late, _call(2))],
+                                   [_completed(_answer("continued", "msg_done"))])
+                self.assertIsNone(await _complete(fixture, history, channel=channel, tools=tools))
                 self.assertEqual([call.args[1].call_id for call in tool.await_args_list], ["call_1", "call_2"])
-                # 随后新话轮仍可使用可靠前缀和通用尾部，不重新执行历史工具。
                 later = _Fixture(self, [_completed(_answer("later", "msg_later"))])
                 self.assertIsNone(await _complete(later, history, tools=tools))
-                calls = [{k: v for k, v in _call(n).items()
-                          if k != "status" and (confirmed is None or k != "id")} for n in (1, 2)]
-                ordered = ([early, answer, calls[0], late, calls[1]] if confirmed is None else
-                           [early, *([{"role": "assistant", "content": confirmed}] if confirmed else []), *calls])
-                expected = packet_fixture.requests[0]["input"] + ordered + [
+                calls = [{k: v for k, v in _call(n).items() if k != "status"} for n in (1, 2)]
+                visible = ([answer] if confirmed is None else
+                           ([{"role": "assistant", "content": confirmed}] if confirmed else []))
+                expected = fixture.requests[0]["input"] + [early, *visible, calls[0], late, calls[1]] + [
                     {"type": "function_call_output", "call_id": f"call_{n}", "output": "accepted"} for n in (1, 2)
                 ]
-                if confirmed is None:
-                    self.assertEqual(packet_fixture.requests[1]["input"], expected)
+                self.assertEqual(fixture.requests[1]["input"], expected)
                 self.assertEqual(later.requests[0]["input"][:len(expected)], expected)
+                self.assertEqual(history.read_after("main")[1].message.content,
+                                 "ABCDEF" if confirmed is None else confirmed)
                 self.assertEqual(tool.await_count, 2)
 
     async def test_incomplete_and_malformed_terminal_do_not_dispatch_or_save_replay(self):
@@ -338,8 +368,6 @@ class OpenAIResponsesTests(unittest.IsolatedAsyncioTestCase):
                      "invalid_tool_arguments"),
                     ([_delta("可见前缀"), _completed(_answer("可见前缀"), _call(), {**_call(2), "call_id": "call_1"})],
                      "duplicate_tool_id"),
-                    ([_delta("可见前缀"), _completed(_answer("可见前缀"), _reason(cipher=None), _call())],
-                     "responses_missing_encrypted_reasoning"),
                     (_Wire([_delta("可见前缀"), valid], close_error=True), "transport_error")]
         for packet, error in variants:
             with self.subTest(error=error), closing(History(":memory:")) as history:
@@ -349,45 +377,47 @@ class OpenAIResponsesTests(unittest.IsolatedAsyncioTestCase):
                 tool.assert_not_awaited()
                 self.assertEqual(history.outcomes("main")[0].model_error, error)
                 self.assertEqual(history.read_after("main")[1].message.content, "可见前缀")
-                self.assertEqual(history._db.execute("SELECT count(*) FROM provider_replays").fetchone()[0], 0)
+                self.assertEqual(history._db.execute("SELECT count(*) FROM model_replays").fetchone()[0], 0)
 
-    async def test_prefix_changes_and_compaction_drop_old_replay_but_keep_common_tool_pair(self):
-        async def tool(_arguments, _ctx):
-            return "accepted"
-
-        tools = Tools([Tool(_SPEC, tool)])
+    async def test_historical_replay_survives_changes_to_tools_and_input_prefix(self):
+        tool = AsyncMock(return_value="accepted")
         fixture = _Fixture(self, [_completed(_reason(), _call())], [_completed(_answer("ended", "msg_done"))],
                            [_completed(_answer("next", "msg_next"))])
         with closing(History(":memory:")) as history:
             prompt = Message("user", (Text("initial"), Image(_IMAGE)))
-            self.assertIsNone(await _complete(fixture, history, prompt=prompt, tools=tools))
+            self.assertIsNone(await _complete(fixture, history, prompt=prompt, tools=Tools([Tool(_SPEC, tool)])))
             first = history.read_after("main")[0].message_id
-            # 模拟压缩在旧工具组前改变了实际请求前缀。该组不应被拆开。
+            # 摘要覆盖的是旧输入，不覆盖其后的工具组。
             history.save_summary("main", Summary(first, "previous input compacted"))
-            self.assertIsNone(await _complete(fixture, history, tools=tools))
-            inputs = fixture.requests[-1]["input"]
-            self.assertEqual([i.get("type") for i in inputs], [None, "function_call", "function_call_output", None, None])
-            self.assertNotIn(_CIPHER, json.dumps(inputs))
-            self.assertNotIn("fc_1", json.dumps(inputs))
-            self.assertEqual(inputs[1]["call_id"], inputs[2]["call_id"])
+            changed = ToolSpec(_SPEC.name, "new description", {"type": "object", "additionalProperties": False})
+            self.assertIsNone(await _complete(fixture, history, tools=Tools([Tool(changed, tool)])))
+            last = fixture.requests[-1]
+            self.assertNotEqual(fixture.requests[0]["tools"], last["tools"])
+            inputs = last["input"]
+            self.assertEqual(inputs[0]["role"], "system")
+            self.assertNotIn("input_image", json.dumps(inputs))
+            self.assertEqual(inputs[1:4], [
+                _reason(), {k: v for k, v in _call().items() if k != "status"},
+                {"type": "function_call_output", "call_id": "call_1", "output": "accepted"},
+            ])
+        tool.assert_awaited_once()
 
-    async def test_continuation_preserves_actual_sent_prefix_and_adds_queued_input(self):
+    async def test_continuation_reprojects_tools_and_adds_queued_input_at_safe_boundary(self):
         settings = RuntimeSettings(context_budget=240, tail_budget=75, summary_budget=45)
         result = "r" * 285
         fixture = _Fixture(self, [_completed(_reason(), _call())], [_completed(_answer("done"))])
         channel = _Channel()
         with closing(History(":memory:")) as history:
-            # 原记录在估算预算内，但转义后的 JSON 在首轮放不下。
-            history.append("main", [Message("user", '"' * 360)])
-
             async def receive_at_tool_boundary(_arguments, _ctx):
-                runtime.submit_batch([Message("user", "queued")])
+                tools.specs = (ToolSpec(_SPEC.name, "updated tool", _SPEC.parameters),)
+                runtime.submit_batch([Message("user", "queued"), Message("user", "same batch")])
                 return result
 
             tool = AsyncMock(side_effect=receive_at_tool_boundary)
+            tools = Tools([Tool(_SPEC, tool)])
             async with httpx.AsyncClient(transport=fixture.transport) as client:
-                runtime = Runtime("main", history, _model(client, request_limit=1000), channel,
-                                  settings=settings, tools=Tools([Tool(_SPEC, tool)]))
+                runtime = Runtime("main", history, _model(client, history=history, request_limit=1000), channel,
+                                  settings=settings, tools=tools)
                 try:
                     runtime.submit_batch([Message("user", "prompt")])
                     await asyncio.wait_for(runtime.wait_idle(), 2)
@@ -398,18 +428,20 @@ class OpenAIResponsesTests(unittest.IsolatedAsyncioTestCase):
         tool.assert_awaited_once()
         self.assertEqual(channel.replies, ["done"])
         first, next_ = fixture.requests
+        self.assertNotEqual(first["tools"], next_["tools"])
         self.assertEqual(first["input"], [{"role": "user", "content": "prompt"}])
         self.assertEqual(next_["input"], first["input"] + [
             _reason(), {k: v for k, v in _call().items() if k != "status"},
             {"type": "function_call_output", "call_id": "call_1", "output": result},
             {"role": "user", "content": "queued"},
+            {"role": "user", "content": "same batch"},
         ])
 
-    async def test_no_reasoning_continuation_can_compact_or_replace_images(self):
+    async def test_reasoning_continuation_can_compact_or_replace_images(self):
         for mode in ("compact", "image"):
             with self.subTest(mode=mode), closing(History(":memory:")) as history:
                 tool = AsyncMock(return_value="r" * 285)
-                initial, final = [_completed(_call())], [_completed(_answer("done"))]
+                initial, final = [_completed(_reason(), _call())], [_completed(_answer("done"))]
                 if mode == "compact":
                     history.append("main", [Message("user", "x" * 360)])
                     fixture = _Fixture(self, initial, [_completed(_answer("summary"))], final)
@@ -424,18 +456,18 @@ class OpenAIResponsesTests(unittest.IsolatedAsyncioTestCase):
                     image = Image("data:image/png;base64," + "YQAA" * 100)
                     prompt = Message("user", (Text("image"), image))
                     fixture = _Fixture(self, initial, final)
-                    self.assertIsNone(await _complete(fixture, history, prompt=prompt, request_limit=950,
+                    self.assertIsNone(await _complete(fixture, history, prompt=prompt, request_limit=1000,
                                                       tools=Tools([Tool(_SPEC, tool)])))
                     self.assertEqual(fixture.requests[0]["input"][0]["content"][1]["image_url"], image.url)
                     self.assertNotIn("input_image", json.dumps(fixture.requests[1]))
                     self.assertEqual(history.read_after("main")[0].message, prompt)
                 tool.assert_awaited_once()
-                self.assertEqual(fixture.requests[-1]["input"][-2:], [
-                    {k: v for k, v in _call().items() if k not in ("id", "status")},
+                self.assertEqual(fixture.requests[-1]["input"][-3:], [
+                    _reason(), {k: v for k, v in _call().items() if k != "status"},
                     {"type": "function_call_output", "call_id": "call_1", "output": "r" * 285},
                 ])
 
-    async def test_budget_downgrade_then_required_replay_with_queued_input(self):
+    async def test_budget_downgrade_then_replay_with_queued_input(self):
         image = Image("data:image/png;base64," + "YQAA" * 225)
         prompt = Message("user", (Text("image"), image))
         first_result, second_result = "r" * 285, "second result"
@@ -453,7 +485,7 @@ class OpenAIResponsesTests(unittest.IsolatedAsyncioTestCase):
         tool = AsyncMock(side_effect=execute)
         with closing(History(":memory:")) as history:
             async with httpx.AsyncClient(transport=fixture.transport) as client:
-                runtime = Runtime("main", history, _model(client, request_limit=1400), channel,
+                runtime = Runtime("main", history, _model(client, history=history, request_limit=1400), channel,
                                   tools=Tools([Tool(_SPEC, tool)]))
                 try:
                     runtime.submit_batch([prompt])
@@ -466,7 +498,7 @@ class OpenAIResponsesTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([call.args[1].call_id for call in tool.await_args_list], ["call_1", "call_2"])
         first, downgraded, continued = (request["input"] for request in fixture.requests)
         self.assertEqual(first[0]["content"][1]["image_url"], image.url)
-        calls = [{k: v for k, v in _call(n).items() if k not in ("id", "status")} for n in (1, 2)]
+        calls = [{k: v for k, v in _call(n).items() if k != "status"} for n in (1, 2)]
         self.assertEqual(downgraded, [
             {"role": "user", "content": [{"type": "input_text", "text": text}
                                          for text in ("image", OMITTED_INPUT_IMAGE.text)]},
@@ -478,14 +510,12 @@ class OpenAIResponsesTests(unittest.IsolatedAsyncioTestCase):
             {"role": "user", "content": "queued"},
         ])
 
-    async def test_required_replay_over_either_budget_never_sends_or_reruns_tools(self):
+    async def test_protected_tool_group_over_either_budget_never_sends_or_reruns_tools(self):
         settings = RuntimeSettings(context_budget=240, tail_budget=75, summary_budget=45)
-        for old, limit, failure in [("x" * 360, 2000, "protected_context_too_large"),
-                                    ("", 700, "protected_request_too_large")]:
+        for limit, result_size, failure in [(2000, 1500, "protected_context_too_large"),
+                                            (700, 285, "protected_request_too_large")]:
             with self.subTest(failure=failure), closing(History(":memory:")) as history:
-                if old:
-                    history.append("main", [Message("user", old)])
-                tool = AsyncMock(return_value="r" * 285)
+                tool = AsyncMock(return_value="r" * result_size)
                 fixture = _Fixture(self, [_completed(_reason(), _call())])
                 with self.assertLogs("agent_companion.runtime.engine", level="WARNING") as logs:
                     self.assertEqual(await _complete(fixture, history, settings=settings, request_limit=limit,
@@ -498,38 +528,51 @@ class OpenAIResponsesTests(unittest.IsolatedAsyncioTestCase):
                     f"tool continuation not sent ({failure}); run={history.outcomes('main')[0].run_id}",
                 ])
 
-    async def test_missing_or_damaged_active_replay_does_not_prove_no_reasoning(self):
-        for missing in (True, False):
-            with self.subTest(missing=missing), closing(History(":memory:")) as history:
+    async def test_missing_or_damaged_active_replay_uses_common_tool_pair(self):
+        for damage in ("missing", "call-id", "escaped-surrogate", "invalid-utf8"):
+            with self.subTest(damage=damage), closing(History(":memory:")) as history:
                 tool = AsyncMock(return_value="accepted")
-                fixture = _Fixture(self, [_completed(_reason(), _call())])
+                fixture = _Fixture(self, [_completed(_reason(), _call())], [_completed(_answer("done"))])
                 finalize = history.finalize_reply
 
                 def damage_after_commit(outcome, rows):
-                    ids = finalize(outcome, rows)
-                    if ids:
+                    finalize(outcome, rows)
+                    if rows and rows[0].tool_calls:
                         with history._db:
-                            if missing:
-                                history._db.execute("DELETE FROM provider_replays WHERE assistant_message_id = ?", (ids[0],))
+                            if damage == "missing":
+                                history._db.execute("DELETE FROM model_replays")
+                            elif damage == "invalid-utf8":
+                                history._db.execute("UPDATE model_replays SET items = CAST(X'FF' AS TEXT)")
                             else:
-                                stored = history._db.execute("SELECT items FROM provider_replays"
-                                                             " WHERE assistant_message_id = ?", (ids[0],)).fetchone()
+                                stored = history._db.execute("SELECT items FROM model_replays").fetchone()
                                 data = json.loads(stored[0])
-                                data["items"].pop(0)  # 终态标记仍表明有推理，不能误作无推理。
-                                history._db.execute("UPDATE provider_replays SET items = ? WHERE assistant_message_id = ?",
-                                                    (json.dumps(data), ids[0]))
-                    return ids
+                                if damage == "call-id":
+                                    data[-1]["call_id"] = "corrupt-call-id"
+                                else:
+                                    data[0]["encrypted_content"] = "\udfff"
+                                history._db.execute("UPDATE model_replays SET items = ?", (json.dumps(data),))
 
                 with patch.object(history, "finalize_reply", side_effect=damage_after_commit):
-                    with self.assertLogs("agent_companion.runtime.engine", level="WARNING") as logs:
-                        self.assertEqual(await _complete(fixture, history, tools=Tools([Tool(_SPEC, tool)])), "model_failed")
+                    self.assertIsNone(await _complete(fixture, history, tools=Tools([Tool(_SPEC, tool)])))
                 tool.assert_awaited_once()
-                self.assertEqual(len(fixture.requests), 1)
-                outcome = history.outcomes("main")[-1]
-                self.assertEqual(outcome.model_error, "responses_required_replay_unavailable")
-                self.assertEqual([record.getMessage() for record in logs.records], [
-                    f"tool continuation not sent (responses_required_replay_unavailable); run={outcome.run_id}",
+                self.assertEqual(fixture.requests[1]["input"], fixture.requests[0]["input"] + [
+                    {k: v for k, v in _call().items() if k not in ("id", "status")},
+                    {"type": "function_call_output", "call_id": "call_1", "output": "accepted"},
                 ])
+
+    async def test_missing_cipher_does_not_discard_other_items_or_block_tools(self):
+        tool = AsyncMock(return_value="accepted")
+        good = _reason("rs_2")
+        answer = _answer("可见正文")
+        fixture = _Fixture(self, [_completed(_reason(cipher=None), answer, good, _call())],
+                           [_completed(_answer("done", "msg_done"))])
+        with closing(History(":memory:")) as history:
+            self.assertIsNone(await _complete(fixture, history, tools=Tools([Tool(_SPEC, tool)])))
+        tool.assert_awaited_once()
+        self.assertEqual(fixture.requests[1]["input"], fixture.requests[0]["input"] + [
+            answer, good, {k: v for k, v in _call().items() if k != "status"},
+            {"type": "function_call_output", "call_id": "call_1", "output": "accepted"},
+        ])
 
     async def test_summary_request_never_receives_private_fields(self):
         fixture = _Fixture(self, [_completed(_reason(summary=(_PRIVATE_SUMMARY,)), _answer("old"))],
@@ -546,19 +589,53 @@ class OpenAIResponsesTests(unittest.IsolatedAsyncioTestCase):
                 self.assertNotIn(_CIPHER, json.dumps(request))
                 self.assertNotIn("rs_1", json.dumps(request))
 
-    async def test_http_rejection_does_not_retry_or_change_effort(self):
-        requests = []
+    async def test_http_rejection_does_not_retry_or_rerun_tools(self):
+        base = "https://responses.example.invalid/fixture"
+        tool = AsyncMock(return_value="accepted")
+        fixture = _Fixture(self, [_completed(_reason(), _call())], httpx.Response(400, json={
+            "error": {"message": f"synthetic upstream error {_KEY} {base} {_CIPHER}"},
+        }), endpoint=base + "/responses")
+        with (closing(History(":memory:")) as history,
+              self.assertLogs("agent_companion.runtime.engine", logging.WARNING) as logs):
+            self.assertEqual(await _complete(fixture, history, effort="none", base_url=base,
+                                             tools=Tools([Tool(_SPEC, tool)])), "model_failed")
+            self.assertEqual(history.outcomes("main")[-1].model_error, "http_400")
+            self.assertEqual(history.read_after("main")[-1].message.tool_call_id, "call_1")
+        tool.assert_awaited_once()
+        self.assertEqual([request["reasoning"] for request in fixture.requests], [{"effort": "none"}] * 2)
+        self.assertIn(_reason(), fixture.requests[-1]["input"])
+        self.assertTrue(all(value not in "".join(logs.output) for value in (_KEY, base, _CIPHER)))
 
-        async def reject(request):
-            requests.append(json.loads(request.content))
-            return httpx.Response(400, json={"error": {"message": "synthetic unsupported effort"}})
+    async def test_redirect_is_not_followed_even_with_client_defaults(self):
+        for destination in ("https://responses.example.invalid/elsewhere", "https://other.example.invalid/responses"):
+            with self.subTest(destination=destination):
+                base = "https://responses.example.invalid/v1"
+                fixture = _Fixture(self, httpx.Response(307, headers={"Location": destination}),
+                                   endpoint=base + "/responses")
+                async with httpx.AsyncClient(transport=fixture.transport, follow_redirects=True,
+                                             auth=("fixture", "unused"), headers={"Authorization": "unused"}) as client:
+                    adapter = _model(client, base_url=base)
+                    self.assertNotIn("fingerprint", repr(adapter.replay_scope))
+                    with self.assertRaisesRegex(ModelError, "^http_307$"):
+                        _ = [event async for event in adapter.stream([Message("user", "x")], (), thinking=False)]
+                self.assertEqual(len(fixture.requests), 1)
+                self.assertTrue(_KEY not in json.dumps(fixture.requests))
 
-        async with httpx.AsyncClient(transport=httpx.MockTransport(reject)) as client:
-            adapter = _model(client, effort="none")
-            with self.assertRaisesRegex(Exception, "http_400"):
-                _ = [event async for event in adapter.stream([Message("user", "x")], (), thinking=False)]
-        self.assertEqual(len(requests), 1)
-        self.assertEqual(requests[0]["reasoning"], {"effort": "none"})
+    async def test_legacy_replay_table_is_ignored_and_left_intact(self):
+        with TemporaryDirectory(dir=Path.cwd()) as folder:
+            path = Path(folder) / "legacy.sqlite"
+            with closing(History(path)) as history:
+                assistant_id, = history.append("main", [Message("assistant", "confirmed")])
+                with history._db:
+                    history._db.execute("CREATE TABLE provider_replays (assistant_message_id INTEGER PRIMARY KEY, items TEXT)")
+                    history._db.execute("INSERT INTO provider_replays VALUES (?, ?)", (assistant_id, _CIPHER))
+            with closing(History(path)) as history:
+                fixture = _Fixture(self, [_completed(_answer("next"))])
+                self.assertIsNone(await _complete(fixture, history))
+                self.assertEqual(fixture.requests[0]["input"], [
+                    {"role": "assistant", "content": "confirmed"}, {"role": "user", "content": "synthetic prompt"},
+                ])
+                self.assertTrue(history._db.execute("SELECT items FROM provider_replays").fetchone()[0] == _CIPHER)
 
     async def test_no_reasoning_is_valid_and_request_sizing_matches_actual_body(self):
         fixture = _Fixture(self, [_completed(_answer("文本"))])
@@ -595,27 +672,32 @@ class OpenAIResponsesTests(unittest.IsolatedAsyncioTestCase):
             self.assertIsNone(await _complete(fixture, history, session_id="other"))
             self.assertNotIn(_CIPHER, json.dumps(fixture.requests[1]))
             async with httpx.AsyncClient(transport=fixture.transport) as client:
-                scope = _model(client).replay_scope
+                scope = _model(client, history=history).replay_scope
             entries = history.read_after("main", replay_scope=scope)
-            before_count = history._db.execute("SELECT count(*) FROM provider_replays").fetchone()[0]
+            before_count = history._db.execute("SELECT count(*) FROM model_replays").fetchone()[0]
             outcome = history.outcomes("main")[0]
             duplicate = ReplyOutcome(outcome.reply_id, "main", outcome.run_id, "complete")
             with self.assertRaises(sqlite3.IntegrityError):
                 history.finalize_reply(duplicate, [entries[-1].message])
             self.assertEqual(history.read_after("main", replay_scope=scope), entries)
-            self.assertEqual(history._db.execute("SELECT count(*) FROM provider_replays").fetchone()[0], before_count)
+            self.assertEqual(history._db.execute("SELECT count(*) FROM model_replays").fetchone()[0], before_count)
 
     async def test_production_composes_selected_openai_adapter(self):
         with TemporaryDirectory(dir=Path.cwd()) as folder:
             settings = Settings(database=Path(folder) / "synthetic.sqlite",
-                                llm=LLMSettings("openai_responses", "none", "fixture-model", "local-a"),
+                                llm=LLMSettings("openai_responses", "none", "fixture-model", "https://responses.example.invalid/api/"),
                                 feishu=FeishuSettings("oc_fixture", "ou_peer", "ou_self"))
             with patch("agent_companion.__main__.run_feishu", new_callable=AsyncMock) as run:
                 await _serve(settings, "synthetic-model-test", "synthetic-speech-test")
                 run.assert_awaited_once()
                 model = run.await_args.args[2]
                 self.assertIsInstance(model, OpenAIResponses)
-                self.assertEqual((model.replay_scope.model, model.replay_scope.profile), ("fixture-model", "local-a"))
+                self.assertEqual(model._endpoint, "https://responses.example.invalid/api/responses")
+                self.assertEqual(model.replay_scope.reasoning_effort, "none")
+                with closing(History(settings.database)) as history:
+                    expected = _model(model._client, history=history, api_key=_KEY, effort="none",
+                                      base_url="https://responses.example.invalid/api")
+                self.assertEqual(model.replay_scope, expected.replay_scope)
 
     async def test_deepseek_explicit_effort_and_disabled_use_existing_wire(self):
         captured = []
@@ -638,10 +720,24 @@ class OpenAIResponsesTests(unittest.IsolatedAsyncioTestCase):
 
 
 class LLMSettingsTests(unittest.TestCase):
+    def test_base_url_normalization_and_validation(self):
+        llm = LLMSettings("openai_responses", "low", "fixture", "HTTPS://[2001:DB8::1]:8443/model/v1///")
+        self.assertEqual(llm.base_url, "https://[2001:db8::1]:8443/model/v1")
+        self.assertNotIn("base_url", repr(llm))
+        for url in ("http://localhost/v1", "https://token@example.invalid/v1", "https://example.invalid/v1?",
+                    "https://example.invalid/v1#", "https://example.invalid:65536/v1", "https://example.invalid:",
+                    "https://example.invalid\\v1", "https://example.invalid/with space", "https:///v1",
+                    "https://example.invalid/" + "路" * 300):
+            with self.subTest(url=url), self.assertRaises(ValueError) as exc:
+                LLMSettings("openai_responses", "low", "fixture", url)
+            self.assertTrue(url not in str(exc.exception))
+
     def test_rejects_old_or_incomplete_configuration(self):
         sections = ('[deepseek]\nthinking = false', '[llm]\nadapter = "deepseek"',
                     '[llm]\nreasoning_effort = "none"', '[llm]\nadapter = "deepseek"\nreasoning_effort = " "',
-                    '[llm]\nadapter = "openai_responses"\nreasoning_effort = "low"\nmodel = "synthetic"')
+                    '[llm]\nadapter = "openai_responses"\nreasoning_effort = "low"',
+                    '[llm]\nadapter = "openai_responses"\nreasoning_effort = "low"\nmodel = "synthetic"\nreplay_profile = "legacy"',
+                    '[llm]\nadapter = "deepseek"\nreasoning_effort = "high"\nbase_url = "https://example.invalid/api"')
         with TemporaryDirectory(dir=Path.cwd()) as folder:
             config = Path(folder) / "config.toml"
             for section in sections:
@@ -670,7 +766,7 @@ class LLMSettingsTests(unittest.TestCase):
             config = Path(folder) / "synthetic.toml"
             for adapter, variable, extra in [("deepseek", "DEEPSEEK_API_KEY", ""),
                                              ("openai_responses", "OPENAI_API_KEY",
-                                              'model="synthetic"\nreplay_profile="local"\n')]:
+                                              'model="synthetic"\n')]:
                 with self.subTest(adapter=adapter):
                     config.write_text(f'[llm]\nadapter="{adapter}"\nreasoning_effort="example"\n{extra}'
                                       '[feishu]\nchat_id="oc_test"\nsender_open_id="ou_peer"\nown_open_id="ou_self"\n',

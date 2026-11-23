@@ -32,8 +32,8 @@ class ToolCall:
 @dataclass(frozen=True, slots=True)
 class ReplayScope:
     protocol: str
-    profile: str = field(repr=False)
-    model: str
+    fingerprint: bytes = field(repr=False)
+    reasoning_effort: str
 
 
 MAX_REPLAY_BYTES = 8 * 1024 * 1024
@@ -54,11 +54,7 @@ class ReplayItem:
 @dataclass(frozen=True, slots=True)
 class ProviderReplay:
     scope: ReplayScope
-    prefix_digest: str = field(repr=False)
     items: tuple[ReplayItem, ...] = field(repr=False)
-    # 来自已校验终态；不能用缺失或损坏的 sidecar 猜测没有推理项。
-    has_reasoning: bool
-    version: int = 2
 
 
 @dataclass(frozen=True, slots=True)
@@ -74,7 +70,6 @@ class Message:
     tool_call_id: str | None = None
     reasoning: str | None = field(default=None, repr=False)
     replay: ProviderReplay | None = field(default=None, repr=False)
-    replay_required: bool = field(default=False, repr=False)
 
 
 @dataclass(frozen=True, slots=True)
@@ -119,21 +114,13 @@ _MODEL_DIAGNOSTICS = frozenset({
     "abnormal_stream_finish", "duplicate_tool_id", "empty_summary", "incomplete_tool_call",
     "internal_tool_call", "invalid_sse_event", "invalid_stream_finish", "invalid_tool_arguments",
     "invalid_tool_delta", "invalid_tool_id", "missing_reasoning", "transport_error", "truncated_stream",
-    "unsupported_tool_type", "request_body_too_large", "responses_required_replay_unavailable",
-    "responses_missing_encrypted_reasoning", "responses_output_limit", "responses_event_limit",
+    "unsupported_tool_type", "request_body_too_large", "responses_output_limit", "responses_event_limit",
     "responses_unsupported_encoding", "responses_unsupported_output", "responses_unexpected_response",
 })
 
 
 class RequestTooLarge(ModelError):
     """请求超出模型提供方的 HTTP 正文字节预算。"""
-
-
-class ReplayUnavailable(ModelError):
-    """活动工具组不能合法回传；这不是字节超限。"""
-
-    def __init__(self) -> None:
-        super().__init__("responses_required_replay_unavailable")
 
 
 class Model(Protocol):

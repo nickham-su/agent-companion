@@ -1,11 +1,46 @@
 """启动配置；鉴权材料不从 TOML 读取。"""
 
 from dataclasses import dataclass, field, fields
+from ipaddress import IPv6Address
 import math
 from pathlib import Path
 import re
 import tomllib
 from typing import Any
+from urllib.parse import urlsplit
+
+import httpx
+
+
+OPENAI_BASE_URL = "https://api.openai.com/v1"
+
+
+def normalize_openai_base_url(value: str | None) -> str:
+    """用于请求和回放范围的同一 HTTPS 基准地址。"""
+    if value is None:
+        return OPENAI_BASE_URL
+    error = "llm.base_url must be an HTTPS API base URL without credentials, query, or fragment"
+    if (not isinstance(value, str) or not 0 < len(value) <= 2048
+            or any(char.isspace() or not char.isprintable() or char in "\\?#" for char in value)
+            or re.search(r"%(?![0-9a-fA-F]{2})", value)):
+        raise ValueError(error)
+    try:
+        split = urlsplit(value)
+        hostname, port = split.hostname, split.port
+        if (split.scheme != "https" or not hostname or "@" in split.netloc
+                or split.netloc.endswith(":") or port == 0):
+            raise ValueError
+        url = httpx.URL(value)
+        if split.netloc.startswith("["):
+            # HTTPX 保留 IPv6 原拼写，规范化后等价地址使用同一指纹。
+            url = url.copy_with(host=IPv6Address(hostname).compressed)
+        origin = url.copy_with(raw_path=b"/", port=None if port == 443 else port)
+        normalized = str(origin).removesuffix("/") + url.raw_path.decode("ascii").rstrip("/")
+        if len(normalized) > 2048:
+            raise ValueError
+        return normalized
+    except (ValueError, httpx.InvalidURL):
+        raise ValueError(error) from None
 
 
 def require_seconds(value: float, name: str) -> None:
@@ -38,7 +73,7 @@ class LLMSettings:
     adapter: str
     reasoning_effort: str
     model: str | None = None
-    replay_profile: str | None = None
+    base_url: str | None = field(default=None, repr=False)
 
     def __post_init__(self) -> None:
         if self.adapter not in ("deepseek", "openai_responses"):
@@ -53,10 +88,9 @@ class LLMSettings:
         if self.adapter == "openai_responses":
             if self.model is None:
                 raise ValueError("llm.model is required for openai_responses")
-            if not isinstance(self.replay_profile, str) or not re.fullmatch(r"[A-Za-z0-9_.-]{1,64}", self.replay_profile):
-                raise ValueError("llm.replay_profile is required for openai_responses")
-        elif self.replay_profile is not None:
-            raise ValueError("llm.replay_profile is only used by openai_responses")
+            object.__setattr__(self, "base_url", normalize_openai_base_url(self.base_url))
+        elif self.base_url is not None:
+            raise ValueError("llm.base_url is only used by openai_responses")
 
 
 @dataclass(frozen=True, slots=True)

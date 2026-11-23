@@ -78,7 +78,8 @@ async def _serve(settings: Settings, model_key: str, minimax_key: str) -> None:
     with closing(History(settings.database, feishu_binding=(settings.main_session_id, identity))) as history:
         # 独立客户端，避免任一平台收到另一平台的凭据。不接受网络重定向。
         async with (
-            httpx.AsyncClient(headers={"Authorization": f"Bearer {model_key}"},
+            httpx.AsyncClient(headers={"Authorization": f"Bearer {model_key}"}
+                              if llm.adapter == "deepseek" else None,
                               follow_redirects=False, trust_env=False, timeout=None) as model_client,
             httpx.AsyncClient(headers={"Authorization": f"Bearer {minimax_key}"},
                               follow_redirects=False, trust_env=False, timeout=None) as speech_client,
@@ -90,11 +91,12 @@ async def _serve(settings: Settings, model_key: str, minimax_key: str) -> None:
                                  voice_id=settings.voice.voice_id, timeout=settings.voice.tts_timeout)
             if llm.adapter == "deepseek":
                 model = DeepSeek(model_client, model=llm.model or MODEL_NAME,
-                                 reasoning_effort=llm.reasoning_effort)
+                                  reasoning_effort=llm.reasoning_effort)
             else:
-                assert llm.model is not None and llm.replay_profile is not None
-                model = OpenAIResponses(model_client, model=llm.model, replay_profile=llm.replay_profile,
-                                        reasoning_effort=llm.reasoning_effort)
+                assert llm.model is not None
+                model = OpenAIResponses(model_client, model=llm.model, api_key=model_key,
+                                         base_url=llm.base_url, reasoning_effort=llm.reasoning_effort,
+                                         replay_salt=history.replay_salt())
             await run_feishu(settings, history, model, asr, tts=tts)
 
 

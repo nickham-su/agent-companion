@@ -10,10 +10,10 @@ from uuid import uuid4
 
 from ..config import RuntimeSettings
 from ..protocol import (Channel, DeliveryStatus, Message, Model, ModelError, ModelEvent,
-                        ReasoningDelta, Receipt, ReplayReady, ReplayScope, ReplayUnavailable, ReplyInfo, ReplyStream,
+                        ReasoningDelta, Receipt, ReplayReady, ReplayScope, ReplyInfo, ReplyStream,
                         RequestBudget, RequestTooLarge, TextDelta, ToolCall, ToolReady)
 from ..storage.sqlite import History, ReplyOutcome
-from .context import Context, Continuation, ProtectedContextTooLarge, ProtectedRequestTooLarge
+from .context import Context, ProtectedContextTooLarge, ProtectedRequestTooLarge
 from .tools import ToolContext, Tools
 
 
@@ -76,7 +76,7 @@ class Runtime:
         if not batch:
             return
         if any(item.role != "user" or item.tool_calls or item.tool_call_id or item.reasoning is not None
-               or item.replay is not None or item.replay_required
+               or item.replay is not None
                for item in batch):
             raise ValueError("runtime inputs must be plain user messages")
         self._enqueue(_InputBatch(batch, has_user_input))
@@ -154,47 +154,33 @@ class Runtime:
             _LOG.error("session runtime could not finish the current input")
 
     async def _run(self, run_id: str, protected_from: int, *, has_user_input: bool) -> None:
-        continuation = None
         for index in range(self._settings.max_tool_rounds):
             try:
                 messages = await self._context.prepare(self.session_id, thinking=self._thinking,
                                                        tools=self._tools.specs, instructions=self._instructions,
-                                                       protected_from=protected_from, continuation=continuation)
+                                                       protected_from=protected_from)
             except (ProtectedContextTooLarge, ProtectedRequestTooLarge) as exc:
-                if continuation is None:
+                if index == 0:
                     raise
                 self.last_failure = ("protected_context_too_large" if isinstance(exc, ProtectedContextTooLarge)
                                      else "protected_request_too_large")
                 _LOG.warning("tool continuation not sent (%s); run=%s", self.last_failure, run_id)
                 return
-            except ReplayUnavailable as exc:
-                # 在规划时结束，不向模型发送不完整的工具续轮。
-                reply_id = uuid4().hex
-                _LOG.warning("tool continuation not sent (%s); run=%s", exc.diagnostic, run_id)
-                self.history.finalize_reply(ReplyOutcome(reply_id, self.session_id, run_id, "model_failed",
-                                                         model_error=exc.diagnostic), [])
-                self.last_failure = "model_failed"
-                return
-            model_status, reply_ids = await self._reply(run_id, messages, has_user_input=has_user_input)
+            model_status, has_calls = await self._reply(run_id, messages, has_user_input=has_user_input)
             if model_status != "complete":
                 self.last_failure = model_status
                 return
-            if not reply_ids:
+            if not has_calls:
                 return
             if index + 1 == self._settings.max_tool_rounds:
                 self.last_failure = "tool_round_limit"
                 return
             if self._closed:
                 return
-            appended = list(reply_ids) if self._replay_scope is not None else None
             while self._pending:
                 batch = self._pending.popleft()
-                if ids := self._record_input(batch):
+                if self._record_input(batch):
                     has_user_input = has_user_input or batch.has_user_input
-                    if appended is not None:
-                        appended.extend(ids)
-            if appended is not None:
-                continuation = Continuation(messages, tuple(appended))
 
     async def _summary_stream(self, messages: Sequence[Message]) -> AsyncGenerator[ModelEvent, None]:
         async with asyncio.timeout(self._settings.model_timeout):
@@ -203,7 +189,7 @@ class Runtime:
                     yield event
 
     async def _reply(self, run_id: str, messages: Sequence[Message], *,
-                     has_user_input: bool) -> tuple[str, list[int]]:
+                     has_user_input: bool) -> tuple[str, bool]:
         loop = asyncio.get_running_loop()
         info = ReplyInfo(uuid4().hex, self.session_id, run_id, loop.time())
         text: list[str] = []
@@ -272,10 +258,10 @@ class Runtime:
                               replay=replay),
                        *results]
                       if receipt is not None or calls or internal_text or replay is not None else [])
-            ids = self.history.finalize_reply(
+            self.history.finalize_reply(
                 ReplyOutcome(info.reply_id, info.session_id, run_id, model_status,
                              receipt.status if receipt else None, model_error=model_error), rows)
-            return model_status, ids if calls else []
+            return model_status, bool(calls)
         finally:
             unfinished = [task for _, task in scheduled.values() if not task.done()]
             if delivery is not None:

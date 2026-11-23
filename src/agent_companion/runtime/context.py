@@ -9,7 +9,7 @@ from time import monotonic
 
 from ..config import RuntimeSettings
 from ..protocol import (OMITTED_INPUT_IMAGE, Image, Message, ModelError, ModelEvent, Part, ReplayScope,
-                         ReplayUnavailable, RequestBudget, RequestTooLarge, Text, TextDelta, ToolSpec)
+                         RequestBudget, RequestTooLarge, Text, TextDelta, ToolSpec)
 from ..storage.sqlite import History, HistoryEntry, Summary, SummaryWriteError
 
 
@@ -47,14 +47,6 @@ def _trim(text: str, budget: int) -> str:
 class _Block:
     end_id: int
     messages: tuple[Message, ...]
-
-
-@dataclass(frozen=True, slots=True, repr=False)
-class Continuation:
-    """上一请求的实际投影，加上本次允许追加的已提交行。"""
-
-    prefix: Sequence[Message]
-    appended_ids: tuple[int, ...]
 
 
 def _blocks(entries: Sequence[HistoryEntry]) -> list[_Block]:
@@ -122,14 +114,12 @@ def _summary_message(summary: Summary | None, budget: int) -> list[Message]:
     return [Message("system", _SUMMARY_PREFIX + content)] if content else []
 
 
-def _protocol_messages(blocks: Sequence[_Block], with_reasoning: bool, *, required: bool = False) -> list[Message]:
+def _protocol_messages(blocks: Sequence[_Block], with_reasoning: bool) -> list[Message]:
     result = []
     for block in blocks:
         for message in block.messages:
             if not with_reasoning and message.reasoning is not None:
                 message = replace(message, reasoning=None)
-            if required and message.role == "assistant" and message.tool_calls:
-                message = replace(message, replay_required=True)
             result.append(message)
     return result
 
@@ -160,8 +150,7 @@ class Context:
         return self._request_budget is None or self._request_budget.request_fits(messages, tools, thinking=thinking)
 
     async def prepare(self, session_id: str, *, thinking: bool, tools: Sequence[ToolSpec],
-                      protected_from: int, instructions: str = "",
-                      continuation: Continuation | None = None) -> list[Message]:
+                      protected_from: int, instructions: str = "") -> list[Message]:
         summary = self._history.summary(session_id)
         covered = summary.covers_through if summary else 0
         if covered >= protected_from:
@@ -170,10 +159,6 @@ class Context:
             8 + _text_cost(tool.name + tool.description + json.dumps(tool.parameters, ensure_ascii=False))
             for tool in tools
         )
-        if continuation is not None:
-            candidate = self._continue(session_id, continuation, tools, budget, thinking=thinking)
-            if candidate is not None:
-                return candidate
         blocks = _blocks(self._history.read_after(session_id, covered, replay_scope=self._replay_scope))
         protected = next(i for i, block in enumerate(blocks) if block.end_id >= protected_from)
         keep_reasoning = thinking and bool(tools)
@@ -186,7 +171,7 @@ class Context:
         costs = [sum(map(_cost, _protocol_messages((block,), keep_reasoning))) for block in blocks]
         budget -= sum(map(_cost, fixed))
         protected_messages = self._limit_current(fixed, _protocol_messages(
-            blocks[protected:], keep_reasoning, required=self._replay_scope is not None),
+            blocks[protected:], keep_reasoning),
             tools, budget, thinking=thinking)
         tail_cost = sum(map(_cost, protected_messages))
         total = sum(costs[:protected]) + tail_cost
@@ -210,44 +195,6 @@ class Context:
         # 摘要连同包裹开销也放不下时，这一次只提交保留的原始尾部；不推进摘要覆盖点。
         return self._limit_body(fixed, _summary_message(summary, summary_space), blocks[cut:protected],
                                 protected_messages, tools, thinking=thinking, keep_reasoning=keep_reasoning)
-
-    def _continue(self, session_id: str, continuation: Continuation, tools: Sequence[ToolSpec],
-                  budget: int, *, thinking: bool) -> list[Message] | None:
-        ids = continuation.appended_ids
-        entries = self._history.read_after(session_id, ids[0] - 1, replay_scope=self._replay_scope)
-        if tuple(row.message_id for row in entries) != ids:
-            raise ReplayUnavailable()
-        answer = entries[0].message
-        end = 1 + len(answer.tool_calls)
-        group = _blocks(entries[:end])
-        new_inputs = [row.message for row in entries[end:]]
-        if (answer.role != "assistant" or end == 1 or len(group) != 1 or len(group[0].messages) != end
-                or any(message.role != "user" for message in new_inputs)):
-            raise ReplayUnavailable()
-
-        base = [*continuation.prefix, *_protocol_messages(group, False, required=True)]
-        # 与发送同样校验兼容性：不合法抛 ReplayUnavailable，不能视为字节超限。
-        candidate = base + new_inputs
-        bytes_fit = self._fits(candidate, tools, thinking=thinking)
-        cost = sum(map(_cost, base))
-        if bytes_fit and cost + sum(map(_cost, new_inputs)) <= budget:
-            return candidate
-
-        pinned = any(message.replay_required and message.replay and message.replay.has_reasoning
-                     for message in base)
-        if cost <= budget and new_inputs and self._fits(base, tools, thinking=thinking):
-            try:
-                # 新输入中的图可以替换，不改变先前实际发送的前缀及完整工具组。
-                return base + self._limit_current(base, new_inputs, tools, budget - cost, thinking=thinking)
-            except (ProtectedContextTooLarge, ProtectedRequestTooLarge):
-                if pinned:
-                    raise
-        if pinned:
-            if cost > budget:
-                raise ProtectedContextTooLarge("protected_context_too_large")
-            raise ProtectedRequestTooLarge("protected_request_too_large")
-        # 所有活动组都已确认无推理；可走一般压缩或图片替换，稳定 call_id 不变。
-        return None
 
     def _limit_coalesced(self, fixed: list[Message], baseline: list[Message],
                          images: list[tuple[int, int, Image]], tools: Sequence[ToolSpec],

@@ -21,7 +21,8 @@ reasoning_effort = "disabled"  # DeepSeek 关闭思考；启用时按其模型�
 # adapter = "openai_responses"
 # model = "your-openai-model"
 # reasoning_effort = "low"   # 支持的值取决于所选模型
-# replay_profile = "local-project"  # 非敏感本地标识，不要填写 API key
+# base_url = "https://api.openai.com/v1"  # 可省略；自定义服务会收到 Key 和模型输入，只配可信 HTTPS 地址
+# Key 仅从 OPENAI_API_KEY 读取。换 Key、地址、模型或推理强度后，旧密文不回传，通用历史保留。
 
 # 飞书模式启用后，把以下占位符换成同一个 CLI 应用下的实际 ID。
 # [feishu]

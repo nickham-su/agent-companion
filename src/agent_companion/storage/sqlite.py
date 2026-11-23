@@ -4,6 +4,7 @@ from collections.abc import Iterable, Sequence
 from dataclasses import asdict, dataclass, field
 import json
 from pathlib import Path
+from secrets import token_bytes
 import sqlite3
 from time import time
 
@@ -38,13 +39,15 @@ CREATE TABLE IF NOT EXISTS reply_outcomes (
     assistant_message_id INTEGER REFERENCES messages(message_id),
     model_error TEXT
 );
-CREATE TABLE IF NOT EXISTS provider_replays (
+CREATE TABLE IF NOT EXISTS model_replay_salt (
+    singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+    salt BLOB NOT NULL CHECK (length(salt) = 32)
+);
+CREATE TABLE IF NOT EXISTS model_replays (
     assistant_message_id INTEGER PRIMARY KEY REFERENCES messages(message_id) ON DELETE CASCADE,
     protocol TEXT NOT NULL,
-    profile TEXT NOT NULL,
-    model TEXT NOT NULL,
-    version INTEGER NOT NULL,
-    prefix_digest TEXT NOT NULL,
+    fingerprint BLOB NOT NULL CHECK (length(fingerprint) = 32),
+    reasoning_effort TEXT NOT NULL,
     items TEXT NOT NULL
 );
 CREATE TABLE IF NOT EXISTS subtask_runs (
@@ -151,27 +154,30 @@ def _decode_content(encoded: str) -> str | tuple[Text | Image, ...]:
 
 
 def _decode_replay(row: sqlite3.Row, scope: ReplayScope) -> ProviderReplay | None:
-    if row["replay_version"] != 2:
+    if row["replay_items"] is None:
         return None
     try:
-        data = json.loads(row["replay_items"])
-        if (type(data) is not dict or type(data.get("items")) is not list
-                or type(data.get("has_reasoning")) is not bool):
+        items = json.loads(row["replay_items"].decode("utf-8"))
+        if not isinstance(items, list):
             raise ValueError
-        items = data["items"]
         parsed = []
         for item in items:
             if (type(item) is not dict or type(item["parts"]) is not list or type(item["summary"]) is not list
                     or any(type(part) is not list for part in item["parts"])):
                 raise ValueError
+            cipher, summary = item["encrypted_content"], tuple(item["summary"])
+            # JSON 转义可以藏有孤立代理码点；此类记录不能被写入 UTF-8 请求。
+            for text in ((cipher,) if cipher is not None else ()) + summary:
+                if not isinstance(text, str):
+                    raise ValueError
+                text.encode("utf-8")
             parsed.append(ReplayItem(
                 kind=item["kind"], item_id=item["item_id"], call_id=item["call_id"], phase=item["phase"],
-                parts=tuple(tuple(part) for part in item["parts"]), encrypted_content=item["encrypted_content"],
-                summary=tuple(item["summary"]),
+                parts=tuple(tuple(part) for part in item["parts"]), encrypted_content=cipher, summary=summary,
             ))
-        return ProviderReplay(scope, row["replay_prefix"], tuple(parsed), data["has_reasoning"])
+        return ProviderReplay(scope, tuple(parsed))
     except (ValueError, TypeError, KeyError, RecursionError):
-        return None  # 缺失与损坏都不能证明该响应没有推理项。
+        return None  # 私有记录损坏时，仍可正常读取通用会话历史。
 
 
 def _decode(row: sqlite3.Row, replay: ProviderReplay | None = None) -> HistoryEntry:
@@ -214,6 +220,16 @@ class History:
 
     def close(self) -> None:
         self._db.close()
+
+    def replay_salt(self) -> bytes:
+        """首次使用建立库级随机盐；重启和不同会话使用同一值。"""
+        row = self._db.execute("SELECT salt FROM model_replay_salt WHERE singleton = 1").fetchone()
+        if row is None:
+            with self._db:
+                self._db.execute("INSERT INTO model_replay_salt VALUES (1, ?) ON CONFLICT DO NOTHING",
+                                 (token_bytes(32),))
+                row = self._db.execute("SELECT salt FROM model_replay_salt WHERE singleton = 1").fetchone()
+        return row["salt"]
 
     def bind_feishu(self, session_id: str, identity_fingerprint: str) -> None:
         """在已打开的历史库校验唯一主会话。生产入口则与建表、迁移一起完成。"""
@@ -292,7 +308,7 @@ class History:
                     recorded.add(external_id)
                     if message is not None:
                         if (message.role != "user" or message.tool_calls or message.tool_call_id is not None
-                                or message.reasoning is not None or message.replay is not None or message.replay_required):
+                                or message.reasoning is not None or message.replay is not None):
                             raise ValueError("inbound batches require plain user messages")
                         contents.append(_encode(message)[0])
             if contents:
@@ -328,13 +344,12 @@ class History:
             ids = self._append(outcome.session_id, messages)
             replay = messages[0].replay if messages else None
             if replay is not None and outcome.model_status == "complete":
-                data = {"has_reasoning": replay.has_reasoning, "items": [asdict(item) for item in replay.items]}
-                items = json.dumps(data, ensure_ascii=False, separators=(",", ":"))
+                items = json.dumps([asdict(item) for item in replay.items], ensure_ascii=False, separators=(",", ":"))
                 if len(items.encode("utf-8")) > MAX_REPLAY_BYTES:
                     raise ValueError("provider replay exceeds storage limit")
                 scope = replay.scope
-                self._db.execute("INSERT INTO provider_replays VALUES (?, ?, ?, ?, ?, ?, ?)", (
-                    ids[0], scope.protocol, scope.profile, scope.model, replay.version, replay.prefix_digest, items,
+                self._db.execute("INSERT INTO model_replays VALUES (?, ?, ?, ?, ?)", (
+                    ids[0], scope.protocol, scope.fingerprint, scope.reasoning_effort, items,
                 ))
             self._db.execute("INSERT INTO reply_outcomes"
                              " (reply_id, session_id, run_id, model_status, delivery_status, assistant_message_id, model_error)"
@@ -421,12 +436,13 @@ class History:
                    replay_scope: ReplayScope | None = None) -> list[HistoryEntry]:
         if replay_scope is not None:
             return [_decode(row, _decode_replay(row, replay_scope)) for row in self._db.execute(
-                "SELECT m.*, r.version AS replay_version, r.prefix_digest AS replay_prefix,"
-                " CASE WHEN length(CAST(r.items AS BLOB)) <= ? THEN r.items END AS replay_items"
-                " FROM messages m LEFT JOIN provider_replays r ON r.assistant_message_id = m.message_id"
-                " AND r.protocol = ? AND r.profile = ? AND r.model = ?"
+                "SELECT m.*,"
+                " CASE WHEN length(CAST(r.items AS BLOB)) <= ? THEN CAST(r.items AS BLOB) END AS replay_items"
+                " FROM messages m LEFT JOIN model_replays r ON r.assistant_message_id = m.message_id"
+                " AND r.protocol = ? AND r.fingerprint = ? AND r.reasoning_effort = ?"
                 " WHERE m.session_id = ? AND m.message_id > ? ORDER BY m.message_id",
-                (MAX_REPLAY_BYTES, replay_scope.protocol, replay_scope.profile, replay_scope.model, session_id, after))]
+                (MAX_REPLAY_BYTES, replay_scope.protocol, replay_scope.fingerprint, replay_scope.reasoning_effort,
+                 session_id, after))]
         return [_decode(row) for row in self._db.execute(
             "SELECT * FROM messages WHERE session_id = ? AND message_id > ? ORDER BY message_id",
             (session_id, after))]
