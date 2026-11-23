@@ -29,6 +29,8 @@ python -m venv .venv
 .venv/bin/python -m unittest discover -s tests -v
 ```
 
+`pip install .` 会一次安装文字和语音模式的 Python 依赖，无需另装 `.[voice]`。安装需要有适配当前 Python 版本和架构的 `onnxruntime` 安装包。Intel Mac 建议用 Python 3.12，Apple 芯片的 Mac 建议用原生 `arm64` Python。
+
 最后一条是统一离线验收入口：不需要模型密钥、飞书登录或音频设备；集成用例使用项目内临时 SQLite，结束后清理。安装依赖若不能访问公开索引，可从准备好的本地 wheel 目录安装：`.venv/bin/python -m pip install --no-index --find-links <wheel目录> .`（还需包含 `pyproject.toml` 的构建依赖）。精简环境若缺 `ensurepip`，需先提供带 pip 的虚拟环境；目标 Mac 建议使用完整的 Python 发行版。
 
 `.venv/bin/python -m agent_companion` 和 `.venv/bin/python -m agent_companion --demo-subtasks` 可单独运行两个简短演示；不需要生产 Provider 或密钥，始终使用内存数据库，不等同于全量验收。可传 `--config config.example.toml` 验证其他模拟配置；只有 `--run` 使用配置中的数据库路径和 Provider。
@@ -111,10 +113,9 @@ python scripts/build_source_zip.py
 ### 本机启用飞书自动接听
 
 1. 在目标 Mac 上安装本机虚拟音频驱动，准备**两台不同的 CoreAudio 虚拟设备**。飞书扬声器设为「飞书 → Agent」设备，程序读取该设备；程序把播报写到「Agent → 飞书」设备，飞书麦克风从后一设备读取。不要把两条线路接到同一设备；按 macOS 提示授予启动程序的终端/应用音频输入权限。
-2. 在目标 Mac 的虚拟环境安装可选依赖，再查询设备名称和索引（命令不启动 Agent）：
+2. 按[安装说明](#运行离线验收)在目标 Mac 的虚拟环境安装项目，再查询设备名称和索引（命令不启动 Agent）：
 
    ```sh
-   .venv/bin/python -m pip install '.[voice]'
    .venv/bin/python -m sounddevice
    ```
 

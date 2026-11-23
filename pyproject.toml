@@ -8,10 +8,16 @@ version = "0.1.0"
 description = "Single-user multimodal Agent runtime"
 readme = "README.md"
 requires-python = ">=3.11"
-dependencies = ["httpx>=0.27,<1"]
+dependencies = [
+    "httpx>=0.27,<1",
+    "sounddevice>=0.5,<1",
+    "numpy>=1.26,<3",
+    "onnxruntime>=1.18,<2",
+]
 
 [project.optional-dependencies]
-voice = ["sounddevice>=0.5,<1", "numpy>=1.26,<3", "onnxruntime>=1.18,<2"]
+# 兼容旧版安装命令；语音依赖已由默认安装提供。
+voice = []
 
 [project.scripts]
 agent-companion = "agent_companion.__main__:main"
