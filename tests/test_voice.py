@@ -7,8 +7,11 @@ from unittest.mock import patch
 import wave
 from weakref import ref
 
+from feishu_test_support import fixed_discovery
+
 from agent_companion.app import run_feishu
 from agent_companion.channels.feishu.channel import FeishuPoller
+from agent_companion.channels.feishu.cli import FeishuCLI
 from agent_companion.config import (ASRSettings, FeishuSettings, MiniMaxConnection, RuntimeSettings, Settings,
                                     VoiceSettings)
 from agent_companion.protocol import (DeliveryStatus, Message, ReplyInfo, ReplyStream, TextDelta,
@@ -878,7 +881,8 @@ class VoiceInputTest(unittest.IsolatedAsyncioTestCase):
     async def test_app_voice_keeps_feishu_input_and_voice_playback_then_cleans_device(self):
         asr, tts, vad, device = _ASR(), _TTS(), _Vad(), _Device()
         samples = 3 * INPUT_FRAMES + 19
-        settings = Settings(feishu=FeishuSettings("oc_test", "ou_peer", "ou_self", mode="voice"), voice=_SETTINGS,
+        settings = Settings(feishu=FeishuSettings(own_open_id="ou_self", peer_open_id="ou_peer", mode="voice"),
+                            voice=_SETTINGS,
                             asr=ASRSettings(MiniMaxConnection("synthetic"), max_audio_seconds=samples / _RATE),
                             runtime=RuntimeSettings())
         called = asyncio.Event()
@@ -907,7 +911,7 @@ class VoiceInputTest(unittest.IsolatedAsyncioTestCase):
                 poll_cleaning.set()
                 await release_poll.wait()
 
-        class FakeCli:
+        class FakeCli(FeishuCLI):
             async def list_page(self, start, end, token, *, page_size):
                 msg = {"message_id": "om_text", "create_time": "101000", "msg_type": "text",
                        "chat_id": "oc_test", "sender": {"id": "ou_peer", "id_type": "open_id", "sender_type": "user"},
@@ -924,8 +928,10 @@ class VoiceInputTest(unittest.IsolatedAsyncioTestCase):
 
         with closing(History(":memory:")) as history:
             with patch.object(FeishuPoller, "run", run):
+                cli = FakeCli("lark-cli", "oc_test", timeout=2)
+                discovery = fixed_discovery("oc_test", "ou_peer", "ou_self", cli=cli)
                 task = asyncio.create_task(run_feishu(settings, history, Model(), asr, tts=tts, vad=vad,
-                                                     audio=device, cli=FakeCli()))
+                                                     audio=device, discovery=discovery))
                 await asyncio.wait_for(device.started.wait(), 1)
                 try:
                     await asyncio.wait_for(called.wait(), 1)

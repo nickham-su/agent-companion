@@ -113,6 +113,46 @@ class SubtaskTests(unittest.IsolatedAsyncioTestCase):
         context = ToolContext("main", "parent-run", call_id, has_user_input=True)
         return json.loads(await subtasks.tools.execute(call, context))
 
+    async def test_locked_admissions_reserve_capacity_and_cancellation_releases_it(self):
+        async def answer(messages, main):
+            yield TextDelta("完成")
+
+        accept = self.history.accept_subtask
+        blocked = True
+        attempts = set()
+        saturated, replacing = asyncio.Event(), asyncio.Event()
+
+        def accept_job(child, run_id, parent, parent_run, call_id):
+            attempts.add(call_id)
+            if len(attempts) == 8:
+                saturated.set()
+            if call_id == "replacement":
+                replacing.set()
+            if blocked:
+                raise OperationalError("database is locked")
+            accept(child, run_id, parent, parent_run, call_id)
+
+        with patch.object(self.history, "accept_subtask", side_effect=accept_job):
+            async with running_agent(self.settings, self.history, _Model(answer), self.channel,
+                                     retry_sqlite_locks=True) as (_, subtasks):
+                tasks = [asyncio.create_task(self._delegate(subtasks, f"call-{i}", "job")) for i in range(10)]
+                try:
+                    await _wait(saturated.wait())
+                    self.assertEqual(await _wait(asyncio.gather(*tasks[8:])),
+                                     [{"error": "delegation_capacity_reached"}] * 2)
+                    tasks[0].cancel()
+                    with self.assertRaises(asyncio.CancelledError):
+                        await tasks[0]
+                    tasks.append(asyncio.create_task(self._delegate(subtasks, "replacement", "job")))
+                    await _wait(replacing.wait())
+                    blocked = False
+                    accepted = await _wait(asyncio.gather(*tasks[1:8], tasks[-1]))
+                    self.assertEqual(len({r["run_id"] for r in accepted}), 8)
+                finally:
+                    for task in tasks:
+                        task.cancel()
+                    await asyncio.gather(*tasks, return_exceptions=True)
+
     async def test_delegation_caps_concurrency_and_reports_each_rejected_tool_id(self):
         started, active = [], 0
         saturated, release = asyncio.Event(), asyncio.Event()
@@ -259,6 +299,34 @@ class SubtaskTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(_result_inputs(followup)[0]["run_id"], accepted["run_id"])
             self.assertEqual([row[2] for row in self.channel.replies], ["hold-delivery", "continued"])
             self.assertEqual(self.channel.replies[0][1], self.channel.replies[1][1])
+
+    async def test_locked_child_ownership_lookup_still_rejects_unknown_child(self):
+        async def answer(messages, main):
+            yield TextDelta("完成")
+
+        async with running_agent(self.settings, self.history, _Model(answer), self.channel,
+                                 retry_sqlite_locks=True) as (main, subtasks):
+            first = await self._delegate(subtasks, "first", "job")
+            child = first["child_session_id"]
+            await _wait(subtasks.wait_idle())
+            lookup = self.history.can_resume_subtask
+            attempts = dict.fromkeys((child, "unknown"), 0)
+
+            def read(parent, requested):
+                attempts[requested] += 1
+                if attempts[requested] < 3:
+                    raise OperationalError("database table is locked")
+                return lookup(parent, requested)
+
+            with patch.object(self.history, "can_resume_subtask", side_effect=read):
+                resumed = await _wait(self._delegate(subtasks, "resume", "resume job", child_session_id=child))
+                refused = await _wait(self._delegate(subtasks, "unknown", "unknown job", child_session_id="unknown"))
+            self.assertEqual(attempts, {child: 3, "unknown": 3})
+            self.assertEqual(resumed["child_session_id"], child)
+            self.assertNotEqual(resumed["run_id"], first["run_id"])
+            self.assertEqual(refused, {"error": "unknown_child_session"})
+            await _wait(subtasks.wait_idle())
+            await _wait(main.wait_idle())
 
     async def test_reuse_is_serial_while_other_child_runs_independently(self):
         first_started, first_release = asyncio.Event(), asyncio.Event()

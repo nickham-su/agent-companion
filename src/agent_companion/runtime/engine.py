@@ -16,6 +16,7 @@ from ..protocol import (BackgroundChannel, Channel, DeliveryStatus, InputUsage, 
 from ..storage.sqlite import History, ReplyOutcome
 from .context import Context
 from .instructions import InstructionsError
+from .sqlite_access import SQLiteAccess
 from .tools import ToolContext, Tools
 
 
@@ -37,7 +38,8 @@ class Runtime:
     def __init__(self, session_id: str, history: History, model: Model, channel: Channel | None, *,
                  tools: Tools | None = None, settings: RuntimeSettings | None = None,
                  thinking: bool = False, instructions: str = "", delivery_idle_timeout: float | None = None,
-                 on_confirmed_reply: Callable[[ReplyInfo, str], None] | None = None) -> None:
+                 on_confirmed_reply: Callable[[ReplyInfo, str], None] | None = None,
+                 retry_sqlite_locks: bool = False) -> None:
         if not session_id:
             raise ValueError("session_id must be non-empty")
         self.session_id = session_id
@@ -52,13 +54,14 @@ class Runtime:
         self._instructions = instructions
         replay_scope = getattr(model, "replay_scope", None)
         self._replay_scope = replay_scope if isinstance(replay_scope, ReplayScope) else None
-        self._context = Context(history, self._settings, self._summary_stream,
-                                 replay_scope=self._replay_scope, agents_path=Path.cwd() / "AGENTS.md")
         self._pending: deque[_InputBatch] = deque()
         self._queued_inbound: set[int] = set()
         self._worker: asyncio.Task[None] | None = None
         self._retired_deliveries: set[asyncio.Task[Receipt]] = set()
         self._closed = False
+        self._sqlite = SQLiteAccess(retry_locks=retry_sqlite_locks, stopped=lambda: self._closed)
+        self._context = Context(history, self._settings, self._summary_stream, sqlite=self._sqlite,
+                                replay_scope=self._replay_scope, agents_path=Path.cwd() / "AGENTS.md")
         self._idle = asyncio.Event()
         self._idle.set()
         self.last_failure: str | None = None
@@ -139,12 +142,12 @@ class Runtime:
             self._worker = None
             self._idle.set()
 
-    def _record_input(self, batch: _InputBatch, run_id: str) -> list[int]:
+    async def _record_input(self, batch: _InputBatch, run_id: str) -> list[int]:
         if batch.persisted_id is None:
-            ids = self.history.append(self.session_id, batch.messages)
+            ids = await self._sqlite(self.history.append, self.session_id, batch.messages)
         else:
             try:
-                ids = self.history.consume_inbound(self.session_id, batch.persisted_id)
+                ids = await self._sqlite(self.history.consume_inbound, self.session_id, batch.persisted_id)
             finally:
                 self._queued_inbound.discard(batch.persisted_id)
         _LOG.debug("runtime input recorded; run=%s batch=%s messages=%d user_input=%s wait_for_delivery=%s",
@@ -156,7 +159,7 @@ class Runtime:
         clock = asyncio.get_running_loop().time
         started = clock()
         try:
-            message_ids = self._record_input(batch, run_id)
+            message_ids = await self._record_input(batch, run_id)
             if message_ids:
                 await self._run(run_id, message_ids[0], has_user_input=batch.has_user_input,
                                 wait_for_delivery=batch.wait_for_delivery)
@@ -180,10 +183,11 @@ class Runtime:
     async def _run(self, run_id: str, protected_from: int, *, has_user_input: bool,
                    wait_for_delivery: bool) -> None:
         for index in range(self._settings.max_tool_rounds):
+            last_input_tokens = await self._sqlite(self.history.last_input_tokens, self.session_id)
             messages = await self._context.prepare(self.session_id, thinking=self._thinking,
-                                                   tools=self._tools.specs, instructions=self._instructions,
-                                                   protected_from=protected_from,
-                                                   last_input_tokens=self.history.last_input_tokens(self.session_id))
+                                                    tools=self._tools.specs, instructions=self._instructions,
+                                                    protected_from=protected_from,
+                                                    last_input_tokens=last_input_tokens)
             model_status, has_calls = await self._reply(run_id, messages, has_user_input=has_user_input,
                                                        wait_for_delivery=wait_for_delivery)
             if model_status != "complete":
@@ -198,7 +202,7 @@ class Runtime:
                 return
             while self._pending:
                 batch = self._pending.popleft()
-                if self._record_input(batch, run_id):
+                if await self._record_input(batch, run_id):
                     has_user_input = has_user_input or batch.has_user_input
 
     async def _summary_stream(self, messages: Sequence[Message], tools: Sequence[ToolSpec],
@@ -313,10 +317,10 @@ class Runtime:
                               replay=replay),
                        *results]
                       if receipt is not None or calls or generated_text or replay is not None else [])
-            self.history.finalize_reply(
-                ReplyOutcome(info.reply_id, info.session_id, run_id, model_status,
-                             receipt.status if receipt else None, model_error=model_error,
-                             input_tokens=input_tokens if model_status == "complete" else None), rows)
+            outcome = ReplyOutcome(info.reply_id, info.session_id, run_id, model_status,
+                                   receipt.status if receipt else None, model_error=model_error,
+                                   input_tokens=input_tokens if model_status == "complete" else None)
+            await self._sqlite(self.history.finalize_reply, outcome, rows)
             _LOG.debug("reply committed; reply=%s receipt=%s confirmed_chars=%d tool_results=%d elapsed_ms=%.0f",
                        info.reply_id, receipt.status if receipt else None, len(confirmed_text), len(results),
                        (loop.time() - info.started_at) * 1000)

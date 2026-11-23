@@ -13,6 +13,7 @@ from ..config import RuntimeSettings
 from ..protocol import Message, Model, ToolSpec
 from ..storage.sqlite import History
 from .engine import Runtime
+from .sqlite_access import SQLiteAccess
 from .tools import Tool, ToolContext, Tools
 
 
@@ -49,7 +50,7 @@ class Subtasks:
 
     def __init__(self, parent_session_id: str, history: History, model: Model,
                  submit_result: Callable[[Message], None], *, settings: RuntimeSettings,
-                 thinking: bool) -> None:
+                 thinking: bool, retry_sqlite_locks: bool = False) -> None:
         self._parent = parent_session_id
         self._history = history
         self._model = model
@@ -59,10 +60,13 @@ class Subtasks:
         self._queues: dict[str, deque[_Job]] = {}
         self._workers: dict[str, asyncio.Task[None]] = {}
         self._closed = False
+        self._retry_sqlite_locks = retry_sqlite_locks
+        self._sqlite = SQLiteAccess(retry_locks=retry_sqlite_locks, stopped=lambda: self._closed)
         self._outstanding = 0
+        self._accepting = 0
         self._slots = asyncio.Semaphore(_MAX_CONCURRENT)
         self.tools = Tools([Tool(_DELEGATE, self._delegate)])
-        # 数据库只记录执行，不驱动补跑或重放；重启时把孤立任务标记为中断。
+        # 不补跑或重放孤立任务。多私聊启动遇锁由轮询重试，持久待处理批次尚未移交。
         history.interrupt_subtasks(parent_session_id, reason="restart")
 
     async def _delegate(self, args: dict[str, Any], context: ToolContext) -> str:
@@ -80,15 +84,20 @@ class Subtasks:
             child = args["child_session_id"]
             if not isinstance(child, str) or not child.strip():
                 return '{"error":"invalid_arguments"}'
-            if child == self._parent or not self._history.can_resume_subtask(self._parent, child):
+            if child == self._parent or not await self._sqlite(self._history.can_resume_subtask, self._parent, child):
                 return '{"error":"unknown_child_session"}'
         else:
             child = f"child-{uuid4().hex}"
-        if self._outstanding >= _MAX_OUTSTANDING:
+        if self._outstanding + self._accepting >= _MAX_OUTSTANDING:
             return '{"error":"delegation_capacity_reached"}'
         run_id = uuid4().hex
         loop = asyncio.get_running_loop()
-        self._history.accept_subtask(child, run_id, self._parent, context.run_id, context.call_id)
+        # 等待写入的委派也占名额，但未提交的委派不属于需要收尾的子 worker。
+        self._accepting += 1
+        try:
+            await self._sqlite(self._history.accept_subtask, child, run_id, self._parent, context.run_id, context.call_id)
+        finally:
+            self._accepting -= 1
         self._outstanding += 1
         queue = self._queues.setdefault(child, deque())
         queue.append(_Job(run_id, prompt))
@@ -102,6 +111,7 @@ class Subtasks:
         try:
             runtime = Runtime(child, self._history, self._model, None,
                               settings=self._settings, thinking=self._thinking,
+                              retry_sqlite_locks=self._retry_sqlite_locks,
                               instructions="你是内部子会话。完成提交的任务并返回结果，不调用工具或联系用户。")
             while queue and not self._closed:
                 job = queue.popleft()
@@ -122,7 +132,7 @@ class Subtasks:
     async def _run_job(self, child: str, runtime: Runtime, job: _Job) -> None:
         clock = asyncio.get_running_loop().time
         started = clock()
-        self._history.start_subtask(job.run_id)
+        await self._sqlite(self._history.start_subtask, job.run_id)
         _LOG.debug("subtask started; run=%s", job.run_id)
         try:
             error = await runtime.run_internal(job.run_id, job.prompt)
@@ -130,7 +140,7 @@ class Subtasks:
             if self._closed:
                 raise
             error = "subtask_cancelled"
-        result = self._history.run_text(child, job.run_id) if error is None else None
+        result = await self._sqlite(self._history.run_text, child, job.run_id) if error is None else None
         if result is None and error is None:
             error = "empty_result"
         if not await self._persist_terminal(job.run_id, result=result, error=error):
@@ -145,16 +155,17 @@ class Subtasks:
                 payload.update(status="completed", result=result)
             # 走主队列，而不是在历史中伪造 tool 结果或直接触碰通道。
             self._submit_result(Message("user", RESULT_PREFIX + json.dumps(payload, ensure_ascii=False)))
-            self._history.mark_subtask_enqueued(job.run_id)
+            await self._sqlite(self._history.mark_subtask_enqueued, job.run_id)
             _LOG.debug("subtask result queued; run=%s", job.run_id)
 
     async def _persist_terminal(self, run_id: str, *, result: str | None, error: str | None) -> bool:
         # 只重试这个 SQLite 写入，不重新执行子任务或回投。
-        for attempt in range(1, _FINISH_ATTEMPTS + 1):
+        attempts = 1 if self._retry_sqlite_locks else _FINISH_ATTEMPTS
+        for attempt in range(1, attempts + 1):
             try:
-                self._history.finish_subtask(run_id, result=result, error=error)
+                await self._sqlite(self._history.finish_subtask, run_id, result=result, error=error)
             except Exception as exc:
-                if attempt == _FINISH_ATTEMPTS:
+                if attempt == attempts:
                     _LOG.error(
                         "subtask terminal write failed: run_id=%s attempts=%d error_type=%s; result not enqueued",
                         run_id, attempt, type(exc).__name__,
@@ -181,4 +192,5 @@ class Subtasks:
         self._workers.clear()
         self._queues.clear()
         self._outstanding = 0
+        # 关闭不等待锁；多私聊收尾遇锁时，下次打开会话再恢复状态。
         self._history.interrupt_subtasks(self._parent, reason="shutdown")

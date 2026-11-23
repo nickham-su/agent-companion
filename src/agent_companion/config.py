@@ -116,22 +116,23 @@ class LLMSettings:
 
 @dataclass(frozen=True, slots=True)
 class FeishuSettings:
-    chat_id: str = field(repr=False)
-    sender_open_id: str = field(repr=False)
     own_open_id: str = field(repr=False)
+    peer_open_id: str | None = field(default=None, repr=False)
     mode: str = "text"
     cli: str = "lark-cli"
     cli_timeout: float = 20
     voice_text_copy: bool = True
 
     def __post_init__(self) -> None:
-        for value, prefix, name in ((self.chat_id, "oc", "chat_id"),
-                                    (self.sender_open_id, "ou", "sender_open_id"),
-                                    (self.own_open_id, "ou", "own_open_id")):
-            if not isinstance(value, str) or not re.fullmatch(rf"{prefix}_[\w-]{{1,160}}", value, flags=re.ASCII):
-                raise ConfigError(f"feishu.{name} 必须是以 {prefix}_ 开头的有效飞书 ID")
-        if self.sender_open_id == self.own_open_id:
-            raise ConfigError("feishu.sender_open_id 与 feishu.own_open_id 必须不同")
+        if self.mode == "voice" and self.peer_open_id is None:
+            raise ConfigError("飞书 voice 模式必须设置 feishu.peer_open_id")
+        for value, name in ((self.own_open_id, "own_open_id"), (self.peer_open_id, "peer_open_id")):
+            if value is None and name == "peer_open_id":
+                continue
+            if not isinstance(value, str) or not re.fullmatch(r"ou_[\w-]{1,160}", value, flags=re.ASCII):
+                raise ConfigError(f"feishu.{name} 必须是以 ou_ 开头的有效飞书 ID")
+        if self.peer_open_id == self.own_open_id:
+            raise ConfigError("feishu.peer_open_id 与 feishu.own_open_id 必须不同")
         if self.mode not in ("text", "voice"):
             raise ConfigError("feishu.mode 必须是 text 或 voice")
         if type(self.voice_text_copy) is not bool:

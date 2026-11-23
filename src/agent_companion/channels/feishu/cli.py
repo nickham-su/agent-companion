@@ -1,4 +1,4 @@
-"""lark-cli v1.0.100 的 raw API 与资源下载协议，固定使用用户身份。"""
+"""lark-cli 的私聊发现、raw API 与资源下载协议，固定使用用户身份。"""
 
 import asyncio
 from collections.abc import Awaitable, Callable
@@ -154,11 +154,9 @@ def _success_data(result: CommandResult) -> dict[str, Any]:
     return data
 
 
-class FeishuCLI:
-    def __init__(self, executable: str, chat_id: str, *, timeout: float,
-                 runner: CommandRunner = run_command) -> None:
+class _UserCLI:
+    def __init__(self, executable: str, *, timeout: float, runner: CommandRunner = run_command) -> None:
         self._executable = executable
-        self._chat_id = chat_id
         self._timeout = timeout
         self._runner = runner
 
@@ -170,6 +168,87 @@ class FeishuCLI:
         result = await self._runner(argv, data, self._timeout)
         _check_exit(result)
         return result
+
+
+@dataclass(frozen=True, slots=True)
+class PrivateChat:
+    chat_id: str = field(repr=False)
+    sender_id: str = field(repr=False)
+
+
+def _valid_id(value: Any, prefix: str) -> bool:
+    return isinstance(value, str) and re.fullmatch(rf"{prefix}_[\w-]{{1,160}}", value, flags=re.ASCII) is not None
+
+
+def _classify_chat(row: Any, own_open_id: str) -> tuple[str, str | None]:
+    """返回可信私聊 ID 与对端；明确不允许的路由没有对端，无法分类则拒绝快照。"""
+    if not isinstance(row, dict) or not _valid_id(chat_id := row.get("chat_id"), "oc"):
+        raise CliError("cli_invalid_chat_page")
+    mode = row.get("chat_mode")
+    if mode in ("group", "topic"):
+        return chat_id, None
+    if mode == "p2p":
+        target = row.get("p2p_target_type")
+        if target == "bot":
+            return chat_id, None
+        peer = row.get("p2p_target_id")
+        if target == "user" and _valid_id(peer, "ou"):
+            return chat_id, peer if peer != own_open_id else None
+    raise CliError("cli_invalid_chat_page")
+
+
+class FeishuDiscovery(_UserCLI):
+    async def account_open_id(self) -> str:
+        data = _success_data(await self._run(("api", "GET", "/open-apis/authen/v1/user_info")))
+        open_id = data.get("open_id")
+        if not _valid_id(open_id, "ou"):
+            raise CliError("cli_invalid_account")
+        return open_id
+
+    async def private_chats(self, own_open_id: str) -> set[PrivateChat]:
+        """只有完整分页扫描才用于绑定；不会用未读完的列表判断是否有冲突。"""
+        chats: set[PrivateChat] = set()
+        unverified_chats: set[str] = set()
+        tokens: set[str] = set()
+        args = ("im", "+chat-list", "--types", "p2p", "--user-id-type", "open_id",
+                "--page-size", str(MAX_PAGE_SIZE))
+        token_args: tuple[str, ...] = ()
+        while True:
+            data = _success_data(await self._run((*args, *token_args)))
+            rows, more, token = data.get("chats"), data.get("has_more"), data.get("page_token")
+            # 上游快捷指令有时将空 Go slice 序列化成 null；字段缺失不是合法空页。
+            if "chats" in data and rows is None:
+                rows = []
+            if not isinstance(rows, list) or type(more) is not bool or (more and (
+                not isinstance(token, str) or not token or len(token) > 2048 or "\x00" in token
+            )):
+                raise CliError("cli_invalid_chat_page")
+            for row in rows:
+                chat_id, sender_id = _classify_chat(row, own_open_id)
+                if sender_id is None:
+                    unverified_chats.add(chat_id)
+                else:
+                    chats.add(PrivateChat(chat_id, sender_id))
+            if not more:
+                return {chat for chat in chats if chat.chat_id not in unverified_chats}
+            if token in tokens:
+                raise CliError("cli_chat_page_cycle")
+            tokens.add(token)
+            token_args = ("--page-token", token)
+
+    def for_chat(self, chat_id: str) -> "FeishuCLI":
+        return FeishuCLI(self._executable, chat_id, timeout=self._timeout, runner=self._runner)
+
+
+class FeishuCLI(_UserCLI):
+    def __init__(self, executable: str, chat_id: str, *, timeout: float, runner: CommandRunner = run_command) -> None:
+        super().__init__(executable, timeout=timeout, runner=runner)
+        self._chat_id = chat_id
+
+    @property
+    def chat_id(self) -> str:
+        """当前实际用于拉取消息和发送回复的地址。"""
+        return self._chat_id
 
     async def list_page(self, start: int, end: int, token: str | None, *,
                         page_size: int = MAX_PAGE_SIZE) -> tuple[list, str | None]:

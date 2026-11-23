@@ -9,6 +9,7 @@ import unittest
 from unittest.mock import AsyncMock, patch
 
 import httpx
+from feishu_test_support import fixed_discovery
 
 from agent_companion.__main__ import _serve
 from agent_companion.app import running_agent
@@ -768,8 +769,7 @@ asr_provider = "speech"
 [timeouts]
 llm = 0.75
 [feishu]
-chat_id = "oc_fixture"
-sender_open_id = "ou_peer"
+peer_open_id = "ou_peer"
 own_open_id = "ou_self"
 [providers.speech]
 adapter = "minimax"
@@ -781,7 +781,7 @@ max_audio_seconds = 500
             tables += (f'[providers.{name}]\nadapter = "openai_responses"\napi_key = "{key}"\nbase_url = "{address}"\n'
                        f'[providers.{name}.llm]\nmodel = "{model}"\nreasoning_effort = "{effort}"\n')
 
-        async def exercise(settings, history, model, asr, *, tts):
+        async def exercise(settings, history, model, asr, route, *, tts):
             self.assertIsInstance(model, OpenAIResponses)
             self.assertIsNone(tts)
             async with running_agent(settings, history, model, _Channel()) as (runtime, _):
@@ -800,10 +800,10 @@ max_audio_seconds = 500
                     answer = (_reason(), _answer("old confirmed")) if name == "initial" else (_answer("follow-up"),)
                     target = "https://other.example.invalid/api/responses" if name == "other_address" else endpoint
                     fixture = _Fixture(self, [_completed(*answer)], api_key=key, endpoint=target)
-                    with (patch("agent_companion.__main__.run_feishu", side_effect=exercise),
+                    with (patch("agent_companion.__main__.run_fixed_feishu", side_effect=exercise),
                           patch("agent_companion.__main__.httpx.AsyncClient",
                                 side_effect=lambda **opts: actual_client(transport=fixture.transport, **opts))):
-                        await _serve(settings)
+                        await _serve(settings, discovery=fixed_discovery("oc_fixture", "ou_peer", "ou_self"))
                     request, = fixture.requests
                     self.assertEqual(request["model"], model)
                     self.assertEqual(request["reasoning"]["effort"], effort)

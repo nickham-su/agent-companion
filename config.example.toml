@@ -52,13 +52,13 @@ max_audio_seconds = 500  # 必填；按所选模型的单文件时长上限填�
 model = "speech-2.8-turbo"
 voice_id = "male-qn-qingse"
 
-# 飞书模式启用后，把以下占位符换成同一个 CLI 应用下的实际 ID。
+# 默认文字模式自动发现真人私聊，每人独立会话；own_open_id 与 CLI 登录账号一致。
 # [feishu]
-# chat_id = "oc_example"
-# sender_open_id = "ou_peer_example"
 # own_open_id = "ou_self_example"
 # mode = "text"
-# voice_text_copy = true  # 仅 voice：将已确认并入库的正文另发到 chat_id
+# voice 必填，text 可选；填入后启动时查找该对端已可发现的唯一真人私聊。
+# peer_open_id = "ou_peer_example"
+# voice_text_copy = true  # 仅 voice：将已确认并入库的正文另发到固定私聊
 # cli = "lark-cli"
 # cli_timeout = 20  # 单次飞书 CLI 调用时限（秒）
 

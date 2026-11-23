@@ -103,16 +103,21 @@ class SileroVADTest(unittest.TestCase):
             from unittest.mock import patch
 
             sys.modules.update(sounddevice=None, numpy=None, onnxruntime=None)
-            from agent_companion.__main__ import run_feishu
+            from agent_companion import __main__
+            from agent_companion.app import run_feishu
             from agent_companion.channels.feishu.channel import FeishuPoller
             from agent_companion.config import FeishuSettings, Settings
             from agent_companion.storage.sqlite import History
 
+            sys.path.insert(0, "tests")
+            from feishu_test_support import fixed_discovery
+
             async def poll(poller):
                 assert poller._channel._voice_output is None
 
-            settings = Settings(feishu=FeishuSettings("oc_fake", "ou_peer", "ou_self", mode="text"))
+            settings = Settings(feishu=FeishuSettings(own_open_id="ou_self", peer_open_id="ou_peer", mode="text"))
+            discovery = fixed_discovery("oc_fake", "ou_peer", "ou_self")
             with closing(History(":memory:")) as history, patch.object(FeishuPoller, "run", poll):
-                asyncio.run(run_feishu(settings, history, object(), object(), cli=object()))
+                asyncio.run(run_feishu(settings, history, object(), object(), discovery=discovery))
         ''')
         subprocess.run([sys.executable, "-c", code], check=True, timeout=5, capture_output=True)

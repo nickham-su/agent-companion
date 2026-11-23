@@ -8,6 +8,7 @@ from unittest.mock import AsyncMock, patch
 import wave
 
 import httpx
+from feishu_test_support import fixed_discovery
 
 from agent_companion.__main__ import _serve, main
 from agent_companion.config import ConfigError, VoiceSettings, load_settings
@@ -20,8 +21,7 @@ from agent_companion.speech.minimax_tts import MiniMaxTTS
 _KEY = "synthetic-private-config-value"
 _FEISHU = '''
 [feishu]
-chat_id = "oc_fixture"
-sender_open_id = "ou_peer"
+peer_open_id = "ou_peer"
 own_open_id = "ou_self"
 mode = "text"
 '''
@@ -179,10 +179,14 @@ api_key = 123
 
     def test_known_common_config_errors_name_safe_fields(self):
         for config, diagnostic in (
-            (_CONFIG.replace('chat_id = "oc_fixture"', f'chat_id = "{_KEY}"'),
-             'feishu.chat_id 必须是以 oc_ 开头的有效飞书 ID'),
-            (_CONFIG.replace('chat_id = "oc_fixture"', ''), 'feishu.chat_id 必须显式设置'),
-            (_CONFIG.replace('"ou_self"', '"ou_peer"'), 'feishu.sender_open_id 与 feishu.own_open_id 必须不同'),
+            (_CONFIG.replace('peer_open_id = "ou_peer"', f'peer_open_id = "{_KEY}"'),
+             'feishu.peer_open_id 必须是以 ou_ 开头的有效飞书 ID'),
+            (_CONFIG.replace('[feishu]', '[feishu]\nchat_id = "oc_fixture"'), 'feishu 配置字段无效'),
+            (_CONFIG.replace('peer_open_id = "ou_peer"', 'sender_open_id = "ou_peer"'), 'feishu 配置字段无效'),
+            (_CONFIG.replace('peer_open_id = "ou_peer"', '').replace('mode = "text"', 'mode = "voice"'),
+             '飞书 voice 模式必须设置 feishu.peer_open_id'),
+            (_CONFIG.replace('own_open_id = "ou_self"', ''), 'feishu.own_open_id'),
+            (_CONFIG.replace('"ou_self"', '"ou_peer"'), 'feishu.peer_open_id 与 feishu.own_open_id 必须不同'),
             (_CONFIG.replace('mode = "text"', f'mode = "{_KEY}"'), 'feishu.mode 必须是 text 或 voice'),
             (_CONFIG.replace('mode = "text"', 'mode = "text"\ncli_timeout = false'), 'feishu.cli_timeout 必须是有限正数'),
             (_CONFIG + '\n[runtime]\ndelivery_timeout = 120\n', 'runtime 配置字段无效'),
@@ -415,7 +419,7 @@ voice_id = "synthetic-other-voice"
                     clients.append(handle)
                     return handle
 
-                async def drive(settings, history, model, asr, *, tts):
+                async def drive(settings, history, model, asr, route, *, tts):
                     self.assertEqual(settings.runtime.model_timeout, 0.75)
                     self.assertEqual(asr._timeout, 2)
                     self.assertEqual(settings.asr.max_audio_seconds, asr._max_audio_seconds)
@@ -430,8 +434,8 @@ voice_id = "synthetic-other-voice"
 
                 with (patch("agent_companion.__main__.httpx.AsyncClient", side_effect=client),
                       patch("agent_companion.__main__.MiniMaxTTS", wraps=MiniMaxTTS) as open_tts,
-                      patch("agent_companion.__main__.run_feishu", side_effect=drive) as run):
-                    await _serve(settings)
+                      patch("agent_companion.__main__.run_fixed_feishu", side_effect=drive) as run):
+                    await _serve(settings, discovery=fixed_discovery("oc_fixture", "ou_peer", "ou_self"))
                 run.assert_awaited_once()
                 self.assertEqual(open_tts.call_count, int(mode != "text"))
                 self.assertEqual(len(clients), 3 if mode == "separate" else 2)

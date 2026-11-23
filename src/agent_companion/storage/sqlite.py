@@ -91,6 +91,15 @@ CREATE TABLE IF NOT EXISTS feishu_bindings (
     session_id TEXT PRIMARY KEY,
     identity_fingerprint TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS feishu_private_account (
+    singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+    owner_fingerprint TEXT NOT NULL,
+    started_ms INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS feishu_private_routes (
+    session_id TEXT PRIMARY KEY,
+    chat_fingerprint TEXT UNIQUE NOT NULL
+);
 """
 
 
@@ -200,8 +209,20 @@ class SummaryWriteError(Exception):
     """摘要写入未提交，可以继续使用已存历史。"""
 
 
+def is_sqlite_lock_error(exc: sqlite3.OperationalError) -> bool:
+    """按 SQLite 主错误码（含扩展码）判定；兼容未携带错误码的合成异常。"""
+    code = getattr(exc, "sqlite_errorcode", None)
+    if code is not None:
+        return isinstance(code, int) and (code & 0xFF) in (sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED)
+    return str(exc) in {"database is locked", "database table is locked", "database schema is locked",
+                        "database is busy"}
+
+
 class History:
-    def __init__(self, path: str | Path, *, feishu_binding: tuple[str, str] | None = None) -> None:
+    def __init__(self, path: str | Path, *, feishu_binding: tuple[str, str] | None = None,
+                 feishu_private_owner: str | None = None) -> None:
+        if feishu_binding is not None and feishu_private_owner is not None:
+            raise FeishuBindingError("飞书固定会话与多私聊模式不能共用数据库。")
         self._db = sqlite3.connect(path)
         self._db.row_factory = sqlite3.Row
         try:
@@ -211,6 +232,9 @@ class History:
                 self._db.executescript("BEGIN IMMEDIATE;\n" + _SCHEMA)
                 if feishu_binding is not None:
                     self._bind_feishu(*feishu_binding)
+                if feishu_private_owner is not None:
+                    # 只预检已有模式与归属；空库须等实际 CLI 账号核验后绑定。
+                    self.check_feishu_private(feishu_private_owner)
                 columns = {row["name"] for row in self._db.execute("PRAGMA table_info(reply_outcomes)")}
                 if "assistant_message_id" not in columns:
                     self._db.execute("ALTER TABLE reply_outcomes ADD COLUMN"
@@ -243,12 +267,19 @@ class History:
             self._bind_feishu(session_id, identity_fingerprint)
 
     def _bind_feishu(self, session_id: str, identity_fingerprint: str) -> None:
+        if self._db.execute("SELECT 1 FROM feishu_private_account").fetchone() is not None:
+            raise FeishuBindingError("飞书固定会话与多私聊模式不能共用数据库；请配置新的数据库路径。")
         existing = self._db.execute("SELECT session_id, identity_fingerprint FROM feishu_bindings LIMIT 2").fetchall()
         if existing:
             if len(existing) != 1 or tuple(existing[0]) != (session_id, identity_fingerprint):
                 raise FeishuBindingError("主会话或飞书身份与数据库绑定不一致；请恢复原配置或使用新的数据库路径。")
             return
-        used = self._db.execute("""
+        if self._has_history():
+            raise FeishuBindingError("现有数据库有历史但没有飞书绑定；请保留旧数据库并配置新的数据库路径。")
+        self._db.execute("INSERT INTO feishu_bindings VALUES (?, ?)", (session_id, identity_fingerprint))
+
+    def _has_history(self) -> bool:
+        return self._db.execute("""
             SELECT 1 FROM messages
             UNION ALL SELECT 1 FROM summaries
             UNION ALL SELECT 1 FROM reply_outcomes
@@ -257,11 +288,41 @@ class History:
             UNION ALL SELECT 1 FROM inbound_seen
             UNION ALL SELECT 1 FROM inbound_batches
             UNION ALL SELECT 1 FROM message_search
+            UNION ALL SELECT 1 FROM feishu_private_routes
             LIMIT 1
-            """).fetchone()
-        if used is not None:
-            raise FeishuBindingError("现有数据库有历史但没有飞书绑定；请保留旧数据库并配置新的数据库路径。")
-        self._db.execute("INSERT INTO feishu_bindings VALUES (?, ?)", (session_id, identity_fingerprint))
+            """).fetchone() is not None
+
+    def bind_feishu_private(self, owner_fingerprint: str, *, started_ms: int) -> int:
+        """账号核验后，在同一事务重新检查并保存首次启用水位。"""
+        with self._db:
+            self._db.execute("BEGIN IMMEDIATE")
+            prior = self.check_feishu_private(owner_fingerprint)
+            if prior is None:
+                self._db.execute("INSERT INTO feishu_private_account VALUES (1, ?, ?)", (owner_fingerprint, started_ms))
+        # 多私聊的轮询在事件循环上执行，不能用 SQLite 的同步忙等阻塞其他路由。
+        self._db.execute("PRAGMA busy_timeout = 0")
+        return started_ms if prior is None else prior
+
+    def check_feishu_private(self, owner_fingerprint: str) -> int | None:
+        """只读检查已有账号与模式；不认领空库。"""
+        if self._db.execute("SELECT 1 FROM feishu_bindings LIMIT 1").fetchone() is not None:
+            raise FeishuBindingError("飞书固定会话与多私聊模式不能共用数据库；请配置新的数据库路径。")
+        row = self._db.execute("SELECT owner_fingerprint, started_ms FROM feishu_private_account").fetchone()
+        if row is not None:
+            if row["owner_fingerprint"] != owner_fingerprint:
+                raise FeishuBindingError("飞书服务账号与数据库绑定不一致；请恢复原配置或使用新的数据库路径。")
+            return row["started_ms"]
+        if self._has_history():
+            raise FeishuBindingError("现有数据库有历史但没有飞书账号绑定；请保留旧数据库并配置新的数据库路径。")
+        return None
+
+    def bind_feishu_private_route(self, session_id: str, chat_fingerprint: str) -> bool:
+        """已见过的发送者和私聊之间必须仍是原来的一对一关系，禁止重绑。"""
+        with self._db:
+            self._db.execute("INSERT INTO feishu_private_routes VALUES (?, ?) ON CONFLICT DO NOTHING",
+                             (session_id, chat_fingerprint))
+            return self._db.execute("SELECT 1 FROM feishu_private_routes WHERE session_id = ? AND chat_fingerprint = ?",
+                                    (session_id, chat_fingerprint)).fetchone() is not None
 
     def _append(self, session_id: str, messages: Iterable[Message]) -> list[int]:
         created_at = time()

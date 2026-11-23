@@ -1,14 +1,18 @@
 """组装主运行时与内部委派；模型和用户通道由入口注入。"""
 
 import asyncio
-from collections.abc import AsyncIterator, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
+from dataclasses import dataclass
 from hashlib import sha256
 import json
+from math import ceil
+from time import time
 
 from .channels.feishu.channel import FeishuChannel, FeishuPoller
-from .channels.feishu.cli import FeishuCLI
+from .channels.feishu.cli import FeishuCLI, FeishuDiscovery, PrivateChat
 from .config import FeishuSettings, Settings
+from .feishu_private import run_private_chats
 from .protocol import Channel, Message, Model, ReplyInfo
 from .runtime.engine import Runtime
 from .runtime.subtasks import Subtasks
@@ -17,7 +21,7 @@ from .speech.audio import AudioDevice
 from .speech.tts import StreamingTTS
 from .speech.vad import SileroVAD, VoiceDetector, VoiceSetupError
 from .speech.voice import VoiceChannel
-from .storage.sqlite import History
+from .storage.sqlite import FeishuBindingError, History
 
 
 @asynccontextmanager
@@ -25,6 +29,8 @@ async def running_agent(
     settings: Settings, history: History, model: Model, channel: Channel, *,
     wait_for_subtask_delivery: bool = True, delivery_idle_timeout: float | None = None,
     on_confirmed_reply: Callable[[ReplyInfo, str], None] | None = None,
+    session_id: str | None = None,
+    retry_sqlite_locks: bool = False,
 ) -> AsyncIterator[tuple[Runtime, Subtasks]]:
     def return_result(message: Message) -> None:
         main.submit_subtask_result(message, wait_for_delivery=wait_for_subtask_delivery)
@@ -32,11 +38,12 @@ async def running_agent(
     llm = settings.llm
     thinking = llm is not None and llm.adapter == "deepseek" and llm.reasoning_effort != "disabled"
 
-    subtasks = Subtasks(settings.main_session_id, history, model, return_result,
-                        settings=settings.runtime, thinking=thinking)
-    main = Runtime(settings.main_session_id, history, model, channel, tools=subtasks.tools,
+    session_id = settings.main_session_id if session_id is None else session_id
+    subtasks = Subtasks(session_id, history, model, return_result,
+                        settings=settings.runtime, thinking=thinking, retry_sqlite_locks=retry_sqlite_locks)
+    main = Runtime(session_id, history, model, channel, tools=subtasks.tools,
                    settings=settings.runtime, thinking=thinking, delivery_idle_timeout=delivery_idle_timeout,
-                   on_confirmed_reply=on_confirmed_reply)
+                   on_confirmed_reply=on_confirmed_reply, retry_sqlite_locks=retry_sqlite_locks)
     try:
         yield main, subtasks
     finally:
@@ -48,21 +55,102 @@ async def running_agent(
                 raise outcome
 
 
-def feishu_identity(settings: Settings) -> tuple[FeishuSettings, str]:
+def feishu_settings(settings: Settings) -> FeishuSettings:
     feishu = settings.feishu
     if feishu is None:
         raise ValueError("missing Feishu settings")
-    # 校验归属必须早于设备、轮询和子任务恢复；mode 不属于身份。
-    identity = (feishu.chat_id, feishu.sender_open_id, feishu.own_open_id)
-    return feishu, sha256(json.dumps(identity, separators=(",", ":")).encode()).hexdigest()
+    return feishu
+
+
+def _identity_fingerprint(*identity: str) -> str:
+    return sha256(json.dumps(identity, separators=(",", ":")).encode()).hexdigest()
+
+
+def private_feishu_identity(feishu: FeishuSettings) -> str:
+    return _identity_fingerprint("private", feishu.own_open_id)
+
+
+async def _verified_discovery(feishu: FeishuSettings, discovery: FeishuDiscovery | None) -> FeishuDiscovery:
+    discovery = discovery if discovery is not None else FeishuDiscovery(feishu.cli, timeout=feishu.cli_timeout)
+    if await discovery.account_open_id() != feishu.own_open_id:
+        raise FeishuBindingError("飞书 CLI 当前登录账号与 feishu.own_open_id 不匹配。")
+    return discovery
+
+
+@dataclass(frozen=True, slots=True)
+class FixedFeishuRoute:
+    chat: PrivateChat
+    cli: FeishuCLI
+    fingerprint: str
+
+    def checked_fingerprint(self, feishu: FeishuSettings) -> str:
+        if feishu.peer_open_id != self.chat.sender_id:
+            raise FeishuBindingError("飞书固定路由与配置的对端不匹配。")
+        if self.cli.chat_id != self.chat.chat_id:
+            raise FeishuBindingError("飞书固定路由的收发地址与已解析私聊不匹配。")
+        expected = _identity_fingerprint(self.chat.chat_id, self.chat.sender_id, feishu.own_open_id)
+        if self.fingerprint != expected:
+            raise FeishuBindingError("飞书固定路由的登录账号或私聊身份不匹配。")
+        return expected
+
+
+async def prepare_fixed_feishu(feishu: FeishuSettings, *, discovery: FeishuDiscovery | None = None) -> FixedFeishuRoute:
+    """核验账号并解析一次固定私聊，地址在本次运行中复用。"""
+    assert feishu.peer_open_id is not None
+    discovery = await _verified_discovery(feishu, discovery)
+    chats = await discovery.private_chats(feishu.own_open_id)
+    matches = [chat for chat in chats if chat.sender_id == feishu.peer_open_id]
+    if not matches:
+        raise FeishuBindingError("没有找到 feishu.peer_open_id 对应的真人私聊；请确认该私聊已能被当前账号发现。")
+    if len(matches) != 1 or sum(chat.chat_id == matches[0].chat_id for chat in chats) != 1:
+        raise FeishuBindingError("无法唯一确定 feishu.peer_open_id 对应的私聊；发现了多个匹配或地址冲突。")
+    chat = matches[0]
+    # 保持固定库原身份元组的顺序，输出模式不属于身份。
+    return FixedFeishuRoute(chat, discovery.for_chat(chat.chat_id),
+                            _identity_fingerprint(chat.chat_id, chat.sender_id, feishu.own_open_id))
+
+
+async def prepare_private_feishu(
+    settings: Settings, history: History, *, discovery: FeishuDiscovery | None = None,
+) -> Callable[[Model, FileASR], Awaitable[None]]:
+    """先确认库的归属和实际登录账号，再提交首次启用基准；不重复查验 CLI。"""
+    feishu = feishu_settings(settings)
+    assert feishu.peer_open_id is None
+    identity = private_feishu_identity(feishu)
+    history.check_feishu_private(identity)
+    candidate_ms = ceil(time() * 1000)
+    discovery = await _verified_discovery(feishu, discovery)
+    started_ms = history.bind_feishu_private(identity, started_ms=candidate_ms)
+
+    async def run(model: Model, asr: FileASR) -> None:
+        await run_private_chats(
+            discovery, history, asr, own_id=feishu.own_open_id, started_ms=started_ms,
+            open_agent=lambda session_id, channel: running_agent(
+                settings, history, model, channel, session_id=session_id, wait_for_subtask_delivery=False,
+                retry_sqlite_locks=True))
+
+    return run
 
 
 async def run_feishu(settings: Settings, history: History, model: Model, asr: FileASR, *,
-                     voice_output: Channel | None = None, cli: FeishuCLI | None = None,
-                     tts: StreamingTTS | None = None, vad: VoiceDetector | None = None,
-                     audio: AudioDevice | None = None) -> None:
-    feishu, identity = feishu_identity(settings)
-    history.bind_feishu(settings.main_session_id, identity)
+                     voice_output: Channel | None = None, tts: StreamingTTS | None = None, vad: VoiceDetector | None = None,
+                     audio: AudioDevice | None = None, discovery: FeishuDiscovery | None = None) -> None:
+    feishu = feishu_settings(settings)
+    if feishu.peer_open_id is None:
+        run_private = await prepare_private_feishu(settings, history, discovery=discovery)
+        await run_private(model, asr)
+        return
+    route = await prepare_fixed_feishu(feishu, discovery=discovery)
+    await run_fixed_feishu(settings, history, model, asr, route, voice_output=voice_output, tts=tts, vad=vad, audio=audio)
+
+
+async def run_fixed_feishu(settings: Settings, history: History, model: Model, asr: FileASR, route: FixedFeishuRoute, *,
+                           voice_output: Channel | None = None, tts: StreamingTTS | None = None,
+                           vad: VoiceDetector | None = None, audio: AudioDevice | None = None) -> None:
+    """启动固定路由前，校验本次实际传入的配置、CLI 和历史库归属。"""
+    feishu = feishu_settings(settings)
+    # 生产入口已原子绑定，仍须防止调用方在最后组装时误传路由或库。
+    history.bind_feishu(settings.main_session_id, route.checked_fingerprint(feishu))
     local_voice = None
     if feishu.mode == "voice" and voice_output is None and tts is not None:
         voice = settings.voice
@@ -82,7 +170,7 @@ async def run_feishu(settings: Settings, history: History, model: Model, asr: Fi
                                    max_audio_seconds=settings.asr.max_audio_seconds)
         voice_output = local_voice
 
-    cli = cli if cli is not None else FeishuCLI(feishu.cli, feishu.chat_id, timeout=feishu.cli_timeout)
+    cli = route.cli
     channel = FeishuChannel(cli, mode=feishu.mode, voice_output=voice_output)
     wait_for_delivery = feishu.mode == "voice"
     copy_voice_text = wait_for_delivery and feishu.voice_text_copy
@@ -101,7 +189,7 @@ async def run_feishu(settings: Settings, history: History, model: Model, asr: Fi
                 main.stop_accepting()
                 channel.stop_accepting()
 
-            poller = FeishuPoller(cli, asr, channel, chat_id=feishu.chat_id, sender_id=feishu.sender_open_id,
+            poller = FeishuPoller(cli, asr, channel, chat_id=route.chat.chat_id, sender_id=route.chat.sender_id,
                                   own_id=feishu.own_open_id, session_id=main.session_id, history=history,
                                   submit=lambda batch_id: main.submit_persisted_batch(
                                       batch_id, wait_for_delivery=wait_for_delivery),

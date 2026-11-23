@@ -141,6 +141,81 @@ class ProjectionTest(unittest.IsolatedAsyncioTestCase):
         finally:
             await runtime.close()
 
+    async def test_retries_context_reads_after_inbound_and_tool_commit_without_repeating_work(self):
+        class ToolModel(CapturingModel):
+            async def stream(self, messages, tools, *, thinking):
+                if messages[-1:] != [_SUMMARIZE] and not self.requests:
+                    self.requests.append((list(messages), tools, thinking))
+                    yield ToolReady(CALLS[0])
+                    yield InputUsage(240)
+                else:
+                    async for event in super().stream(messages, tools, thinking=thinking):
+                        yield event
+
+        class CapturingSink(Sink):
+            def __init__(self):
+                self.replies = []
+
+            async def deliver(self, reply):
+                receipt = await super().deliver(reply)
+                if receipt.confirmed:
+                    self.replies.append(receipt.confirmed)
+                return receipt
+
+        model, sink = ToolModel(), CapturingSink()
+        tools_called, attempts = [], []
+        read_names = ("last_input_tokens", "summary", "read_after")
+        faults = dict.fromkeys(read_names, 2)
+
+        async def tool(args, context):
+            tools_called.append(context.call_id)
+            return "tool result"
+
+        with closing(History(":memory:")) as history:
+            history.append("main", [Message("user", "old history" * 30), Message("assistant", "old reply")])
+            history.finalize_reply(ReplyOutcome("prior", "main", "prior", "complete", input_tokens=240), [])
+            history.record_inbound("main", "test", 1, [("new", Message("user", "new input"))])
+            batch, = history.pending_inbound("main", "test")
+            finalize = history.finalize_reply
+
+            def commit(outcome, rows):
+                result = finalize(outcome, rows)
+                if rows and rows[0].tool_calls:
+                    faults.update(dict.fromkeys(read_names, 2))
+                return result
+
+            def intercept(name):
+                read = getattr(history, name)
+
+                def attempt(*args, **kwargs):
+                    attempts.append(name)
+                    self.assertEqual(history.pending_inbound("main", "test"), [])
+                    if faults[name]:
+                        faults[name] -= 1
+                        raise sqlite3.OperationalError("database is locked")
+                    return read(*args, **kwargs)
+
+                return patch.object(history, name, side_effect=attempt)
+
+            with (intercept("last_input_tokens"), intercept("summary"), intercept("read_after"),
+                  patch.object(history, "finalize_reply", side_effect=commit)):
+                runtime = Runtime("main", history, model, sink, retry_sqlite_locks=True,
+                                  settings=RuntimeSettings(context_budget=240, tail_budget=65),
+                                  tools=Tools([Tool(SPEC, tool)]))
+                try:
+                    runtime.submit_persisted_batch(batch)
+                    await asyncio.wait_for(runtime.wait_idle(), 3)
+                    self.assertIsNone(runtime.last_failure)
+                finally:
+                    await runtime.close()
+            self.assertEqual(attempts, [name for name in read_names for _ in range(3)] * 2)
+            self.assertEqual(tools_called, [CALLS[0].id])
+            self.assertEqual(len(model.summaries), 1)
+            self.assertEqual([req[0][-1].content for req in model.requests], ["new input", "tool result"])
+            self.assertEqual(sink.replies, ["ok"])
+            self.assertEqual([e.message.role for e in history.read_after("main")],
+                             ["user", "assistant", "user", "assistant", "tool", "assistant"])
+
     async def test_tool_continuation_keeps_tool_group_and_busy_inputs_under_compaction(self):
         reached, release = asyncio.Event(), asyncio.Event()
 

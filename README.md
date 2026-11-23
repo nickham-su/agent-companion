@@ -78,15 +78,23 @@ python scripts/build_source_zip.py
 
 ## 本机启动飞书文字模式
 
-1. 使用 [lark-cli v1.0.100](https://github.com/larksuite/cli/releases/tag/v1.0.100) 或保留同等协议的版本；在本机完成飞书用户登录，并确认应用有指定聊天的列表、媒体下载和发消息权限。程序不会发起登录或读取 CLI 的凭据文件。参考 [CLI JSON 输出契约](https://github.com/larksuite/cli/blob/v1.0.100/README.md#json-output-contract)和[飞书消息列表 API](https://open.feishu.cn/document/server-docs/im-v1/message/list)。
-2. 复制 `config.example.toml` 为 `config.local.toml`，取消 `[feishu]` 注释，填写目标对话 `chat_id`、业务对端 `sender_open_id` 与登录账号 `own_open_id`，使用同一 CLI 应用下的 Open ID；两者必须不同。`mode="text"` 不打开音频设备。`cli_timeout` 限制单次 CLI 调用（默认 20 秒）。每个数据库只允许一个飞书主 Session 绑定，首次绑定要求全库没有历史或入站状态。日后要更换主 Session ID、对话、对端或账号，或旧数据库已有数据但未绑定，请配置新的数据库路径，不要覆盖旧库。仅切换输出模式不影响绑定。
+1. 用专用飞书账号在本机完成 CLI **用户身份**登录。需要支持 [`im +chat-list --types p2p`](https://github.com/larksuite/cli/blob/main/skills/lark-im/references/lark-im-chat-list.md) 的 CLI 版本和 `im:chat:read` 权限，并确认已授权查询当前登录用户信息（`GET /open-apis/authen/v1/user_info`）、[读取私聊历史](https://open.feishu.cn/document/server-docs/im-v1/message/list)、下载媒体和发送消息。程序不会发起登录或直接读取凭据文件。运行中不要切换 CLI 登录账号或应用配置。
+2. 复制 `config.example.toml` 为 `config.local.toml`，启用 `[feishu]`，填写同一 CLI 应用下登录账号的 `own_open_id`，保持 `mode="text"`，省略 `peer_open_id` 即启用多私聊。首次启用多私聊请使用新的数据库路径。文字模式不打开音频设备；`cli_timeout` 限制单次飞书 CLI 调用（默认 20 秒）。
 3. 按[选择 Provider](#选择-provider)填好所选 LLM 和 MiniMax ASR 的 `api_key`；只在本机私有配置填写真实 Key，不要分享或提交该文件。MiniMax 区域按账号选择 `cn`（[国内 API](https://platform.minimax.cn/docs/api-reference/speech-to-text)）或 `global`（[国际 API](https://platform.minimax.io/docs/api-reference/speech-to-text)）。工作目录需要允许建立用于资源下载的短期目录。
 
 ```sh
 .venv/bin/python -m agent_companion --run --config config.local.toml
 ```
 
-轮询使用用户身份调用原始 `/open-apis/im/v1/messages`，保留 `body.content`、发送者和媒体键；每 10 秒扫描一次，单次最多 200 页，未读完时从下一页继续同一个固定时间窗口，不提前入队或推进水位。取齐后按原时间顺序提交一个批次。累计窗口超过状态上限时尝试缩短时间范围重新读取；即使最小可推进范围也超限则报错，不跳过数据。初次从启动时所在秒开始，不回放更早聊天；后续查询回看 10 秒并以消息 ID 去重，重启从持久化水位重读未完成窗口。水位、去重和待接收输入在同一事务保存，已接收但尚未进入历史的批次重启后继续移交；用户输入进入历史后不自动重跑未完成的模型或外发操作。一个数据库由一个实例运行，不复制 SQLite 文件到交付包。云端只使用模拟 CLI、模型与合成音频，本机真实协议和权限待验收。
+多私聊模式不设白名单，依赖飞书自身的访问边界。只接受真人的一对一私聊，忽略群聊、机器人和自己的消息。第一次收到合格消息才为发送者启动独立主 Session；之后按发送者的 `open_id` 恢复历史、向原私聊回复，`main_session_id` 不参与分配。同一用户串行，不同用户可并行；没有新增每人限频或全局并发限制。只处理数据库首次启用后发出的消息，即使该私聊稍晚才被发现；重启不会重设这个基准。
+
+启动时先检查数据库归属，再核验 CLI 的登录账号，通过后才绑定空库；核验期间的新消息也纳入首次扫描。只有完整、每条记录都能明确分类的快照才能停用路由。无效的 `chat_id`、无法判定对话类型，或真人私聊的对端 `open_id` 缺失或无效，都会使整轮发现失败并保留旧路由。明确是群聊、话题群、机器人或自身的记录仍会排除对应路由。只有同一私聊与同一对端重新验证通过，才从原水位及待处理批次恢复。
+
+多私聊轮询遇 SQLite 暂时锁冲突时保留尚未提交的窗口，下轮重试。运行中，关键上下文及子任务结果读取只重试遇锁的查询，输入移交、内部回投入历史、回复归档和子任务状态写入只重试遇锁的事务。不阻塞事件循环，也不重跑模型、工具或发送。后续输入不会越过正在等待的输入；停用路由会取消等待，不补发已取消的回复。
+
+**固定私聊模式：** 填写 `[feishu].peer_open_id` 指定唯一对端，只使用一个主 Session；这不是多私聊白名单。`voice` 必填，`text` 可选。启动时先核验 CLI 登录账号，再分页查找唯一的真人私聊；该私聊须已能在登录账号的私聊列表中找到。没有匹配、有多个匹配或地址冲突时拒绝启动。成功后在进程内复用查到的地址，不会在每次收发时重新发现。旧配置请把 `sender_open_id` 改名为 `peer_open_id`，并删除 `chat_id`；两项旧键均不再接受，固定群聊也不再支持。只要解析所得私聊、对端、登录账号和主 Session 未变，原固定私聊数据库可继续使用，`text`／`voice` 切换不改变绑定。固定与多私聊不能共用数据库；更换登录账号须用新库。不会迁移或清空旧库。
+
+轮询使用用户身份调用原始 `/open-apis/im/v1/messages`，保留 `body.content`、发送者和媒体键；每个对话约每 10 秒扫描一次，单次最多 200 页，未读完时从下一页继续同一个固定时间窗口，不提前入队或推进水位。取齐后按原时间顺序提交一个批次。累计窗口超过状态上限时尝试缩短时间范围重新读取；即使最小可推进范围也超限则报错，不跳过数据。固定模式初次从启动时所在秒开始；后续查询回看 10 秒并以消息 ID 去重，重启从持久化水位重读未完成窗口。水位、去重和待接收输入在同一事务保存，已接收但尚未进入历史的批次重启后继续移交；用户输入进入历史后不自动重跑未完成的模型或外发操作。一个数据库由一个实例运行，不复制 SQLite 文件到交付包。离线测试使用模拟 CLI、模型与合成音频，真实协议和权限待本机验收。
 
 每个新窗口默认每页 50 条。列表 CLI 标准输出超过 4 MiB 时，将页大小减半（最低 1 条），丢弃该窗口未提交的消息及游标，下次轮询从同一时间窗口的第一页重读。每页仅 1 条仍超限时报告 `cli_single_result_output_limit`，不提交部分结果、不推进水位，也不跳过消息。
 
@@ -107,9 +115,9 @@ python scripts/build_source_zip.py
    ```
 
 3. 从 [Silero VAD 官方源码](https://github.com/snakers4/silero-vad/blob/master/src/silero_vad/data/silero_vad.onnx)单独取得 `silero_vad.onnx`（使用带 `input/state/sr` 接口的 v6 系列模型，不选只支持其他输入形状的变体），放在本机配置指定路径。程序只加载已有文件，不下载模型，不需要 PyTorch；相对路径以 TOML 文件所在目录为准。音频和 ONNX 依赖不在 `text` 或模拟模式下加载。
-4. 设置 `[feishu].mode = "voice"`，检查 `tts_provider` 所选 MiniMax 配置含 `.tts` 配置表和 `api_key`，再按 `config.example.toml` 填写 `[voice]` 的设备与 VAD 模型路径。用同一个 `--run --config config.local.toml` 命令重启程序，手动用飞书接听和挂断；切回 `text` 同样修改配置并重启。同一数据库和主 Session 历史保留。飞书文本、图文和语音条仍轮询；语音条失败通知始终通过飞书文字发送。
+4. 设置 `[feishu].mode = "voice"`，填入固定私聊对端 `peer_open_id`，使用固定模式的数据库（不要指向多私聊数据库）。检查 `tts_provider` 所选 MiniMax 配置含 `.tts` 配置表和 `api_key`，再按 `config.example.toml` 填写 `[voice]` 的设备与 VAD 模型路径。用同一个 `--run --config config.local.toml` 命令重启程序。程序不能识别实际来电者，请在飞书中人工确认对端、接听和挂断；切回 `text` 时保留同一 `peer_open_id`，即可继续使用同一固定库与主 Session。飞书文本、图文和语音条仍轮询；语音条失败通知始终通过飞书文字发送。
 
-`[feishu].voice_text_copy` 默认是 `true`。`voice` 模式不判断是否正在通话：所有经语音通道结算的模型回复，不论由什么输入触发，只要有确认正文且已写入历史，就会原样发一份文字副本。正常播完发全文；打断、故障或超时只发历史保留的前缀（打断或故障时可能包含估算的尾字），没有确认正文就不发。副本发送到配置的 `chat_id`，不是私发给通话者；若绑定群聊，群成员可能看到，内容会留在会话记录里。不想留下文字副本时，在 `[feishu]` 加上 `voice_text_copy = false` 并重启。副本复用文字后台队列，尽力发送，不等待、不重试，也不另写一条历史或改变语音投递状态；`text` 模式不受此项影响。
+`[feishu].voice_text_copy` 默认是 `true`。`voice` 模式不判断是否正在通话：所有经语音通道结算的模型回复，不论由什么输入触发，只要有确认正文且已写入历史，就会原样发一份文字副本。正常播完发全文；打断、故障或超时只发历史保留的前缀（打断或故障时可能包含估算的尾字），没有确认正文就不发。副本始终发到启动时确认的固定私聊，不根据实际通话者改发。不想留下文字副本时，在 `[feishu]` 加上 `voice_text_copy = false` 并重启。副本复用文字后台队列，尽力发送，不等待、不重试，也不另写一条历史或改变语音投递状态；`text` 模式不受此项影响。
 
 程序在启动时检查两路设备是否支持所需流格式。输入为 16 kHz 单声道有符号 16-bit PCM（512 样本一帧），直接供 Silero 和 WAV 文件转写使用。输出为 MiniMax 相同采样率的单声道 16-bit PCM，默认 44.1 kHz，可配 16/24/32/44.1 kHz。CoreAudio 在需要且支持时转换设备格式，程序不更改设备全局采样率、不再做第二次重采样。若报 `voice_input_pcm_16khz_mono_not_supported` 或 `voice_output_pcm_rate_or_channels_not_supported`，在「音频 MIDI 设置」和 `sounddevice` 列表核对两条线路；输出可选一个双方支持的采样率，输入需选择能提供 16 kHz 单声道流的设备或系统转换。若通话对端无声，核对虚拟设备首个单声道的路由、飞书麦克风/扬声器选项和设备权限。
 

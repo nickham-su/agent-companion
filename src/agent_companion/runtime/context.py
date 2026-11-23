@@ -13,6 +13,7 @@ from ..protocol import (Message, ModelError, ModelEvent, Part, ProviderReplay, R
                           ReplayReady, ReplayScope, Text, TextDelta, ToolReady, ToolSpec)
 from ..storage.sqlite import History, HistoryEntry, Summary, SummaryWriteError
 from .instructions import read_agents
+from .sqlite_access import SQLiteAccess
 
 
 _SUMMARIZE = Message("user", "内部会话压缩：只归纳本请求提供的已有摘要和有效历史，保留用户意图、已知事实、"
@@ -119,11 +120,12 @@ Summarize = Callable[[Sequence[Message], Sequence[ToolSpec], bool], AsyncGenerat
 
 class Context:
     def __init__(self, history: History, settings: RuntimeSettings, summarize: Summarize,
-                 replay_scope: ReplayScope | None = None, *, agents_path: Path) -> None:
+                 replay_scope: ReplayScope | None = None, *, agents_path: Path, sqlite: SQLiteAccess) -> None:
         self._history = history
         self._settings = settings
         self._summarize = summarize
         self._replay_scope = replay_scope
+        self._sqlite = sqlite
         self._agents_path = agents_path
         self._failed_prefix: tuple[str, int, int] | None = None
         self._retry_after = 0.0
@@ -136,12 +138,13 @@ class Context:
 
     async def prepare(self, session_id: str, *, thinking: bool, tools: Sequence[ToolSpec],
                       protected_from: int, instructions: str = "", last_input_tokens: int | None = None) -> list[Message]:
-        summary = self._history.summary(session_id)
+        summary = await self._sqlite(self._history.summary, session_id)
         covered = summary.covers_through if summary else 0
         if covered >= protected_from:
             raise ModelError("protected_history_already_compacted")
         fixed = await self._system_messages(instructions)
-        blocks = _blocks(self._history.read_after(session_id, covered, replay_scope=self._replay_scope))
+        entries = await self._sqlite(self._history.read_after, session_id, covered, replay_scope=self._replay_scope)
+        blocks = _blocks(entries)
         protected = next(i for i, block in enumerate(blocks) if block.end_id >= protected_from)
         keep_reasoning = thinking and bool(tools)
         if keep_reasoning and any(_needs_reasoning(block) for block in blocks[protected:]):

@@ -12,6 +12,8 @@ import unittest
 from unittest.mock import patch
 import wave
 
+from feishu_test_support import fixed_discovery
+
 from agent_companion.app import run_feishu
 from agent_companion.channels.feishu.channel import FeishuPoller
 from agent_companion.channels.feishu.cli import CommandResult, FeishuCLI
@@ -198,7 +200,8 @@ async def _service(settings, history, model, transport, asr, **voice):
     # Only the polling clock and cadence are changed: use actual scan, ingress, and app shutdown.
     with (patch("agent_companion.app.FeishuPoller", partial(FeishuPoller, clock=transport.clock)),
           patch("agent_companion.channels.feishu.channel._POLL_SECONDS", 0.01)):
-        task = asyncio.create_task(run_feishu(settings, history, model, asr, cli=cli, **voice))
+        discovery = fixed_discovery(_CHAT, _PEER, _OWN, cli=cli)
+        task = asyncio.create_task(run_feishu(settings, history, model, asr, discovery=discovery, **voice))
         try:
             await transport.first_tick.wait()
             yield
@@ -226,7 +229,7 @@ class MVPIntegrationTest(unittest.IsolatedAsyncioTestCase):
     async def _scenario(self, database):
         settings = Settings(
             database=database, main_session_id="mvp-main",
-            feishu=FeishuSettings(_CHAT, _PEER, _OWN, cli_timeout=1),
+            feishu=FeishuSettings(own_open_id=_OWN, peer_open_id=_PEER, cli_timeout=1),
             runtime=RuntimeSettings(model_timeout=3),
             asr=ASRSettings(MiniMaxConnection("synthetic"), max_audio_seconds=500),
             voice=VoiceSettings(output_sample_rate=INPUT_RATE, silence_seconds=0.06, delivery_timeout=2),

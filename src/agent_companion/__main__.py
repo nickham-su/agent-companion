@@ -10,7 +10,9 @@ from pathlib import Path
 
 import httpx
 
-from .app import feishu_identity, run_feishu, running_agent
+from .app import (feishu_settings, prepare_fixed_feishu, prepare_private_feishu, private_feishu_identity,
+                  run_fixed_feishu, running_agent)
+from .channels.feishu.cli import CliError, FeishuDiscovery
 from .config import ConfigError, Settings, load_settings
 from .logging_setup import stdout_logging
 from .models.deepseek import MODEL_NAME, DeepSeek
@@ -72,13 +74,20 @@ async def run_demo(settings: Settings, *, delegate: bool = False) -> bool:
             return runtime.last_failure is None and (not delegate or model.received_subtask_result)
 
 
-async def _serve(settings: Settings) -> None:
-    feishu, identity = feishu_identity(settings)
+async def _serve(settings: Settings, *, discovery: FeishuDiscovery | None = None) -> None:
+    feishu = feishu_settings(settings)
     llm, asr_settings = settings.llm, settings.asr
     tts_settings = settings.tts if feishu.mode == "voice" else None
     if llm is None or asr_settings is None or (feishu.mode == "voice" and tts_settings is None):
         raise ConfigError("正式启动缺少已选中的 Provider 配置")
-    with closing(History(settings.database, feishu_binding=(settings.main_session_id, identity))) as history:
+    if feishu.peer_open_id is None:
+        route = None
+        binding = {"feishu_private_owner": private_feishu_identity(feishu)}
+    else:
+        route = await prepare_fixed_feishu(feishu, discovery=discovery)
+        binding = {"feishu_binding": (settings.main_session_id, route.checked_fingerprint(feishu))}
+    with closing(History(settings.database, **binding)) as history:
+        run_private = await prepare_private_feishu(settings, history, discovery=discovery) if route is None else None
         # 独立客户端，避免任一平台收到另一平台的凭据。不接受网络重定向。
         async with AsyncExitStack() as stack:
             async def client(key: str | None) -> httpx.AsyncClient:
@@ -105,7 +114,11 @@ async def _serve(settings: Settings) -> None:
                 model = OpenAIResponses(model_client, model=llm.model, api_key=llm.api_key,
                                          base_url=llm.base_url, reasoning_effort=llm.reasoning_effort,
                                          replay_salt=history.replay_salt())
-            await run_feishu(settings, history, model, asr, tts=tts)
+            if route is not None:
+                await run_fixed_feishu(settings, history, model, asr, route, tts=tts)
+            else:
+                assert run_private is not None
+                await run_private(model, asr)
 
 
 def main() -> int:
@@ -139,7 +152,7 @@ def _run(settings: Settings, *, for_run: bool, delegate: bool) -> int:
             asyncio.run(_serve(settings))
         except KeyboardInterrupt:
             return 0
-        except FeishuBindingError as exc:
+        except (FeishuBindingError, CliError) as exc:
             _LOG.error("飞书模式无法启动：%s", exc)
             return 1
         except VoiceSetupError as exc:

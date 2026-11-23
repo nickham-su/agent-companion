@@ -2,15 +2,16 @@
 
 import asyncio
 from collections import deque
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 import json
 import logging
+from sqlite3 import OperationalError
 from time import time
 
-from ...protocol import Channel, DeliveryStatus, Receipt, ReplyInfo, ReplyStream
+from ...protocol import Channel, DeliveryStatus, Message, Receipt, ReplyInfo, ReplyStream
 from ...speech.asr import FileASR
-from ...storage.sqlite import History
+from ...storage.sqlite import History, is_sqlite_lock_error
 from .cli import MAX_PAGE_SIZE, MIN_PAGE_SIZE, CliError, CliStdoutLimit, FeishuCLI
 from .messages import MAX_BATCH_BYTES, NORMALIZE_ERRORS, BatchMediaBudget, IncomingMessage, MessageNormalizer, incoming
 
@@ -89,6 +90,8 @@ class FeishuChannel:
             self._sender = None
 
     async def notify_audio_failure(self) -> None:
+        if self._closed:
+            return
         if await self._cli.send_text(_VOICE_FAILURE) != DeliveryStatus.FULL:
             _LOG.warning("Feishu audio failure notice not confirmed")
 
@@ -105,6 +108,7 @@ class _ScanWindow:
     raw_bytes: int = 0
     completed: bool = False
     failures: int = 0
+    prepared: tuple[list[tuple[str, Message | None]], list[str]] | None = None
 
     def restart(self, *, end: int | None = None, page_size: int | None = None) -> "_ScanWindow":
         return _ScanWindow(
@@ -118,7 +122,8 @@ class _ScanWindow:
 class FeishuPoller:
     def __init__(self, cli: FeishuCLI, asr: FileASR, channel: FeishuChannel, *,
                  chat_id: str, sender_id: str, own_id: str, session_id: str, history: History,
-                 submit: Callable[[int], None], clock: Callable[[], float] = time,
+                 submit: Callable[[int], Awaitable[None] | None], clock: Callable[[], float] = time,
+                 private_started_ms: int | None = None,
                  batch_budget: int = MAX_BATCH_BYTES, before_close: Callable[[], None] | None = None) -> None:
         self._cli = cli
         self._normalizer = MessageNormalizer(cli, asr)
@@ -128,7 +133,9 @@ class FeishuPoller:
         self._sender_id = sender_id
         self._own_id = own_id
         self._session_id = session_id
-        self._source = json.dumps(["feishu", chat_id, sender_id, own_id])
+        self._private_started_ms = private_started_ms
+        self._source = ("feishu-private" if private_started_ms is not None else
+                        json.dumps(["feishu", chat_id, sender_id, own_id]))
         self._history = history
         self._submit = submit
         self._before_close = before_close
@@ -137,9 +144,11 @@ class FeishuPoller:
         self._notices: set[asyncio.Task[None]] = set()
         self._window: _ScanWindow | None = None
 
-    def _submit_pending(self) -> None:
+    async def _submit_pending(self) -> None:
         for batch_id in self._history.pending_inbound(self._session_id, self._source):
-            self._submit(batch_id)
+            result = self._submit(batch_id)
+            if result is not None:
+                await result
 
     def _narrow_window(self, window: _ScanWindow) -> None:
         # 只有完整读取的时间范围才提交水位；超出总状态上限时可从较短范围重读。
@@ -175,6 +184,7 @@ class FeishuPoller:
             for item in items:
                 message = incoming(item, chat_id=self._chat_id, sender_id=self._sender_id, own_id=self._own_id)
                 if (message is not None and window.start * 1000 <= message.created_ms < window.end * 1000
+                        and (self._private_started_ms is None or message.created_ms >= self._private_started_ms)
                         and message.message_id not in window.messages
                         and not self._history.inbound_seen(self._session_id, self._source, message.message_id)):
                     size = 4 * len(message.content)  # Python 字符串每个码点至多占 4 字节。
@@ -192,13 +202,31 @@ class FeishuPoller:
             window.tokens.add(token)
         return False  # 本次调用到页预算，下个刻度仍查询同一窗口和后续页。
 
+    async def _prepare(self, window: _ScanWindow) -> tuple[list[tuple[str, Message | None]], list[str]]:
+        received = []
+        media_budget = BatchMediaBudget(self._batch_budget)
+        failed_audio = []
+        # 稳定排序，时间相同则保留服务端第一次见到的相对顺序。
+        for raw in sorted(window.messages.values(), key=lambda message: message.created_ms):
+            try:
+                normalized = await self._normalizer.normalize(raw, media_budget)
+            except NORMALIZE_ERRORS:
+                normalized = None
+                if raw.kind == "audio":
+                    failed_audio.append(raw.message_id)
+                else:
+                    _LOG.warning("Feishu input could not be normalized")
+            received.append((raw.message_id, normalized))
+        return media_budget.finish(received), failed_audio
+
     async def poll_once(self) -> None:
         async with self._poll_lock:
             # 恢复上次进程在「接收已落库、仍未移交历史」时留下的批次。
-            self._submit_pending()
+            await self._submit_pending()
             if self._window is None:
                 now = int(self._clock())
-                floor, through = self._history.inbound_window(self._session_id, self._source, now)
+                initial = now if self._private_started_ms is None else self._private_started_ms // 1000
+                floor, through = self._history.inbound_window(self._session_id, self._source, initial)
                 start = max(floor, through - _OVERLAP_SECONDS)
                 if now <= start:
                     return
@@ -207,34 +235,25 @@ class FeishuPoller:
             if not await self._collect(window):
                 return
             started = asyncio.get_running_loop().time()
-            received = []
-            media_budget = BatchMediaBudget(self._batch_budget)
-            failed_audio = []
-            # 稳定排序，时间相同则保留服务端第一次见到的相对顺序。
-            for raw in sorted(window.messages.values(), key=lambda message: message.created_ms):
-                try:
-                    normalized = await self._normalizer.normalize(raw, media_budget)
-                except NORMALIZE_ERRORS:
-                    normalized = None
-                    if raw.kind == "audio":
-                        failed_audio.append(raw.message_id)
-                    else:
-                        _LOG.warning("Feishu input could not be normalized")
-                received.append((raw.message_id, normalized))
-            normalized_items = media_budget.finish(received)
+            if window.prepared is None:
+                # 写入遇锁不丢窗口；下轮重试同一批，不重复下载与转写。
+                window.prepared = await self._prepare(window)
+            normalized_items, failed_audio = window.prepared
             recorded = self._history.record_inbound(self._session_id, self._source, window.end, normalized_items)
-            if received and _LOG.isEnabledFor(logging.DEBUG):
+            if normalized_items and _LOG.isEnabledFor(logging.DEBUG):
                 accepted = sum(message is not None and key in recorded for key, message in normalized_items)
                 _LOG.debug("Feishu input window recorded; candidates=%d accepted=%d audio_failures=%d elapsed_ms=%.0f",
-                           len(received), accepted, len(failed_audio),
+                           len(normalized_items), accepted, len(failed_audio),
                            (asyncio.get_running_loop().time() - started) * 1000)
             self._window = None
-            self._submit_pending()
-            for message_id in failed_audio:
-                if message_id in recorded:
-                    task = asyncio.create_task(self._notify())
-                    self._notices.add(task)
-                    task.add_done_callback(self._notices.discard)
+            try:
+                await self._submit_pending()
+            finally:
+                for message_id in failed_audio:
+                    if message_id in recorded:
+                        task = asyncio.create_task(self._notify())
+                        self._notices.add(task)
+                        task.add_done_callback(self._notices.discard)
 
     async def _notify(self) -> None:
         try:
@@ -252,6 +271,14 @@ class FeishuPoller:
                     await self.poll_once()
                 except CliError as exc:
                     _LOG.warning("Feishu poll failed (%s)", exc)
+                except OperationalError as exc:
+                    if self._private_started_ms is None:
+                        raise
+                    if not is_sqlite_lock_error(exc):
+                        _LOG.error("Feishu private inbox storage failed; sqlite_code=%s",
+                                   getattr(exc, "sqlite_errorcode", None))
+                        raise
+                    _LOG.warning("Feishu private inbox storage busy; retrying on next poll")
                 next_tick += _POLL_SECONDS
                 now = loop.time()
                 if next_tick < now:
