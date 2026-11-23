@@ -17,6 +17,7 @@ from agent_companion.models.deepseek import CHAT_COMPLETIONS, DeepSeek
 from agent_companion.models.openai_responses import OpenAIResponses
 from agent_companion.protocol import (OMITTED_INPUT_IMAGE, DeliveryStatus, Image, Message, ModelError, Receipt,
                                       ReplayReady, Text, ToolSpec)
+from agent_companion.runtime.context import _SUMMARIZE
 from agent_companion.runtime.engine import Runtime
 from agent_companion.runtime.tools import Tool, Tools
 from agent_companion.storage.sqlite import History, ReplyOutcome, Summary
@@ -126,10 +127,10 @@ def _model(client, *, history=None, api_key=_KEY, model="fixture-model", effort=
 
 
 async def _complete(fixture, history, *, prompt=None, channel=None, tools=None, settings=None, session_id="main",
-                    **model_settings):
+                    instructions="", **model_settings):
     async with httpx.AsyncClient(transport=fixture.transport) as client:
         runtime = Runtime(session_id, history, _model(client, history=history, **model_settings), channel or _Channel(),
-                          tools=tools, settings=settings)
+                          tools=tools, settings=settings, instructions=instructions)
         try:
             runtime.submit_batch([prompt or Message("user", "synthetic prompt")])
             await asyncio.wait_for(runtime.wait_idle(), 2)
@@ -445,7 +446,7 @@ class OpenAIResponsesTests(unittest.IsolatedAsyncioTestCase):
                 if mode == "compact":
                     history.append("main", [Message("user", "x" * 360)])
                     fixture = _Fixture(self, initial, [_completed(_answer("summary"))], final)
-                    settings = RuntimeSettings(context_budget=240, tail_budget=75)
+                    settings = RuntimeSettings(context_budget=270, tail_budget=75)
                     self.assertIsNone(await _complete(fixture, history, settings=settings,
                                                       tools=Tools([Tool(_SPEC, tool)])))
                     self.assertIsNotNone(history.summary("main"))
@@ -574,20 +575,205 @@ class OpenAIResponsesTests(unittest.IsolatedAsyncioTestCase):
             {"type": "function_call_output", "call_id": "call_1", "output": "accepted"},
         ])
 
-    async def test_summary_request_never_receives_private_fields(self):
-        fixture = _Fixture(self, [_completed(_reason(summary=(_PRIVATE_SUMMARY,)), _answer("old"))],
+    async def test_summary_reuses_native_prefix_and_omits_tail_and_current_input(self):
+        private = _reason(summary=(_PRIVATE_SUMMARY,))
+        tool = AsyncMock(return_value="historical result")
+        registry = Tools([Tool(_SPEC, tool)])
+        options = {"tools": registry, "instructions": "fixed synthetic instructions"}
+        fixture = _Fixture(self, [_completed(private, _call())], [_completed(_answer("retained tail"))],
                            [_completed(_answer("compressed"))], [_completed(_answer("new response"))])
+        channel = _Channel()
         with closing(History(":memory:")) as history:
-            self.assertIsNone(await _complete(fixture, history, prompt=Message("user", "prior " + "x" * 330)))
-            settings = RuntimeSettings(context_budget=220, tail_budget=55)
-            self.assertIsNone(await _complete(fixture, history, settings=settings,
-                                              prompt=Message("user", "current " + "y" * 290)))
+            covered, = history.append("main", [Message("user", "prior seed")])
+            history.save_summary("main", Summary(covered, "same existing summary"))
+            image = Message("user", (Text("historical image"), Image(_IMAGE)))
+            self.assertIsNone(await _complete(fixture, history, prompt=image, channel=channel, **options))
+            current = "current " + "y" * 1400
+            settings = RuntimeSettings(context_budget=2500, tail_budget=510)
+            self.assertIsNone(await _complete(fixture, history, settings=settings, channel=channel,
+                                              prompt=Message("user", current), **options))
+            self.assertEqual(len(fixture.requests), 4)
+            previous_reply, compressed, current_reply = fixture.requests[1:]
+            self.assertEqual(compressed, {**previous_reply, "input": previous_reply["input"] + [
+                {"role": "user", "content": _SUMMARIZE.content},
+            ]})
+            self.assertIn(private, compressed["input"])
+            self.assertIn("same existing summary", repr(compressed["input"]))
+            self.assertNotIn("retained tail", repr(compressed["input"]))
+            self.assertNotIn(current, repr(compressed["input"]))
+            self.assertIn("retained tail", repr(current_reply["input"]))
+            self.assertNotIn(private, current_reply["input"])
+            self.assertNotIn(_SUMMARIZE, [row.message for row in history.read_after("main")])
+            self.assertEqual(history.summary("main").text, "compressed")
+            self.assertEqual(channel.replies, ["retained tail", "new response"])
+        tool.assert_awaited_once()
+
+    async def test_summary_checks_exact_byte_budget_and_can_replace_old_image(self):
+        fixture = _Fixture(self, [_completed(_answer("compressed"))], [_completed(_answer("new answer"))])
+        previous = Message("user", (Text("historical caption"), Image("data:image/png;base64," + "YQAA" * 400)))
+        current = "x" * 690
+        with closing(History(":memory:")) as history:
+            covered, = history.append("main", [previous])
+            settings = RuntimeSettings(context_budget=2280, tail_budget=260)
+            self.assertIsNone(await _complete(fixture, history, settings=settings, request_limit=950,
+                                              prompt=Message("user", current)))
+            self.assertEqual(len(fixture.requests), 2)
+            compressed, _ = fixture.requests
+            self.assertLessEqual(len(json.dumps(compressed, ensure_ascii=False, separators=(",", ":"))
+                                     .encode("utf-8")), 950)
+            self.assertEqual(compressed["input"][-1], {"role": "user", "content": _SUMMARIZE.content})
+            self.assertIn("历史图片已省略", repr(compressed))
+            self.assertIn("historical caption", repr(compressed))
+            self.assertNotIn(current, repr(compressed))
+            self.assertNotIn("input_image", repr(compressed))
+            self.assertEqual(history.read_after("main")[0].message, previous)
+            self.assertEqual(history.summary("main"), Summary(covered, "compressed"))
+
+    async def test_summary_batches_consecutive_oversized_images_until_native_block(self):
+        limit = 8192
+        large = Image("data:image/png;base64," + "YQAA" * 2200)
+
+        def wire_size(request):
+            return len(json.dumps(request, ensure_ascii=False, separators=(",", ":")).encode("utf-8"))
+
+        for native_boundary in (False, True):
+            with self.subTest(native_boundary=native_boundary), closing(History(":memory:")) as history:
+                old = [Message("user", (Text(f"old image {i:02d}"), large)) for i in range(20)]
+                if native_boundary:
+                    seed, = history.append("main", [Message("user", "prior covered input")])
+                    history.save_summary("main", Summary(seed, "previous summary " * 65))
+                    medium = Image("data:image/png;base64," + "YQAA" * 1850)
+                    old.insert(10, Message("user", (Text("native boundary"), medium)))
+                old_ids = history.append("main", old + [Message("user", "retained tail")])
+                expected = [range(10), (), range(10, 20)] if native_boundary else [range(20)]
+                summaries = [[_completed(_answer(f"summary {i}"))] for i in range(len(expected))]
+                fixture = _Fixture(self, *summaries, [_completed(_answer("normal response"))])
+                settings = RuntimeSettings(context_budget=8000, tail_budget=100)
+                current = Message("user", "current user input")
+                self.assertIsNone(await _complete(fixture, history, settings=settings, request_limit=limit,
+                                                  prompt=current))
+                self.assertEqual(len(fixture.requests), len(expected) + 1)
+                if native_boundary:
+                    first, middle = fixture.requests[:2]
+                    # 中间块单独可原生发送，却放不进携带原有摘要的请求，因此仍须停止合批。
+                    self.assertGreater(wire_size({**middle, "input": first["input"][:1] + middle["input"][1:]}),
+                                       limit)
+                for request, included in zip(fixture.requests[:-1], expected):
+                    self.assertLessEqual(wire_size(request), limit)
+                    self.assertEqual(request["input"][-1], {"role": "user", "content": _SUMMARIZE.content})
+                    serialized = repr(request)
+                    self.assertNotIn("retained tail", serialized)
+                    self.assertNotIn(current.content, serialized)
+                    self.assertEqual("input_image" in serialized, not included)
+                    self.assertEqual(serialized.count("历史图片已省略"), len(included))
+                    for i in range(20):
+                        self.assertEqual(f"old image {i:02d}" in serialized, i in included)
+                    self.assertEqual("native boundary" in serialized, not included)
+                self.assertEqual(history.summary("main"), Summary(old_ids[-2], f"summary {len(expected) - 1}"))
+                self.assertEqual(history.read_after("main")[int(native_boundary)].message, old[0])
+                self.assertIn("retained tail", repr(fixture.requests[-1]))
+                self.assertIn(current.content, repr(fixture.requests[-1]))
+
+    async def test_summary_keeps_initial_block_that_fits_natively_alone_out_of_degraded_batch(self):
+        limit = 8192
+        medium = Image("data:image/png;base64," + "YQAA" * 1850)
+        large = Image("data:image/png;base64," + "YQAA" * 2200)
+        first = Message("user", (Text("native first"), medium))
+        followers = [Message("user", (Text(f"oversized follower {i}"), large)) for i in range(2)]
+        fixture = _Fixture(self, [_completed(_answer("first summary"))], [_completed(_answer("combined followers"))],
+                           [_completed(_answer("normal response"))])
+        with closing(History(":memory:")) as history:
+            seed, = history.append("main", [Message("user", "prior covered input")])
+            previous = Summary(seed, "previous summary " * 65)
+            history.save_summary("main", previous)
+            covered = history.append("main", [first, *followers])[-1]
+            async with httpx.AsyncClient(transport=fixture.transport) as client:
+                adapter = _model(client, history=history, request_limit=limit)
+                old_summary = Message("system", "此前会话摘要：\n" + previous.text)
+                self.assertTrue(adapter.request_fits([first, _SUMMARIZE], (), thinking=False))
+                self.assertFalse(adapter.request_fits([old_summary, first, _SUMMARIZE], (), thinking=False))
+                self.assertFalse(adapter.request_fits([followers[0], _SUMMARIZE], (), thinking=False))
+            settings = RuntimeSettings(context_budget=3000, tail_budget=100)
+            self.assertIsNone(await _complete(fixture, history, settings=settings, request_limit=limit))
             self.assertEqual(len(fixture.requests), 3)
-            self.assertIsNotNone(history.summary("main"))
-            for request in fixture.requests[1:]:
-                self.assertNotIn(_PRIVATE_SUMMARY, json.dumps(request))
-                self.assertNotIn(_CIPHER, json.dumps(request))
-                self.assertNotIn("rs_1", json.dumps(request))
+            initial, following, _ = (repr(request) for request in fixture.requests)
+            self.assertIn("native first", initial)
+            self.assertEqual(initial.count("历史图片已省略"), 1)
+            self.assertNotIn("oversized follower", initial)
+            self.assertNotIn("native first", following)
+            self.assertIn("first summary", following)
+            for i in range(2):
+                self.assertIn(f"oversized follower {i}", following)
+            self.assertEqual(following.count("历史图片已省略"), 2)
+            self.assertEqual(history.summary("main"), Summary(covered, "combined followers"))
+
+    async def test_old_openai_replay_over_byte_budget_can_archive_complete_group(self):
+        private = "opaque-synthetic-" + "Q" * 1600
+        tool = AsyncMock(return_value="compacted visible tool result")
+        tools = Tools([Tool(_SPEC, tool)])
+        fixture = _Fixture(self, [_completed(_reason(cipher=private), _answer("historical decision"), _call())],
+                           [_completed(_answer("retained tail"))], [_completed(_answer("first summary"))],
+                           [_completed(_answer("updated summary"))], [_completed(_answer("current response"))])
+        with closing(History(":memory:")) as history:
+            old = Message("user", "old " + "x" * 390)
+            self.assertIsNone(await _complete(fixture, history, prompt=old, tools=tools))
+            before = history.read_after("main")
+            self.assertEqual(len(before), 4)
+            settings = RuntimeSettings(context_budget=304, tail_budget=145)
+            self.assertIsNone(await _complete(fixture, history, settings=settings, request_limit=1150,
+                                              tools=tools, prompt=Message("user", "new " + "y" * 310)))
+            self.assertEqual(len(fixture.requests), 5)
+            continuation, first, archived, _ = fixture.requests[1:]
+            self.assertIn(private, repr(continuation))
+            self.assertIn(old.content, repr(first))
+            self.assertEqual(archived["input"][-1], {"role": "user", "content": _SUMMARIZE.content})
+            self.assertEqual(archived["tools"], continuation["tools"])
+            self.assertEqual(archived["reasoning"], continuation["reasoning"])
+            for visible in ("历史归档", "historical decision", "compacted visible tool result", "first summary"):
+                self.assertIn(visible, repr(archived))
+            self.assertNotIn(private, repr(archived))
+            self.assertNotIn("retained tail", repr(archived))
+            self.assertLessEqual(len(json.dumps(archived, ensure_ascii=False, separators=(",", ":"))
+                                     .encode("utf-8")), 1150)
+            self.assertEqual(history.summary("main"), Summary(before[2].message_id, "updated summary"))
+            self.assertEqual(history.read_after("main")[:4], before)
+        tool.assert_awaited_once()
+
+    async def test_summary_rejects_obvious_private_replay_echo_but_allows_short_common_text(self):
+        long_text = "synthetic long private reasoning token " * 2
+        long_cipher = "synthetic-opaque-" + "q" * 42
+        cases = (
+            ("summary part", "prefix " + long_text, (), True),
+            ("ciphertext", "prefix " + long_cipher, (), True),
+            ("response's short field", "status", (_reason("rs_2", summary=("status",)),), True),
+            ("ordinary prose", "updated status for the case", (), False),
+        )
+        for case, generated, output_reasoning, rejected in cases:
+            with self.subTest(case=case), closing(History(":memory:")) as history:
+                fixture = _Fixture(self, [_completed(_reason(cipher=long_cipher, summary=("status", long_text)),
+                                                     _answer("old response"))],
+                                   [_completed(*output_reasoning, _answer(generated))],
+                                   [_completed(_answer("normal visible reply"))])
+                covered, = history.append("main", [Message("user", "prior seed")])
+                saved = Summary(covered, "existing")
+                history.save_summary("main", saved)
+                self.assertIsNone(await _complete(fixture, history, prompt=Message("user", "x" * 340)))
+                old_end = history.read_after("main")[-1].message_id
+                options = dict(settings=RuntimeSettings(context_budget=252, tail_budget=125),
+                               prompt=Message("user", "y" * 420))
+                if rejected:
+                    with self.assertLogs("agent_companion.runtime.context", level="WARNING") as logs:
+                        self.assertIsNone(await _complete(fixture, history, **options))
+                    self.assertIn("summary_private_echo", logs.output[0])
+                    self.assertNotIn(generated, logs.output[0])
+                    self.assertEqual(history.summary("main"), saved)
+                else:
+                    self.assertIsNone(await _complete(fixture, history, **options))
+                    self.assertEqual(history.summary("main"), Summary(old_end, generated))
+                self.assertEqual(len(fixture.requests), 3)
+                self.assertIn(long_text, repr(fixture.requests[1]))
+                self.assertIn(long_cipher, repr(fixture.requests[1]))
+                self.assertNotIn(generated, [entry.message.content for entry in history.read_after("main")])
 
     async def test_http_rejection_does_not_retry_or_rerun_tools(self):
         base = "https://responses.example.invalid/fixture"

@@ -384,8 +384,8 @@ class RuntimeTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(raw[2], Message("tool", "completed tool result", tool_call_id=CALL.id))
         self.assertEqual(raw[-1].reasoning, "complete reasoning")
         summary_messages, tools, thinking = model.requests[1]
-        self.assertFalse(thinking)
-        self.assertEqual(tools, ())
+        self.assertTrue(thinking)
+        self.assertEqual(tools, (SPEC,))
         prompt = repr(build_request(summary_messages, tools, thinking=thinking))
         self.assertIn("confirmed prefix", prompt)
         self.assertIn("completed tool result", prompt)

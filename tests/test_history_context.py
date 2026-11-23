@@ -11,6 +11,7 @@ from agent_companion.config import RuntimeSettings, load_settings
 from agent_companion.models.deepseek import build_request
 from agent_companion.protocol import (DeliveryStatus, Image, Message, ModelError, ReasoningDelta, Receipt, Text, TextDelta,
                                       ToolCall, ToolReady, ToolSpec)
+from agent_companion.runtime.context import Context, _SUMMARIZE
 from agent_companion.runtime.engine import Runtime
 from agent_companion.runtime.tools import Tool, Tools
 from agent_companion.storage.sqlite import History, ReplyOutcome, Summary
@@ -100,7 +101,7 @@ class CapturingModel:
         self.summaries = []
 
     async def stream(self, messages, tools, *, thinking):
-        if messages and messages[0].role == "system" and str(messages[0].content).startswith("把给出的历史"):
+        if messages[-1:] == [_SUMMARIZE]:
             self.summaries.append((list(messages), tools, thinking))
             yield TextDelta("summary-material")
         else:
@@ -202,7 +203,8 @@ class ProjectionTest(unittest.IsolatedAsyncioTestCase):
     async def test_summary_failure_falls_back_with_reasoning_compatibility_and_tool_continuation(self):
         class FailingSummary(CapturingModel):
             async def stream(self, messages, tools, *, thinking):
-                if not tools:
+                if messages[-1:] == [_SUMMARIZE]:
+                    build_request(messages, tools, thinking=thinking)
                     self.summaries.append(tuple(messages))
                     raise ModelError("http_400")
                 # Validate the actual DeepSeek contract independent of the simulated response.
@@ -218,7 +220,7 @@ class ProjectionTest(unittest.IsolatedAsyncioTestCase):
             return "已完成测试工具"
 
         model = FailingSummary()
-        settings = RuntimeSettings(context_budget=240, tail_budget=150)
+        settings = RuntimeSettings(context_budget=330, tail_budget=150)
         with closing(History(":memory:")) as history:
             covered, = history.append("main", [Message("user", "此前信息")])
             saved = Summary(covered, "已保存摘要")
@@ -248,7 +250,8 @@ class ProjectionTest(unittest.IsolatedAsyncioTestCase):
     async def test_summary_write_failure_falls_back_and_retries_after_backoff(self):
         class ToolModel(CapturingModel):
             async def stream(self, messages, tools, *, thinking):
-                if not tools:
+                if messages[-1:] == [_SUMMARIZE]:
+                    build_request(messages, tools, thinking=thinking)
                     async for delta in super().stream(messages, tools, thinking=thinking):
                         yield delta
                     return
@@ -264,7 +267,7 @@ class ProjectionTest(unittest.IsolatedAsyncioTestCase):
             return "已完成测试工具"
 
         model = ToolModel()
-        settings = RuntimeSettings(context_budget=240, tail_budget=150)
+        settings = RuntimeSettings(context_budget=330, tail_budget=150)
         with tempfile.TemporaryDirectory(dir=Path.cwd()) as folder:
             path = Path(folder) / "summary.sqlite"
             with (closing(History(path)) as history, closing(sqlite3.connect(path)) as fault,
@@ -324,7 +327,7 @@ class ProjectionTest(unittest.IsolatedAsyncioTestCase):
     async def test_later_summary_chunk_failure_does_not_advance_coverage(self):
         class LaterFailure(CapturingModel):
             async def stream(self, messages, tools, *, thinking):
-                if messages[0].role == "system" and str(messages[0].content).startswith("把给出的历史"):
+                if messages[-1:] == [_SUMMARIZE]:
                     self.summaries.append(tuple(messages))
                     if len(self.summaries) > 1:
                         raise TimeoutError
@@ -476,6 +479,164 @@ class ProjectionTest(unittest.IsolatedAsyncioTestCase):
                 self.assertNotIn("old-start", repr(prompt))
                 self.assertEqual(history.read_after("main")[0], first)
 
+    async def test_deepseek_prefix_matches_native_history_and_rejects_summary_tool_calls(self):
+        calls = []
+
+        async def forbidden_tool(args, context):
+            calls.append(context.call_id)
+            return "unexpected"
+
+        class ToolDuringSummary(CapturingModel):
+            async def stream(self, messages, tools, *, thinking):
+                payload = build_request(messages, tools, thinking=thinking)
+                if messages[-1] == _SUMMARIZE:
+                    self.summaries.append(payload)
+                    yield TextDelta("must not save partial summary")
+                    yield ToolReady(CALLS[0])
+                else:
+                    self.requests.append(payload)
+                    yield ReasoningDelta("response reasoning")
+                    yield TextDelta("normal reply")
+
+        model = ToolDuringSummary()
+        second_spec = ToolSpec("earlier", "another tool", {"type": "object"})
+        tools = Tools([Tool(second_spec, forbidden_tool), Tool(SPEC, forbidden_tool)])
+        settings = RuntimeSettings(context_budget=420, tail_budget=165)
+        with closing(History(":memory:")) as history:
+            covered, = history.append("main", [Message("user", "previous seed")])
+            previous = Summary(covered, "stable saved summary")
+            history.save_summary("main", previous)
+            native = [Message("user", "old " + "x" * 465),
+                      Message("assistant", "old reply", (CALLS[0],), reasoning="prior reasoning"),
+                      Message("tool", "old result", tool_call_id=CALLS[0].id)]
+            history.append("main", native)
+            options = dict(settings=settings, instructions="system instructions", tools=tools, thinking=True)
+            tail = "tail " + "t" * 140
+            await self.turn(history, model, tail, **options)
+            current = "current " + "c" * 225
+            with self.assertLogs("agent_companion.runtime.context", level="WARNING") as logs:
+                await self.turn(history, model, current, **options)
+            self.assertEqual(len(model.summaries), 1)
+            self.assertIn("summary_tool_call", logs.output[0])
+            warm = model.requests[0]
+            request = model.summaries[0]
+            self.assertEqual(request, {**warm, "messages": warm["messages"][:-1] + [
+                {"role": "user", "content": _SUMMARIZE.content},
+            ]})
+            self.assertNotIn(tail, repr(request))
+            self.assertNotIn(current, repr(request))
+            self.assertIn(tail, repr(model.requests[-1]))
+            self.assertEqual(request["messages"][-3]["reasoning_content"], "prior reasoning")
+            self.assertEqual([tool["function"]["name"] for tool in request["tools"]], ["earlier", "test"])
+            self.assertEqual(history.summary("main"), previous)
+            self.assertNotIn(_SUMMARIZE, [entry.message for entry in history.read_after("main")])
+            self.assertEqual(calls, [])
+
+    async def test_private_deepseek_reasoning_over_token_budget_can_archive_complete_group(self):
+        async def unexpected_tool(args, context):
+            self.fail("historical tool must not be dispatched")
+
+        settings = RuntimeSettings(context_budget=290, tail_budget=95)
+        for crowded in (False, True):
+            with self.subTest(crowded=crowded), closing(History(":memory:")) as history:
+                seed, = history.append("main", [Message("user", "summary seed")])
+                saved = Summary(seed, "saved " * 110 if crowded else "saved summary")
+                history.save_summary("main", saved)
+                private = "synthetic private thinking " * 70
+                group = [Message("assistant", "historical decision", CALLS, reasoning=private),
+                         Message("tool", "first historical outcome", tool_call_id=CALLS[0].id),
+                         Message("tool", "second historical outcome", tool_call_id=CALLS[1].id)]
+                _, _, end = history.append("main", group)
+                model = CapturingModel()
+                opts = dict(settings=settings, tools=Tools([Tool(SPEC, unexpected_tool)]), thinking=True)
+                if crowded:
+                    with self.assertLogs("agent_companion.runtime.context", level="WARNING") as logs:
+                        await self.turn(history, model, "next", **opts)
+                    self.assertIn("summary_context_too_large", logs.output[0])
+                    self.assertEqual(model.summaries, [])
+                    self.assertEqual(history.summary("main"), saved)
+                else:
+                    await self.turn(history, model, "next", **opts)
+                    self.assertEqual(len(model.summaries), 1)
+                    messages, tools, thinking = model.summaries[0]
+                    payload = build_request(messages, tools, thinking=thinking)
+                    self.assertTrue(thinking)
+                    self.assertEqual(tools, (SPEC,))
+                    self.assertEqual(messages[-1], _SUMMARIZE)
+                    self.assertEqual(len(messages), 3)  # 旧摘要、整个工具组归档、内部指令。
+                    self.assertIn("历史归档", repr(payload))
+                    for visible in ("historical decision", "first historical outcome", "second historical outcome"):
+                        self.assertIn(visible, repr(payload))
+                    self.assertNotIn(private, repr(payload))
+                    self.assertNotIn("reasoning_content", repr(payload))
+                    self.assertEqual(history.summary("main"), Summary(end, "summary-material"))
+                self.assertEqual([entry.message for entry in history.read_after("main", seed)[:3]], group)
+
+    async def test_private_deepseek_reasoning_verbatim_echo_is_rejected(self):
+        private = "synthetic private reasoning for echo detection"
+
+        class EchoModel(CapturingModel):
+            async def stream(self, messages, tools, *, thinking):
+                if messages[-1] == _SUMMARIZE:
+                    self.summaries.append(build_request(messages, tools, thinking=thinking))
+                    yield TextDelta("prefix " + private)
+                    return
+                async for event in super().stream(messages, tools, thinking=thinking):
+                    yield event
+
+        async def unexpected_tool(args, context):
+            self.fail("summary check must not dispatch tools")
+
+        model = EchoModel()
+        settings = RuntimeSettings(context_budget=320, tail_budget=80)
+        with closing(History(":memory:")) as history:
+            covered, = history.append("main", [Message("user", "prior seed")])
+            saved = Summary(covered, "existing short summary")
+            history.save_summary("main", saved)
+            history.append("main", [Message("assistant", "x" * 445, reasoning=private)])
+            registry = Tools([Tool(SPEC, unexpected_tool)])
+            with self.assertLogs("agent_companion.runtime.context", level="WARNING") as logs:
+                await self.turn(history, model, "y" * 455, settings=settings, tools=registry, thinking=True)
+            self.assertEqual(model.summaries[0]["messages"][-2]["reasoning_content"], private)
+            self.assertIn("summary_private_echo", logs.output[0])
+            self.assertNotIn(private, logs.output[0])
+            self.assertEqual(history.summary("main"), saved)
+
+    def test_summary_byte_probing_does_not_measure_unrelated_tail_blocks(self):
+        class Blocks:
+            def __init__(self):
+                self.accesses = 0
+
+            def __len__(self):
+                return 300
+
+            def __getitem__(self, index):
+                self.accesses += 1
+                return [Message("user", str(index))]
+
+        model = CapturingModel()
+        sizes = []
+
+        def fits(messages, tools, *, thinking):
+            count = len(messages) - 1  # 末尾的内部指令不计入旧块数。
+            sizes.append(count)
+            return count <= 3
+
+        with closing(History(":memory:")) as history:
+            settings = RuntimeSettings()
+            context = Context(history, settings, model.stream, agents_path=Path("unused"))
+            blocks = Blocks()
+            with patch.object(context, "_fits", side_effect=fits):
+                for start in range(0, len(blocks), 3):
+                    end, prompt = context._summary_batch([], blocks, start, (), thinking=False,
+                                                         tools_budget=settings.context_budget)
+                    self.assertEqual(end, start + 3)
+                    self.assertEqual([m.content for m in prompt[:-1]], [str(i) for i in range(start, end)])
+                    self.assertEqual(prompt[-1], _SUMMARIZE)
+        self.assertLessEqual(blocks.accesses, 2 * len(blocks))
+        self.assertLessEqual(max(sizes), 4)
+        self.assertLessEqual(sum(sizes), 4 * len(blocks))
+
     async def test_thinking_switch_after_legacy_history_summarizes_not_fabricates(self):
         model = CapturingModel()
 
@@ -494,7 +655,10 @@ class ProjectionTest(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(history.summary("main").covers_through, before[3].message_id)
             self.assertEqual(history.read_after("main")[:len(before)], before)
             self.assertEqual(history.read_after("main")[-1].message.reasoning, "NEW_REASONING")
-            first_summary = build_request(model.summaries[0][0], (), thinking=False)
+            messages, tools, thinking = model.summaries[0]
+            self.assertEqual(tools, (SPEC,))
+            self.assertTrue(thinking)
+            first_summary = build_request(messages, tools, thinking=thinking)
             self.assertIn("first old result", repr(first_summary))
             self.assertIn("second old result", repr(first_summary))
             self.assertNotIn("reasoning_content", repr(first_summary))

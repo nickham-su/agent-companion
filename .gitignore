@@ -63,6 +63,7 @@ db.sqlite3
 db.sqlite3-journal
 # 飞书部署配置和下载进程被强制退出时可能留下的临时目录。
 config.local.toml
+/AGENTS.md
 .feishu-*/
 .mvp-test-*/
 

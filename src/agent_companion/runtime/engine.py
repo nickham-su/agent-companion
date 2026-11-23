@@ -6,14 +6,16 @@ from collections.abc import AsyncGenerator, Sequence
 from contextlib import aclosing
 from dataclasses import dataclass
 import logging
+from pathlib import Path
 from uuid import uuid4
 
 from ..config import RuntimeSettings
 from ..protocol import (Channel, DeliveryStatus, Message, Model, ModelError, ModelEvent,
                         ReasoningDelta, Receipt, ReplayReady, ReplayScope, ReplyInfo, ReplyStream,
-                        RequestBudget, RequestTooLarge, TextDelta, ToolCall, ToolReady)
+                        RequestBudget, RequestTooLarge, TextDelta, ToolCall, ToolReady, ToolSpec)
 from ..storage.sqlite import History, ReplyOutcome
 from .context import Context, ProtectedContextTooLarge, ProtectedRequestTooLarge
+from .instructions import InstructionsError
 from .tools import ToolContext, Tools
 
 
@@ -46,8 +48,8 @@ class Runtime:
         replay_scope = getattr(model, "replay_scope", None)
         self._replay_scope = replay_scope if isinstance(replay_scope, ReplayScope) else None
         self._context = Context(history, self._settings, self._summary_stream,
-                                request_budget=model if isinstance(model, RequestBudget) else None,
-                                replay_scope=self._replay_scope)
+                                 request_budget=model if isinstance(model, RequestBudget) else None,
+                                 replay_scope=self._replay_scope, agents_path=Path.cwd() / "AGENTS.md")
         self._pending: deque[_InputBatch] = deque()
         self._queued_inbound: set[int] = set()
         self._worker: asyncio.Task[None] | None = None
@@ -147,6 +149,9 @@ class Runtime:
         except ProtectedRequestTooLarge:
             self.last_failure = "protected_request_too_large"
             _LOG.warning("Current input exceeds the model request body limit")
+        except InstructionsError as exc:
+            self.last_failure = exc.diagnostic
+            _LOG.warning("Local system instructions unavailable (%s)", exc.diagnostic)
         except (ModelError, TimeoutError):
             self.last_failure = "context_failed"
         except Exception:
@@ -182,9 +187,10 @@ class Runtime:
                 if self._record_input(batch):
                     has_user_input = has_user_input or batch.has_user_input
 
-    async def _summary_stream(self, messages: Sequence[Message]) -> AsyncGenerator[ModelEvent, None]:
+    async def _summary_stream(self, messages: Sequence[Message], tools: Sequence[ToolSpec],
+                              thinking: bool) -> AsyncGenerator[ModelEvent, None]:
         async with asyncio.timeout(self._settings.model_timeout):
-            async with aclosing(self._model.stream(messages, (), thinking=False)) as stream:
+            async with aclosing(self._model.stream(messages, tools, thinking=thinking)) as stream:
                 async for event in stream:
                     yield event
 
