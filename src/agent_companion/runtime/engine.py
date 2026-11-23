@@ -10,11 +10,11 @@ from pathlib import Path
 from uuid import uuid4
 
 from ..config import RuntimeSettings
-from ..protocol import (BackgroundChannel, Channel, DeliveryStatus, Message, Model, ModelError, ModelEvent,
-                        ReasoningDelta, Receipt, ReplayReady, ReplayScope, ReplyInfo, ReplyStream,
-                        RequestBudget, RequestTooLarge, TextDelta, ToolCall, ToolReady, ToolSpec)
+from ..protocol import (BackgroundChannel, Channel, DeliveryStatus, InputUsage, Message, Model, ModelError,
+                        ModelEvent, ReasoningDelta, Receipt, ReplayReady, ReplayScope, ReplyInfo,
+                        ReplyStream, TextDelta, ToolCall, ToolReady, ToolSpec)
 from ..storage.sqlite import History, ReplyOutcome
-from .context import Context, ProtectedContextTooLarge, ProtectedRequestTooLarge
+from .context import Context
 from .instructions import InstructionsError
 from .tools import ToolContext, Tools
 
@@ -53,7 +53,6 @@ class Runtime:
         replay_scope = getattr(model, "replay_scope", None)
         self._replay_scope = replay_scope if isinstance(replay_scope, ReplayScope) else None
         self._context = Context(history, self._settings, self._summary_stream,
-                                 request_budget=model if isinstance(model, RequestBudget) else None,
                                  replay_scope=self._replay_scope, agents_path=Path.cwd() / "AGENTS.md")
         self._pending: deque[_InputBatch] = deque()
         self._queued_inbound: set[int] = set()
@@ -153,11 +152,6 @@ class Runtime:
             if message_ids:
                 await self._run(run_id, message_ids[0], has_user_input=batch.has_user_input,
                                 wait_for_delivery=batch.wait_for_delivery)
-        except ProtectedContextTooLarge:
-            self.last_failure = "protected_context_too_large"
-        except ProtectedRequestTooLarge:
-            self.last_failure = "protected_request_too_large"
-            _LOG.warning("Current input exceeds the model request body limit")
         except InstructionsError as exc:
             self.last_failure = exc.diagnostic
             _LOG.warning("Local system instructions unavailable (%s)", exc.diagnostic)
@@ -170,17 +164,10 @@ class Runtime:
     async def _run(self, run_id: str, protected_from: int, *, has_user_input: bool,
                    wait_for_delivery: bool) -> None:
         for index in range(self._settings.max_tool_rounds):
-            try:
-                messages = await self._context.prepare(self.session_id, thinking=self._thinking,
-                                                       tools=self._tools.specs, instructions=self._instructions,
-                                                       protected_from=protected_from)
-            except (ProtectedContextTooLarge, ProtectedRequestTooLarge) as exc:
-                if index == 0:
-                    raise
-                self.last_failure = ("protected_context_too_large" if isinstance(exc, ProtectedContextTooLarge)
-                                     else "protected_request_too_large")
-                _LOG.warning("tool continuation not sent (%s); run=%s", self.last_failure, run_id)
-                return
+            messages = await self._context.prepare(self.session_id, thinking=self._thinking,
+                                                   tools=self._tools.specs, instructions=self._instructions,
+                                                   protected_from=protected_from,
+                                                   last_input_tokens=self.history.last_input_tokens(self.session_id))
             model_status, has_calls = await self._reply(run_id, messages, has_user_input=has_user_input,
                                                        wait_for_delivery=wait_for_delivery)
             if model_status != "complete":
@@ -239,6 +226,7 @@ class Runtime:
         delivery: asyncio.Task[Receipt] | None = None
         model_status = "complete"
         model_error = None
+        input_tokens: int | None = None
         try:
             try:
                 async with asyncio.timeout(self._settings.model_timeout):
@@ -254,6 +242,8 @@ class Runtime:
                                         reply.publish(event.text)
                             elif isinstance(event, ReasoningDelta) and self._thinking:
                                 reasoning.append(event.text)
+                            elif isinstance(event, InputUsage):
+                                input_tokens = event.input_tokens
                             elif isinstance(event, ReplayReady):
                                 if replay is not None or event.replay.scope != self._replay_scope:
                                     raise ModelError("invalid_sse_event")
@@ -268,8 +258,6 @@ class Runtime:
                                 scheduled[call.id] = (call, loop.create_task(self._tools.execute(call, context)))
             except TimeoutError:
                 model_status = "model_timeout"
-            except RequestTooLarge:
-                model_status = "model_request_too_large"
             except ModelError as exc:
                 model_status = "model_failed"
                 model_error = exc.diagnostic
@@ -302,7 +290,8 @@ class Runtime:
                       if receipt is not None or calls or generated_text or replay is not None else [])
             self.history.finalize_reply(
                 ReplyOutcome(info.reply_id, info.session_id, run_id, model_status,
-                             receipt.status if receipt else None, model_error=model_error), rows)
+                             receipt.status if receipt else None, model_error=model_error,
+                             input_tokens=input_tokens if model_status == "complete" else None), rows)
             # 外部副本与主投递状态无关，只在历史事务成功后尽力入队。
             try:
                 if confirmed_text and self._on_confirmed_reply is not None:

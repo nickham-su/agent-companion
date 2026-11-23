@@ -11,14 +11,12 @@ from typing import Any
 import httpx
 
 from ..config import normalize_openai_base_url
-from ..protocol import (MAX_REPLAY_BYTES, Image, Message, ModelError, ModelEvent, ProviderReplay,
-                        ReplayItem, ReplayReady, ReplayScope, RequestTooLarge, Text, TextDelta,
+from ..protocol import (MAX_REPLAY_BYTES, Image, InputUsage, Message, ModelError, ModelEvent, ProviderReplay,
+                        ReplayItem, ReplayReady, ReplayScope, Text, TextDelta,
                         ToolCall, ToolReady, ToolSpec)
 from ._request import JSON_ENCODER, request_body
 
 
-# 本机资源预算，不是 OpenAI 对请求大小的协议承诺。
-MAX_REQUEST_BYTES = 32 * 1024 * 1024
 _MAX_EVENT = 16 * 1024 * 1024
 _MAX_STREAM = 64 * 1024 * 1024
 _MAX_TEXT = 2 * 1024 * 1024
@@ -190,10 +188,12 @@ def _read_output(raw: Any, scope: ReplayScope, done_reasoning: dict[int, tuple[s
         else:
             # 不接受可产生外部副作用的内建工具或尚未定义的 item。
             raise ModelError("responses_unsupported_output")
+    size = 0
     try:
-        request_body([asdict(item) for item in replay], MAX_REPLAY_BYTES)
-    except RequestTooLarge:
-        raise ModelError("responses_output_limit") from None
+        for chunk in JSON_ENCODER.iterencode([asdict(item) for item in replay]):
+            size += len(chunk.encode("utf-8"))
+            if size > MAX_REPLAY_BYTES:
+                raise ModelError("responses_output_limit")
     except UnicodeError:
         raise ModelError("invalid_sse_event") from None
     return text_parts, tuple(calls), ProviderReplay(scope, tuple(replay)) if replay else None
@@ -311,15 +311,18 @@ async def _events(chunks: AsyncIterator[bytes], scope: ReplayScope) -> AsyncIter
                 # 先完整校验本响应所有 item，再派发任何工具。
                 for call in calls:
                     yield ToolReady(call)
+                usage = response.get("usage")
+                if isinstance(usage, dict):
+                    tokens = usage.get("input_tokens")
+                    if type(tokens) is int and 0 <= tokens < 2**63:
+                        yield InputUsage(tokens)
                 return
     raise ModelError("truncated_stream")
 
 
 class OpenAIResponses:
     def __init__(self, client: httpx.AsyncClient, *, model: str, api_key: str, replay_salt: bytes,
-                 reasoning_effort: str, base_url: str | None = None, request_limit: int = MAX_REQUEST_BYTES) -> None:
-        if type(request_limit) is not int or not 0 < request_limit <= MAX_REQUEST_BYTES:
-            raise ValueError("invalid OpenAI Responses request body limit")
+                 reasoning_effort: str, base_url: str | None = None) -> None:
         if not api_key or not api_key.isascii() or any(not 33 <= ord(char) <= 126 for char in api_key):
             raise ValueError("invalid OpenAI Responses API credential")
         if not isinstance(replay_salt, bytes) or len(replay_salt) != 32:
@@ -334,7 +337,6 @@ class OpenAIResponses:
         self._authorization = f"Bearer {api_key}"
         self._model = model
         self.replay_scope = ReplayScope("openai_responses", fingerprint, reasoning_effort)
-        self._request_limit = request_limit
 
     def _payload(self, messages: Sequence[Message], tools: Sequence[ToolSpec]) -> dict[str, Any]:
         items: list[dict[str, Any]] = []
@@ -350,30 +352,13 @@ class OpenAIResponses:
             payload["tools"] = tools_data
         return payload
 
-    def request_fits(self, messages: Sequence[Message], tools: Sequence[ToolSpec], *, thinking: bool) -> bool:
-        return self.remaining_request_bytes(messages, tools, thinking=thinking) is not None
-
-    def remaining_request_bytes(self, messages: Sequence[Message], tools: Sequence[ToolSpec], *,
-                                thinking: bool) -> int | None:
-        payload = self._payload(messages, tools)
-        try:
-            return request_body(payload, self._request_limit)
-        except RequestTooLarge:
-            return None
-
-    def image_replacement_bytes(self, image: Image, placeholder: Text) -> int:
-        return (len(JSON_ENCODER.encode(_input_part(image)).encode("utf-8"))
-                - len(JSON_ENCODER.encode(_input_part(placeholder)).encode("utf-8")))
-
     async def stream(self, messages: Sequence[Message], tools: Sequence[ToolSpec], *,
                      thinking: bool) -> AsyncGenerator[ModelEvent, None]:
         # thinking 是 DeepSeek 内部协议参数；Responses 只采用用户选定的 effort。
-        payload = self._payload(messages, tools)
-        body = bytearray()
-        request_body(payload, self._request_limit, output=body)
+        body = request_body(self._payload(messages, tools))
         terminal: list[ModelEvent] = []
         try:
-            async with self._client.stream("POST", self._endpoint, content=bytes(body), follow_redirects=False,
+            async with self._client.stream("POST", self._endpoint, content=body, follow_redirects=False,
                                            auth=None, headers={
                 "Authorization": self._authorization,
                 "Accept": "text/event-stream", "Content-Type": "application/json", "Accept-Encoding": "identity",

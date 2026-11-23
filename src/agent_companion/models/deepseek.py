@@ -8,15 +8,13 @@ from typing import Any
 
 import httpx
 
-from ..protocol import (Image, Message, ModelError, ModelEvent, ReasoningDelta, RequestTooLarge,
-                        Text, TextDelta, ToolCall, ToolReady, ToolSpec)
-from ._request import JSON_ENCODER, request_body
+from ..protocol import (Image, InputUsage, Message, ModelError, ModelEvent, ReasoningDelta, Text,
+                        TextDelta, ToolCall, ToolReady, ToolSpec)
+from ._request import request_body
 
 
 CHAT_COMPLETIONS = "https://api.deepseek.com/chat/completions"
 MODEL_NAME = "deepseek-flash"
-# 供应商公布 48 MiB；本机更早裁剪，为请求开销预留余量。
-MAX_REQUEST_BYTES = 40 * 1024 * 1024
 
 
 def _content_part(part: Text | Image) -> dict[str, Any]:
@@ -45,7 +43,7 @@ def build_request(messages: Sequence[Message], tools: Sequence[ToolSpec], *, thi
                 raise ModelError("missing_reasoning")
             item["reasoning_content"] = message.reasoning
         result.append(item)
-    payload = {"model": model, "stream": True, "messages": result,
+    payload = {"model": model, "stream": True, "stream_options": {"include_usage": True}, "messages": result,
                "thinking": {"type": "enabled" if thinking else "disabled"}}
     if thinking and reasoning_effort is not None:
         payload["reasoning_effort"] = reasoning_effort
@@ -109,6 +107,7 @@ class _ToolParts:
 async def parse_stream(lines: AsyncIterator[str]) -> AsyncIterator[ModelEvent]:
     fragments: dict[int, _ToolParts] = {}
     finish: str | None = None
+    input_usage: InputUsage | None = None
     async for event in _events(lines):
         if event == "[DONE]":
             if finish == "tool_calls" and fragments:
@@ -119,11 +118,18 @@ async def parse_stream(lines: AsyncIterator[str]) -> AsyncIterator[ModelEvent]:
                     yield ToolReady(call)
             elif finish != "stop" or fragments:
                 raise ModelError("invalid_stream_finish")
+            if input_usage is not None:
+                yield input_usage
             return
         try:
             item = json.loads(event)
             if not isinstance(item, dict) or "error" in item:
                 raise ValueError
+            usage = item.get("usage")
+            if isinstance(usage, dict):
+                tokens = usage.get("prompt_tokens")
+                if type(tokens) is int and 0 <= tokens < 2**63:
+                    input_usage = InputUsage(tokens)
             choices = item["choices"]
             if not isinstance(choices, list) or len(choices) > 1:
                 raise ValueError
@@ -159,12 +165,9 @@ async def parse_stream(lines: AsyncIterator[str]) -> AsyncIterator[ModelEvent]:
 
 
 class DeepSeek:
-    def __init__(self, client: httpx.AsyncClient, *, request_limit: int = MAX_REQUEST_BYTES,
-                 model: str = MODEL_NAME, reasoning_effort: str | None = None) -> None:
-        if type(request_limit) is not int or not 0 < request_limit <= MAX_REQUEST_BYTES:
-            raise ValueError("invalid DeepSeek request body limit")
+    def __init__(self, client: httpx.AsyncClient, *, model: str = MODEL_NAME,
+                 reasoning_effort: str | None = None) -> None:
         self._client = client
-        self._request_limit = request_limit
         self._model = model
         self._effort = reasoning_effort
 
@@ -172,27 +175,11 @@ class DeepSeek:
         return build_request(messages, tools, model=self._model,
                              thinking=thinking and self._effort != "disabled", reasoning_effort=self._effort)
 
-    def request_fits(self, messages: Sequence[Message], tools: Sequence[ToolSpec], *, thinking: bool) -> bool:
-        return self.remaining_request_bytes(messages, tools, thinking=thinking) is not None
-
-    def remaining_request_bytes(self, messages: Sequence[Message], tools: Sequence[ToolSpec], *,
-                                thinking: bool) -> int | None:
-        try:
-            return request_body(self._payload(messages, tools, thinking), self._request_limit)
-        except RequestTooLarge:
-            return None
-
-    def image_replacement_bytes(self, image: Image, placeholder: Text) -> int:
-        return (len(JSON_ENCODER.encode(_content_part(image)).encode("utf-8"))
-                - len(JSON_ENCODER.encode(_content_part(placeholder)).encode("utf-8")))
-
     async def stream(self, messages: Sequence[Message], tools: Sequence[ToolSpec], *,
                      thinking: bool) -> AsyncGenerator[ModelEvent, None]:
-        # 对将要发送的准确字节做最终硬检查，避免 httpx 再序列化后改变正文大小。
-        body = bytearray()
-        request_body(self._payload(messages, tools, thinking), self._request_limit, output=body)
+        body = request_body(self._payload(messages, tools, thinking))
         try:
-            async with self._client.stream("POST", CHAT_COMPLETIONS, content=bytes(body),
+            async with self._client.stream("POST", CHAT_COMPLETIONS, content=body,
                                            headers={"Accept": "text/event-stream",
                                                     "Content-Type": "application/json"}) as response:
                 if not response.is_success:

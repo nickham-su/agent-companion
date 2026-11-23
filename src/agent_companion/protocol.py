@@ -96,7 +96,14 @@ class ToolReady:
     call: ToolCall
 
 
-ModelEvent = TextDelta | ReasoningDelta | ToolReady | ReplayReady
+@dataclass(frozen=True, slots=True)
+class InputUsage:
+    """服务端报告的整次请求实际输入 token 数。"""
+
+    input_tokens: int
+
+
+ModelEvent = TextDelta | ReasoningDelta | ToolReady | ReplayReady | InputUsage
 
 
 class ModelError(Exception):
@@ -114,37 +121,17 @@ _MODEL_DIAGNOSTICS = frozenset({
     "abnormal_stream_finish", "duplicate_tool_id", "empty_summary", "incomplete_tool_call",
     "internal_tool_call", "invalid_sse_event", "invalid_stream_finish", "invalid_tool_arguments",
     "invalid_tool_delta", "invalid_tool_id", "missing_reasoning", "transport_error", "truncated_stream",
-    "unsupported_tool_type", "request_body_too_large", "responses_output_limit", "responses_event_limit",
+    "unsupported_tool_type", "responses_output_limit", "responses_event_limit",
     "responses_unsupported_encoding", "responses_unsupported_output", "responses_unexpected_response",
-    "summary_context_too_large", "summary_tool_call", "summary_private_echo", "agents_md_invalid_file",
+    "summary_tool_call", "summary_private_echo", "agents_md_invalid_file",
     "agents_md_unreadable", "agents_md_too_large", "agents_md_invalid_utf8",
 })
-
-
-class RequestTooLarge(ModelError):
-    """请求超出模型提供方的 HTTP 正文字节预算。"""
 
 
 class Model(Protocol):
     def stream(
         self, messages: Sequence[Message], tools: Sequence[ToolSpec], *, thinking: bool
     ) -> AsyncGenerator[ModelEvent, None]: ...
-
-
-@runtime_checkable
-class RequestBudget(Protocol):
-    """可选：模型适配器的请求正文上限，独立于 Runtime 的 token 预算。"""
-
-    def request_fits(self, messages: Sequence[Message], tools: Sequence[ToolSpec], *, thinking: bool) -> bool: ...
-
-    def remaining_request_bytes(self, messages: Sequence[Message], tools: Sequence[ToolSpec], *,
-                                thinking: bool) -> int | None:
-        """准确剩余字节数；None 表示当前请求已超限。"""
-        ...
-
-    def image_replacement_bytes(self, image: Image, placeholder: Text) -> int:
-        """同一内容数组中用图片替换文字占位带来的正文字节增量。"""
-        ...
 
 
 class DeliveryStatus(StrEnum):

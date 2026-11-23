@@ -7,7 +7,7 @@ import unittest
 from unittest.mock import patch
 
 from agent_companion.config import RuntimeSettings
-from agent_companion.protocol import DeliveryStatus, Message, Receipt, TextDelta, ToolCall, ToolReady, ToolSpec
+from agent_companion.protocol import DeliveryStatus, InputUsage, Message, Receipt, TextDelta, ToolCall, ToolReady, ToolSpec
 from agent_companion.runtime.context import _SUMMARIZE
 from agent_companion.runtime.engine import Runtime
 from agent_companion.runtime.instructions import MAX_AGENTS_BYTES
@@ -114,37 +114,26 @@ class LocalInstructionsTests(unittest.IsolatedAsyncioTestCase):
                          ["固定指令\n\n第一版", "固定指令\n\n第二版"])
         self.assertEqual(model.requests[-1][-1].content, "工具结果")
 
-    async def test_each_summary_batch_and_later_normal_request_reads_a_new_snapshot(self):
+    async def test_summary_and_later_normal_request_read_separate_snapshots(self):
         self.path.write_text("第一版", encoding="utf-8")
         self.history.append("main", [Message("user", f"old {i} " + "x" * 258) for i in range(3)])
 
         def respond(index, messages):
             if messages[-1] == _SUMMARIZE:
-                self.path.write_text(f"更新 {index}", encoding="utf-8")
+                self.path.write_text("y" * 700, encoding="utf-8")
                 return [TextDelta("摘要")]
-            return [TextDelta("answer")]
+            return [TextDelta("answer"), InputUsage(230)]
 
         model = Model(respond)
         runtime = self.runtime(model, settings=RuntimeSettings(context_budget=230, tail_budget=70))
-        await self.turn(runtime)
-        self.assertIsNone(runtime.last_failure)
-        self.assertEqual(len(model.requests), 4)
-        self.assertEqual([request[0].content for request in model.requests],
-                         [f"固定指令\n\n{value}" for value in ("第一版", "更新 1", "更新 2", "更新 3")])
-        self.assertTrue(all(request[-1] == _SUMMARIZE for request in model.requests[:-1]))
-        self.assertEqual(model.requests[-1][-1], Message("user", "新消息"))
-
-    async def test_revalidates_refreshed_prompt_before_normal_request_without_recompacting(self):
-        self.history.append("main", [Message("user", "old " + "x" * 360)])
-
-        def respond(index, messages):
-            self.path.write_text("y" * 700, encoding="utf-8")
-            return [TextDelta("摘要")]
-
-        model = Model(respond)
-        runtime = self.runtime(model, settings=RuntimeSettings(context_budget=240, tail_budget=75))
+        await self.turn(runtime, "首次请求")
         await self.turn(runtime, "新" * 120)
-        self.assertEqual(runtime.last_failure, "protected_context_too_large")
-        self.assertEqual(len(model.requests), 1)
-        self.assertEqual(model.requests[0][-1], _SUMMARIZE)
+        self.assertIsNone(runtime.last_failure)
+        self.assertEqual(len(model.requests), 3)
+        first, summary, last = model.requests
+        self.assertEqual(first[0].content, "固定指令\n\n第一版")
+        self.assertEqual(summary[0], first[0])
+        self.assertEqual(summary[-1], _SUMMARIZE)
+        self.assertEqual(last[0].content, "固定指令\n\n" + "y" * 700)
+        self.assertEqual(last[-1], Message("user", "新" * 120))
         self.assertEqual(self.history.summary("main").text, "摘要")

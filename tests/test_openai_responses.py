@@ -15,7 +15,7 @@ from agent_companion.app import running_agent
 from agent_companion.config import LLMSettings, RuntimeSettings, load_settings
 from agent_companion.models.deepseek import CHAT_COMPLETIONS, DeepSeek
 from agent_companion.models.openai_responses import OpenAIResponses
-from agent_companion.protocol import (OMITTED_INPUT_IMAGE, DeliveryStatus, Image, Message, ModelError, Receipt,
+from agent_companion.protocol import (DeliveryStatus, Image, InputUsage, Message, ModelError, Receipt,
                                       ReplayReady, Text, ToolSpec)
 from agent_companion.runtime.context import _SUMMARIZE
 from agent_companion.runtime.engine import Runtime
@@ -51,8 +51,11 @@ def _delta(body, output=0, part=0):
     return {"type": "response.output_text.delta", "output_index": output, "content_index": part, "delta": body}
 
 
-def _completed(*items):
-    return {"type": "response.completed", "response": {"status": "completed", "output": list(items)}}
+def _completed(*items, input_tokens=None):
+    response = {"status": "completed", "output": list(items)}
+    if input_tokens is not None:
+        response["usage"] = {"input_tokens": input_tokens, "output_tokens": 9000, "total_tokens": 9999}
+    return {"type": "response.completed", "response": response}
 
 
 class _Wire(httpx.AsyncByteStream):
@@ -417,7 +420,7 @@ class OpenAIResponsesTests(unittest.IsolatedAsyncioTestCase):
             tool = AsyncMock(side_effect=receive_at_tool_boundary)
             tools = Tools([Tool(_SPEC, tool)])
             async with httpx.AsyncClient(transport=fixture.transport) as client:
-                runtime = Runtime("main", history, _model(client, history=history, request_limit=1000), channel,
+                runtime = Runtime("main", history, _model(client, history=history), channel,
                                   settings=settings, tools=tools)
                 try:
                     runtime.submit_batch([Message("user", "prompt")])
@@ -438,11 +441,11 @@ class OpenAIResponsesTests(unittest.IsolatedAsyncioTestCase):
             {"role": "user", "content": "same batch"},
         ])
 
-    async def test_reasoning_continuation_can_compact_or_replace_images(self):
+    async def test_reasoning_continuation_compacts_history_or_keeps_current_image(self):
         for mode in ("compact", "image"):
             with self.subTest(mode=mode), closing(History(":memory:")) as history:
                 tool = AsyncMock(return_value="r" * 285)
-                initial, final = [_completed(_reason(), _call())], [_completed(_answer("done"))]
+                initial, final = [_completed(_reason(), _call(), input_tokens=270)], [_completed(_answer("done"))]
                 if mode == "compact":
                     history.append("main", [Message("user", "x" * 360)])
                     fixture = _Fixture(self, initial, [_completed(_answer("summary"))], final)
@@ -457,10 +460,10 @@ class OpenAIResponsesTests(unittest.IsolatedAsyncioTestCase):
                     image = Image("data:image/png;base64," + "YQAA" * 100)
                     prompt = Message("user", (Text("image"), image))
                     fixture = _Fixture(self, initial, final)
-                    self.assertIsNone(await _complete(fixture, history, prompt=prompt, request_limit=1000,
+                    self.assertIsNone(await _complete(fixture, history, prompt=prompt,
                                                       tools=Tools([Tool(_SPEC, tool)])))
                     self.assertEqual(fixture.requests[0]["input"][0]["content"][1]["image_url"], image.url)
-                    self.assertNotIn("input_image", json.dumps(fixture.requests[1]))
+                    self.assertEqual(fixture.requests[1]["input"][0], fixture.requests[0]["input"][0])
                     self.assertEqual(history.read_after("main")[0].message, prompt)
                 tool.assert_awaited_once()
                 self.assertEqual(fixture.requests[-1]["input"][-3:], [
@@ -468,7 +471,7 @@ class OpenAIResponsesTests(unittest.IsolatedAsyncioTestCase):
                     {"type": "function_call_output", "call_id": "call_1", "output": "r" * 285},
                 ])
 
-    async def test_budget_downgrade_then_replay_with_queued_input(self):
+    async def test_images_remain_in_replay_with_queued_input(self):
         image = Image("data:image/png;base64," + "YQAA" * 225)
         prompt = Message("user", (Text("image"), image))
         first_result, second_result = "r" * 285, "second result"
@@ -486,7 +489,7 @@ class OpenAIResponsesTests(unittest.IsolatedAsyncioTestCase):
         tool = AsyncMock(side_effect=execute)
         with closing(History(":memory:")) as history:
             async with httpx.AsyncClient(transport=fixture.transport) as client:
-                runtime = Runtime("main", history, _model(client, history=history, request_limit=1400), channel,
+                runtime = Runtime("main", history, _model(client, history=history), channel,
                                   tools=Tools([Tool(_SPEC, tool)]))
                 try:
                     runtime.submit_batch([prompt])
@@ -497,37 +500,32 @@ class OpenAIResponsesTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual([row.message.content for row in history.read_after("main")
                               if row.message.role == "assistant"], ["", "ABC", "done"])
         self.assertEqual([call.args[1].call_id for call in tool.await_args_list], ["call_1", "call_2"])
-        first, downgraded, continued = (request["input"] for request in fixture.requests)
+        first, intermediate, continued = (request["input"] for request in fixture.requests)
         self.assertEqual(first[0]["content"][1]["image_url"], image.url)
         calls = [{k: v for k, v in _call(n).items() if k != "status"} for n in (1, 2)]
-        self.assertEqual(downgraded, [
-            {"role": "user", "content": [{"type": "input_text", "text": text}
-                                         for text in ("image", OMITTED_INPUT_IMAGE.text)]},
+        self.assertEqual(intermediate, [
+            first[0],
             calls[0], {"type": "function_call_output", "call_id": "call_1", "output": first_result},
         ])
-        self.assertEqual(continued, downgraded + [
+        self.assertEqual(continued, intermediate + [
             _reason(), {"role": "assistant", "content": "ABC"}, calls[1],
             {"type": "function_call_output", "call_id": "call_2", "output": second_result},
             {"role": "user", "content": "queued"},
         ])
 
-    async def test_protected_tool_group_over_either_budget_never_sends_or_reruns_tools(self):
+    async def test_tool_group_over_soft_threshold_is_sent_once_and_whole(self):
         settings = RuntimeSettings(context_budget=240, tail_budget=75)
-        for limit, result_size, failure in [(2000, 1500, "protected_context_too_large"),
-                                            (700, 285, "protected_request_too_large")]:
-            with self.subTest(failure=failure), closing(History(":memory:")) as history:
-                tool = AsyncMock(return_value="r" * result_size)
-                fixture = _Fixture(self, [_completed(_reason(), _call())])
-                with self.assertLogs("agent_companion.runtime.engine", level="WARNING") as logs:
-                    self.assertEqual(await _complete(fixture, history, settings=settings, request_limit=limit,
-                                                     tools=Tools([Tool(_SPEC, tool)])), failure)
-                tool.assert_awaited_once()
-                self.assertEqual(len(fixture.requests), 1)
-                self.assertIsNone(history.summary("main"))
-                self.assertEqual(history.read_after("main")[-1].message.tool_call_id, "call_1")
-                self.assertEqual([record.getMessage() for record in logs.records], [
-                    f"tool continuation not sent ({failure}); run={history.outcomes('main')[0].run_id}",
-                ])
+        result = "r" * 1500
+        tool = AsyncMock(return_value=result)
+        fixture = _Fixture(self, [_completed(_reason(), _call(), input_tokens=240)], [_completed(_answer("done"))])
+        with closing(History(":memory:")) as history:
+            self.assertIsNone(await _complete(fixture, history, settings=settings, tools=Tools([Tool(_SPEC, tool)])))
+            self.assertEqual(len(fixture.requests), 2)
+            self.assertIsNone(history.summary("main"))
+            self.assertEqual(fixture.requests[-1]["input"][-1],
+                             {"type": "function_call_output", "call_id": "call_1", "output": result})
+            self.assertEqual(history.outcomes("main")[0].input_tokens, 240)
+        tool.assert_awaited_once()
 
     async def test_missing_or_damaged_active_replay_uses_common_tool_pair(self):
         for damage in ("missing", "call-id", "escaped-surrogate", "invalid-utf8"):
@@ -580,7 +578,7 @@ class OpenAIResponsesTests(unittest.IsolatedAsyncioTestCase):
         tool = AsyncMock(return_value="historical result")
         registry = Tools([Tool(_SPEC, tool)])
         options = {"tools": registry, "instructions": "fixed synthetic instructions"}
-        fixture = _Fixture(self, [_completed(private, _call())], [_completed(_answer("retained tail"))],
+        fixture = _Fixture(self, [_completed(private, _call())], [_completed(_answer("retained tail"), input_tokens=2500)],
                            [_completed(_answer("compressed"))], [_completed(_answer("new response"))])
         channel = _Channel()
         with closing(History(":memory:")) as history:
@@ -608,136 +606,21 @@ class OpenAIResponsesTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(channel.replies, ["retained tail", "new response"])
         tool.assert_awaited_once()
 
-    async def test_summary_checks_exact_byte_budget_and_can_replace_old_image(self):
-        fixture = _Fixture(self, [_completed(_answer("compressed"))], [_completed(_answer("new answer"))])
-        previous = Message("user", (Text("historical caption"), Image("data:image/png;base64," + "YQAA" * 400)))
-        current = "x" * 690
-        with closing(History(":memory:")) as history:
-            covered, = history.append("main", [previous])
-            settings = RuntimeSettings(context_budget=2280, tail_budget=260)
-            self.assertIsNone(await _complete(fixture, history, settings=settings, request_limit=950,
-                                              prompt=Message("user", current)))
-            self.assertEqual(len(fixture.requests), 2)
-            compressed, _ = fixture.requests
-            self.assertLessEqual(len(json.dumps(compressed, ensure_ascii=False, separators=(",", ":"))
-                                     .encode("utf-8")), 950)
-            self.assertEqual(compressed["input"][-1], {"role": "user", "content": _SUMMARIZE.content})
-            self.assertIn("历史图片已省略", repr(compressed))
-            self.assertIn("historical caption", repr(compressed))
-            self.assertNotIn(current, repr(compressed))
-            self.assertNotIn("input_image", repr(compressed))
-            self.assertEqual(history.read_after("main")[0].message, previous)
-            self.assertEqual(history.summary("main"), Summary(covered, "compressed"))
+    async def test_request_larger_than_old_body_limit_is_sent(self):
+        image = Image("data:image/png;base64," + "A" * (32 * 1024 * 1024))
+        seen = []
 
-    async def test_summary_batches_consecutive_oversized_images_until_native_block(self):
-        limit = 8192
-        large = Image("data:image/png;base64," + "YQAA" * 2200)
+        def endpoint(request):
+            self.assertGreater(len(request.content), 32 * 1024 * 1024)
+            payload = json.loads(request.content)
+            self.assertEqual(payload["input"][0]["content"][0]["image_url"], image.url)
+            seen.append(True)
+            return httpx.Response(413)
 
-        def wire_size(request):
-            return len(json.dumps(request, ensure_ascii=False, separators=(",", ":")).encode("utf-8"))
-
-        for native_boundary in (False, True):
-            with self.subTest(native_boundary=native_boundary), closing(History(":memory:")) as history:
-                old = [Message("user", (Text(f"old image {i:02d}"), large)) for i in range(20)]
-                if native_boundary:
-                    seed, = history.append("main", [Message("user", "prior covered input")])
-                    history.save_summary("main", Summary(seed, "previous summary " * 65))
-                    medium = Image("data:image/png;base64," + "YQAA" * 1850)
-                    old.insert(10, Message("user", (Text("native boundary"), medium)))
-                old_ids = history.append("main", old + [Message("user", "retained tail")])
-                expected = [range(10), (), range(10, 20)] if native_boundary else [range(20)]
-                summaries = [[_completed(_answer(f"summary {i}"))] for i in range(len(expected))]
-                fixture = _Fixture(self, *summaries, [_completed(_answer("normal response"))])
-                settings = RuntimeSettings(context_budget=8000, tail_budget=100)
-                current = Message("user", "current user input")
-                self.assertIsNone(await _complete(fixture, history, settings=settings, request_limit=limit,
-                                                  prompt=current))
-                self.assertEqual(len(fixture.requests), len(expected) + 1)
-                if native_boundary:
-                    first, middle = fixture.requests[:2]
-                    # 中间块单独可原生发送，却放不进携带原有摘要的请求，因此仍须停止合批。
-                    self.assertGreater(wire_size({**middle, "input": first["input"][:1] + middle["input"][1:]}),
-                                       limit)
-                for request, included in zip(fixture.requests[:-1], expected):
-                    self.assertLessEqual(wire_size(request), limit)
-                    self.assertEqual(request["input"][-1], {"role": "user", "content": _SUMMARIZE.content})
-                    serialized = repr(request)
-                    self.assertNotIn("retained tail", serialized)
-                    self.assertNotIn(current.content, serialized)
-                    self.assertEqual("input_image" in serialized, not included)
-                    self.assertEqual(serialized.count("历史图片已省略"), len(included))
-                    for i in range(20):
-                        self.assertEqual(f"old image {i:02d}" in serialized, i in included)
-                    self.assertEqual("native boundary" in serialized, not included)
-                self.assertEqual(history.summary("main"), Summary(old_ids[-2], f"summary {len(expected) - 1}"))
-                self.assertEqual(history.read_after("main")[int(native_boundary)].message, old[0])
-                self.assertIn("retained tail", repr(fixture.requests[-1]))
-                self.assertIn(current.content, repr(fixture.requests[-1]))
-
-    async def test_summary_keeps_initial_block_that_fits_natively_alone_out_of_degraded_batch(self):
-        limit = 8192
-        medium = Image("data:image/png;base64," + "YQAA" * 1850)
-        large = Image("data:image/png;base64," + "YQAA" * 2200)
-        first = Message("user", (Text("native first"), medium))
-        followers = [Message("user", (Text(f"oversized follower {i}"), large)) for i in range(2)]
-        fixture = _Fixture(self, [_completed(_answer("first summary"))], [_completed(_answer("combined followers"))],
-                           [_completed(_answer("normal response"))])
-        with closing(History(":memory:")) as history:
-            seed, = history.append("main", [Message("user", "prior covered input")])
-            previous = Summary(seed, "previous summary " * 65)
-            history.save_summary("main", previous)
-            covered = history.append("main", [first, *followers])[-1]
-            async with httpx.AsyncClient(transport=fixture.transport) as client:
-                adapter = _model(client, history=history, request_limit=limit)
-                old_summary = Message("system", "此前会话摘要：\n" + previous.text)
-                self.assertTrue(adapter.request_fits([first, _SUMMARIZE], (), thinking=False))
-                self.assertFalse(adapter.request_fits([old_summary, first, _SUMMARIZE], (), thinking=False))
-                self.assertFalse(adapter.request_fits([followers[0], _SUMMARIZE], (), thinking=False))
-            settings = RuntimeSettings(context_budget=3000, tail_budget=100)
-            self.assertIsNone(await _complete(fixture, history, settings=settings, request_limit=limit))
-            self.assertEqual(len(fixture.requests), 3)
-            initial, following, _ = (repr(request) for request in fixture.requests)
-            self.assertIn("native first", initial)
-            self.assertEqual(initial.count("历史图片已省略"), 1)
-            self.assertNotIn("oversized follower", initial)
-            self.assertNotIn("native first", following)
-            self.assertIn("first summary", following)
-            for i in range(2):
-                self.assertIn(f"oversized follower {i}", following)
-            self.assertEqual(following.count("历史图片已省略"), 2)
-            self.assertEqual(history.summary("main"), Summary(covered, "combined followers"))
-
-    async def test_old_openai_replay_over_byte_budget_can_archive_complete_group(self):
-        private = "opaque-synthetic-" + "Q" * 1600
-        tool = AsyncMock(return_value="compacted visible tool result")
-        tools = Tools([Tool(_SPEC, tool)])
-        fixture = _Fixture(self, [_completed(_reason(cipher=private), _answer("historical decision"), _call())],
-                           [_completed(_answer("retained tail"))], [_completed(_answer("first summary"))],
-                           [_completed(_answer("updated summary"))], [_completed(_answer("current response"))])
-        with closing(History(":memory:")) as history:
-            old = Message("user", "old " + "x" * 390)
-            self.assertIsNone(await _complete(fixture, history, prompt=old, tools=tools))
-            before = history.read_after("main")
-            self.assertEqual(len(before), 4)
-            settings = RuntimeSettings(context_budget=304, tail_budget=145)
-            self.assertIsNone(await _complete(fixture, history, settings=settings, request_limit=1150,
-                                              tools=tools, prompt=Message("user", "new " + "y" * 310)))
-            self.assertEqual(len(fixture.requests), 5)
-            continuation, first, archived, _ = fixture.requests[1:]
-            self.assertIn(private, repr(continuation))
-            self.assertIn(old.content, repr(first))
-            self.assertEqual(archived["input"][-1], {"role": "user", "content": _SUMMARIZE.content})
-            self.assertEqual(archived["tools"], continuation["tools"])
-            self.assertEqual(archived["reasoning"], continuation["reasoning"])
-            for visible in ("历史归档", "historical decision", "compacted visible tool result", "first summary"):
-                self.assertIn(visible, repr(archived))
-            self.assertNotIn(private, repr(archived))
-            self.assertNotIn("retained tail", repr(archived))
-            self.assertLessEqual(len(json.dumps(archived, ensure_ascii=False, separators=(",", ":"))
-                                     .encode("utf-8")), 1150)
-            self.assertEqual(history.summary("main"), Summary(before[2].message_id, "updated summary"))
-            self.assertEqual(history.read_after("main")[:4], before)
-        tool.assert_awaited_once()
+        async with httpx.AsyncClient(transport=httpx.MockTransport(endpoint)) as client:
+            with self.assertRaisesRegex(ModelError, "^http_413$"):
+                _ = [event async for event in _model(client).stream([Message("user", (image,))], (), thinking=False)]
+        self.assertEqual(seen, [True])
 
     async def test_summary_rejects_obvious_private_replay_echo_but_allows_short_common_text(self):
         long_text = "synthetic long private reasoning token " * 2
@@ -751,7 +634,7 @@ class OpenAIResponsesTests(unittest.IsolatedAsyncioTestCase):
         for case, generated, output_reasoning, rejected in cases:
             with self.subTest(case=case), closing(History(":memory:")) as history:
                 fixture = _Fixture(self, [_completed(_reason(cipher=long_cipher, summary=("status", long_text)),
-                                                     _answer("old response"))],
+                                                     _answer("old response"), input_tokens=252)],
                                    [_completed(*output_reasoning, _answer(generated))],
                                    [_completed(_answer("normal visible reply"))])
                 covered, = history.append("main", [Message("user", "prior seed")])
@@ -823,17 +706,18 @@ class OpenAIResponsesTests(unittest.IsolatedAsyncioTestCase):
                 ])
                 self.assertTrue(history._db.execute("SELECT items FROM provider_replays").fetchone()[0] == _CIPHER)
 
-    async def test_no_reasoning_is_valid_and_request_sizing_matches_actual_body(self):
-        fixture = _Fixture(self, [_completed(_answer("文本"))])
+    async def test_no_reasoning_is_valid_and_input_usage_is_optional(self):
+        fixture = _Fixture(self, [_completed(_answer("文本"), input_tokens=17)],
+                           [_completed(_answer("正常"), input_tokens=True)])
         messages = [Message("user", (Text("文字"), Image(_IMAGE)))]
         async with httpx.AsyncClient(transport=fixture.transport) as client:
-            adapter = _model(client, request_limit=512)
+            adapter = _model(client)
             events = [item async for item in adapter.stream(messages, (), thinking=False)]
-            payload = json.dumps(fixture.requests[0], separators=(",", ":"), ensure_ascii=False).encode()
-            self.assertEqual(adapter.remaining_request_bytes(messages, (), thinking=False), 512 - len(payload))
-            self.assertFalse(adapter.request_fits([Message("user", "y" * 1024)], (), thinking=False))
+            invalid = [item async for item in adapter.stream(messages, (), thinking=False)]
         replay = next(event.replay for event in events if isinstance(event, ReplayReady))
         self.assertEqual([item.kind for item in replay.items], ["message"])
+        self.assertEqual([event for event in events if isinstance(event, InputUsage)], [InputUsage(17)])
+        self.assertFalse(any(isinstance(event, InputUsage) for event in invalid))
 
     async def test_tools_without_reasoning_still_continue(self):
         tool = AsyncMock(return_value="accepted")

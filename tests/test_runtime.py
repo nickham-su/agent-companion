@@ -466,8 +466,7 @@ class RuntimeTest(unittest.IsolatedAsyncioTestCase):
         async def tool(args, context):
             return "completed tool result"
 
-        model = ScriptModel(failed, events(TextDelta("old response summary")),
-                            events(ReasoningDelta("complete reasoning"), TextDelta("new answer")))
+        model = ScriptModel(failed, events(ReasoningDelta("complete reasoning"), TextDelta("new answer")))
         runtime, history = self.setup_runtime(model, Channel(), tools=Tools([Tool(SPEC, tool)]), thinking=True)
         runtime.submit_batch([Message("user", "one")])
         runtime.submit_batch([Message("user", "two")])
@@ -476,16 +475,17 @@ class RuntimeTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(raw[1], Message("assistant", "confirmed prefix", (CALL,)))
         self.assertEqual(raw[2], Message("tool", "completed tool result", tool_call_id=CALL.id))
         self.assertEqual(raw[-1].reasoning, "complete reasoning")
-        summary_messages, tools, thinking = model.requests[1]
+        self.assertIsNone(history.summary("main"))
+        self.assertEqual(len(model.requests), 2)
+        projected, tools, thinking = model.requests[1]
         self.assertTrue(thinking)
         self.assertEqual(tools, (SPEC,))
-        prompt = repr(build_request(summary_messages, tools, thinking=thinking))
+        request = build_request(projected, tools, thinking=thinking)
+        self.assertEqual(request["messages"][1]["role"], "user")
+        prompt = repr(request)
         self.assertIn("confirmed prefix", prompt)
         self.assertIn("completed tool result", prompt)
         self.assertNotIn("unfinished reasoning", prompt)
-        request = repr(build_request(model.requests[2][0], (SPEC,), thinking=True))
-        self.assertIn("old response summary", request)
-        self.assertNotIn("unfinished reasoning", request)
 
     async def test_invalid_tool_arguments_never_invoke_the_handler(self):
         invoked = []

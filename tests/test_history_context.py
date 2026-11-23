@@ -9,9 +9,9 @@ from unittest.mock import patch
 
 from agent_companion.config import RuntimeSettings, load_settings
 from agent_companion.models.deepseek import build_request
-from agent_companion.protocol import (DeliveryStatus, Image, Message, ModelError, ReasoningDelta, Receipt, Text, TextDelta,
+from agent_companion.protocol import (DeliveryStatus, Image, InputUsage, Message, ModelError, ReasoningDelta, Receipt, Text, TextDelta,
                                       ToolCall, ToolReady, ToolSpec)
-from agent_companion.runtime.context import Context, _SUMMARIZE
+from agent_companion.runtime.context import _SUMMARIZE
 from agent_companion.runtime.engine import Runtime
 from agent_companion.runtime.tools import Tool, Tools
 from agent_companion.storage.sqlite import History, ReplyOutcome, Summary
@@ -68,7 +68,9 @@ class HistoryTest(unittest.TestCase):
                                " run_id TEXT NOT NULL, model_status TEXT NOT NULL, delivery_status TEXT)")
                 legacy.execute("INSERT INTO reply_outcomes VALUES ('old', 'main', 'run', 'complete', 'full')")
             with closing(History(path)) as db:
-                db.finalize_reply(ReplyOutcome("new", "main", "run", "complete", DeliveryStatus.FULL),
+                self.assertIsNone(db.last_input_tokens("main"))
+                db.finalize_reply(ReplyOutcome("new", "main", "run", "complete", DeliveryStatus.FULL,
+                                               input_tokens=42),
                                   [Message("assistant", "new body")])
                 db.finalize_reply(ReplyOutcome("empty", "main", "run", "model_failed"), [])
                 expected_id = db.tail("main", 1)[0].message_id
@@ -77,6 +79,10 @@ class HistoryTest(unittest.TestCase):
                 self.assertEqual(outcomes[0], ReplyOutcome("old", "main", "run", "complete", DeliveryStatus.FULL))
                 self.assertEqual(outcomes[1].assistant_message_id, expected_id)
                 self.assertIsNone(outcomes[2].assistant_message_id)
+                self.assertEqual(db.last_input_tokens("main"), 42)
+                self.assertIsNone(db.last_input_tokens("other"))
+                db.finalize_reply(ReplyOutcome("without-usage", "main", "run", "complete"), [])
+                self.assertIsNone(db.last_input_tokens("main"))
 
     def test_default_and_explicit_configuration(self):
         default = load_settings()
@@ -97,9 +103,10 @@ class HistoryTest(unittest.TestCase):
 
 
 class CapturingModel:
-    def __init__(self):
+    def __init__(self, input_tokens=None):
         self.requests = []
         self.summaries = []
+        self.input_tokens = input_tokens
 
     async def stream(self, messages, tools, *, thinking):
         if messages[-1:] == [_SUMMARIZE]:
@@ -110,6 +117,8 @@ class CapturingModel:
             if thinking:
                 yield ReasoningDelta("NEW_REASONING")
             yield TextDelta("ok")
+            if self.input_tokens is not None:
+                yield InputUsage(self.input_tokens)
 
 
 class Sink:
@@ -119,7 +128,11 @@ class Sink:
 
 
 class ProjectionTest(unittest.IsolatedAsyncioTestCase):
-    async def turn(self, history, model, content, **options):
+    async def turn(self, history, model, content, *, previous_input_tokens=None, **options):
+        if previous_input_tokens is not None:
+            reply = f"prior-{len(history.outcomes('main'))}"
+            history.finalize_reply(ReplyOutcome(reply, "main", "fixture", "complete",
+                                                input_tokens=previous_input_tokens), [])
         runtime = Runtime("main", history, model, Sink(), **options)
         try:
             runtime.submit_batch([Message("user", content)])
@@ -138,6 +151,7 @@ class ProjectionTest(unittest.IsolatedAsyncioTestCase):
                     yield ToolReady(CALLS[0])
                     reached.set()
                     await release.wait()
+                    yield InputUsage(240)
                     return
                 async for event in super().stream(messages, tools, thinking=thinking):
                     yield event
@@ -169,7 +183,7 @@ class ProjectionTest(unittest.IsolatedAsyncioTestCase):
                 Message("user", "new intake one"), Message("user", "new intake two"),
             ])
 
-    async def test_protected_tool_group_over_budget_fails_without_incomplete_followup(self):
+    async def test_protected_tool_group_over_threshold_is_sent_whole(self):
         class BigToolModel(CapturingModel):
             async def stream(self, messages, tools, *, thinking):
                 if not self.requests:
@@ -190,14 +204,15 @@ class ProjectionTest(unittest.IsolatedAsyncioTestCase):
                 runtime.submit_batch([Message("user", "start")])
                 runtime.submit_batch([Message("user", "queued")])
                 await asyncio.wait_for(runtime.wait_idle(), 2)
-                self.assertEqual(runtime.last_failure, "protected_context_too_large")
-                self.assertEqual(len(model.requests), 1)
+                self.assertIsNone(runtime.last_failure)
+                self.assertEqual(len(model.requests), 2)
                 self.assertEqual(model.summaries, [])
                 self.assertIsNone(history.summary("main"))
                 raw = [row.message for row in history.read_after("main")]
                 self.assertEqual(raw[1:3], [Message("assistant", "", (CALLS[0],)),
                                              Message("tool", "b" * 600, tool_call_id=CALLS[0].id)])
-                self.assertEqual(raw[-1], Message("user", "queued"))
+                self.assertEqual(raw[-2], Message("user", "queued"))
+                self.assertEqual(model.requests[-1][0][-3:], raw[1:4])
             finally:
                 await runtime.close()
 
@@ -216,6 +231,7 @@ class ProjectionTest(unittest.IsolatedAsyncioTestCase):
                     yield ToolReady(CALLS[0])
                 else:
                     yield TextDelta("正文仍能回答")
+                yield InputUsage(330)
 
         async def tool(args, context):
             return "已完成测试工具"
@@ -263,6 +279,7 @@ class ProjectionTest(unittest.IsolatedAsyncioTestCase):
                     yield ToolReady(CALLS[0])
                 else:
                     yield TextDelta("正文仍能回答")
+                yield InputUsage(330)
 
         async def tool(args, context):
             return "已完成测试工具"
@@ -325,121 +342,54 @@ class ProjectionTest(unittest.IsolatedAsyncioTestCase):
                 finally:
                     await runtime.close()
 
-    async def test_later_summary_chunk_failure_does_not_advance_coverage(self):
-        class LaterFailure(CapturingModel):
-            async def stream(self, messages, tools, *, thinking):
-                if messages[-1:] == [_SUMMARIZE]:
-                    self.summaries.append(tuple(messages))
-                    if len(self.summaries) > 1:
-                        raise TimeoutError
-                    yield TextDelta("未提交的中间摘要")
-                else:
-                    self.requests.append(tuple(messages))
-                    yield TextDelta("正文继续")
-
-        model = LaterFailure()
-        settings = RuntimeSettings(context_budget=230, tail_budget=70)
-        with closing(History(":memory:")) as history:
-            covered, = history.append("main", [Message("user", "此前信息")])
-            saved = Summary(covered, "旧摘要")
-            history.save_summary("main", saved)
-            history.append("main", [Message("user", "old " + "x" * 258)] * 3)
-            with self.assertLogs("agent_companion.runtime.context", level="WARNING") as logs:
-                await self.turn(history, model, "新文本", settings=settings)
-            self.assertEqual(len(model.summaries), 2)
-            self.assertIn("timeout", logs.output[0])
-            self.assertEqual(history.summary("main"), saved)
-            self.assertIn("旧摘要", model.requests[0][0].content)
-            self.assertEqual(model.requests[0][-1].content, "新文本")
-
-    async def test_long_generated_summary_is_saved_in_full_and_does_not_mark_more_history_covered(self):
-        chunks = ("\n摘要开头\n" + "长" * 4_001, "摘要结尾\n")
+    async def test_long_summary_sent_in_full_and_usage_from_summary_is_ignored(self):
+        text = "长" * 4000
 
         class LongSummaryModel(CapturingModel):
             async def stream(self, messages, tools, *, thinking):
-                async for event in super().stream(messages, tools, thinking=thinking):
-                    if isinstance(event, TextDelta) and event.text == "summary-material":
-                        for chunk in chunks:
-                            yield TextDelta(chunk)
-                    else:
-                        yield event
+                if messages[-1] == _SUMMARIZE:
+                    self.summaries.append(tuple(messages))
+                    yield TextDelta(text)
+                    yield InputUsage(7_000)
+                else:
+                    self.requests.append(tuple(messages))
+                    yield TextDelta("正文")
 
-        settings = RuntimeSettings(context_budget=500, tail_budget=200)
-        old = Message("user", "旧消息 " + "x" * 800)
-        current = "新消息 " + "y" * 800
-        with tempfile.TemporaryDirectory(dir=Path.cwd()) as folder:
-            path = Path(folder) / "test.sqlite"
-            with closing(History(path)) as history:
-                covered, = history.append("main", [old])
-                model = LongSummaryModel()
-                await self.turn(history, model, current, settings=settings)
-                self.assertEqual(len(model.summaries), 1)
-                self.assertEqual(model.requests[0][0], [Message("user", current)])
-            with closing(History(path)) as history:
-                saved = Summary(covered, "".join(chunks))
-                self.assertEqual(history.summary("main"), saved)
-                self.assertEqual(history.read_after("main")[0].message, old)
-
-                model = CapturingModel()
-                with self.assertLogs("agent_companion.runtime.context", level="WARNING") as logs:
-                    await self.turn(history, model, current, settings=settings)
-                self.assertIn("summary_context_too_large", logs.output[0])
-                self.assertEqual(model.summaries, [])
-                self.assertEqual(history.summary("main"), saved)
-                self.assertEqual(history.read_after("main", covered)[0].message, Message("user", current))
-
-    async def test_summary_that_does_not_fit_request_is_omitted_but_not_changed_in_storage(self):
-        settings = RuntimeSettings(context_budget=180, tail_budget=70)
-        model = CapturingModel()
-        newest = "x" * 450
+        settings = RuntimeSettings(context_budget=100, tail_budget=70)
+        old = Message("user", "旧" * 800)
+        model = LongSummaryModel()
         with closing(History(":memory:")) as history:
-            covered, = history.append("main", [Message("user", "prior text")])
-            original_summary = Summary(covered, "previous summary " * 12)
-            history.save_summary("main", original_summary)
-            await self.turn(history, model, newest, settings=settings)
-            self.assertEqual(model.requests[0][0], [Message("user", newest)])
-            self.assertEqual(history.summary("main"), original_summary)
+            old_id, = history.append("main", [old])
+            await self.turn(history, model, "新" * 800, settings=settings, previous_input_tokens=100)
+            saved = Summary(old_id, text)
+            self.assertEqual(history.summary("main"), saved)
+            self.assertEqual(model.requests[0][0], Message("system", "此前会话摘要：\n" + text))
+            self.assertIsNone(history.last_input_tokens("main"))
+            await self.turn(history, model, "第二轮", settings=settings)
+            self.assertEqual(len(model.summaries), 1)
+            self.assertEqual(model.requests[1][0], model.requests[0][0])
+            self.assertEqual(history.summary("main"), saved)
+            self.assertEqual(history.read_after("main")[0].message, old)
 
-    async def test_no_room_for_summary_uses_existing_tail_without_marking_old_history_covered(self):
-        settings = RuntimeSettings(context_budget=180, tail_budget=70)
-        model = CapturingModel()
-        newest = "x" * 510
+    async def test_long_requests_do_not_compact_without_reported_threshold(self):
+        settings = RuntimeSettings(context_budget=100, tail_budget=70)
+        fixed = "系统指令" * 800
+        old = Message("user", (Text("旧" * 800), Image("data:image/png;base64,AAAA")))
+        current = "新" * 800
+        model = CapturingModel(99)
         with closing(History(":memory:")) as history:
-            covered, prior = history.append("main", [Message("user", "already summarized"),
-                                                     Message("user", "old uncompressed " * 16)])
-            original_summary = Summary(covered, "stored summary")
-            history.save_summary("main", original_summary)
-            await self.turn(history, model, newest, settings=settings)
-            self.assertEqual(model.requests[0][0], [Message("user", newest)])
+            history.append("main", [old])
+            await self.turn(history, model, current, settings=settings, instructions=fixed)
+            self.assertEqual(model.requests[0][0], [Message("system", fixed), old, Message("user", current)])
+            self.assertEqual(history.last_input_tokens("main"), 99)
+            await self.turn(history, model, current, settings=settings, instructions=fixed)
+            self.assertEqual(model.requests[1][0][1], old)
+            self.assertEqual(model.requests[1][0][-1], Message("user", current))
             self.assertEqual(model.summaries, [])
-            self.assertEqual(history.summary("main"), original_summary)
-            self.assertEqual(history.read_after("main", covered)[0].message_id, prior)
-
-    async def test_one_oversized_input_does_not_prevent_later_turns(self):
-        settings = RuntimeSettings(context_budget=180, tail_budget=90)
-        model = CapturingModel()
-        oversized = "q" * 2000
-        with closing(History(":memory:")) as history:
-            runtime = Runtime("main", history, model, Sink(), settings=settings)
-            try:
-                runtime.submit_batch([Message("user", oversized)])
-                await asyncio.wait_for(runtime.wait_idle(), 2)
-                self.assertEqual(runtime.last_failure, "protected_context_too_large")
-                self.assertEqual(model.requests, [])
-
-                runtime.submit_batch([Message("user", "fits")])
-                await asyncio.wait_for(runtime.wait_idle(), 2)
-                self.assertIsNone(runtime.last_failure)
-                self.assertEqual(history.read_after("main")[0].message.content, oversized)
-                self.assertIn("原文仍可查", history.summary("main").text)
-                self.assertEqual(model.requests[0][0][-1], Message("user", "fits"))
-                self.assertEqual(model.summaries, [])
-            finally:
-                await runtime.close()
 
     async def test_context_compaction_keeps_blocks_raw_history_and_previous_summary(self):
         settings = RuntimeSettings(context_budget=275, tail_budget=125)
-        model = CapturingModel()
+        model = CapturingModel(275)
         with tempfile.TemporaryDirectory(dir=Path.cwd()) as folder:
             path = Path(folder) / "test.sqlite"
             with closing(History(path)) as history:
@@ -451,7 +401,7 @@ class ProjectionTest(unittest.IsolatedAsyncioTestCase):
                 tool_ids = [row.message_id for row in history.read_after("main")[1:]]
                 history.append("child", [Message("user", "other-session")])
                 history.append("main", [Message("user", f"old-{i} " + "z" * 130) for i in range(5)])
-                await self.turn(history, model, "new tail", settings=settings)
+                await self.turn(history, model, "new tail", settings=settings, previous_input_tokens=275)
                 summary = history.summary("main")
                 self.assertIsNotNone(summary)
                 self.assertNotIn(summary.covers_through, tool_ids[:2])
@@ -498,6 +448,7 @@ class ProjectionTest(unittest.IsolatedAsyncioTestCase):
                     self.requests.append(payload)
                     yield ReasoningDelta("response reasoning")
                     yield TextDelta("normal reply")
+                    yield InputUsage(420)
 
         model = ToolDuringSummary()
         second_spec = ToolSpec("earlier", "another tool", {"type": "object"})
@@ -533,45 +484,30 @@ class ProjectionTest(unittest.IsolatedAsyncioTestCase):
             self.assertNotIn(_SUMMARIZE, [entry.message for entry in history.read_after("main")])
             self.assertEqual(calls, [])
 
-    async def test_private_deepseek_reasoning_over_token_budget_can_archive_complete_group(self):
+    async def test_large_old_reasoning_and_tool_group_use_native_summary_projection(self):
         async def unexpected_tool(args, context):
             self.fail("historical tool must not be dispatched")
 
         settings = RuntimeSettings(context_budget=290, tail_budget=95)
-        for crowded in (False, True):
-            with self.subTest(crowded=crowded), closing(History(":memory:")) as history:
-                seed, = history.append("main", [Message("user", "summary seed")])
-                saved = Summary(seed, "saved " * 110 if crowded else "saved summary")
-                history.save_summary("main", saved)
-                private = "synthetic private thinking " * 70
-                group = [Message("assistant", "historical decision", CALLS, reasoning=private),
-                         Message("tool", "first historical outcome", tool_call_id=CALLS[0].id),
-                         Message("tool", "second historical outcome", tool_call_id=CALLS[1].id)]
-                _, _, end = history.append("main", group)
-                model = CapturingModel()
-                opts = dict(settings=settings, tools=Tools([Tool(SPEC, unexpected_tool)]), thinking=True)
-                if crowded:
-                    with self.assertLogs("agent_companion.runtime.context", level="WARNING") as logs:
-                        await self.turn(history, model, "next", **opts)
-                    self.assertIn("summary_context_too_large", logs.output[0])
-                    self.assertEqual(model.summaries, [])
-                    self.assertEqual(history.summary("main"), saved)
-                else:
-                    await self.turn(history, model, "next", **opts)
-                    self.assertEqual(len(model.summaries), 1)
-                    messages, tools, thinking = model.summaries[0]
-                    payload = build_request(messages, tools, thinking=thinking)
-                    self.assertTrue(thinking)
-                    self.assertEqual(tools, (SPEC,))
-                    self.assertEqual(messages[-1], _SUMMARIZE)
-                    self.assertEqual(len(messages), 3)  # 旧摘要、整个工具组归档、内部指令。
-                    self.assertIn("历史归档", repr(payload))
-                    for visible in ("historical decision", "first historical outcome", "second historical outcome"):
-                        self.assertIn(visible, repr(payload))
-                    self.assertNotIn(private, repr(payload))
-                    self.assertNotIn("reasoning_content", repr(payload))
-                    self.assertEqual(history.summary("main"), Summary(end, "summary-material"))
-                self.assertEqual([entry.message for entry in history.read_after("main", seed)[:3]], group)
+        with closing(History(":memory:")) as history:
+            seed, = history.append("main", [Message("user", "summary seed")])
+            saved = Summary(seed, "saved " * 300)
+            history.save_summary("main", saved)
+            private = "synthetic private thinking " * 70
+            group = [Message("assistant", "historical decision", CALLS, reasoning=private),
+                     Message("tool", "first historical outcome", tool_call_id=CALLS[0].id),
+                     Message("tool", "second historical outcome", tool_call_id=CALLS[1].id)]
+            _, _, end = history.append("main", group)
+            model = CapturingModel()
+            await self.turn(history, model, "next", settings=settings, previous_input_tokens=290,
+                            tools=Tools([Tool(SPEC, unexpected_tool)]), thinking=True)
+            self.assertEqual(len(model.summaries), 1)
+            messages, tools, thinking = model.summaries[0]
+            self.assertTrue(thinking)
+            self.assertEqual(tools, (SPEC,))
+            self.assertEqual(messages, [Message("system", "此前会话摘要：\n" + saved.text), *group, _SUMMARIZE])
+            self.assertEqual(history.summary("main"), Summary(end, "summary-material"))
+            self.assertEqual([entry.message for entry in history.read_after("main", seed)[:3]], group)
 
     async def test_private_deepseek_reasoning_verbatim_echo_is_rejected(self):
         private = "synthetic private reasoning for echo detection"
@@ -597,48 +533,14 @@ class ProjectionTest(unittest.IsolatedAsyncioTestCase):
             history.append("main", [Message("assistant", "x" * 445, reasoning=private)])
             registry = Tools([Tool(SPEC, unexpected_tool)])
             with self.assertLogs("agent_companion.runtime.context", level="WARNING") as logs:
-                await self.turn(history, model, "y" * 455, settings=settings, tools=registry, thinking=True)
+                await self.turn(history, model, "y" * 455, settings=settings, previous_input_tokens=320,
+                                tools=registry, thinking=True)
             self.assertEqual(model.summaries[0]["messages"][-2]["reasoning_content"], private)
             self.assertIn("summary_private_echo", logs.output[0])
             self.assertNotIn(private, logs.output[0])
             self.assertEqual(history.summary("main"), saved)
 
-    def test_summary_byte_probing_does_not_measure_unrelated_tail_blocks(self):
-        class Blocks:
-            def __init__(self):
-                self.accesses = 0
-
-            def __len__(self):
-                return 300
-
-            def __getitem__(self, index):
-                self.accesses += 1
-                return [Message("user", str(index))]
-
-        model = CapturingModel()
-        sizes = []
-
-        def fits(messages, tools, *, thinking):
-            count = len(messages) - 1  # 末尾的内部指令不计入旧块数。
-            sizes.append(count)
-            return count <= 3
-
-        with closing(History(":memory:")) as history:
-            settings = RuntimeSettings()
-            context = Context(history, settings, model.stream, agents_path=Path("unused"))
-            blocks = Blocks()
-            with patch.object(context, "_fits", side_effect=fits):
-                for start in range(0, len(blocks), 3):
-                    end, prompt = context._summary_batch([], blocks, start, (), thinking=False,
-                                                         tools_budget=settings.context_budget)
-                    self.assertEqual(end, start + 3)
-                    self.assertEqual([m.content for m in prompt[:-1]], [str(i) for i in range(start, end)])
-                    self.assertEqual(prompt[-1], _SUMMARIZE)
-        self.assertLessEqual(blocks.accesses, 2 * len(blocks))
-        self.assertLessEqual(max(sizes), 4)
-        self.assertLessEqual(sum(sizes), 4 * len(blocks))
-
-    async def test_thinking_switch_after_legacy_history_summarizes_not_fabricates(self):
+    async def test_thinking_switch_projects_incompatible_legacy_history_without_compacting(self):
         model = CapturingModel()
 
         async def ignored_tool(args, context):
@@ -653,18 +555,17 @@ class ProjectionTest(unittest.IsolatedAsyncioTestCase):
             before = history.read_after("main")
             registry = Tools([Tool(SPEC, ignored_tool)])
             await self.turn(history, model, "after switch", tools=registry, thinking=True)
-            self.assertEqual(history.summary("main").covers_through, before[3].message_id)
+            self.assertIsNone(history.summary("main"))
+            self.assertEqual(model.summaries, [])
             self.assertEqual(history.read_after("main")[:len(before)], before)
             self.assertEqual(history.read_after("main")[-1].message.reasoning, "NEW_REASONING")
-            messages, tools, thinking = model.summaries[0]
-            self.assertEqual(tools, (SPEC,))
-            self.assertTrue(thinking)
-            first_summary = build_request(messages, tools, thinking=thinking)
-            self.assertIn("first old result", repr(first_summary))
-            self.assertIn("second old result", repr(first_summary))
-            self.assertNotIn("reasoning_content", repr(first_summary))
-            self.assertNotIn("KEEP_NOT_SUMMARIZE", repr(first_summary))
             current = build_request(model.requests[-1][0], [SPEC], thinking=True)
-            self.assertEqual(current["messages"][1]["reasoning_content"], "KEEP_NOT_SUMMARIZE")
-            self.assertEqual(current["messages"][-1], {"role": "user", "content": "after switch"})
-            self.assertNotIn("past reply", repr(current))
+            first, archived, compatible, last = current["messages"]
+            self.assertEqual(first["content"], "past question")
+            self.assertEqual(archived["role"], "user")
+            self.assertIn("past reply", repr(archived))
+            self.assertIn("first old result", repr(archived))
+            self.assertIn("second old result", repr(archived))
+            self.assertNotIn("reasoning_content", archived)
+            self.assertEqual(compatible["reasoning_content"], "KEEP_NOT_SUMMARIZE")
+            self.assertEqual(last, {"role": "user", "content": "after switch"})

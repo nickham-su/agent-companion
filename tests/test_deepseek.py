@@ -1,16 +1,14 @@
 import asyncio
 from contextlib import closing
 import json
-from pathlib import Path
-from tempfile import TemporaryDirectory
 import unittest
 
 import httpx
 
 from agent_companion.config import RuntimeSettings
 from agent_companion.models.deepseek import DeepSeek, build_request, parse_stream
-from agent_companion.protocol import (OMITTED_INPUT_IMAGE, DeliveryStatus, Image, Message, ModelError, ReasoningDelta, Receipt,
-                                      RequestTooLarge, Text, TextDelta, ToolCall, ToolReady, ToolSpec)
+from agent_companion.protocol import (DeliveryStatus, Image, InputUsage, Message, ModelError, ReasoningDelta, Receipt, Text,
+                                      TextDelta, ToolCall, ToolReady, ToolSpec)
 from agent_companion.runtime.engine import Runtime
 from agent_companion.runtime.tools import Tool, Tools
 from agent_companion.storage.sqlite import History
@@ -46,229 +44,34 @@ class Bytes(httpx.AsyncByteStream):
 
 
 class DeepSeekTest(unittest.IsolatedAsyncioTestCase):
-    async def test_request_body_limit_is_exact_and_applies_before_transport(self):
-        requests = []
-        messages = [Message("user", '汉字\n"' * 100)]
-        expected = json.dumps(build_request(messages, (), thinking=False), ensure_ascii=False,
-                              separators=(",", ":")).encode("utf-8")
+    async def test_large_request_reaches_transport_as_compact_utf8_json(self):
+        image = Image("data:image/png;base64," + "A" * (40 * 1024 * 1024))
+        message = Message("user", (Text('汉字\n"'), image))
 
         def endpoint(request):
-            requests.append(request)
+            self.assertGreater(len(request.content), 40 * 1024 * 1024)
+            self.assertEqual(request.headers["Content-Type"], "application/json")
+            payload = json.loads(request.content)
+            self.assertEqual(payload["messages"][0]["content"][0], {"type": "text", "text": '汉字\n"'})
+            self.assertEqual(payload["messages"][0]["content"][1]["image_url"]["url"], image.url)
+            self.assertEqual(payload["stream_options"], {"include_usage": True})
             frames = [chunk({"content": "模拟"}), chunk(finish="stop"), "[DONE]"]
-            return httpx.Response(200, content="".join(f"data: {frame}\n\n" for frame in frames).encode())
+            return httpx.Response(200, text="".join(f"data: {frame}\n\n" for frame in frames))
 
         async with httpx.AsyncClient(transport=httpx.MockTransport(endpoint)) as client:
-            exact = DeepSeek(client, request_limit=len(expected))
-            over = DeepSeek(client, request_limit=len(expected) - 1)
-            self.assertTrue(exact.request_fits(messages, (), thinking=False))
-            self.assertFalse(over.request_fits(messages, (), thinking=False))
-            with self.assertRaisesRegex(RequestTooLarge, "^request_body_too_large$"):
-                _ = [item async for item in over.stream(messages, (), thinking=False)]
-            self.assertEqual(requests, [])
-            self.assertEqual([item async for item in exact.stream(messages, (), thinking=False)], [TextDelta("模拟")])
-            self.assertEqual(requests[0].headers["Content-Type"], "application/json")
-            self.assertEqual(requests[0].content, expected)
+            events = [event async for event in DeepSeek(client).stream([message], (), thinking=False)]
+        self.assertEqual(events, [TextDelta("模拟")])
 
-    async def test_oversized_current_batch_preserves_text_and_valid_image_then_projects_old_images(self):
-        requests = []
-        image = Image("data:image/png;base64," + "A" * 56)
-        original = [Message("user", "同批文字"), *(Message("user", (image,)) for _ in range(4))]
-
-        def endpoint(request):
-            self.assertLessEqual(len(request.content), 512)
-            requests.append(json.loads(request.content))
-            frames = [chunk({"content": "已继续"}), chunk(finish="stop"), "[DONE]"]
-            return httpx.Response(200, content="".join(f"data: {frame}\n\n" for frame in frames).encode())
-
-        class Channel:
-            async def deliver(self, reply):
-                text = "".join([part async for part in reply])
-                return Receipt(reply.info.reply_id, DeliveryStatus.FULL, text)
-
-        with closing(History(":memory:")) as history:
-            async with httpx.AsyncClient(transport=httpx.MockTransport(endpoint)) as client:
-                model = DeepSeek(client, request_limit=512)
-                runtime = Runtime("main", history, model, Channel())
-                self.assertTrue(all(model.request_fits([item], (), thinking=False) for item in original))
-                runtime.submit_batch(original)
-                await runtime.wait_idle()
-                self.assertIsNone(runtime.last_failure)
-                self.assertEqual(len(requests), 1)
-                first = requests[0]["messages"]
-                self.assertEqual(first[0]["content"], "同批文字")
-                self.assertEqual(first[-1]["content"][0]["type"], "image_url")
-                self.assertTrue(any(item["content"] == [{"type": "text", "text": OMITTED_INPUT_IMAGE.text}]
-                                    for item in first[1:-1]))
-                runtime.submit_batch([Message("user", "下一条纯文字")])
-                await runtime.wait_idle()
-                self.assertIsNone(runtime.last_failure)
-                self.assertEqual(len(requests), 2)
-                self.assertEqual(requests[1]["messages"][-1]["content"], "下一条纯文字")
-                self.assertEqual([row.message for row in history.read_after("main")[:5]], original)
-                await runtime.close()
-
-    async def test_current_batch_skips_large_image_and_still_sends_small_image(self):
-        requests = []
-        large = Image("data:image/png;base64," + "A" * 512)
-        small = SAMPLE_IMAGE
-        text = Text('同批文字\n"原样"')
-        original = Message("user", (large, small, large, text))
-        spec = ToolSpec("test", "", {"type": "object"})
-
-        def endpoint(request):
-            self.assertLessEqual(len(request.content), 512)
-            requests.append(json.loads(request.content))
-            return httpx.Response(200, text="".join(f"data: {part}\n\n" for part in (
-                chunk({"content": "正文可答"}), chunk(finish="stop"), "[DONE]")))
-
-        async def tool(args, context):
-            self.fail("unexpected tool call")
-
-        class Channel:
-            async def deliver(self, reply):
-                return Receipt(reply.info.reply_id, DeliveryStatus.FULL, "".join([part async for part in reply]))
-
-        with closing(History(":memory:")) as history:
-            async with httpx.AsyncClient(transport=httpx.MockTransport(endpoint)) as client:
-                runtime = Runtime("main", history, DeepSeek(client, request_limit=512), Channel(),
-                                  instructions="固定指令", tools=Tools([Tool(spec, tool)]))
-                try:
-                    runtime.submit_batch([original])
-                    await runtime.wait_idle()
-                    self.assertIsNone(runtime.last_failure)
-                    self.assertEqual(len(requests), 1)
-                    self.assertEqual(requests[0], build_request([
-                        Message("system", "固定指令"),
-                        Message("user", (OMITTED_INPUT_IMAGE, small, OMITTED_INPUT_IMAGE, text)),
-                    ], (spec,), thinking=False))
-                    self.assertEqual(history.read_after("main")[0].message, original)
-                finally:
-                    await runtime.close()
-
-    async def test_image_placeholders_do_not_fill_small_request_before_text(self):
-        received = []
-
-        def endpoint(request):
-            received.extend(json.loads(request.content)["messages"])
-            return httpx.Response(200, text="".join(f"data: {part}\n\n" for part in (
-                chunk({"content": "文字可答"}), chunk(finish="stop"), "[DONE]")))
-
-        class Channel:
-            async def deliver(self, reply):
-                return Receipt(reply.info.reply_id, DeliveryStatus.FULL, "".join([part async for part in reply]))
-
-        with closing(History(":memory:")) as history:
-            async with httpx.AsyncClient(transport=httpx.MockTransport(endpoint)) as client:
-                runtime = Runtime("main", history, DeepSeek(client, request_limit=250), Channel())
-                runtime.submit_batch([Message("user", (SAMPLE_IMAGE,))] * 15 + [Message("user", "正常文字")])
-                await runtime.wait_idle()
-                self.assertIsNone(runtime.last_failure)
-                self.assertEqual([item["content"] for item in received], [OMITTED_INPUT_IMAGE.text, "正常文字"])
-                self.assertEqual(len(history.read_after("main")), 17)
-                await runtime.close()
-
-    async def test_coalesced_image_placeholders_keep_a_later_small_image_and_tool_group(self):
-        requests, delivered = [], []
-        large = Image("data:image/png;base64," + "A" * 2048)
-        text = Message("user", "正常文字")
-        original = [Message("user", (large,))] * 300 + [Message("user", (SAMPLE_IMAGE,)), text]
-        tool_call = ToolCall("call-a", "test", '{"size":2}')
-        frames = [
-            [chunk({"reasoning_content": "模拟推理"}),
-             chunk(call(id=tool_call.id, function={"name": tool_call.name, "arguments": tool_call.arguments})),
-             chunk(finish="tool_calls"), "[DONE]"],
-            [chunk({"content": "图文已处理"}), chunk(finish="stop"), "[DONE]"],
-        ]
-
-        def endpoint(request):
-            self.assertLessEqual(len(request.content), 1024)
-            events = frames[len(requests)]
-            requests.append(json.loads(request.content))
-            return httpx.Response(200, text="".join(f"data: {event}\n\n" for event in events))
-
-        async def tool(args, context):
-            return "尺寸为 2"
-
-        class Channel:
-            async def deliver(self, reply):
-                body = "".join([part async for part in reply])
-                delivered.append(body)
-                return Receipt(reply.info.reply_id, DeliveryStatus.FULL, body)
-
-        settings = RuntimeSettings(context_budget=4096, tail_budget=1024)
-        with TemporaryDirectory(dir=Path.cwd()) as folder:
-            path = Path(folder) / "history.sqlite"
-            with closing(History(path)) as history:
-                async with httpx.AsyncClient(transport=httpx.MockTransport(endpoint)) as client:
-                    runtime = Runtime("main", history, DeepSeek(client, request_limit=1024), Channel(),
-                                      settings=settings, thinking=True, tools=Tools([Tool(SPEC, tool)]))
-                    try:
-                        history.inbound_window("main", "feishu", 1)
-                        history.record_inbound("main", "feishu", 2,
-                                               [(f"om_{i}", message) for i, message in enumerate(original)])
-                        batch_id, = history.pending_inbound("main", "feishu")
-                        runtime.submit_persisted_batch(batch_id)
-                        await asyncio.wait_for(runtime.wait_idle(), 2)
-                        self.assertIsNone(runtime.last_failure)
-                    finally:
-                        await runtime.close()
-            with closing(History(path)) as reopened:
-                self.assertEqual([row.message for row in reopened.read_after("main")[:len(original)]], original)
-
-        expected = [Message("user", OMITTED_INPUT_IMAGE.text), Message("user", (SAMPLE_IMAGE,)), text]
-        continuation = [Message("assistant", "", (tool_call,), reasoning="模拟推理"),
-                        Message("tool", "尺寸为 2", tool_call_id=tool_call.id)]
-        self.assertEqual(requests, [build_request(expected, (SPEC,), thinking=True),
-                                    build_request(expected + continuation, (SPEC,), thinking=True)])
-        self.assertEqual(delivered, ["图文已处理"])
-
-    async def test_default_request_limit_prefers_latest_of_137_images(self):
-        old = Image("data:image/png;base64,AAAA")
-        head, tail = Message("user", "批次开头"), Message("user", "批次结尾")
-        old_image = Message("user", (old,))
-        omitted_image = Message("user", (OMITTED_INPUT_IMAGE,))
-        latest = Message("user", (SAMPLE_IMAGE,))
-        before, between, after = Text("富文本开头"), Text("目标图之前"), Text('保留\n"原文"')
-        rich = Message("user", (before, *((old,) * 135), between, SAMPLE_IMAGE, after))
-        rich_projection = Message("user", (before, *((OMITTED_INPUT_IMAGE,) * 135), between, SAMPLE_IMAGE, after))
-        cases = (
-            ("富文本", [head, old_image, rich, tail], [head, omitted_image, rich_projection, tail]),
-            ("独立图片", [head, *([old_image] * 136), latest, tail],
-             [head, Message("user", OMITTED_INPUT_IMAGE.text), latest, tail]),
-        )
-        settings = RuntimeSettings(context_budget=4096, tail_budget=1024)
-        fixed = Message("system", "保留图文顺序")
-
-        for label, original, projected in cases:
-            with self.subTest(layout=label):
-                requests, delivered = [], []
-
-                def endpoint(request):
-                    self.assertLessEqual(len(request.content), 40 * 1024 * 1024)
-                    requests.append(json.loads(request.content))
-                    frames = [chunk({"content": "图文已处理"}), chunk(finish="stop"), "[DONE]"]
-                    return httpx.Response(200, text="".join(f"data: {frame}\n\n" for frame in frames))
-
-                class Channel:
-                    async def deliver(self, reply):
-                        body = "".join([part async for part in reply])
-                        delivered.append(body)
-                        return Receipt(reply.info.reply_id, DeliveryStatus.FULL, body)
-
-                with closing(History(":memory:")) as history:
-                    async with httpx.AsyncClient(transport=httpx.MockTransport(endpoint)) as client:
-                        runtime = Runtime("main", history, DeepSeek(client), Channel(), settings=settings,
-                                          instructions=fixed.content)
-                        try:
-                            runtime.submit_batch(original)
-                            await asyncio.wait_for(runtime.wait_idle(), 2)
-                            self.assertIsNone(runtime.last_failure)
-                            self.assertEqual([row.message for row in history.read_after("main")],
-                                             [*original, Message("assistant", "图文已处理")])
-                        finally:
-                            await runtime.close()
-                self.assertEqual(requests, [build_request([fixed, *projected], (), thinking=False)])
-                self.assertEqual(delivered, ["图文已处理"])
+    async def test_usage_from_final_content_or_empty_choice_chunk(self):
+        final = json.loads(chunk(finish="stop"))
+        usage = {"prompt_tokens": 21, "completion_tokens": 300, "total_tokens": 321}
+        for chunks in ([json.dumps({**final, "usage": usage})],
+                       [json.dumps(final), json.dumps({"choices": [], "usage": usage})]):
+            with self.subTest(chunks=chunks):
+                self.assertEqual([event async for event in parse_stream(lines(*chunks, "[DONE]"))], [InputUsage(21)])
+        for invalid in (None, True, -1, 1.5, "21", 2**63):
+            frame = json.dumps({**final, "usage": {"prompt_tokens": invalid, "total_tokens": 400}})
+            self.assertEqual([event async for event in parse_stream(lines(frame, "[DONE]"))], [])
 
     async def test_model_response_diagnostics_keep_only_safe_status(self):
         statuses = iter((401, 429))
@@ -289,30 +92,33 @@ class DeepSeekTest(unittest.IsolatedAsyncioTestCase):
                 self.assertNotIn("synthetic", lines)
                 self.assertEqual(ModelError("unrecognized adapter details").diagnostic, "model_failed")
 
-    async def test_summary_projection_uses_byte_budget_for_images_and_large_text(self):
+    async def test_actual_prompt_usage_triggers_summary_with_original_image(self):
         requests = []
-        limit = 1400
+        old = Message("user", (Text("历史图文"), Image("data:image/png;base64," + "A" * 6000)))
+        settings = RuntimeSettings(context_budget=300, tail_budget=60)
 
         def endpoint(request):
-            self.assertLessEqual(len(request.content), limit)
+            content, tokens = [("初次回复", 300), ("简洁概要", 1000), ("新的回复", 1)][len(requests)]
             requests.append(json.loads(request.content))
-            frames = [chunk({"content": "简洁概要"}), chunk(finish="stop"), "[DONE]"]
-            return httpx.Response(200, content="".join(f"data: {frame}\n\n" for frame in frames).encode())
+            finish = json.dumps({**json.loads(chunk(finish="stop")), "usage": {"prompt_tokens": tokens}})
+            frames = [chunk({"content": content}), finish, "[DONE]"]
+            return httpx.Response(200, text="".join(f"data: {frame}\n\n" for frame in frames))
 
-        first = Message("user", (Text("历史图文"), Image("data:image/png;base64," + "A" * 6000)))
-        old_text = Message("user", "旧文本" * 650)
-        settings = RuntimeSettings(context_budget=3000, tail_budget=300)
         with closing(History(":memory:")) as history:
-            history.append("child", [first, old_text])
+            history.append("child", [old])
             async with httpx.AsyncClient(transport=httpx.MockTransport(endpoint)) as client:
-                runtime = Runtime("child", history, DeepSeek(client, request_limit=limit), None, settings=settings)
-                self.assertIsNone(await runtime.run_internal("run", "新的文字"))
-                self.assertEqual(len(requests), 2)
-                serialized = json.dumps(requests[0], ensure_ascii=False)
-                self.assertIn("历史图片已省略", serialized)
-                self.assertNotIn("image_url", serialized)
-                self.assertEqual(requests[1]["messages"][-1]["content"], "新的文字")
-                self.assertEqual([row.message for row in history.read_after("child")[:2]], [first, old_text])
+                runtime = Runtime("child", history, DeepSeek(client), None, settings=settings)
+                self.assertIsNone(await runtime.run_internal("first", "首次请求"))
+                self.assertIsNone(history.summary("child"))
+                self.assertEqual(history.last_input_tokens("child"), 300)
+                self.assertIsNone(await runtime.run_internal("next", "新的文字"))
+            compressed = requests[1]["messages"]
+            self.assertEqual(compressed[0], requests[0]["messages"][0])
+            self.assertNotIn("新的文字", repr(compressed))
+            self.assertNotIn("image_url", repr(requests[2]))
+            self.assertEqual(requests[2]["messages"][-1]["content"], "新的文字")
+            self.assertEqual(history.read_after("child")[0].message, old)
+            self.assertEqual([outcome.input_tokens for outcome in history.outcomes("child")], [300, 1])
 
     async def test_image_tool_and_reasoning_round_trip_over_sse(self):
         pending = []

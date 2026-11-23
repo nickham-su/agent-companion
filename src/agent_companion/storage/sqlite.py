@@ -37,8 +37,10 @@ CREATE TABLE IF NOT EXISTS reply_outcomes (
     model_status TEXT NOT NULL,
     delivery_status TEXT,
     assistant_message_id INTEGER REFERENCES messages(message_id),
-    model_error TEXT
+    model_error TEXT,
+    input_tokens INTEGER
 );
+CREATE INDEX IF NOT EXISTS reply_outcomes_session_status ON reply_outcomes(session_id, model_status);
 CREATE TABLE IF NOT EXISTS model_replay_salt (
     singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
     salt BLOB NOT NULL CHECK (length(salt) = 32)
@@ -115,6 +117,7 @@ class ReplyOutcome:
     delivery_status: DeliveryStatus | None = None
     assistant_message_id: int | None = None
     model_error: str | None = None
+    input_tokens: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -214,6 +217,8 @@ class History:
                                      " assistant_message_id INTEGER REFERENCES messages(message_id)")
                 if "model_error" not in columns:
                     self._db.execute("ALTER TABLE reply_outcomes ADD COLUMN model_error TEXT")
+                if "input_tokens" not in columns:
+                    self._db.execute("ALTER TABLE reply_outcomes ADD COLUMN input_tokens INTEGER")
         except BaseException:
             self._db.close()
             raise
@@ -352,19 +357,26 @@ class History:
                     ids[0], scope.protocol, scope.fingerprint, scope.reasoning_effort, items,
                 ))
             self._db.execute("INSERT INTO reply_outcomes"
-                             " (reply_id, session_id, run_id, model_status, delivery_status, assistant_message_id, model_error)"
-                             " VALUES (?, ?, ?, ?, ?, ?, ?)", (
+                             " (reply_id, session_id, run_id, model_status, delivery_status,"
+                             " assistant_message_id, model_error, input_tokens) VALUES (?, ?, ?, ?, ?, ?, ?, ?)", (
                 outcome.reply_id, outcome.session_id, outcome.run_id, outcome.model_status,
-                outcome.delivery_status, ids[0] if ids else None, outcome.model_error,
+                outcome.delivery_status, ids[0] if ids else None, outcome.model_error, outcome.input_tokens,
             ))
         return ids
 
     def outcomes(self, session_id: str) -> list[ReplyOutcome]:
         return [ReplyOutcome(row["reply_id"], row["session_id"], row["run_id"], row["model_status"],
                              DeliveryStatus(row["delivery_status"]) if row["delivery_status"] else None,
-                             row["assistant_message_id"], row["model_error"])
+                             row["assistant_message_id"], row["model_error"], row["input_tokens"])
                 for row in self._db.execute(
                     "SELECT * FROM reply_outcomes WHERE session_id = ? ORDER BY rowid", (session_id,))]
+
+    def last_input_tokens(self, session_id: str) -> int | None:
+        row = self._db.execute(
+            "SELECT input_tokens FROM reply_outcomes WHERE session_id = ? AND model_status = 'complete'"
+            " ORDER BY rowid DESC LIMIT 1", (session_id,),
+        ).fetchone()
+        return row["input_tokens"] if row is not None else None
 
     def run_text(self, session_id: str, run_id: str) -> str | None:
         row = self._db.execute(
