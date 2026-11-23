@@ -120,6 +120,7 @@ class FeishuSettings:
     mode: str = "text"
     cli: str = "lark-cli"
     cli_timeout: float = 20
+    voice_text_copy: bool = True
 
     def __post_init__(self) -> None:
         for value, prefix, name in ((self.chat_id, "oc", "chat_id"),
@@ -131,6 +132,8 @@ class FeishuSettings:
             raise ConfigError("feishu.sender_open_id 与 feishu.own_open_id 必须不同")
         if self.mode not in ("text", "voice"):
             raise ConfigError("feishu.mode 必须是 text 或 voice")
+        if type(self.voice_text_copy) is not bool:
+            raise ConfigError("feishu.voice_text_copy 必须是布尔值")
         if not isinstance(self.cli, str) or not self.cli.strip() or "\x00" in self.cli:
             raise ConfigError("feishu.cli 必须是非空且不含 NUL 字符的命令名或路径")
         _config_seconds(self.cli_timeout, "feishu.cli_timeout")

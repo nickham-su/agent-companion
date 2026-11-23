@@ -2,7 +2,7 @@
 
 import asyncio
 from collections import deque
-from collections.abc import AsyncGenerator, Sequence
+from collections.abc import AsyncGenerator, Callable, Sequence
 from contextlib import aclosing
 from dataclasses import dataclass
 import logging
@@ -36,13 +36,15 @@ class Runtime:
 
     def __init__(self, session_id: str, history: History, model: Model, channel: Channel | None, *,
                  tools: Tools | None = None, settings: RuntimeSettings | None = None,
-                 thinking: bool = False, instructions: str = "", delivery_idle_timeout: float | None = None) -> None:
+                 thinking: bool = False, instructions: str = "", delivery_idle_timeout: float | None = None,
+                 on_confirmed_reply: Callable[[ReplyInfo, str], None] | None = None) -> None:
         if not session_id:
             raise ValueError("session_id must be non-empty")
         self.session_id = session_id
         self.history = history
         self._model = model
         self._channel = channel
+        self._on_confirmed_reply = on_confirmed_reply
         self._delivery_idle_timeout = delivery_idle_timeout
         self._tools = tools if tools is not None else Tools()
         self._settings = settings if settings is not None else RuntimeSettings()
@@ -285,6 +287,7 @@ class Runtime:
             receipt = await self._delivery_result(reply, delivery, generated)
             # 内部会话与后台发送都只保存成功生成的全文，不制造回执。
             generated_text = generated if not wait_for_delivery and model_status == "complete" else ""
+            confirmed_text = receipt.confirmed if receipt else ""
             calls = tuple(call for call, _ in scheduled.values())
             if scheduled:
                 await asyncio.wait([task for _, task in scheduled.values()])
@@ -292,19 +295,22 @@ class Runtime:
                                  tool_call_id=call.id) for call, task in scheduled.values()]
             if model_status != "complete":
                 replay = None
-            rows = ([Message("assistant", receipt.confirmed if receipt else generated_text, calls,
+            rows = ([Message("assistant", confirmed_text if receipt else generated_text, calls,
                               reasoning="".join(reasoning) if model_status == "complete" and reasoning else None,
                               replay=replay),
                        *results]
-                       if receipt is not None or calls or generated_text or replay is not None else [])
+                      if receipt is not None or calls or generated_text or replay is not None else [])
             self.history.finalize_reply(
                 ReplyOutcome(info.reply_id, info.session_id, run_id, model_status,
                              receipt.status if receipt else None, model_error=model_error), rows)
-            if generated_text and isinstance(self._channel, BackgroundChannel):
-                try:
+            # 外部副本与主投递状态无关，只在历史事务成功后尽力入队。
+            try:
+                if confirmed_text and self._on_confirmed_reply is not None:
+                    self._on_confirmed_reply(info, confirmed_text)
+                elif generated_text and isinstance(self._channel, BackgroundChannel):
                     self._channel.enqueue(info, generated_text)
-                except Exception:
-                    _LOG.warning("background reply could not be queued; reply=%s", info.reply_id)
+            except Exception:
+                _LOG.warning("background reply could not be queued; reply=%s", info.reply_id)
             return model_status, bool(calls)
         finally:
             unfinished = [task for _, task in scheduled.values() if not task.done()]

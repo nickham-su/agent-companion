@@ -101,7 +101,9 @@ python scripts/build_source_zip.py
    ```
 
 3. 从 [Silero VAD 官方源码](https://github.com/snakers4/silero-vad/blob/master/src/silero_vad/data/silero_vad.onnx)单独取得 `silero_vad.onnx`（使用带 `input/state/sr` 接口的 v6 系列模型，不选只支持其他输入形状的变体），放在本机配置指定路径。程序只加载已有文件，不下载模型，不需要 PyTorch；相对路径以 TOML 文件所在目录为准。音频和 ONNX 依赖不在 `text` 或模拟模式下加载。
-4. 设置 `[feishu].mode = "voice"`，检查 `tts_provider` 所选 MiniMax 配置含 `.tts` 配置表和 `api_key`，再按 `config.example.toml` 填写 `[voice]` 的设备与 VAD 模型路径。用同一个 `--run --config config.local.toml` 命令重启程序，手动用飞书接听和挂断；切回 `text` 同样修改配置并重启。同一数据库和主 Session 历史保留。不判断通话状态：`voice` 模式即使没有通话，也只向虚拟设备播报模型回复，不自动发飞书文字。飞书文本、图文和语音条仍轮询；语音条失败通知始终通过飞书文字发送。
+4. 设置 `[feishu].mode = "voice"`，检查 `tts_provider` 所选 MiniMax 配置含 `.tts` 配置表和 `api_key`，再按 `config.example.toml` 填写 `[voice]` 的设备与 VAD 模型路径。用同一个 `--run --config config.local.toml` 命令重启程序，手动用飞书接听和挂断；切回 `text` 同样修改配置并重启。同一数据库和主 Session 历史保留。飞书文本、图文和语音条仍轮询；语音条失败通知始终通过飞书文字发送。
+
+`[feishu].voice_text_copy` 默认是 `true`。`voice` 模式不判断是否正在通话：所有经语音通道结算的模型回复，不论由什么输入触发，只要有确认正文且已写入历史，就会原样发一份文字副本。正常播完发全文；打断、故障或超时只发历史保留的前缀（打断或故障时可能包含估算的尾字），没有确认正文就不发。副本发送到配置的 `chat_id`，不是私发给通话者；若绑定群聊，群成员可能看到，内容会留在会话记录里。不想留下文字副本时，在 `[feishu]` 加上 `voice_text_copy = false` 并重启。副本复用文字后台队列，尽力发送，不等待、不重试，也不另写一条历史或改变语音投递状态；`text` 模式不受此项影响。
 
 程序在启动时检查两路设备是否支持所需流格式。输入为 16 kHz 单声道有符号 16-bit PCM（512 样本一帧），直接供 Silero 和 WAV 文件转写使用。输出为 MiniMax 相同采样率的单声道 16-bit PCM，默认 44.1 kHz，可配 16/24/32/44.1 kHz。CoreAudio 在需要且支持时转换设备格式，程序不更改设备全局采样率、不再做第二次重采样。若报 `voice_input_pcm_16khz_mono_not_supported` 或 `voice_output_pcm_rate_or_channels_not_supported`，在「音频 MIDI 设置」和 `sounddevice` 列表核对两条线路；输出可选一个双方支持的采样率，输入需选择能提供 16 kHz 单声道流的设备或系统转换。若通话对端无声，核对虚拟设备首个单声道的路由、飞书麦克风/扬声器选项和设备权限。
 

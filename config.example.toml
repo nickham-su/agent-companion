@@ -54,6 +54,7 @@ voice_id = "male-qn-qingse"
 # sender_open_id = "ou_peer_example"
 # own_open_id = "ou_self_example"
 # mode = "text"
+# voice_text_copy = true  # 仅 voice：将已确认并入库的正文另发到 chat_id
 # cli = "lark-cli"
 # cli_timeout = 20  # 单次飞书 CLI 调用时限（秒）
 

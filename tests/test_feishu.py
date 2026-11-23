@@ -19,7 +19,8 @@ from agent_companion.channels.feishu.channel import FeishuChannel, FeishuPoller
 from agent_companion.channels.feishu.cli import CliError, CliStdoutLimit, CommandResult, FeishuCLI, run_command
 from agent_companion.config import (ASRSettings, FeishuSettings, LLMSettings, MiniMaxConnection, Settings, TTSSettings,
                                     VoiceSettings, load_settings)
-from agent_companion.protocol import OMITTED_INPUT_IMAGE, DeliveryStatus, Image, Message, ReplyInfo, Text, TextDelta
+from agent_companion.protocol import (OMITTED_INPUT_IMAGE, DeliveryStatus, Image, Message, Receipt, ReplyInfo,
+                                      Text, TextDelta)
 from agent_companion.speech.asr import AsrError
 from agent_companion.storage.sqlite import FeishuBindingError, History
 
@@ -341,6 +342,83 @@ class FeishuBackgroundDeliveryTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("count=1", logs.output[0])
         self.assertIn("closed", logs.output[1])
 
+    async def test_voice_copies_only_the_confirmed_text_after_history_commit(self):
+        full, prefix = "  模拟回复。\n 后续", "  模拟回复。\n "
+        cases = (
+            ("full", DeliveryStatus.FULL, full, full),
+            ("partial", DeliveryStatus.PARTIAL, prefix, prefix),
+            ("failed", DeliveryStatus.FAILED, prefix, prefix),
+            ("idle timeout", DeliveryStatus.UNKNOWN, prefix, prefix),
+            ("zero", DeliveryStatus.ZERO, "", ""),
+            ("invalid receipt", DeliveryStatus.FULL, "错误回执", ""),
+            ("disabled", DeliveryStatus.FULL, full, full),
+            ("commit failed", DeliveryStatus.FULL, full, full),
+        )
+        for case, status, confirmed, saved in cases:
+            with self.subTest(case=case), closing(History(":memory:")) as history:
+                voice = FeishuSettings(_CHAT, _PEER, _SELF, mode="voice")
+                if case == "disabled":
+                    voice = replace(voice, voice_text_copy=False)
+                settings = Settings(feishu=voice, voice=VoiceSettings(idle_timeout=0.05))
+                finalized, sent = asyncio.Event(), asyncio.Event()
+                outbound = []
+
+                class Model:
+                    async def stream(self, messages, tools, *, thinking):
+                        yield TextDelta(full)
+
+                class Voice:
+                    async def deliver(self, reply):
+                        async for _ in reply:
+                            pass
+                        if case == "idle timeout":
+                            reply.report_progress(reply.info.reply_id, 42, confirmed)
+                            await asyncio.Future()
+                        return Receipt(reply.info.reply_id, status, confirmed)
+
+                class Runner(_Runner):
+                    async def __call__(self, argv, data, timeout):
+                        result = await super().__call__(argv, data, timeout)
+                        if argv[1:3] == ("api", "POST"):
+                            body = json.loads(data)
+                            outbound.append((body["receive_id"], json.loads(body["content"])["text"],
+                                             history.tail("main", 1)[0].message))
+                            sent.set()
+                        return result
+
+                runner = Runner()
+                runner.pages[None]["items"] = [_raw("om_input", 101_000, "text", {"text": "测试输入"})]
+                cli = FeishuCLI("lark-cli", _CHAT, timeout=2, runner=runner)
+                finalize_reply = history.finalize_reply
+
+                def finalize(outcome, messages):
+                    finalized.set()
+                    if case == "commit failed":
+                        raise sqlite3.OperationalError("synthetic write failure")
+                    return finalize_reply(outcome, messages)
+
+                expected_to_send = bool(saved) and case not in ("disabled", "commit failed")
+
+                async def poll(poller):
+                    ticks = iter((100, 110))
+                    poller._clock = lambda: next(ticks)
+                    await poller.poll_once()
+                    await poller.poll_once()
+                    await asyncio.wait_for(finalized.wait(), 1)
+                    if expected_to_send:
+                        await asyncio.wait_for(sent.wait(), 1)
+                    else:
+                        await asyncio.sleep(0)  # 若错误入队，给发送器执行机会。
+
+                with patch.object(FeishuPoller, "run", poll), patch.object(history, "finalize_reply", finalize):
+                    await run_feishu(settings, history, Model(), _ASR(), cli=cli, voice_output=Voice())
+                self.assertEqual(outbound, [(_CHAT, saved, Message("assistant", saved))] if expected_to_send else [])
+                assistant = [entry.message for entry in history.read_after("main") if entry.message.role == "assistant"]
+                outcomes = history.outcomes("main")
+                self.assertEqual(assistant, [] if case == "commit failed" else [Message("assistant", saved)])
+                expected_status = DeliveryStatus.UNKNOWN if case == "invalid receipt" else status
+                self.assertEqual([outcome.delivery_status for outcome in outcomes],
+                                 [] if case == "commit failed" else [expected_status])
 
     async def test_application_stops_ingress_and_sends_before_async_poll_cleanup(self):
         active, poll_ready, poll_cleaning, release_poll = (asyncio.Event() for _ in range(4))
@@ -397,6 +475,11 @@ class FeishuBackgroundDeliveryTests(unittest.IsolatedAsyncioTestCase):
                     await asyncio.wait_for(app, 1)
 
     async def test_poll_failure_stops_replies_before_fixed_notice_cleanup(self):
+        for mode in ("text", "voice"):
+            with self.subTest(mode=mode):
+                await self._check_poll_failure_stops_replies(mode)
+
+    async def _check_poll_failure_stops_replies(self, mode):
         active, release_send, send_cleaned = (asyncio.Event() for _ in range(3))
         send_cancelled, notice_cleaning = asyncio.Event(), asyncio.Event()
         sent = []
@@ -448,10 +531,11 @@ class FeishuBackgroundDeliveryTests(unittest.IsolatedAsyncioTestCase):
             await runner.notice_entered.wait()
             raise RuntimeError("synthetic poll failure")
 
-        settings = Settings(feishu=FeishuSettings(_CHAT, _PEER, _SELF))
+        settings = Settings(feishu=FeishuSettings(_CHAT, _PEER, _SELF, mode=mode))
         with (closing(History(":memory:")) as history, patch.object(FeishuPoller, "poll_once", poll_once),
               patch("agent_companion.app.FeishuPoller", partial(FeishuPoller, clock=lambda: clock[0]))):
-            app = asyncio.create_task(run_feishu(settings, history, _Model(), asr, cli=cli))
+            app = asyncio.create_task(run_feishu(settings, history, _Model(), asr, cli=cli,
+                                                 voice_output=_Voice() if mode == "voice" else None))
             try:
                 await asyncio.wait_for(notice_cleaning.wait(), 1)
                 release_send.set()

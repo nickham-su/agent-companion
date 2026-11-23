@@ -42,8 +42,7 @@ class FeishuChannel:
         return await self._voice_output.deliver(reply)
 
     def enqueue(self, info: ReplyInfo, text: str) -> None:
-        if self._voice_output is not None:
-            raise RuntimeError("Feishu voice replies require a receipt")
+        """将已落库的文字正文交给发送队列，也可用于语音确认正文的副本。"""
         if self._closed or len(self._pending) >= _MAX_PENDING_REPLIES:
             _LOG.warning("Feishu text reply dropped (%s); reply=%s",
                          "closed" if self._closed else "queue_full", info.reply_id)

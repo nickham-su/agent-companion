@@ -233,6 +233,17 @@ api_key = 123
                 else:
                     self.assertEqual(settings.voice, VoiceSettings())
 
+    def test_voice_text_copy_defaults_to_true_and_requires_a_boolean(self):
+        voice = _CONFIG.replace('mode = "text"', 'mode = "voice"')
+        self.path.write_text(voice, encoding="utf-8")
+        self.assertIs(load_settings(self.path, for_run=True).feishu.voice_text_copy, True)
+        self.path.write_text(voice.replace('[feishu]', '[feishu]\nvoice_text_copy = false'), encoding="utf-8")
+        self.assertIs(load_settings(self.path, for_run=True).feishu.voice_text_copy, False)
+        for value in ('"false"', '1', '[]'):
+            with self.subTest(value=value):
+                self.assert_startup_error(voice.replace('[feishu]', f'[feishu]\nvoice_text_copy = {value}'),
+                                          'feishu.voice_text_copy 必须是布尔值')
+
     def test_explicit_llm_settings_and_adapter_specific_model_and_address(self):
         for before, after, message in (
             ('adapter = "deepseek"', '', 'adapter'),

@@ -292,7 +292,9 @@ class MVPIntegrationTest(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(device.pull(4), _PCM * 4)
                 self.assertEqual(await _outcome(history, session, 7), (DeliveryStatus.FULL, _NEW_VOICE))
                 self.assertEqual(tts.calls, [_OLD_VOICE, _NEW_VOICE])
-                self.assertEqual(transport.sends, [_ACCEPTED, _RETURNED, _FAILED, _UNKNOWN])
+                while len(transport.sends) < 6:
+                    await asyncio.sleep(0.002)
+                self.assertEqual(transport.sends, [_ACCEPTED, _RETURNED, _FAILED, _UNKNOWN, prefix, _NEW_VOICE])
             self.assertTrue(device.closed)
             before_restart = history.read_after(session)
 
@@ -303,9 +305,10 @@ class MVPIntegrationTest(unittest.IsolatedAsyncioTestCase):
             async with _service(settings, history, restart_model, transport, asr):
                 transport.push("重启后的新输入")
                 self.assertEqual(await _outcome(history, session, 8), (None, _RESTARTED))
-                while len(transport.sends) < 5:
+                while len(transport.sends) < 7:
                     await asyncio.sleep(0.002)
-                self.assertEqual(transport.sends, [_ACCEPTED, _RETURNED, _FAILED, _UNKNOWN, _RESTARTED])
+                self.assertEqual(transport.sends,
+                                 [_ACCEPTED, _RETURNED, _FAILED, _UNKNOWN, prefix, _NEW_VOICE, _RESTARTED])
                 messages = [row.message.content for row in history.read_after(session)]
                 self.assertEqual(messages.count(_ASR_TEXT), 1)
                 self.assertEqual(messages.count(_USER), 1)

@@ -1,7 +1,7 @@
 """组装主运行时与内部委派；模型和用户通道由入口注入。"""
 
 import asyncio
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
 from hashlib import sha256
 import json
@@ -9,7 +9,7 @@ import json
 from .channels.feishu.channel import FeishuChannel, FeishuPoller
 from .channels.feishu.cli import FeishuCLI
 from .config import FeishuSettings, Settings
-from .protocol import Channel, Message, Model
+from .protocol import Channel, Message, Model, ReplyInfo
 from .runtime.engine import Runtime
 from .runtime.subtasks import Subtasks
 from .speech.asr import FileASR
@@ -24,6 +24,7 @@ from .storage.sqlite import History
 async def running_agent(
     settings: Settings, history: History, model: Model, channel: Channel, *,
     wait_for_subtask_delivery: bool = True, delivery_idle_timeout: float | None = None,
+    on_confirmed_reply: Callable[[ReplyInfo, str], None] | None = None,
 ) -> AsyncIterator[tuple[Runtime, Subtasks]]:
     def return_result(message: Message) -> None:
         main.submit_subtask_result(message, wait_for_delivery=wait_for_subtask_delivery)
@@ -34,7 +35,8 @@ async def running_agent(
     subtasks = Subtasks(settings.main_session_id, history, model, return_result,
                         settings=settings.runtime, thinking=thinking)
     main = Runtime(settings.main_session_id, history, model, channel, tools=subtasks.tools,
-                   settings=settings.runtime, thinking=thinking, delivery_idle_timeout=delivery_idle_timeout)
+                   settings=settings.runtime, thinking=thinking, delivery_idle_timeout=delivery_idle_timeout,
+                   on_confirmed_reply=on_confirmed_reply)
     try:
         yield main, subtasks
     finally:
@@ -83,11 +85,19 @@ async def run_feishu(settings: Settings, history: History, model: Model, asr: Fi
     cli = cli if cli is not None else FeishuCLI(feishu.cli, feishu.chat_id, timeout=feishu.cli_timeout)
     channel = FeishuChannel(cli, mode=feishu.mode, voice_output=voice_output)
     wait_for_delivery = feishu.mode == "voice"
+    copy_voice_text = wait_for_delivery and feishu.voice_text_copy
+    uses_text_queue = not wait_for_delivery or copy_voice_text
     delivery_idle_timeout = settings.voice.idle_timeout if wait_for_delivery else None
     try:
         async with running_agent(settings, history, model, channel, wait_for_subtask_delivery=wait_for_delivery,
-                                 delivery_idle_timeout=delivery_idle_timeout) as (main, _):
+                                 delivery_idle_timeout=delivery_idle_timeout,
+                                 on_confirmed_reply=channel.enqueue if copy_voice_text else None) as (main, subtasks):
+            stopping = False
+
             def stop_text_delivery() -> None:
+                nonlocal stopping
+                stopping = True
+                subtasks.stop_accepting()
                 main.stop_accepting()
                 channel.stop_accepting()
 
@@ -95,8 +105,12 @@ async def run_feishu(settings: Settings, history: History, model: Model, asr: Fi
                                   own_id=feishu.own_open_id, session_id=main.session_id, history=history,
                                   submit=lambda batch_id: main.submit_persisted_batch(
                                       batch_id, wait_for_delivery=wait_for_delivery),
-                                  before_close=None if wait_for_delivery else stop_text_delivery)
-            if not wait_for_delivery:
+                                  before_close=stop_text_delivery if uses_text_queue else None)
+
+            async def run_polling() -> None:
+                if not uses_text_queue:
+                    await poller.run()
+                    return
                 # CLI 轮询自身也可能异步清理；应用先关入口及发送，再取消它。
                 polling = asyncio.create_task(poller.run())
                 try:
@@ -106,15 +120,18 @@ async def run_feishu(settings: Settings, history: History, model: Model, asr: Fi
                     if not polling.done():
                         polling.cancel()
                     await asyncio.gather(polling, return_exceptions=True)
-            elif local_voice is None:
-                await poller.run()
+
+            if local_voice is None:
+                await run_polling()
             else:
                 assert audio is not None
 
                 def submit_voice(text: str) -> None:
-                    main.submit_batch((Message("user", text),), wait_for_delivery=wait_for_delivery)
+                    # 关闭轮询通知期间，音频转写可能还在收尾。
+                    if not stopping:
+                        main.submit_batch((Message("user", text),), wait_for_delivery=wait_for_delivery)
 
                 async with local_voice.connected(audio, submit_voice):
-                    await poller.run()
+                    await run_polling()
     finally:
         await channel.close()
