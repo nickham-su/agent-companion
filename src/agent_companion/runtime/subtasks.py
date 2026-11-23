@@ -92,6 +92,8 @@ class Subtasks:
         self._outstanding += 1
         queue = self._queues.setdefault(child, deque())
         queue.append(_Job(run_id, prompt))
+        _LOG.debug("subtask accepted; run=%s parent_run=%s outstanding=%d",
+                   run_id, context.run_id, self._outstanding)
         if child not in self._workers:
             self._workers[child] = loop.create_task(self._drain(child, queue))
         return json.dumps({"status": "accepted", "child_session_id": child, "run_id": run_id})
@@ -118,7 +120,10 @@ class Subtasks:
             self._queues.pop(child, None)
 
     async def _run_job(self, child: str, runtime: Runtime, job: _Job) -> None:
+        clock = asyncio.get_running_loop().time
+        started = clock()
         self._history.start_subtask(job.run_id)
+        _LOG.debug("subtask started; run=%s", job.run_id)
         try:
             error = await runtime.run_internal(job.run_id, job.prompt)
         except asyncio.CancelledError:
@@ -130,6 +135,8 @@ class Subtasks:
             error = "empty_result"
         if not await self._persist_terminal(job.run_id, result=result, error=error):
             return
+        _LOG.debug("subtask finished; run=%s status=%s elapsed_ms=%.0f",
+                   job.run_id, "failed" if error is not None else "completed", (clock() - started) * 1000)
         if not self._closed:
             payload = {"child_session_id": child, "run_id": job.run_id}
             if error is not None:
@@ -139,6 +146,7 @@ class Subtasks:
             # 走主队列，而不是在历史中伪造 tool 结果或直接触碰通道。
             self._submit_result(Message("user", RESULT_PREFIX + json.dumps(payload, ensure_ascii=False)))
             self._history.mark_subtask_enqueued(job.run_id)
+            _LOG.debug("subtask result queued; run=%s", job.run_id)
 
     async def _persist_terminal(self, run_id: str, *, result: str | None, error: str | None) -> bool:
         # 只重试这个 SQLite 写入，不重新执行子任务或回投。

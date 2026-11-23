@@ -12,6 +12,7 @@ import httpx
 
 from .app import feishu_identity, run_feishu, running_agent
 from .config import ConfigError, Settings, load_settings
+from .logging_setup import stdout_logging
 from .models.deepseek import MODEL_NAME, DeepSeek
 from .models.openai_responses import OpenAIResponses
 from .protocol import (DeliveryStatus, Message, ModelEvent, ReasoningDelta, Receipt, ReplyStream,
@@ -23,6 +24,8 @@ from .speech.vad import VoiceSetupError
 from .storage.sqlite import FeishuBindingError, History
 
 
+# 用固定名称，保证 python -m 启动时也走应用的日志配置。
+_LOG = logging.getLogger("agent_companion.__main__")
 _DEMO_DELEGATION = "离线模拟：委派一个后台任务"
 
 
@@ -122,22 +125,31 @@ def main() -> int:
         config_error = "无法加载配置，请检查文件路径和配置格式"
     if config_error is not None:
         parser.error(config_error)
-    if args.run:
+    with stdout_logging(settings.log_level):
+        _LOG.info("agent companion started; mode=%s", settings.feishu.mode if args.run else "demo")
+        try:
+            return _run(settings, for_run=args.run, delegate=args.demo_subtasks)
+        finally:
+            _LOG.info("agent companion stopped")
+
+
+def _run(settings: Settings, *, for_run: bool, delegate: bool) -> int:
+    if for_run:
         try:
             asyncio.run(_serve(settings))
         except KeyboardInterrupt:
             return 0
         except FeishuBindingError as exc:
-            logging.getLogger(__name__).error("飞书模式无法启动：%s", exc)
+            _LOG.error("飞书模式无法启动：%s", exc)
             return 1
         except VoiceSetupError as exc:
-            logging.getLogger(__name__).error("实时语音无法启动（%s）", exc)
+            _LOG.error("实时语音无法启动（%s）", exc)
             return 1
         except Exception as exc:
-            logging.getLogger(__name__).error("飞书模式已停止（%s）", type(exc).__name__)
+            _LOG.error("飞书模式已停止（%s）", type(exc).__name__)
             return 1
         return 0
-    passed = asyncio.run(run_demo(settings, delegate=args.demo_subtasks))
+    passed = asyncio.run(run_demo(settings, delegate=delegate))
     return 0 if passed else 1
 
 

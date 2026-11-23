@@ -33,6 +33,12 @@ python -m venv .venv
 
 `.venv/bin/python -m agent_companion` 和 `.venv/bin/python -m agent_companion --demo-subtasks` 可单独运行两个简短演示；不需要生产 Provider 或密钥，始终使用内存数据库，不等同于全量验收。可传 `--config config.example.toml` 验证其他模拟配置；只有 `--run` 使用配置中的数据库路径和 Provider。
 
+## 运行日志
+
+应用日志只写标准输出，不创建日志文件。在配置顶层设置 `log_level`，修改后重启。默认 `WARNING`，只显示警告和错误，同模块同类警告每 30 秒最多打印一次；`INFO` 另显示启停，`ERROR` 和 `CRITICAL` 可进一步收紧输出。
+
+排查时改为 `log_level = "DEBUG"`。用 `run` 和 `reply` ID 串起输入、模型、工具与投递；另外记录上下文压缩、子任务和实时语音的阶段状态。日志只有计数、耗时、状态等诊断信息，不包含消息正文、语音转写、工具参数、原始请求或密钥；不逐 token、逐音频帧或逐空轮询输出。
+
 ## 选择 Provider
 
 正式启动通过顶层 `llm_provider`、`asr_provider` 引用 `[providers.<名字>]`；`voice` 还需 `tts_provider`，`text` 不使用它。名字是任意配置 ID，`adapter` 才是实际适配器。每套 Provider 在本机配置中直接填写 `api_key`，不从环境变量读取；未选用的 Provider 不需要密钥。改引用后重启即可切换。

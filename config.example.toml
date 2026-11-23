@@ -1,6 +1,8 @@
 # 相对路径以配置文件所在目录为准。
 database = "db.sqlite3"
 main_session_id = "main"
+# 日志只写标准输出，部署默认 WARNING；排查时改为 DEBUG，修改后重启。
+log_level = "WARNING"
 # 切换时只改对应引用，再重启；真实 Key 请只填写在本机私有配置中。
 llm_provider = "deepseek_default"  # 或 "openai_default"
 asr_provider = "minimax_cn"       # 文字模式也用它转写飞书语音条

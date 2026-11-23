@@ -225,7 +225,9 @@ class VoiceOutput:
             reply.abandon()
             return Receipt(reply_id, DeliveryStatus.FAILED)
         loop = asyncio.get_running_loop()
-        deadline = loop.time() + self._settings.delivery_timeout
+        started = loop.time()
+        deadline = started + self._settings.delivery_timeout
+        _LOG.debug("voice playback started; reply=%s", reply_id)
         state = _PlaybackReply(loop.create_future(), loop.time, deadline)
         reply.bind_playback(lambda timeout, cutoff: self._pcm.arm_idle(state, timeout, cutoff),
                             lambda: self._pcm.idle_snapshot(state))
@@ -248,9 +250,11 @@ class VoiceOutput:
                                    return_when=asyncio.FIRST_COMPLETED)
             if state.stopped_at is not None and state.stopped_at < deadline:
                 status = state.signal.result()
+                if status == DeliveryStatus.PARTIAL:
+                    _LOG.debug("voice playback interrupted; reply=%s", reply_id)
             elif state.worker_finished_at is None or state.worker_finished_at >= deadline:
                 status = DeliveryStatus.UNKNOWN
-                _LOG.warning("voice delivery deadline reached")
+                _LOG.warning("voice delivery deadline reached; reply=%s", reply_id)
             else:
                 cancelled = worker.cancelled()
                 error = None if cancelled else worker.exception()
@@ -273,6 +277,8 @@ class VoiceOutput:
                   state.confirmation(self._bytes_per_second))
         if not prefix and status in (DeliveryStatus.PARTIAL, DeliveryStatus.FULL):
             status = DeliveryStatus.ZERO
+        _LOG.debug("voice playback finished; reply=%s status=%s confirmed_chars=%d elapsed_ms=%.0f",
+                   reply_id, status, len(prefix), (loop.time() - started) * 1000)
         return Receipt(reply_id, status, prefix)
 
     async def _produce(self, reply: ReplyStream, state: _PlaybackReply) -> None:

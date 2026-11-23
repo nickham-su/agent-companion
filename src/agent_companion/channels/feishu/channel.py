@@ -32,7 +32,7 @@ class FeishuChannel:
             raise ValueError("voice mode requires an audio output")
         self._cli = cli
         self._voice_output = voice_output if mode == "voice" else None
-        self._pending: deque[str] = deque()
+        self._pending: deque[tuple[str, str]] = deque()
         self._sender: asyncio.Task[None] | None = None
         self._closed = False
 
@@ -47,19 +47,26 @@ class FeishuChannel:
             _LOG.warning("Feishu text reply dropped (%s); reply=%s",
                          "closed" if self._closed else "queue_full", info.reply_id)
             return
-        self._pending.append(text)
+        self._pending.append((info.reply_id, text))
+        _LOG.debug("Feishu text reply queued; reply=%s chars=%d pending=%d",
+                   info.reply_id, len(text), len(self._pending))
         if self._sender is None:
             self._sender = asyncio.create_task(self._send_pending())
 
     async def _send_pending(self) -> None:
+        clock = asyncio.get_running_loop().time
         try:
             while not self._closed and self._pending:
-                text = self._pending.popleft()
+                reply_id, text = self._pending.popleft()
+                started = clock()
                 try:
                     if await self._cli.send_text(text) != DeliveryStatus.FULL:
-                        _LOG.warning("Feishu text send not confirmed")
+                        _LOG.warning("Feishu text send not confirmed; reply=%s", reply_id)
+                    else:
+                        _LOG.debug("Feishu text send confirmed; reply=%s elapsed_ms=%.0f",
+                                   reply_id, (clock() - started) * 1000)
                 except Exception:
-                    _LOG.warning("Feishu text send failed")
+                    _LOG.warning("Feishu text send failed; reply=%s", reply_id)
         finally:
             self._sender = None
 
@@ -199,6 +206,7 @@ class FeishuPoller:
             window = self._window
             if not await self._collect(window):
                 return
+            started = asyncio.get_running_loop().time()
             received = []
             media_budget = BatchMediaBudget(self._batch_budget)
             failed_audio = []
@@ -213,7 +221,13 @@ class FeishuPoller:
                     else:
                         _LOG.warning("Feishu input could not be normalized")
                 received.append((raw.message_id, normalized))
-            recorded = self._history.record_inbound(self._session_id, self._source, window.end, media_budget.finish(received))
+            normalized_items = media_budget.finish(received)
+            recorded = self._history.record_inbound(self._session_id, self._source, window.end, normalized_items)
+            if received and _LOG.isEnabledFor(logging.DEBUG):
+                accepted = sum(message is not None and key in recorded for key, message in normalized_items)
+                _LOG.debug("Feishu input window recorded; candidates=%d accepted=%d audio_failures=%d elapsed_ms=%.0f",
+                           len(received), accepted, len(failed_audio),
+                           (asyncio.get_running_loop().time() - started) * 1000)
             self._window = None
             self._submit_pending()
             for message_id in failed_audio:

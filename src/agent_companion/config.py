@@ -17,6 +17,8 @@ MINIMAX_ASR_MODEL = "asr-1.0"
 DEFAULT_ASR_TIMEOUT = 30
 DEFAULT_MODEL_TIMEOUT = 60
 DEFAULT_TTS_TIMEOUT = 25
+_DEFAULT_LOG_LEVEL = "WARNING"
+_LOG_LEVELS = ("DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL")
 _LEGACY_CONFIG_ERROR = "旧配置格式不再支持，请按 config.example.toml 迁移到命名 Provider"
 
 
@@ -232,8 +234,11 @@ class Settings:
     # LLM 时限仅保存在 runtime.model_timeout，供既有 Runtime 机制使用。
     asr_timeout: float = DEFAULT_ASR_TIMEOUT
     tts_timeout: float = DEFAULT_TTS_TIMEOUT
+    log_level: str = _DEFAULT_LOG_LEVEL
 
     def __post_init__(self) -> None:
+        if not isinstance(self.log_level, str) or self.log_level not in _LOG_LEVELS:
+            raise ConfigError("log_level 必须是 DEBUG、INFO、WARNING、ERROR 或 CRITICAL")
         _config_seconds(self.asr_timeout, "timeouts.asr")
         _config_seconds(self.tts_timeout, "timeouts.tts")
 
@@ -346,7 +351,7 @@ def _parse_settings(data: dict[str, Any], path: Path, *, for_run: bool) -> Setti
     if (data.keys() & {"deepseek", "llm", "minimax"}
             or isinstance(runtime_data, dict) and "model_timeout" in runtime_data):
         raise ConfigError(_LEGACY_CONFIG_ERROR)
-    _table(data, {"database", "main_session_id", "runtime", "feishu", "voice", "providers", "timeouts",
+    _table(data, {"database", "main_session_id", "log_level", "runtime", "feishu", "voice", "providers", "timeouts",
                   "llm_provider", "asr_provider", "tts_provider"}, "顶层")
     database = data.get("database", "db.sqlite3")
     session_id = data.get("main_session_id", "main")
@@ -382,4 +387,5 @@ def _parse_settings(data: dict[str, Any], path: Path, *, for_run: bool) -> Setti
         voice=voice,
         asr_timeout=timeouts.get("asr", DEFAULT_ASR_TIMEOUT),
         tts_timeout=timeouts.get("tts", DEFAULT_TTS_TIMEOUT) if for_run and use_voice else DEFAULT_TTS_TIMEOUT,
+        log_level=data.get("log_level", _DEFAULT_LOG_LEVEL),
     )

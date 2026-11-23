@@ -181,6 +181,8 @@ class Context:
         if not any(message.role != "assistant" or message.content or message.tool_calls for message in old):
             return summary
         prompt = fixed + _summary_message(summary) + old + [_SUMMARIZE]
+        started = monotonic()
+        _LOG.debug("context compaction started; blocks=%d prompt_messages=%d", len(blocks), len(prompt))
         try:
             content = await self._summarize_prefix(prompt, tools, thinking)
         except (ModelError, TimeoutError) as exc:
@@ -193,6 +195,8 @@ class Context:
                 reason = "summary_write_failed"
             else:
                 self._failed_prefix = None
+                _LOG.debug("context compaction committed; summary_chars=%d elapsed_ms=%.0f",
+                           len(content), (monotonic() - started) * 1000)
                 return compacted
 
         # 生成或落库失败不裁历史；同一旧前缀不会在后续每轮重试。

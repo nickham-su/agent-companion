@@ -100,6 +100,8 @@ class Runtime:
     def _enqueue(self, batch: _InputBatch) -> None:
         loop = asyncio.get_running_loop()
         self._pending.append(batch)
+        _LOG.debug("runtime input queued; batch=%s messages=%d user_input=%s pending=%d",
+                   batch.persisted_id, len(batch.messages), batch.has_user_input, len(self._pending))
         self._idle.clear()
         if self._worker is None:
             self._worker = loop.create_task(self._drain())
@@ -137,29 +139,43 @@ class Runtime:
             self._worker = None
             self._idle.set()
 
-    def _record_input(self, batch: _InputBatch) -> list[int]:
+    def _record_input(self, batch: _InputBatch, run_id: str) -> list[int]:
         if batch.persisted_id is None:
-            return self.history.append(self.session_id, batch.messages)
-        try:
-            return self.history.consume_inbound(self.session_id, batch.persisted_id)
-        finally:
-            self._queued_inbound.discard(batch.persisted_id)
+            ids = self.history.append(self.session_id, batch.messages)
+        else:
+            try:
+                ids = self.history.consume_inbound(self.session_id, batch.persisted_id)
+            finally:
+                self._queued_inbound.discard(batch.persisted_id)
+        _LOG.debug("runtime input recorded; run=%s batch=%s messages=%d user_input=%s wait_for_delivery=%s",
+                   run_id, batch.persisted_id, len(ids), batch.has_user_input, batch.wait_for_delivery)
+        return ids
 
     async def _process(self, batch: _InputBatch, run_id: str) -> None:
         self.last_failure = None
+        clock = asyncio.get_running_loop().time
+        started = clock()
         try:
-            message_ids = self._record_input(batch)
+            message_ids = self._record_input(batch, run_id)
             if message_ids:
                 await self._run(run_id, message_ids[0], has_user_input=batch.has_user_input,
                                 wait_for_delivery=batch.wait_for_delivery)
+        except asyncio.CancelledError:
+            _LOG.debug("runtime run cancelled; run=%s", run_id)
+            raise
         except InstructionsError as exc:
             self.last_failure = exc.diagnostic
-            _LOG.warning("Local system instructions unavailable (%s)", exc.diagnostic)
-        except (ModelError, TimeoutError):
+            _LOG.warning("Local system instructions unavailable (%s); run=%s", exc.diagnostic, run_id)
+        except (ModelError, TimeoutError) as exc:
             self.last_failure = "context_failed"
-        except Exception:
+            _LOG.warning("runtime context failed (%s); run=%s",
+                         "timeout" if isinstance(exc, TimeoutError) else exc.diagnostic, run_id)
+        except Exception as exc:
             self.last_failure = "runtime_failed"
-            _LOG.error("session runtime could not finish the current input")
+            _LOG.error("session runtime could not finish the current input; run=%s error_type=%s",
+                       run_id, type(exc).__name__)
+        _LOG.debug("runtime run finished; run=%s status=%s elapsed_ms=%.0f",
+                   run_id, self.last_failure or "complete", (clock() - started) * 1000)
 
     async def _run(self, run_id: str, protected_from: int, *, has_user_input: bool,
                    wait_for_delivery: bool) -> None:
@@ -182,7 +198,7 @@ class Runtime:
                 return
             while self._pending:
                 batch = self._pending.popleft()
-                if self._record_input(batch):
+                if self._record_input(batch, run_id):
                     has_user_input = has_user_input or batch.has_user_input
 
     async def _summary_stream(self, messages: Sequence[Message], tools: Sequence[ToolSpec],
@@ -227,6 +243,8 @@ class Runtime:
         model_status = "complete"
         model_error = None
         input_tokens: int | None = None
+        _LOG.debug("model request started; run=%s reply=%s messages=%d tools=%d thinking=%s",
+                   run_id, info.reply_id, len(messages), len(self._tools.specs), self._thinking)
         try:
             try:
                 async with asyncio.timeout(self._settings.model_timeout):
@@ -234,6 +252,9 @@ class Runtime:
                                                            thinking=self._thinking)) as events:
                         async for event in events:
                             if isinstance(event, TextDelta) and event.text:
+                                if not text:
+                                    _LOG.debug("model first text; reply=%s elapsed_ms=%.0f", info.reply_id,
+                                               (loop.time() - info.started_at) * 1000)
                                 text.append(event.text)
                                 if self._channel is not None and wait_for_delivery:
                                     if delivery is None:
@@ -258,6 +279,7 @@ class Runtime:
                                 scheduled[call.id] = (call, loop.create_task(self._tools.execute(call, context)))
             except TimeoutError:
                 model_status = "model_timeout"
+                _LOG.warning("model request timed out; reply=%s", info.reply_id)
             except ModelError as exc:
                 model_status = "model_failed"
                 model_error = exc.diagnostic
@@ -271,6 +293,9 @@ class Runtime:
                 reply.close()
 
             generated = "".join(text)
+            _LOG.debug("model request finished; reply=%s status=%s input_tokens=%s output_chars=%d tools=%d elapsed_ms=%.0f",
+                       info.reply_id, model_status, input_tokens, len(generated), len(scheduled),
+                       (loop.time() - info.started_at) * 1000)
             # 工具和投递一直独立运行；这个汇合点只提交成套的终态数据。
             receipt = await self._delivery_result(reply, delivery, generated)
             # 内部会话与后台发送都只保存成功生成的全文，不制造回执。
@@ -292,6 +317,9 @@ class Runtime:
                 ReplyOutcome(info.reply_id, info.session_id, run_id, model_status,
                              receipt.status if receipt else None, model_error=model_error,
                              input_tokens=input_tokens if model_status == "complete" else None), rows)
+            _LOG.debug("reply committed; reply=%s receipt=%s confirmed_chars=%d tool_results=%d elapsed_ms=%.0f",
+                       info.reply_id, receipt.status if receipt else None, len(confirmed_text), len(results),
+                       (loop.time() - info.started_at) * 1000)
             # 外部副本与主投递状态无关，只在历史事务成功后尽力入队。
             try:
                 if confirmed_text and self._on_confirmed_reply is not None:

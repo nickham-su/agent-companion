@@ -115,6 +115,7 @@ class VoiceChannel:
         self._speaking = True
         self._quiet_frames = 0
         self._obsolete_until = asyncio.get_running_loop().time()
+        _LOG.debug("voice turn started")
         self._output.interrupt()
         if not self._discard_gap:
             preroll = b"".join(self._preroll)
@@ -150,6 +151,8 @@ class VoiceChannel:
         if recording and self._pending < _MAX_ASR_TURNS:
             self._pending += 1
             self._turns.put_nowait(bytes(recording))
+            _LOG.debug("voice turn queued for transcription; pcm_bytes=%d duration_limited=%s pending=%d",
+                       len(recording), ignore_tail, self._pending)
         elif recording:
             _LOG.warning("voice turn dropped (asr backlog)")
         self._release_if_idle()
@@ -270,8 +273,10 @@ class VoiceChannel:
         return "" if task.cancelled() else task.result().strip()
 
     async def _transcribe(self, submit: Callable[[str], None]) -> None:
+        clock = asyncio.get_running_loop().time
         while not self._failed:
             recording = await self._turns.get()
+            started = clock()
             try:
                 text = await self._recognize(recording)
             except Exception:
@@ -283,6 +288,7 @@ class VoiceChannel:
                 self._pending -= 1
                 self._release_if_idle()
             if text and not self._failed:
+                _LOG.debug("voice transcription ready; chars=%d elapsed_ms=%.0f", len(text), (clock() - started) * 1000)
                 submit(text)
 
     @asynccontextmanager
