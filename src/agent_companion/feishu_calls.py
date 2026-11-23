@@ -1,7 +1,6 @@
 """一次只接入一通飞书来电；来电身份和设备生命周期不改变私聊路由。"""
 
 import asyncio
-from collections import deque
 from collections.abc import Awaitable, Callable
 import logging
 from sqlite3 import OperationalError
@@ -19,8 +18,8 @@ from .storage.sqlite import is_sqlite_lock_error
 
 _LOG = logging.getLogger(__name__)
 _POLL_SECONDS = 0.25
-_LOOKUP_SECONDS = 8.0
-_CONNECT_SECONDS = 4.0
+_CLICK_FRESH_SECONDS = 0.5
+_CONNECT_SECONDS = 10.0
 
 
 class CallDesktop(Protocol):
@@ -31,13 +30,23 @@ class CallDesktop(Protocol):
 
 
 class CallPeer(Protocol):
-    async def runtime(self) -> Runtime | None: ...
+    async def runtime(self, *, wait_for_lock: bool = True) -> Runtime | None: ...
     def copy_confirmed(self, info: ReplyInfo, text: str) -> None: ...
     def watch_call(self, stop: Callable[[], None]) -> bool: ...
     def unwatch_call(self, stop: Callable[[], None]) -> None: ...
 
 
 VoiceFactory = Callable[[], Awaitable[tuple[VoiceChannel, AudioDevice]]]
+
+
+def _require_audio(voice: VoiceChannel, device: AudioDevice) -> None:
+    if not voice.failed:
+        try:
+            device.check_active()
+            return
+        except Exception:
+            pass
+    raise VoiceSetupError("feishu_call_audio_inactive")
 
 
 class _CallBinding:
@@ -50,15 +59,6 @@ class _CallBinding:
 
     def active(self) -> bool:
         return self._connected and not self.closed and not self._voice.failed
-
-    def require_audio(self, device: AudioDevice) -> None:
-        if not self._voice.failed:
-            try:
-                device.check_active()
-                return
-            except Exception:
-                pass
-        raise VoiceSetupError("feishu_call_audio_inactive")
 
     def confirm(self) -> None:
         if not self.closed:
@@ -82,19 +82,13 @@ class IncomingCalls:
         self._desktop, self._discovery, self._voice_factory = desktop, discovery, voice_factory
         self._own_id = own_id
         self._idle_timeout, self._copy_confirmed = idle_timeout, copy_confirmed
-        self._clicked_meetings: deque[str] = deque(maxlen=16)
 
     async def run(self, resolve: Callable[[str], CallPeer | None]) -> None:
-        attempted: deque[WindowIdentity] = deque(maxlen=16)
         desktop_error: str | None = None
         while True:
             try:
                 rings = self._desktop.ringing()
-                for identity in tuple(attempted):
-                    if not any(r.identity.overlaps(identity) for r in rings) and not self._desktop.window_exists(identity):
-                        attempted.remove(identity)
-                if len(rings) == 1 and not any(rings[0].identity.overlaps(identity) for identity in attempted):
-                    attempted.append(rings[0].identity)
+                if len(rings) == 1 and not self._desktop.main_windows():
                     await self._handle(rings[0], resolve)
                 desktop_error = None
             except DesktopCallError as exc:
@@ -106,99 +100,87 @@ class IncomingCalls:
     async def _handle(self, ring: RingingWindow, resolve: Callable[[str], CallPeer | None]) -> None:
         loop = asyncio.get_running_loop()
         started_at = loop.time()
-        deadline = started_at + _LOOKUP_SECONDS
 
-        def before_deadline() -> bool:
-            return loop.time() < deadline
-
-        phase = "caller_lookup"
         try:
-            async with asyncio.timeout_at(deadline):
-                caller = await self._discovery.ringing_caller(self._own_id)
-                if caller is None:
-                    _LOG.debug("Feishu auto-answer skipped: no unique ringing caller")
-                    return
-                if caller.meeting_id in self._clicked_meetings:
-                    return  # 同一通话的浮窗被客户端重建也不再尝试点击。
-                phase, route_started_at = "private_route", loop.time()
-                while self._desktop.ringing() == (ring,):
-                    peer = resolve(caller.sender_open_id)
-                    if peer is not None:
-                        try:
-                            main = await peer.runtime()
-                        except OperationalError as exc:
-                            if not is_sqlite_lock_error(exc):
-                                raise
-                        else:
-                            if main is not None:
-                                break
-                    await asyncio.sleep(_POLL_SECONDS)
-                else:
-                    return
-                # 首版不尝试接入另一个已开的通话，避免虚拟线路对应错会话。
-                if self._desktop.main_windows():
-                    _LOG.debug("Feishu auto-answer skipped: pre-existing meeting window")
-                    return
-                phase, audio_prepare_started_at = "audio_prepare", loop.time()
-                voice, device = await self._voice_factory()
-                audio_prepared_at = loop.time()
-        except CliError as exc:
-            _LOG.warning("Feishu auto-answer caller lookup failed (%s)", exc)
-            return
-        except TimeoutError:
-            _LOG.debug("Feishu auto-answer skipped: ringing lookup timed out (phase=%s, elapsed=%.3fs)",
-                       phase, loop.time() - started_at)
-            return
+            voice, device = await self._voice_factory()
         except VoiceSetupError as exc:
             _LOG.warning("Feishu auto-answer audio setup failed (%s)", exc)
             return
 
-        binding = _CallBinding(main, voice, idle_timeout=self._idle_timeout,
-                               copy_confirmed=peer.copy_confirmed if self._copy_confirmed else None)
-        if not peer.watch_call(binding.stop):
+        if self._desktop.ringing() != (ring,) or self._desktop.main_windows():
+            _LOG.debug("Feishu auto-answer skipped: desktop changed during audio preparation")
             return
+
+        binding: _CallBinding | None = None
+        peer: CallPeer | None = None
+
+        def submit(text: str) -> None:
+            if binding is not None:
+                binding.submit(text)
+
         audio_open_started_at = loop.time()
         try:
-            async with voice.connected(device, binding.submit, capture_enabled=False, wait_for_cleanup=False):
+            async with voice.connected(device, submit, capture_enabled=False, wait_for_cleanup=False):
                 try:
-                    if binding.closed:
-                        return
-                    if not before_deadline():
-                        now = loop.time()
-                        _LOG.debug("Feishu auto-answer skipped: deadline expired before ringing recheck "
-                                   "(audio_open=%.3fs, elapsed=%.3fs)",
-                                   now - audio_open_started_at, now - started_at)
-                        return
-                    binding.require_audio(device)
-                    # 同一窗口号也可能被客户端复用；打开设备后用剩余判定时间复查来电身份。
-                    recheck_started_at = loop.time()
-                    _LOG.debug("Feishu auto-answer ringing recheck started (caller_lookup=%.3fs, "
-                               "private_route=%.3fs, audio_prepare=%.3fs, audio_open=%.3fs, remaining=%.3fs)",
-                               route_started_at - started_at, audio_prepare_started_at - route_started_at,
-                               audio_prepared_at - audio_prepare_started_at,
-                               recheck_started_at - audio_open_started_at, deadline - recheck_started_at)
+                    _require_audio(voice, device)
+                    lookup_started_at = loop.time()
+                    _LOG.debug("Feishu auto-answer caller lookup started (audio_prepare=%.3fs, audio_open=%.3fs)",
+                               audio_open_started_at - started_at, lookup_started_at - audio_open_started_at)
                     try:
-                        async with asyncio.timeout_at(deadline):
-                            verified = await self._discovery.ringing_caller(self._own_id)
+                        caller = await self._discovery.ringing_caller(self._own_id)
                     finally:
-                        recheck_finished_at = loop.time()
-                        _LOG.debug("Feishu auto-answer ringing recheck finished (elapsed=%.3fs, remaining=%.3fs)",
-                                   recheck_finished_at - recheck_started_at, deadline - recheck_finished_at)
-                    if verified != caller:
-                        _LOG.debug("Feishu auto-answer skipped: ringing identity changed or became unavailable")
+                        lookup_finished_at = loop.time()
+                        _LOG.debug("Feishu auto-answer caller lookup finished (elapsed=%.3fs)",
+                                   lookup_finished_at - lookup_started_at)
+                    if caller is None:
+                        _LOG.debug("Feishu auto-answer skipped: no unique ringing caller")
                         return
-                    if (binding.closed or resolve(caller.sender_open_id) is not peer or self._desktop.main_windows()
-                            or not before_deadline()):
+                    if self._desktop.ringing() != (ring,):
+                        _LOG.debug("Feishu auto-answer skipped: ringing window changed during caller lookup")
                         return
-                    binding.require_audio(device)
+
+                    # 本轮只短暂使用身份结果，之后回到桌面轮询重新查询。
+                    click_deadline = lookup_finished_at + _CLICK_FRESH_SECONDS
+
+                    def before_deadline() -> bool:
+                        return loop.time() < click_deadline
+
                     if not before_deadline():
-                        _LOG.debug("Feishu auto-answer skipped: deadline expired during audio check")
+                        _LOG.debug("Feishu auto-answer skipped: caller lookup result expired")
                         return
-                    self._clicked_meetings.append(caller.meeting_id)
+                    peer = resolve(caller.sender_open_id)
+                    if peer is None:
+                        _LOG.debug("Feishu auto-answer skipped: private route not ready")
+                        return
+                    try:
+                        async with asyncio.timeout_at(click_deadline):
+                            main = await peer.runtime(wait_for_lock=False)
+                    except TimeoutError:
+                        _LOG.debug("Feishu auto-answer skipped: caller lookup result expired during private binding")
+                        return
+                    except OperationalError as exc:
+                        if not is_sqlite_lock_error(exc):
+                            raise
+                        _LOG.debug("Feishu auto-answer skipped: private route storage busy")
+                        return
+                    if main is None:
+                        _LOG.debug("Feishu auto-answer skipped: private route not ready")
+                        return
+                    binding = _CallBinding(main, voice, idle_timeout=self._idle_timeout,
+                                           copy_confirmed=peer.copy_confirmed if self._copy_confirmed else None)
+                    if not peer.watch_call(binding.stop):
+                        return
+                    if (binding.closed or resolve(caller.sender_open_id) is not peer or self._desktop.main_windows()):
+                        _LOG.debug("Feishu auto-answer skipped: private route or desktop changed before click")
+                        return
+                    _require_audio(voice, device)
+                    if not before_deadline():
+                        _LOG.debug("Feishu auto-answer skipped: caller lookup result expired before click")
+                        return
                     if not self._desktop.answer(ring, before_deadline=before_deadline):
                         _LOG.debug("Feishu auto-answer skipped: target window changed or deadline expired")
                         return
-                    window = await self._confirm(ring, binding, device)
+                    window = await self._confirm(ring, binding, voice, device)
                     if window is None:
                         _LOG.debug("Feishu auto-answer did not confirm connection")
                         return
@@ -207,33 +189,31 @@ class IncomingCalls:
                     await self._follow(window, binding)
                 # 在 VoiceChannel 的 TaskGroup 内消化预期错误，文字服务继续运行。
                 except DesktopCallError as exc:
-                    binding.stop()
-                    _LOG.warning("Feishu auto-answer released binding after desktop error (%s)", exc)
+                    if binding is not None:
+                        binding.stop()
+                    _LOG.warning("Feishu auto-answer released audio after desktop error (%s)", exc)
                 except CliError as exc:
-                    _LOG.warning("Feishu auto-answer caller recheck failed (%s)", exc)
-                except TimeoutError:
-                    _LOG.debug("Feishu auto-answer skipped: ringing recheck timed out")
+                    _LOG.warning("Feishu auto-answer caller lookup failed (%s)", exc)
                 except VoiceSetupError as exc:
                     _LOG.warning("Feishu auto-answer audio unavailable (%s)", exc)
                 finally:
-                    binding.stop()  # 先封闸和清 PCM，再由 connected 取消请求、关闭设备。
+                    if binding is not None and peer is not None:
+                        binding.stop()  # 先封闸和清 PCM，再由 connected 取消请求、关闭设备。
+                        peer.unwatch_call(binding.stop)
         except VoiceSetupError as exc:
             _LOG.warning("Feishu auto-answer audio setup failed (%s)", exc)
-        finally:
-            binding.stop()
-            peer.unwatch_call(binding.stop)
 
     async def _confirm(self, ring: RingingWindow, binding: _CallBinding,
-                       device: AudioDevice) -> WindowIdentity | None:
+                       voice: VoiceChannel, device: AudioDevice) -> WindowIdentity | None:
         loop = asyncio.get_running_loop()
         deadline = loop.time() + _CONNECT_SECONDS
         while not binding.closed and loop.time() < deadline:
-            binding.require_audio(device)
+            _require_audio(voice, device)
             windows = self._desktop.main_windows()
-            if len(windows) == 1 and windows[0].pid == ring.identity.pid and not self._desktop.ringing():
-                binding.require_audio(device)
-                return windows[0]
-            await asyncio.sleep(_POLL_SECONDS)
+            if len(windows) == 1 and windows[0].pid == ring.identity.pid:
+                _require_audio(voice, device)
+                return windows[0] if loop.time() < deadline else None
+            await asyncio.sleep(min(_POLL_SECONDS, max(0, deadline - loop.time())))
         return None
 
     async def _follow(self, window: WindowIdentity, binding: _CallBinding) -> None:

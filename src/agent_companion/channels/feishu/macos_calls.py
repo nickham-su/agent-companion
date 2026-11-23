@@ -32,9 +32,6 @@ class WindowIdentity:
     pid: int
     numbers: frozenset[int]
 
-    def overlaps(self, other: "WindowIdentity") -> bool:
-        return self.pid == other.pid and not self.numbers.isdisjoint(other.numbers)
-
 
 @dataclass(frozen=True, slots=True)
 class RingingWindow:

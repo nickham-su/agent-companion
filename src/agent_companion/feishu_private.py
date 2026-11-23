@@ -50,7 +50,9 @@ class _Route:
                                     private_started_ms=started_ms, submit=self._submit,
                                     before_close=self.stop_accepting)
 
-    async def runtime(self) -> Runtime | None:
+    async def runtime(self, *, wait_for_lock: bool = True) -> Runtime | None:
+        if not wait_for_lock and self._agent_lock.locked():
+            return None
         async with self._agent_lock:
             if self._closed:
                 return None

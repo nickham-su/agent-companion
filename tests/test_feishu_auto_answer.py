@@ -189,7 +189,11 @@ class _CallRunner(_Runner):
             caller = self.caller
             meeting_id = self.meeting_id
             self.details_asked.set()
-            await self.release_detail.wait()
+            try:
+                async with asyncio.timeout(timeout):
+                    await self.release_detail.wait()
+            except TimeoutError:
+                raise CliError("cli_timeout") from None
             return _ok(_meeting(caller, id=meeting_id))
         return await super().__call__(argv, data, timeout)
 
@@ -201,7 +205,6 @@ class _Desktop:
         self.main = ()
         self.clicks = []
         self.error = False
-        self.click_ok = True
 
     def ring(self, sender, number):
         self.runner.caller = sender
@@ -227,7 +230,7 @@ class _Desktop:
         if self.rings != (ring,) or not before_deadline():
             return False
         self.clicks.append(ring.identity)
-        return self.click_ok
+        return True
 
 
 class _Echo:
@@ -282,7 +285,6 @@ class IncomingCallTests(unittest.IsolatedAsyncioTestCase):
               patch("agent_companion.feishu_private._DISCOVERY_SECONDS", 0.015),
               patch("agent_companion.channels.feishu.channel._POLL_SECONDS", 0.015),
               patch("agent_companion.feishu_calls._POLL_SECONDS", 0.005),
-              patch("agent_companion.feishu_calls._LOOKUP_SECONDS", 0.35),
               patch("agent_companion.feishu_calls._CONNECT_SECONDS", 0.12)):
             task = asyncio.create_task(run_feishu(settings, history, model, object(), tts=tts,
                                                 discovery=self.runner.discovery()))
@@ -305,8 +307,8 @@ class IncomingCallTests(unittest.IsolatedAsyncioTestCase):
         self.runner.messages[_CHATS[index]].append(_message(str(index), _CHATS[index], _SENDERS[index], content))
         self.clock = 102.0
 
-    async def test_first_call_waits_for_route_and_confirmation_then_shares_text_history(self):
-        self.runner.pages[None] = ([], None)
+    async def test_first_call_looks_up_once_after_audio_opens_and_shares_text_history(self):
+        self.runner.release_detail.clear()
         model, tts = _Echo(), _TTS()
         sender = _SENDERS[0]
         async with self._serve(model, tts=tts) as (history, agents):
@@ -316,9 +318,11 @@ class IncomingCallTests(unittest.IsolatedAsyncioTestCase):
             await self.runner.details_asked.wait()
             self.assertFalse(self.desktop.clicks)
             self.assertEqual(agents.call_count, 0)
-            self.runner.pages[None] = ([_chat(_CHATS[0], sender)], None)
-            await _eventually(lambda: len(self.desktop.clicks) == 1)
             device = self.devices[0]
+            self.assertTrue(device.started.is_set())
+            _talk(device)  # 查询期间打开了设备，但不能收音。
+            self.runner.release_detail.set()
+            await _eventually(lambda: len(self.desktop.clicks) == 1)
             _talk(device)
             await asyncio.sleep(0.03)
             self.assertFalse(self.asrs[0].files)
@@ -334,95 +338,143 @@ class IncomingCallTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(self.runner.sent[_CHATS[0]][1], "通话中发文字。")
             self.assertEqual(len(tts.calls), 1)
             self.assertEqual(agents.call_count, 1)
-            self.assertEqual(self.runner.lookups, 2)
+            self.assertEqual(self.runner.lookups, 1)
             self.assertEqual([row.message.content for row in history.tail(_session(sender), 10)],
                              ["测试语音1", "测试语音1。", "通话中发文字", "通话中发文字。"])
 
-    async def test_replaced_candidate_failed_click_and_pre_existing_or_unconfirmed_window(self):
+    async def test_retries_same_window_with_fresh_lookup_after_route_becomes_ready(self):
+        self.runner.pages[None] = ([], None)
+        async with self._serve(_Echo()) as (_, agents):
+            await _eventually(lambda: bool(self.runner.queries))
+            self.desktop.ring(_SENDERS[0], 1)
+            await _eventually(lambda: bool(self.devices) and self.devices[0].closed)
+            self.assertEqual(agents.call_count, 0)
+            self.assertFalse(self.desktop.clicks)
+            lookups_before = self.runner.lookups
+
+            self.runner.pages[None] = ([_chat(_CHATS[0], _SENDERS[0])], None)
+            self.clock = 102.0
+            await _eventually(lambda: bool(self.desktop.clicks))
+            self.assertEqual(self.desktop.clicks[0].numbers, {1})
+            self.assertGreater(self.runner.lookups, lookups_before)
+
+    async def test_window_replaced_during_lookup_uses_next_lookup_for_the_new_window(self):
         self.runner.release_detail.clear()
         async with self._serve(_Echo()) as (_, agents):
             self.desktop.ring(_SENDERS[0], 1)
             await self.runner.details_asked.wait()
-            self.desktop.ring(_SENDERS[1], 2)  # 同坐标不同窗口号码；A 的身份不能用于点击 B。
-            self.desktop.click_ok = False
+            self.desktop.ring(_SENDERS[1], 2)  # 同坐标不同窗口号，不能沿用原结果。
             self.runner.release_detail.set()
-            await _eventually(lambda: len(self.desktop.clicks) == 1 and self.devices[-1].closed)
+            await _eventually(lambda: bool(self.desktop.clicks))
             self.assertEqual(self.desktop.clicks[0].numbers, {2})
-            await asyncio.sleep(0.03)
-            self.assertEqual(self.runner.lookups, 3)
+            self.assertEqual(self.runner.lookups, 2)
             self.assertEqual(agents.call_count, 1)
-            self.desktop.click_ok = True
-            self.desktop.ring(_SENDERS[1], 5)
-            self.runner.meeting_id = "2"  # 客户端重建浮窗，CLI 仍指向刚才的电话。
-            await _eventually(lambda: self.runner.lookups == 4)
-            await asyncio.sleep(0.025)
-            self.assertEqual(len(self.desktop.clicks), 1)
-            self.desktop.main = (WindowIdentity(3, frozenset({90})),)
-            self.desktop.ring(_SENDERS[0], 3)
-            await _eventually(lambda: self.runner.lookups == 5)
-            await asyncio.sleep(0.025)
-            self.assertEqual(len(self.desktop.clicks), 1)
-            self.desktop.main = ()
-            self.desktop.ring(_SENDERS[0], 4)
-            await _eventually(lambda: len(self.desktop.clicks) == 2)
-            await _eventually(lambda: self.devices[-1].closed)
-            self.assertEqual(len(self.desktop.clicks), 2)
-            self.assertFalse(self.asrs[-1].files)
+            self.assertTrue(self.devices[0].closed)
 
-    async def test_rechecks_caller_when_same_window_is_reused_or_identity_is_lost(self):
+    async def test_pre_existing_meeting_prevents_preparing_audio_and_looking_up_a_caller(self):
+        desktop = self.desktop
+        desktop.main = (WindowIdentity(3, frozenset({90})),)
+        with patch.object(desktop, "main_windows", wraps=desktop.main_windows) as main_windows:
+            async with self._serve(_Echo()):
+                desktop.ring(_SENDERS[0], 1)
+                await _eventually(lambda: main_windows.call_count >= 2)
+                self.assertFalse(self.devices)
+                self.assertFalse(desktop.clicks)
+                self.assertEqual(self.runner.lookups, 0)
+
+    async def test_rejected_click_retries_same_window_with_fresh_lookup(self):
+        desktop = self.desktop
+        real_answer = desktop.answer
+        attempts = []
+
+        def answer(ring, *, before_deadline):
+            attempts.append(ring)
+            if len(attempts) == 1:
+                return False
+            self.assertTrue(self.devices[0].closed)
+            return real_answer(ring, before_deadline=before_deadline)
+
+        with patch.object(desktop, "answer", side_effect=answer):
+            async with self._serve(_Echo()):
+                desktop.ring(_SENDERS[0], 1)
+                await _eventually(lambda: bool(desktop.clicks))
+                self.assertEqual(attempts, [desktop.rings[0]] * 2)
+                self.assertEqual(self.runner.lookups, 2)
+
+    async def test_unconfirmed_click_retries_same_window_then_confirms_with_popup_still_present(self):
+        desktop = self.desktop
+        real_answer = desktop.answer
+        click_times = []
+
+        def answer(ring, *, before_deadline):
+            clicked = real_answer(ring, before_deadline=before_deadline)
+            if clicked:
+                click_times.append(asyncio.get_running_loop().time())
+                if len(click_times) == 2:
+                    self.assertTrue(self.devices[0].closed)
+                    desktop.main = (WindowIdentity(3, frozenset({101})),)  # 浮窗仍在。
+            return clicked
+
+        with patch.object(desktop, "answer", side_effect=answer):
+            async with self._serve(_Echo()) as (history, _):
+                desktop.ring(_SENDERS[0], 1)
+                await _eventually(lambda: bool(desktop.clicks))
+                _talk(self.devices[0])
+                await _eventually(lambda: len(desktop.clicks) == 2)
+                self.assertGreaterEqual(click_times[1] - click_times[0], 0.12)
+                self.assertTrue(desktop.rings)
+                self.assertFalse(self.asrs[0].files)
+                _talk(self.devices[1])
+                await _eventually(lambda: bool(history.tail(_session(_SENDERS[0]), 10)))
+                self.assertEqual(self.runner.lookups, 2)
+
+    async def test_lookup_after_audio_opens_can_see_a_reused_window_has_a_new_caller(self):
         desktop, runner = self.desktop, self.runner
-        for meeting, sender in (("2", _SENDERS[1]), ("2", _SENDERS[0]),
-                                ("1", _SENDERS[1]), (None, _SENDERS[0])):
-            with self.subTest(meeting=meeting, sender=sender):
-                self.devices.clear()
-                runner.lookups = 0
+        other = _SENDERS[1]
 
-                class ReusedWindow(_Device):
-                    def start(self, capture, render):
-                        super().start(capture, render)
-                        # PID、CG 窗口号、坐标一样，单靠复核窗口无法识别换人。
-                        desktop.ring(sender, 1)
-                        runner.meeting_id = meeting
-
-                async with self._serve(_Echo(), make_device=ReusedWindow):
-                    desktop.ring(_SENDERS[0], 1)
-                    original = desktop.rings
-                    await _eventually(lambda: bool(self.devices) and self.devices[0].closed)
-                    self.assertEqual(desktop.rings, original)
-                    self.assertEqual(runner.lookups, 2)
-                    self.assertFalse(desktop.clicks)
-
-    async def test_recheck_timeout_logs_stage_timings_without_ids(self):
-        runner = self.runner
-        sender, meeting = _SENDERS[0], "123456789012345"
-
-        class SlowRecheckDevice(_Device):
+        class ReusedWindow(_Device):
             def start(self, capture, render):
                 super().start(capture, render)
-                runner.release_detail.clear()
+                # PID、CG 窗口号、坐标没变，但在唯一一次查询前已经换成另一通。
+                desktop.ring(other, 1)
+                runner.meeting_id = "2"
+
+        async with self._serve(_Echo(), make_device=ReusedWindow) as (history, agents):
+            await self._ring_connect(_SENDERS[0], 1, 1)
+            self.assertEqual(runner.lookups, 1)
+            self.assertEqual(agents.call_count, 1)
+            _talk(self.devices[-1])
+            await _eventually(lambda: bool(history.tail(_session(other), 10)))
+            self.assertFalse(history.tail(_session(_SENDERS[0]), 10))
+
+    async def test_cli_timeout_logs_stage_timings_without_ids(self):
+        runner = self.runner
+        sender, meeting = _SENDERS[0], "123456789012345"
+        runner.release_detail.clear()
 
         with self.assertLogs("agent_companion", level="DEBUG") as logs:
-            async with self._serve(_Echo(), make_device=SlowRecheckDevice):
+            async with self._serve(_Echo()):
                 self.desktop.ring(sender, 1)
                 runner.meeting_id = meeting
+                await runner.details_asked.wait()
+                self.desktop.rings = ()
                 await _eventually(lambda: bool(self.devices) and self.devices[0].closed)
-                self.assertEqual(runner.lookups, 2)
+                self.assertEqual(runner.lookups, 1)
                 self.assertFalse(self.desktop.clicks)
 
         messages = [record.getMessage() for record in logs.records
                     if record.name in {"agent_companion.feishu_calls", "agent_companion.channels.feishu.cli"}]
         diagnostics = "\n".join(messages)
-        self.assertEqual(diagnostics.count("step=list_active, outcome=ok, elapsed="), 2)
-        self.assertIn("step=meeting_detail, outcome=ok, elapsed=", diagnostics)
-        self.assertIn("step=meeting_detail, outcome=cancelled, elapsed=", diagnostics)
-        self.assertRegex(diagnostics, r"recheck started \(caller_lookup=\d+\.\d+s, private_route=\d+\.\d+s, "
-                         r"audio_prepare=\d+\.\d+s, audio_open=\d+\.\d+s, remaining=\d+\.\d+s\)")
-        self.assertIn("recheck finished (elapsed=", diagnostics)
-        self.assertIn("ringing recheck timed out", diagnostics)
+        self.assertEqual(diagnostics.count("step=list_active, outcome=ok, elapsed="), 1)
+        self.assertIn("step=meeting_detail, outcome=failed, elapsed=", diagnostics)
+        self.assertRegex(diagnostics, r"caller lookup started \(audio_prepare=\d+\.\d+s, "
+                         r"audio_open=\d+\.\d+s\)")
+        self.assertIn("caller lookup finished (elapsed=", diagnostics)
+        self.assertIn("caller lookup failed (cli_timeout)", diagnostics)
         for identifier in (sender, meeting, _OWN):
             self.assertNotIn(identifier, diagnostics)
 
-    async def test_audio_check_after_caller_recheck_can_exhaust_click_deadline(self):
+    async def test_expired_identity_is_not_clicked_and_next_round_queries_again(self):
         loop = asyncio.get_running_loop()
         clock = loop.time
         time_spent = 0.0
@@ -432,19 +484,41 @@ class IncomingCallTests(unittest.IsolatedAsyncioTestCase):
             def check_active(self):
                 nonlocal time_spent
                 super().check_active()
-                if runner.lookups == 2 and not time_spent:
+                if runner.lookups == 1 and not time_spent:
                     # 用同一单调时钟模拟最后一次同步设备检查耗时，不真正阻塞测试。
-                    time_spent = 1.0
+                    time_spent = 0.6
 
         with (patch.object(loop, "time", new=lambda: clock() + time_spent),
               patch.object(loop, "slow_callback_duration", 2.0),  # 不把模拟时钟跳变报告为实际阻塞
               patch.object(self.desktop, "answer", wraps=self.desktop.answer) as answer):
             async with self._serve(_Echo(), make_device=SlowCheckDevice):
                 self.desktop.ring(_SENDERS[0], 1)
-                await _eventually(lambda: bool(self.devices) and self.devices[0].closed)
+                await _eventually(lambda: bool(self.desktop.clicks))
                 self.assertEqual(runner.lookups, 2)
-                self.assertEqual(time_spent, 1.0)
-                answer.assert_not_called()
+                self.assertEqual(time_spent, 0.6)
+                self.assertTrue(self.devices[0].closed)
+                answer.assert_called_once()
+
+    async def test_audio_open_exceeding_old_total_deadline_does_not_block_fresh_lookup_and_click(self):
+        loop = asyncio.get_running_loop()
+        clock = loop.time
+        elapsed = 0.0
+        audio_opened = asyncio.Event()
+
+        class SlowOpenDevice(_Device):
+            def start(self, capture, render):
+                nonlocal elapsed
+                super().start(capture, render)
+                elapsed = 9.0
+                audio_opened.set()
+
+        with (patch.object(loop, "time", new=lambda: clock() + elapsed),
+              patch.object(loop, "slow_callback_duration", 12.0)):
+            async with self._serve(_Echo(), make_device=SlowOpenDevice):
+                self.desktop.ring(_SENDERS[0], 1)
+                await asyncio.wait_for(audio_opened.wait(), timeout=12.0)
+                await _eventually(lambda: bool(self.desktop.clicks))
+                self.assertEqual(self.runner.lookups, 1)
 
     async def test_audio_inactive_at_start_or_while_confirming_never_opens_capture(self):
         desktop = self.desktop

@@ -335,7 +335,7 @@ class MVPIntegrationTest(unittest.IsolatedAsyncioTestCase):
                 while not desktop.connected:
                     await asyncio.sleep(0.002)
                 self.assertEqual(desktop.clicks, 1)
-                self.assertEqual(transport.meeting_lookups, ["list", "detail", "list", "detail"])
+                self.assertEqual(transport.meeting_lookups, ["list", "detail"])
                 device.frames(_HOT, 3)
                 device.frames(bytes(len(_HOT)), 2)
                 await tts.old_buffered.wait()
@@ -389,7 +389,7 @@ class MVPIntegrationTest(unittest.IsolatedAsyncioTestCase):
                 messages = [row.message.content for row in history.read_after(session)]
                 self.assertEqual(messages.count(_ASR_TEXT), 1)
                 self.assertEqual(messages.count(_USER), 1)
-                self.assertEqual(transport.meeting_lookups, ["list", "detail", "list", "detail"])
+                self.assertEqual(transport.meeting_lookups, ["list", "detail"])
                 self.assertEqual(history.subtask_run(child, run).status, "completed")
                 model_history = [message.content for message in restart_model.restart_request]
                 for recorded in (_ACCEPTED, _RETURNED, _FAILED, _UNKNOWN, prefix, _ASR_TEXT, _NEW_VOICE):
