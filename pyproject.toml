@@ -1,0 +1,20 @@
+[build-system]
+requires = ["setuptools>=65", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "agent-companion"
+version = "0.1.0"
+description = "Single-user multimodal Agent runtime"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = ["httpx>=0.27,<1"]
+
+[project.optional-dependencies]
+voice = ["sounddevice>=0.5,<1", "numpy>=1.26,<3", "onnxruntime>=1.18,<2"]
+
+[project.scripts]
+agent-companion = "agent_companion.__main__:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
