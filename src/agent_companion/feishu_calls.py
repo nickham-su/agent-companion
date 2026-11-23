@@ -105,11 +105,13 @@ class IncomingCalls:
 
     async def _handle(self, ring: RingingWindow, resolve: Callable[[str], CallPeer | None]) -> None:
         loop = asyncio.get_running_loop()
-        deadline = loop.time() + _LOOKUP_SECONDS
+        started_at = loop.time()
+        deadline = started_at + _LOOKUP_SECONDS
 
         def before_deadline() -> bool:
             return loop.time() < deadline
 
+        phase = "caller_lookup"
         try:
             async with asyncio.timeout_at(deadline):
                 caller = await self._discovery.ringing_caller(self._own_id)
@@ -118,6 +120,7 @@ class IncomingCalls:
                     return
                 if caller.meeting_id in self._clicked_meetings:
                     return  # 同一通话的浮窗被客户端重建也不再尝试点击。
+                phase, route_started_at = "private_route", loop.time()
                 while self._desktop.ringing() == (ring,):
                     peer = resolve(caller.sender_open_id)
                     if peer is not None:
@@ -136,12 +139,15 @@ class IncomingCalls:
                 if self._desktop.main_windows():
                     _LOG.debug("Feishu auto-answer skipped: pre-existing meeting window")
                     return
+                phase, audio_prepare_started_at = "audio_prepare", loop.time()
                 voice, device = await self._voice_factory()
+                audio_prepared_at = loop.time()
         except CliError as exc:
             _LOG.warning("Feishu auto-answer caller lookup failed (%s)", exc)
             return
         except TimeoutError:
-            _LOG.debug("Feishu auto-answer skipped: ringing lookup timed out")
+            _LOG.debug("Feishu auto-answer skipped: ringing lookup timed out (phase=%s, elapsed=%.3fs)",
+                       phase, loop.time() - started_at)
             return
         except VoiceSetupError as exc:
             _LOG.warning("Feishu auto-answer audio setup failed (%s)", exc)
@@ -151,15 +157,33 @@ class IncomingCalls:
                                copy_confirmed=peer.copy_confirmed if self._copy_confirmed else None)
         if not peer.watch_call(binding.stop):
             return
+        audio_open_started_at = loop.time()
         try:
             async with voice.connected(device, binding.submit, capture_enabled=False, wait_for_cleanup=False):
                 try:
-                    if binding.closed or not before_deadline():
+                    if binding.closed:
+                        return
+                    if not before_deadline():
+                        now = loop.time()
+                        _LOG.debug("Feishu auto-answer skipped: deadline expired before ringing recheck "
+                                   "(audio_open=%.3fs, elapsed=%.3fs)",
+                                   now - audio_open_started_at, now - started_at)
                         return
                     binding.require_audio(device)
                     # 同一窗口号也可能被客户端复用；打开设备后用剩余判定时间复查来电身份。
-                    async with asyncio.timeout_at(deadline):
-                        verified = await self._discovery.ringing_caller(self._own_id)
+                    recheck_started_at = loop.time()
+                    _LOG.debug("Feishu auto-answer ringing recheck started (caller_lookup=%.3fs, "
+                               "private_route=%.3fs, audio_prepare=%.3fs, audio_open=%.3fs, remaining=%.3fs)",
+                               route_started_at - started_at, audio_prepare_started_at - route_started_at,
+                               audio_prepared_at - audio_prepare_started_at,
+                               recheck_started_at - audio_open_started_at, deadline - recheck_started_at)
+                    try:
+                        async with asyncio.timeout_at(deadline):
+                            verified = await self._discovery.ringing_caller(self._own_id)
+                    finally:
+                        recheck_finished_at = loop.time()
+                        _LOG.debug("Feishu auto-answer ringing recheck finished (elapsed=%.3fs, remaining=%.3fs)",
+                                   recheck_finished_at - recheck_started_at, deadline - recheck_finished_at)
                     if verified != caller:
                         _LOG.debug("Feishu auto-answer skipped: ringing identity changed or became unavailable")
                         return

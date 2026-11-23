@@ -371,13 +371,11 @@ class IncomingCallTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_rechecks_caller_when_same_window_is_reused_or_identity_is_lost(self):
         desktop, runner = self.desktop, self.runner
-        for meeting, sender, delayed in (("2", _SENDERS[1], False), ("2", _SENDERS[0], False),
-                                          ("1", _SENDERS[1], False), (None, _SENDERS[0], False),
-                                          ("1", _SENDERS[0], True)):
-            with self.subTest(meeting=meeting, sender=sender, delayed=delayed):
+        for meeting, sender in (("2", _SENDERS[1]), ("2", _SENDERS[0]),
+                                ("1", _SENDERS[1]), (None, _SENDERS[0])):
+            with self.subTest(meeting=meeting, sender=sender):
                 self.devices.clear()
                 runner.lookups = 0
-                runner.release_detail.set()
 
                 class ReusedWindow(_Device):
                     def start(self, capture, render):
@@ -385,8 +383,6 @@ class IncomingCallTests(unittest.IsolatedAsyncioTestCase):
                         # PID、CG 窗口号、坐标一样，单靠复核窗口无法识别换人。
                         desktop.ring(sender, 1)
                         runner.meeting_id = meeting
-                        if delayed:
-                            runner.release_detail.clear()
 
                 async with self._serve(_Echo(), make_device=ReusedWindow):
                     desktop.ring(_SENDERS[0], 1)
@@ -395,6 +391,36 @@ class IncomingCallTests(unittest.IsolatedAsyncioTestCase):
                     self.assertEqual(desktop.rings, original)
                     self.assertEqual(runner.lookups, 2)
                     self.assertFalse(desktop.clicks)
+
+    async def test_recheck_timeout_logs_stage_timings_without_ids(self):
+        runner = self.runner
+        sender, meeting = _SENDERS[0], "123456789012345"
+
+        class SlowRecheckDevice(_Device):
+            def start(self, capture, render):
+                super().start(capture, render)
+                runner.release_detail.clear()
+
+        with self.assertLogs("agent_companion", level="DEBUG") as logs:
+            async with self._serve(_Echo(), make_device=SlowRecheckDevice):
+                self.desktop.ring(sender, 1)
+                runner.meeting_id = meeting
+                await _eventually(lambda: bool(self.devices) and self.devices[0].closed)
+                self.assertEqual(runner.lookups, 2)
+                self.assertFalse(self.desktop.clicks)
+
+        messages = [record.getMessage() for record in logs.records
+                    if record.name in {"agent_companion.feishu_calls", "agent_companion.channels.feishu.cli"}]
+        diagnostics = "\n".join(messages)
+        self.assertEqual(diagnostics.count("step=list_active, outcome=ok, elapsed="), 2)
+        self.assertIn("step=meeting_detail, outcome=ok, elapsed=", diagnostics)
+        self.assertIn("step=meeting_detail, outcome=cancelled, elapsed=", diagnostics)
+        self.assertRegex(diagnostics, r"recheck started \(caller_lookup=\d+\.\d+s, private_route=\d+\.\d+s, "
+                         r"audio_prepare=\d+\.\d+s, audio_open=\d+\.\d+s, remaining=\d+\.\d+s\)")
+        self.assertIn("recheck finished (elapsed=", diagnostics)
+        self.assertIn("ringing recheck timed out", diagnostics)
+        for identifier in (sender, meeting, _OWN):
+            self.assertNotIn(identifier, diagnostics)
 
     async def test_audio_check_after_caller_recheck_can_exhaust_click_deadline(self):
         loop = asyncio.get_running_loop()

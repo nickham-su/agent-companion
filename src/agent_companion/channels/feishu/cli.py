@@ -4,6 +4,7 @@ import asyncio
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 import json
+import logging
 import os
 from pathlib import Path
 import re
@@ -15,6 +16,7 @@ from typing import Any
 from ...protocol import DeliveryStatus
 
 
+_LOG = logging.getLogger(__name__)
 _MESSAGES = "/open-apis/im/v1/messages"
 MIN_PAGE_SIZE = 1
 MAX_PAGE_SIZE = 50
@@ -242,9 +244,25 @@ class FeishuDiscovery(_UserCLI):
             tokens.add(token)
             token_args = ("--page-token", token)
 
+    async def _ringing_query(self, step: str, args: tuple[str, ...]) -> dict[str, Any]:
+        loop = asyncio.get_running_loop()
+        started_at = loop.time()
+        outcome = "failed"
+        try:
+            data = _success_data(await self._run(args))
+            outcome = "ok"
+            return data
+        except asyncio.CancelledError:
+            outcome = "cancelled"
+            raise
+        finally:
+            # 只记录固定步骤和耗时，不记录参数或响应（含会议和参与者身份）。
+            _LOG.debug("Feishu ringing CLI query (step=%s, outcome=%s, elapsed=%.3fs)",
+                       step, outcome, loop.time() - started_at)
+
     async def ringing_caller(self, own_open_id: str) -> RingingCaller | None:
         """只接受当前实测的一对一响铃形态，不将其当作会议来源的证明。"""
-        data = _success_data(await self._run(("vc", "+meeting-list-active")))
+        data = await self._ringing_query("list_active", ("vc", "+meeting-list-active"))
         meetings = data.get("meetings")
         if meetings is None and "meetings" in data:
             return None
@@ -256,8 +274,8 @@ class FeishuDiscovery(_UserCLI):
         meeting_id = row.get("meeting_id") if isinstance(row, dict) else None
         if not isinstance(meeting_id, str) or re.fullmatch(r"[0-9]{1,32}", meeting_id) is None:
             raise CliError("cli_invalid_meeting_id")
-        data = _success_data(await self._run(("vc", "meeting", "get", "--meeting-id", meeting_id,
-                                              "--with-participants", "--user-id-type", "open_id")))
+        data = await self._ringing_query("meeting_detail", ("vc", "meeting", "get", "--meeting-id", meeting_id,
+                                                            "--with-participants", "--user-id-type", "open_id"))
         meeting = data.get("meeting")
         if not isinstance(meeting, dict) or meeting.get("id") != meeting_id:
             raise CliError("cli_invalid_meeting_detail")
