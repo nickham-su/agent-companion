@@ -131,13 +131,19 @@ def _model(client, *, history=None, api_key=_KEY, model="fixture-model", effort=
 
 
 async def _complete(fixture, history, *, prompt=None, channel=None, tools=None, settings=None, session_id="main",
-                    instructions="", **model_settings):
+                    instructions="", followup=None, **model_settings):
     async with httpx.AsyncClient(transport=fixture.transport) as client:
         runtime = Runtime(session_id, history, _model(client, history=history, **model_settings), channel or _Channel(),
                           tools=tools, settings=settings, instructions=instructions)
         try:
             runtime.submit_batch([prompt or Message("user", "synthetic prompt")])
             await asyncio.wait_for(runtime.wait_idle(), 2)
+            if followup is not None and runtime.last_failure is None:
+                task = runtime._compactions._generating
+                if task is not None:
+                    await asyncio.wait_for(asyncio.shield(task), 2)
+                runtime.submit_batch([followup])
+                await asyncio.wait_for(runtime.wait_idle(), 2)
             return runtime.last_failure
         finally:
             await runtime.close()
@@ -449,14 +455,24 @@ class OpenAIResponsesTests(unittest.IsolatedAsyncioTestCase):
                 initial, final = [_completed(_reason(), _call(), input_tokens=270)], [_completed(_answer("done"))]
                 if mode == "compact":
                     history.append("main", [Message("user", "x" * 360)])
-                    fixture = _Fixture(self, initial, [_completed(_answer("summary"))], final)
+                    def generation_or_reply(payload):
+                        if payload["input"][-1].get("content") == _SUMMARIZE.content:
+                            return [_completed(_answer("summary"))]
+                        return final
+
+                    fixture = _Fixture(self, initial, generation_or_reply, generation_or_reply,
+                                       [_completed(_answer("followup"))])
                     settings = RuntimeSettings(context_budget=270, tail_budget=75)
                     self.assertIsNone(await _complete(fixture, history, settings=settings,
-                                                      tools=Tools([Tool(_SPEC, tool)])))
+                                                      tools=Tools([Tool(_SPEC, tool)]),
+                                                      followup=Message("user", "apply summary")))
                     self.assertIsNotNone(history.summary("main"))
-                    self.assertEqual(len(fixture.requests), 3)
+                    self.assertEqual(len(fixture.requests), 4)
                     self.assertEqual(fixture.requests[-1]["input"][0]["role"], "system")
                     self.assertNotIn("x" * 360, json.dumps(fixture.requests[-1]))
+                    continuation = next(payload for payload in fixture.requests[1:3]
+                                        if payload["input"][-1].get("type") == "function_call_output")
+                    self.assertIn("x" * 360, json.dumps(continuation))
                 else:
                     image = Image("data:image/png;base64," + "YQAA" * 100)
                     prompt = Message("user", (Text("image"), image))
@@ -466,8 +482,9 @@ class OpenAIResponsesTests(unittest.IsolatedAsyncioTestCase):
                     self.assertEqual(fixture.requests[0]["input"][0]["content"][1]["image_url"], image.url)
                     self.assertEqual(fixture.requests[1]["input"][0], fixture.requests[0]["input"][0])
                     self.assertEqual(history.read_after("main")[0].message, prompt)
+                    continuation = fixture.requests[-1]
                 tool.assert_awaited_once()
-                self.assertEqual(fixture.requests[-1]["input"][-3:], [
+                self.assertEqual(continuation["input"][-3:], [
                     _reason(), {k: v for k, v in _call().items() if k != "status"},
                     {"type": "function_call_output", "call_id": "call_1", "output": "r" * 285},
                 ])
@@ -578,21 +595,41 @@ class OpenAIResponsesTests(unittest.IsolatedAsyncioTestCase):
         private = _reason(summary=(_PRIVATE_SUMMARY,))
         tool = AsyncMock(return_value="historical result")
         registry = Tools([Tool(_SPEC, tool)])
-        options = {"tools": registry, "instructions": "fixed synthetic instructions"}
+        summary_prompt = {"role": "user", "content": _SUMMARIZE.content}
+
+        def generation_or_reply(payload):
+            text = "compressed" if payload["input"][-1] == summary_prompt else "new response"
+            return [_completed(_answer(text))]
+
         fixture = _Fixture(self, [_completed(private, _call())], [_completed(_answer("retained tail"), input_tokens=2500)],
-                           [_completed(_answer("compressed"))], [_completed(_answer("new response"))])
+                           generation_or_reply, generation_or_reply, [_completed(_answer("followup response"))])
         channel = _Channel()
         with closing(History(":memory:")) as history:
             covered, = history.append("main", [Message("user", "prior seed")])
             history.save_summary("main", Summary(covered, "same existing summary"))
             image = Message("user", (Text("historical image"), Image(_IMAGE)))
-            self.assertIsNone(await _complete(fixture, history, prompt=image, channel=channel, **options))
             current = "current " + "y" * 1400
             settings = RuntimeSettings(context_budget=2500, tail_budget=510)
-            self.assertIsNone(await _complete(fixture, history, settings=settings, channel=channel,
-                                              prompt=Message("user", current), **options))
-            self.assertEqual(len(fixture.requests), 4)
-            previous_reply, compressed, current_reply = fixture.requests[1:]
+            async with httpx.AsyncClient(transport=fixture.transport) as client:
+                runtime = Runtime("main", history, _model(client, history=history), channel, tools=registry,
+                                  settings=settings, instructions="fixed synthetic instructions")
+                try:
+                    for prompt in (image, Message("user", current)):
+                        runtime.submit_batch([prompt])
+                        await asyncio.wait_for(runtime.wait_idle(), 2)
+                        self.assertIsNone(runtime.last_failure)
+                    task = runtime._compactions._generating
+                    if task is not None:
+                        await asyncio.wait_for(asyncio.shield(task), 2)
+                    self.assertEqual(history.summary("main").text, "same existing summary")
+                    runtime.submit_batch([Message("user", "apply summary")])
+                    await asyncio.wait_for(runtime.wait_idle(), 2)
+                    self.assertIsNone(runtime.last_failure)
+                finally:
+                    await runtime.close()
+            self.assertEqual(len(fixture.requests), 5)
+            previous_reply, current_reply = fixture.requests[1], fixture.requests[-1]
+            compressed = next(payload for payload in fixture.requests[2:4] if payload["input"][-1] == summary_prompt)
             self.assertEqual(compressed, {**previous_reply, "input": previous_reply["input"] + [
                 {"role": "user", "content": _SUMMARIZE.content},
             ]})
@@ -601,10 +638,11 @@ class OpenAIResponsesTests(unittest.IsolatedAsyncioTestCase):
             self.assertNotIn("retained tail", repr(compressed["input"]))
             self.assertNotIn(current, repr(compressed["input"]))
             self.assertIn("retained tail", repr(current_reply["input"]))
+            self.assertIn(current, repr(current_reply["input"]))
             self.assertNotIn(private, current_reply["input"])
             self.assertNotIn(_SUMMARIZE, [row.message for row in history.read_after("main")])
             self.assertEqual(history.summary("main").text, "compressed")
-            self.assertEqual(channel.replies, ["retained tail", "new response"])
+            self.assertEqual(channel.replies, ["retained tail", "new response", "followup response"])
         tool.assert_awaited_once()
 
     async def test_request_larger_than_old_body_limit_is_sent(self):
@@ -634,19 +672,24 @@ class OpenAIResponsesTests(unittest.IsolatedAsyncioTestCase):
         )
         for case, generated, output_reasoning, rejected in cases:
             with self.subTest(case=case), closing(History(":memory:")) as history:
+                def generation_or_reply(payload):
+                    if payload["input"][-1].get("content") == _SUMMARIZE.content:
+                        return [_completed(*output_reasoning, _answer(generated))]
+                    return [_completed(_answer("normal visible reply"))]
+
                 fixture = _Fixture(self, [_completed(_reason(cipher=long_cipher, summary=("status", long_text)),
                                                      _answer("old response"), input_tokens=252)],
-                                   [_completed(*output_reasoning, _answer(generated))],
-                                   [_completed(_answer("normal visible reply"))])
+                                   generation_or_reply, generation_or_reply,
+                                   [_completed(_answer("followup reply"))])
                 covered, = history.append("main", [Message("user", "prior seed")])
                 saved = Summary(covered, "existing")
                 history.save_summary("main", saved)
                 self.assertIsNone(await _complete(fixture, history, prompt=Message("user", "x" * 340)))
                 old_end = history.read_after("main")[-1].message_id
                 options = dict(settings=RuntimeSettings(context_budget=252, tail_budget=125),
-                               prompt=Message("user", "y" * 420))
+                               prompt=Message("user", "y" * 420), followup=Message("user", "use candidate"))
                 if rejected:
-                    with self.assertLogs("agent_companion.runtime.context", level="WARNING") as logs:
+                    with self.assertLogs("agent_companion.runtime.compaction", level="WARNING") as logs:
                         self.assertIsNone(await _complete(fixture, history, **options))
                     self.assertIn("summary_private_echo", logs.output[0])
                     self.assertNotIn(generated, logs.output[0])
@@ -654,9 +697,11 @@ class OpenAIResponsesTests(unittest.IsolatedAsyncioTestCase):
                 else:
                     self.assertIsNone(await _complete(fixture, history, **options))
                     self.assertEqual(history.summary("main"), Summary(old_end, generated))
-                self.assertEqual(len(fixture.requests), 3)
-                self.assertIn(long_text, repr(fixture.requests[1]))
-                self.assertIn(long_cipher, repr(fixture.requests[1]))
+                self.assertEqual(len(fixture.requests), 4)
+                summary = next(payload for payload in fixture.requests[1:3]
+                               if payload["input"][-1].get("content") == _SUMMARIZE.content)
+                self.assertIn(long_text, repr(summary))
+                self.assertIn(long_cipher, repr(summary))
                 self.assertNotIn(generated, [entry.message.content for entry in history.read_after("main")])
 
     async def test_http_rejection_does_not_retry_or_rerun_tools(self):

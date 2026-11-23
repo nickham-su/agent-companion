@@ -15,6 +15,7 @@ from .channels.feishu.cli import FeishuDiscovery
 from .config import FeishuSettings, Settings
 from .feishu_private import run_private_chats
 from .protocol import Channel, Message, Model, ReplyRoute
+from .runtime.compaction import Compactions
 from .runtime.engine import Runtime
 from .runtime.subtasks import Subtasks
 from .speech.asr import FileASR
@@ -31,8 +32,9 @@ if TYPE_CHECKING:
 async def running_agent(
     settings: Settings, history: History, model: Model, channel: Channel, *,
     session_id: str, wait_for_subtask_delivery: bool = True,
-    retry_sqlite_locks: bool = False,
+    retry_sqlite_locks: bool = False, compactions: Compactions | None = None,
 ) -> AsyncIterator[tuple[Runtime, Subtasks]]:
+    """组装一组主、子会话；注入的压缩管理器由应用入口负责关闭。"""
     def return_result(message: Message) -> None:
         main.submit_subtask_result(message, wait_for_delivery=wait_for_subtask_delivery)
 
@@ -45,18 +47,26 @@ async def running_agent(
     llm = settings.llm
     thinking = llm is not None and llm.adapter == "deepseek" and llm.reasoning_effort != "disabled"
 
+    owns_compactions = compactions is None
+    if compactions is None:
+        compactions = Compactions(history, model)
     subtasks = Subtasks(session_id, history, model, return_result,
                         settings=settings.runtime, thinking=thinking, retry_sqlite_locks=retry_sqlite_locks,
-                        submit_routed_result=return_routed_result)
+                        submit_routed_result=return_routed_result, compactions=compactions)
     main = Runtime(session_id, history, model, channel, tools=subtasks.tools,
-                   settings=settings.runtime, thinking=thinking, retry_sqlite_locks=retry_sqlite_locks)
+                   settings=settings.runtime, thinking=thinking, retry_sqlite_locks=retry_sqlite_locks,
+                   compactions=compactions)
     try:
         yield main, subtasks
     finally:
         # 在首次让出事件循环之前关停两端入口，再异步收尾，之后才可关闭 SQLite。
         subtasks.stop_accepting()
         main.stop_accepting()
-        for outcome in await asyncio.gather(subtasks.close(), main.close(), return_exceptions=True):
+        cleanups = [subtasks.close(), main.close()]
+        if owns_compactions:
+            compactions.stop()
+            cleanups.append(compactions.close())
+        for outcome in await asyncio.gather(*cleanups, return_exceptions=True):
             if isinstance(outcome, BaseException):
                 raise outcome
 
@@ -108,11 +118,15 @@ async def prepare_private_feishu(
 
             incoming = IncomingCalls(desktop, discovery, prepare_voice, own_id=feishu.own_open_id,
                                      idle_timeout=settings.voice.idle_timeout, copy_confirmed=feishu.voice_text_copy)
-        await run_private_chats(
-            discovery, history, asr, own_id=feishu.own_open_id, started_ms=started_ms, incoming=incoming,
-            open_agent=lambda session_id, channel: running_agent(
-                settings, history, model, channel, session_id=session_id, wait_for_subtask_delivery=False,
-                retry_sqlite_locks=True))
+        compactions = Compactions(history, model)
+        try:
+            await run_private_chats(
+                discovery, history, asr, own_id=feishu.own_open_id, started_ms=started_ms, incoming=incoming,
+                open_agent=lambda session_id, channel: running_agent(
+                    settings, history, model, channel, session_id=session_id, wait_for_subtask_delivery=False,
+                    retry_sqlite_locks=True, compactions=compactions))
+        finally:
+            await compactions.close()
 
     return run
 

@@ -12,6 +12,7 @@ from uuid import uuid4
 from ..config import RuntimeSettings
 from ..protocol import Message, Model, ReplyRoute, ToolSpec
 from ..storage.sqlite import History
+from .compaction import Compactions
 from .engine import Runtime
 from .sqlite_access import SQLiteAccess
 from .tools import Tool, ToolContext, Tools
@@ -52,7 +53,8 @@ class Subtasks:
     def __init__(self, parent_session_id: str, history: History, model: Model,
                  submit_result: Callable[[Message], None], *, settings: RuntimeSettings,
                  thinking: bool, retry_sqlite_locks: bool = False,
-                 submit_routed_result: Callable[[Message, ReplyRoute], bool] | None = None) -> None:
+                 submit_routed_result: Callable[[Message, ReplyRoute], bool] | None = None,
+                 compactions: Compactions | None = None) -> None:
         self._parent = parent_session_id
         self._history = history
         self._model = model
@@ -60,6 +62,9 @@ class Subtasks:
         self._submit_routed_result = submit_routed_result
         self._settings = settings
         self._thinking = thinking
+        self._owns_compactions = compactions is None
+        self._compactions = compactions if compactions is not None else Compactions(history, model)
+        self._compactions.check_owner(history, model)
         self._queues: dict[str, deque[_Job]] = {}
         self._workers: dict[str, asyncio.Task[None]] = {}
         self._closed = False
@@ -114,7 +119,7 @@ class Subtasks:
         try:
             runtime = Runtime(child, self._history, self._model, None,
                               settings=self._settings, thinking=self._thinking,
-                              retry_sqlite_locks=self._retry_sqlite_locks,
+                              retry_sqlite_locks=self._retry_sqlite_locks, compactions=self._compactions,
                               instructions="你是内部子会话。完成提交的任务并返回结果，不调用工具或联系用户。")
             while queue and not self._closed:
                 job = queue.popleft()
@@ -189,6 +194,8 @@ class Subtasks:
     def stop_accepting(self) -> None:
         """同步阻止新委派和新回投。"""
         self._closed = True
+        if self._owns_compactions:
+            self._compactions.stop()
 
     async def close(self) -> None:
         self.stop_accepting()
@@ -196,6 +203,8 @@ class Subtasks:
         for worker in workers:
             worker.cancel()
         await asyncio.gather(*workers, return_exceptions=True)
+        if self._owns_compactions:
+            await self._compactions.close()
         self._workers.clear()
         self._queues.clear()
         self._outstanding = 0

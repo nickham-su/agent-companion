@@ -2,7 +2,7 @@
 
 import asyncio
 from collections import deque
-from collections.abc import AsyncGenerator, AsyncIterator, Sequence
+from collections.abc import AsyncIterator, Sequence
 from contextlib import aclosing, asynccontextmanager
 from dataclasses import dataclass
 import logging
@@ -11,9 +11,10 @@ from uuid import uuid4
 
 from ..config import RuntimeSettings
 from ..protocol import (BackgroundChannel, Channel, DeliveryStatus, InputUsage, Message, Model, ModelError,
-                        ModelEvent, ReasoningDelta, Receipt, ReplayReady, ReplayScope, ReplyInfo,
-                        ReplyRoute, ReplyStream, TextDelta, ToolCall, ToolReady, ToolSpec)
+                        ReasoningDelta, Receipt, ReplayReady, ReplayScope, ReplyInfo,
+                        ReplyRoute, ReplyStream, TextDelta, ToolCall, ToolReady)
 from ..storage.sqlite import History, ReplyOutcome
+from .compaction import Compactions
 from .context import Context
 from .instructions import InstructionsError
 from .sqlite_access import SQLiteAccess
@@ -39,7 +40,7 @@ class Runtime:
     def __init__(self, session_id: str, history: History, model: Model, channel: Channel | None, *,
                  tools: Tools | None = None, settings: RuntimeSettings | None = None,
                  thinking: bool = False, instructions: str = "", delivery_idle_timeout: float | None = None,
-                 retry_sqlite_locks: bool = False) -> None:
+                 retry_sqlite_locks: bool = False, compactions: Compactions | None = None) -> None:
         if not session_id:
             raise ValueError("session_id must be non-empty")
         self.session_id = session_id
@@ -61,7 +62,10 @@ class Runtime:
         self._active_model_deadline: asyncio.Timeout | None = None
         self._closed = False
         self._sqlite = SQLiteAccess(retry_locks=retry_sqlite_locks, stopped=lambda: self._closed)
-        self._context = Context(history, self._settings, self._summary_stream, sqlite=self._sqlite,
+        self._owns_compactions = compactions is None
+        self._compactions = compactions if compactions is not None else Compactions(history, model)
+        self._compactions.check_owner(history, model)
+        self._context = Context(history, self._settings, self._compactions, sqlite=self._sqlite,
                                 replay_scope=self._replay_scope, agents_path=Path.cwd() / "AGENTS.md")
         self._idle = asyncio.Event()
         self._idle.set()
@@ -134,6 +138,8 @@ class Runtime:
     def stop_accepting(self) -> None:
         """同步关停入口；可以在调度异步清理之前调用。"""
         self._closed = True
+        if self._owns_compactions:
+            self._compactions.stop()
 
     async def close(self) -> None:
         self.stop_accepting()
@@ -141,6 +147,8 @@ class Runtime:
         if task is not None:
             task.cancel()
             await asyncio.gather(task, return_exceptions=True)
+        if self._owns_compactions:
+            await self._compactions.close()
         self._pending.clear()
         self._queued_inbound.clear()
         self._worker = None
@@ -204,15 +212,18 @@ class Runtime:
 
     async def _run(self, run_id: str, protected_from: int, *, has_user_input: bool,
                    wait_for_delivery: bool, reply_route: ReplyRoute | None) -> None:
+        def can_send() -> bool:
+            return not self._closed and (reply_route is None or reply_route.active())
+
         for index in range(self._settings.max_tool_rounds):
-            if reply_route is not None and not reply_route.active():
+            if not can_send():
                 return
             last_input_tokens = await self._sqlite(self.history.last_input_tokens, self.session_id)
             messages = await self._context.prepare(self.session_id, thinking=self._thinking,
                                                     tools=self._tools.specs, instructions=self._instructions,
-                                                    protected_from=protected_from,
+                                                    protected_from=protected_from, can_send=can_send,
                                                     last_input_tokens=last_input_tokens)
-            if reply_route is not None and not reply_route.active():
+            if messages is None:
                 return
             model_status, has_calls = await self._reply(run_id, messages, has_user_input=has_user_input,
                                                        wait_for_delivery=wait_for_delivery, reply_route=reply_route)
@@ -244,13 +255,6 @@ class Runtime:
                 yield
             finally:
                 self._active_model_deadline = None
-
-    async def _summary_stream(self, messages: Sequence[Message], tools: Sequence[ToolSpec],
-                              thinking: bool) -> AsyncGenerator[ModelEvent, None]:
-        async with self._model_deadline():
-            async with aclosing(self._model.stream(messages, tools, thinking=thinking)) as stream:
-                async for event in stream:
-                    yield event
 
     async def _reply(self, run_id: str, messages: Sequence[Message], *,
                      has_user_input: bool, wait_for_delivery: bool,

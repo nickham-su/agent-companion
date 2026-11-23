@@ -9,6 +9,7 @@ from agent_companion.config import RuntimeSettings
 from agent_companion.models.deepseek import DeepSeek, build_request, parse_stream
 from agent_companion.protocol import (DeliveryStatus, Image, InputUsage, Message, ModelError, ReasoningDelta, Receipt, Text,
                                       TextDelta, ToolCall, ToolReady, ToolSpec)
+from agent_companion.runtime.context import _SUMMARIZE
 from agent_companion.runtime.engine import Runtime
 from agent_companion.runtime.tools import Tool, Tools
 from agent_companion.storage.sqlite import History
@@ -98,8 +99,14 @@ class DeepSeekTest(unittest.IsolatedAsyncioTestCase):
         settings = RuntimeSettings(context_budget=300, tail_budget=60)
 
         def endpoint(request):
-            content, tokens = [("初次回复", 300), ("简洁概要", 1000), ("新的回复", 1)][len(requests)]
-            requests.append(json.loads(request.content))
+            payload = json.loads(request.content)
+            content, tokens = {
+                "首次请求": ("初次回复", 300),
+                _SUMMARIZE.content: ("简洁概要", 1000),
+                "新的文字": ("新的回复", 1),
+                "应用摘要": ("下一轮回复", 2),
+            }[payload["messages"][-1]["content"]]
+            requests.append(payload)
             finish = json.dumps({**json.loads(chunk(finish="stop")), "usage": {"prompt_tokens": tokens}})
             frames = [chunk({"content": content}), finish, "[DONE]"]
             return httpx.Response(200, text="".join(f"data: {frame}\n\n" for frame in frames))
@@ -108,17 +115,29 @@ class DeepSeekTest(unittest.IsolatedAsyncioTestCase):
             history.append("child", [old])
             async with httpx.AsyncClient(transport=httpx.MockTransport(endpoint)) as client:
                 runtime = Runtime("child", history, DeepSeek(client), None, settings=settings)
-                self.assertIsNone(await runtime.run_internal("first", "首次请求"))
-                self.assertIsNone(history.summary("child"))
-                self.assertEqual(history.last_input_tokens("child"), 300)
-                self.assertIsNone(await runtime.run_internal("next", "新的文字"))
-            compressed = requests[1]["messages"]
+                try:
+                    self.assertIsNone(await runtime.run_internal("first", "首次请求"))
+                    self.assertIsNone(history.summary("child"))
+                    self.assertEqual(history.last_input_tokens("child"), 300)
+                    self.assertIsNone(await runtime.run_internal("next", "新的文字"))
+                    task = runtime._compactions._generating
+                    if task is not None:
+                        await asyncio.wait_for(asyncio.shield(task), 2)
+                    self.assertIsNone(history.summary("child"))
+                    self.assertIsNone(await runtime.run_internal("apply", "应用摘要"))
+                finally:
+                    await runtime.close()
+            self.assertEqual(len(requests), 4)
+            compressed = next(request["messages"] for request in requests[1:3]
+                              if request["messages"][-1]["content"] == _SUMMARIZE.content)
             self.assertEqual(compressed[0], requests[0]["messages"][0])
             self.assertNotIn("新的文字", repr(compressed))
-            self.assertNotIn("image_url", repr(requests[2]))
-            self.assertEqual(requests[2]["messages"][-1]["content"], "新的文字")
+            self.assertNotIn("image_url", repr(requests[-1]))
+            self.assertIn("新的文字", repr(requests[-1]))
+            self.assertEqual(requests[-1]["messages"][-1]["content"], "应用摘要")
+            self.assertEqual(history.summary("child").text, "简洁概要")
             self.assertEqual(history.read_after("child")[0].message, old)
-            self.assertEqual([outcome.input_tokens for outcome in history.outcomes("child")], [300, 1])
+            self.assertEqual([outcome.input_tokens for outcome in history.outcomes("child")], [300, 1, 2])
 
     async def test_image_tool_and_reasoning_round_trip_over_sse(self):
         pending = []

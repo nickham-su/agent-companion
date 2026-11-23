@@ -1,6 +1,7 @@
 """SQLite 中的原始会话历史、摘要与独立投递记录。"""
 
-from collections.abc import Iterable, Sequence
+from collections.abc import Iterable, Iterator, Sequence
+from contextlib import contextmanager
 from dataclasses import asdict, dataclass, field
 import json
 from pathlib import Path
@@ -491,6 +492,28 @@ class History:
             "SELECT * FROM messages WHERE session_id = ? AND message_id > ? ORDER BY message_id",
             (session_id, after))]
 
+    def context_snapshot(
+        self, session_id: str, *, replay_scope: ReplayScope | None = None,
+    ) -> tuple[Summary | None, list[HistoryEntry]]:
+        """摘要、续尾及私有回放来自同一个 SQLite 读事务。"""
+        self._db.execute("BEGIN")
+        with self._db:
+            summary = self.summary(session_id)
+            entries = self.read_after(session_id, summary.covers_through if summary else 0, replay_scope=replay_scope)
+        return summary, entries
+
+    def try_context_snapshot(
+        self, session_id: str, *, replay_scope: ReplayScope | None = None,
+    ) -> tuple[Summary | None, list[HistoryEntry]] | None:
+        """压缩 CAS 失利后的单次刷新；遇锁时调用方保留原快照。"""
+        with self._without_busy_wait():
+            try:
+                return self.context_snapshot(session_id, replay_scope=replay_scope)
+            except sqlite3.OperationalError as exc:
+                if not is_sqlite_lock_error(exc):
+                    raise
+                return None
+
     def tail(self, session_id: str, limit: int) -> list[HistoryEntry]:
         if limit < 1:
             raise ValueError("limit must be positive")
@@ -510,16 +533,42 @@ class History:
                                  (session_id, summary.covers_through)).fetchone()
         if found is None:
             raise ValueError("summary coverage must point to a message in the same session")
+        if not self._write_summary(
+            "INSERT INTO summaries VALUES (?, ?, ?) ON CONFLICT(session_id) DO UPDATE SET"
+            " covers_through = excluded.covers_through, text = excluded.text"
+            " WHERE excluded.covers_through > summaries.covers_through",
+            (session_id, summary.covers_through, summary.text),
+        ):
+            raise ValueError("summary coverage must advance")
+
+    def try_save_summary(self, session_id: str, summary: Summary, *, covered: int, protected_from: int) -> bool:
+        """在发包前单次尝试；锁冲突不等待，也不改变连接的常规锁策略。"""
+        if not 0 <= covered < summary.covers_through < protected_from:
+            return False
+        with self._without_busy_wait():
+            return self._write_summary(
+                "INSERT INTO summaries (session_id, covers_through, text) SELECT ?, ?, ?"
+                " WHERE COALESCE((SELECT covers_through FROM summaries WHERE session_id = ?), 0) = ?"
+                " AND EXISTS (SELECT 1 FROM messages WHERE session_id = ? AND message_id = ?)"
+                " ON CONFLICT(session_id) DO UPDATE SET covers_through = excluded.covers_through, text = excluded.text",
+                (session_id, summary.covers_through, summary.text, session_id, covered,
+                 session_id, summary.covers_through),
+            )
+
+    @contextmanager
+    def _without_busy_wait(self) -> Iterator[None]:
+        timeout = self._db.execute("PRAGMA busy_timeout").fetchone()[0]
+        self._db.execute("PRAGMA busy_timeout = 0")
+        try:
+            yield
+        finally:
+            self._db.execute(f"PRAGMA busy_timeout = {timeout:d}")
+
+    def _write_summary(self, sql: str, params: tuple[str | int, ...]) -> bool:
         try:
             with self._db:
-                cursor = self._db.execute(
-                    "INSERT INTO summaries VALUES (?, ?, ?) ON CONFLICT(session_id) DO UPDATE SET"
-                    " covers_through = excluded.covers_through, text = excluded.text"
-                    " WHERE excluded.covers_through > summaries.covers_through",
-                    (session_id, summary.covers_through, summary.text),
-                )
-                if cursor.rowcount != 1:
-                    raise ValueError("summary coverage must advance")
+                rowcount = self._db.execute(sql, params).rowcount
+            return rowcount == 1
         except sqlite3.DatabaseError as exc:
             code = getattr(exc, "sqlite_errorcode", 0)
             # 只转换写入被拒绝或无法持久化的故障；保留结构错误及覆盖点不变量错误。

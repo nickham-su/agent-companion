@@ -128,12 +128,20 @@ class LocalInstructionsTests(unittest.IsolatedAsyncioTestCase):
         runtime = self.runtime(model, settings=RuntimeSettings(context_budget=230, tail_budget=70))
         await self.turn(runtime, "首次请求")
         await self.turn(runtime, "新" * 120)
+        task = runtime._compactions._generating
+        if task is not None:
+            await asyncio.wait_for(asyncio.shield(task), 2)
+        self.assertIsNone(self.history.summary("main"))
+        await self.turn(runtime, "应用摘要")
         self.assertIsNone(runtime.last_failure)
-        self.assertEqual(len(model.requests), 3)
-        first, summary, last = model.requests
+        self.assertEqual(len(model.requests), 4)
+        first, preparing, last = model.requests[0], model.requests[1:3], model.requests[-1]
+        summary = next(request for request in preparing if request[-1] == _SUMMARIZE)
+        original = next(request for request in preparing if request is not summary)
         self.assertEqual(first[0].content, "固定指令\n\n第一版")
         self.assertEqual(summary[0], first[0])
-        self.assertEqual(summary[-1], _SUMMARIZE)
+        self.assertEqual(original[0], first[0])
+        self.assertEqual(original[-1], Message("user", "新" * 120))
         self.assertEqual(last[0].content, "固定指令\n\n" + "y" * 700)
-        self.assertEqual(last[-1], Message("user", "新" * 120))
+        self.assertEqual(last[-1], Message("user", "应用摘要"))
         self.assertEqual(self.history.summary("main").text, "摘要")
