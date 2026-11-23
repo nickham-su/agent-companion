@@ -5,7 +5,7 @@ from hashlib import sha256
 import json
 from pathlib import Path
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from agent_companion.app import run_feishu, running_agent
 from agent_companion.channels.feishu.cli import CliError, CommandResult, FeishuDiscovery
@@ -168,6 +168,33 @@ class DesktopTests(unittest.TestCase):
         full[:] = [_cg(401, pid=4)]
         self.assertFalse(desktop.window_exists(main))
 
+    def test_timeout_snapshot_summarizes_raw_windows_without_metadata_values(self):
+        desktop = MacCallDesktop.__new__(MacCallDesktop)
+        windows = [
+            _cg(10), _cg(11, layer=0), _cg(12, layer=0, title=""),
+            _cg(13, layer=0, title="synthetic other title"), _cg(14, layer=0),
+            _cg(15, layer=3), _cg(16, layer=0, pid=4), _cg(17, layer=0, owner="synthetic other owner"),
+        ]
+        windows[0]["kCGWindowIsOnscreen"] = windows[1]["kCGWindowIsOnscreen"] = True
+        del windows[4]["kCGWindowName"]
+        desktop._windows = Mock(return_value=windows)
+
+        snapshot = desktop.main_window_diagnostics(3)
+
+        desktop._windows.assert_called_once_with(visible=False)
+        self.assertEqual(snapshot, {
+            "desktop_records": 8,
+            "meeting_owner_records": 7,
+            "same_pid_records": 7,
+            "same_pid_meeting_owner_records": 6,
+            "same_pid_onscreen_records": 2,
+            "same_pid_meeting_layers": {0: 4, 3: 1, 25: 1},
+            "same_pid_layer0_title_match": 1,
+            "same_pid_layer0_title_missing": 2,
+            "same_pid_layer0_title_other": 1,
+            "other_pid_layer0_title_match": 1,
+        })
+
 
 class _CallRunner(_Runner):
     def __init__(self):
@@ -220,6 +247,9 @@ class _Desktop:
 
     def main_windows(self):
         return self.main
+
+    def main_window_diagnostics(self, pid):
+        return {"desktop_records": len(self.main) + len(self.rings)}
 
     def window_exists(self, identity):
         if self.error and self.main:
@@ -429,6 +459,31 @@ class IncomingCallTests(unittest.IsolatedAsyncioTestCase):
                 _talk(self.devices[1])
                 await _eventually(lambda: bool(history.tail(_session(_SENDERS[0]), 10)))
                 self.assertEqual(self.runner.lookups, 2)
+
+    async def test_confirmation_timeout_logs_poll_summary_and_one_snapshot(self):
+        desktop = self.desktop
+        real_answer = desktop.answer
+
+        def answer(ring, *, before_deadline):
+            accepted = real_answer(ring, before_deadline=before_deadline)
+            if accepted:
+                desktop.main = (WindowIdentity(5, frozenset({104})),)
+            return accepted
+
+        with (patch.object(desktop, "answer", side_effect=answer),
+              patch.object(desktop, "main_window_diagnostics", wraps=desktop.main_window_diagnostics) as snapshot,
+              self.assertLogs("agent_companion.feishu_calls", level="DEBUG") as logs):
+            async with self._serve(_Echo()):
+                desktop.ring(_SENDERS[0], 1)
+                await _eventually(lambda: bool(self.devices) and self.devices[0].closed)
+                self.assertEqual(len(desktop.clicks), 1)
+
+        snapshot.assert_called_once_with(3)
+        diagnostics = "\n".join(logs.output)
+        self.assertIn("click sent; waiting up to", diagnostics)
+        self.assertRegex(diagnostics, r"did not confirm connection \(reason=timeout, elapsed=\d+\.\d+s, "
+                         r"polls=[1-9]\d*, peak_candidates=1, peak_same_pid_candidates=0\)")
+        self.assertIn("meeting window timeout snapshot: {'desktop_records': 2}", diagnostics)
 
     async def test_confirms_and_tracks_multiple_meeting_windows_from_the_ringing_process(self):
         desktop = self.desktop

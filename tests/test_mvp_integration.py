@@ -155,6 +155,9 @@ class _Desktop:
     def main_windows(self):
         return (self.main,) if self.connected else ()
 
+    def main_window_diagnostics(self, pid):
+        return {"desktop_records": int(self.connected)}
+
     def window_exists(self, identity):
         return self.connected and identity == self.main
 

@@ -25,6 +25,7 @@ _CONNECT_SECONDS = 10.0
 class CallDesktop(Protocol):
     def ringing(self) -> tuple[RingingWindow, ...]: ...
     def main_windows(self) -> tuple[WindowIdentity, ...]: ...
+    def main_window_diagnostics(self, pid: int) -> dict[str, int | dict[int, int]]: ...
     def window_exists(self, identity: WindowIdentity) -> bool: ...
     def answer(self, ring: RingingWindow, *, before_deadline: Callable[[], bool]) -> bool: ...
 
@@ -180,9 +181,10 @@ class IncomingCalls:
                     if not self._desktop.answer(ring, before_deadline=before_deadline):
                         _LOG.debug("Feishu auto-answer skipped: target window changed or deadline expired")
                         return
+                    _LOG.debug("Feishu auto-answer click sent; waiting up to %.1fs for a meeting window",
+                               _CONNECT_SECONDS)
                     window = await self._confirm(ring, binding, voice, device)
                     if window is None:
-                        _LOG.debug("Feishu auto-answer did not confirm connection")
                         return
                     binding.confirm()
                     _LOG.debug("Feishu auto-answer connected")
@@ -206,20 +208,36 @@ class IncomingCalls:
     async def _confirm(self, ring: RingingWindow, binding: _CallBinding,
                        voice: VoiceChannel, device: AudioDevice) -> WindowIdentity | None:
         loop = asyncio.get_running_loop()
-        deadline = loop.time() + _CONNECT_SECONDS
+        started_at = loop.time()
+        deadline = started_at + _CONNECT_SECONDS
         pid = ring.identity.pid
+        polls = peak_candidates = peak_same_pid = 0
         while not binding.closed and loop.time() < deadline:
             _require_audio(voice, device)
+            candidates = self._desktop.main_windows()
+            same_pid = tuple(window for window in candidates if window.pid == pid)
+            polls += 1
+            peak_candidates = max(peak_candidates, len(candidates))
+            peak_same_pid = max(peak_same_pid, len(same_pid))
             # 点击前没有会议窗口。合并同一进程新出现的窗口，避免只跟踪大窗口或控制条。
-            numbers = frozenset(
-                number
-                for window in self._desktop.main_windows() if window.pid == pid
-                for number in window.numbers
-            )
+            numbers = frozenset(number for window in same_pid for number in window.numbers)
             if numbers:
                 _require_audio(voice, device)
-                return WindowIdentity(pid, numbers) if loop.time() < deadline else None
+                if loop.time() < deadline:
+                    return WindowIdentity(pid, numbers)
+                break
             await asyncio.sleep(min(_POLL_SECONDS, max(0, deadline - loop.time())))
+        _LOG.debug("Feishu auto-answer did not confirm connection "
+                   "(reason=%s, elapsed=%.3fs, polls=%d, peak_candidates=%d, peak_same_pid_candidates=%d)",
+                   "binding_closed" if binding.closed else "timeout", loop.time() - started_at,
+                   polls, peak_candidates, peak_same_pid)
+        if not binding.closed and _LOG.isEnabledFor(logging.DEBUG):
+            try:
+                snapshot = self._desktop.main_window_diagnostics(pid)
+            except DesktopCallError as exc:
+                _LOG.debug("Feishu meeting window timeout snapshot unavailable (%s)", exc)
+            else:
+                _LOG.debug("Feishu meeting window timeout snapshot: %s", snapshot)
         return None
 
     async def _follow(self, window: WindowIdentity, binding: _CallBinding) -> None:

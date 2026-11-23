@@ -1,5 +1,6 @@
 """0002 的 macOS 桌面适配器：双记录归并、命中校验和窗口身份跟踪。"""
 
+from collections import Counter
 from collections.abc import Callable
 import ctypes as C
 from dataclasses import dataclass
@@ -148,6 +149,29 @@ class MacCallDesktop:
 
     def main_windows(self) -> tuple[WindowIdentity, ...]:
         return tuple(window.identity for window, named in _groups(self._windows(visible=False), 0) if named)
+
+    def main_window_diagnostics(self, pid: int) -> dict[str, int | dict[int, int]]:
+        """返回超时后快照的计数，不暴露原始标题、PID、窗口编号或坐标。"""
+        windows = self._windows(visible=False)
+        owned = [window for window in windows if window.get("kCGWindowOwnerName") == _MEETING_OWNER]
+        same_pid = [window for window in owned if window["kCGWindowOwnerPID"] == pid]
+        layers = Counter(layer for window in same_pid if type(layer := window.get("kCGWindowLayer")) is int)
+        titles = [window.get("kCGWindowName") for window in same_pid if window.get("kCGWindowLayer") == 0]
+        return {
+            "desktop_records": len(windows),
+            "meeting_owner_records": len(owned),
+            "same_pid_records": sum(window["kCGWindowOwnerPID"] == pid for window in windows),
+            "same_pid_meeting_owner_records": len(same_pid),
+            "same_pid_onscreen_records": sum(bool(window.get("kCGWindowIsOnscreen")) for window in same_pid),
+            "same_pid_meeting_layers": dict(sorted(layers.items())),
+            "same_pid_layer0_title_match": titles.count(_MEETING_OWNER),
+            "same_pid_layer0_title_missing": sum(not title for title in titles),
+            "same_pid_layer0_title_other": sum(bool(title) and title != _MEETING_OWNER for title in titles),
+            "other_pid_layer0_title_match": sum(
+                window["kCGWindowOwnerPID"] != pid and window.get("kCGWindowLayer") == 0
+                and window.get("kCGWindowName") == _MEETING_OWNER for window in owned
+            ),
+        }
 
     def window_exists(self, identity: WindowIdentity) -> bool:
         return any(window["kCGWindowOwnerPID"] == identity.pid and window["kCGWindowNumber"] in identity.numbers
