@@ -207,12 +207,18 @@ class IncomingCalls:
                        voice: VoiceChannel, device: AudioDevice) -> WindowIdentity | None:
         loop = asyncio.get_running_loop()
         deadline = loop.time() + _CONNECT_SECONDS
+        pid = ring.identity.pid
         while not binding.closed and loop.time() < deadline:
             _require_audio(voice, device)
-            windows = self._desktop.main_windows()
-            if len(windows) == 1 and windows[0].pid == ring.identity.pid:
+            # 点击前没有会议窗口。合并同一进程新出现的窗口，避免只跟踪大窗口或控制条。
+            numbers = frozenset(
+                number
+                for window in self._desktop.main_windows() if window.pid == pid
+                for number in window.numbers
+            )
+            if numbers:
                 _require_audio(voice, device)
-                return windows[0] if loop.time() < deadline else None
+                return WindowIdentity(pid, numbers) if loop.time() < deadline else None
             await asyncio.sleep(min(_POLL_SECONDS, max(0, deadline - loop.time())))
         return None
 

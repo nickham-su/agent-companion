@@ -224,7 +224,9 @@ class _Desktop:
     def window_exists(self, identity):
         if self.error and self.main:
             raise DesktopCallError("synthetic_window_failure")
-        return identity in self.main or any(ring.identity == identity for ring in self.rings)
+        windows = self.main + tuple(ring.identity for ring in self.rings)
+        return any(window.pid == identity.pid and not window.numbers.isdisjoint(identity.numbers)
+                   for window in windows)
 
     def answer(self, ring, *, before_deadline):
         if self.rings != (ring,) or not before_deadline():
@@ -427,6 +429,36 @@ class IncomingCallTests(unittest.IsolatedAsyncioTestCase):
                 _talk(self.devices[1])
                 await _eventually(lambda: bool(history.tail(_session(_SENDERS[0]), 10)))
                 self.assertEqual(self.runner.lookups, 2)
+
+    async def test_confirms_and_tracks_multiple_meeting_windows_from_the_ringing_process(self):
+        desktop = self.desktop
+        real_answer = desktop.answer
+        primary = WindowIdentity(3, frozenset({101, 102}))
+        controls = WindowIdentity(3, frozenset({103}))
+        foreign = WindowIdentity(5, frozenset({104}))
+
+        def answer(ring, *, before_deadline):
+            accepted = real_answer(ring, before_deadline=before_deadline)
+            if accepted:
+                desktop.main = (foreign, primary, controls)
+            return accepted
+
+        with patch.object(desktop, "answer", side_effect=answer):
+            async with self._serve(_Echo()) as (history, _):
+                desktop.ring(_SENDERS[0], 1)
+                await _eventually(lambda: bool(desktop.clicks))
+                device = self.devices[0]
+                _talk(device)
+                await _eventually(lambda: bool(history.tail(_session(_SENDERS[0]), 10)))
+
+                desktop.main = (controls, foreign)
+                with patch.object(desktop, "window_exists", wraps=desktop.window_exists) as probe:
+                    await _eventually(lambda: probe.call_count >= 2)
+                self.assertFalse(device.closed)
+
+                desktop.main = (foreign,)
+                await _eventually(lambda: device.closed)
+                self.assertEqual(self.runner.lookups, 1)
 
     async def test_lookup_after_audio_opens_can_see_a_reused_window_has_a_new_caller(self):
         desktop, runner = self.desktop, self.runner
