@@ -1,9 +1,18 @@
 # 相对路径以配置文件所在目录为准。
 database = "db.sqlite3"
 main_session_id = "main"
+# 切换时只改对应引用，再重启；真实 Key 请只填写在本机私有配置中。
+llm_provider = "deepseek_default"  # 或 "openai_default"
+asr_provider = "minimax_cn"       # 文字模式也用它转写飞书语音条
+tts_provider = "minimax_cn"       # 仅 voice 模式使用；可指向另一套 MiniMax 配置
+
+# 各能力共用同一时限，切换 Provider 不变。单位为秒。
+[timeouts]
+llm = 60  # 单次模型请求总时限
+asr = 30  # 单次转写总时限
+tts = 25  # 单次网络读写、等待响应的时限
 
 [runtime]
-model_timeout = 60
 delivery_timeout = 120
 # 上下文预算为估算值，不是供应商实际 token 计数。
 context_budget = 64000
@@ -12,17 +21,34 @@ summary_budget = 4000
 max_tool_rounds = 8
 
 # 正式启动必须显式选择适配器及推理强度。
-[llm]
+[providers.deepseek_default]
 adapter = "deepseek"
-reasoning_effort = "disabled"  # DeepSeek 关闭思考；启用时按其模型填写强度
-# model = "deepseek-flash"  # 只有 DeepSeek 可省略模型名
+api_key = "your-deepseek-api-key"
 
-# 要使用 OpenAI Responses，请替换上面的 [llm] 内容：
-# adapter = "openai_responses"
-# model = "your-openai-model"
-# reasoning_effort = "low"   # 支持的值取决于所选模型
-# base_url = "https://api.openai.com/v1"  # 可省略；自定义服务会收到 Key 和模型输入，只配可信 HTTPS 地址
-# Key 仅从 OPENAI_API_KEY 读取。换 Key、地址、模型或推理强度后，旧密文不回传，通用历史保留。
+[providers.deepseek_default.llm]
+model = "deepseek-flash"       # DeepSeek 可省略模型名，默认此值
+reasoning_effort = "disabled"  # 关闭思考；启用时按模型填写强度
+
+[providers.openai_default]
+adapter = "openai_responses"
+api_key = "your-openai-api-key"
+# base_url = "https://api.openai.com/v1"  # 可省略；仅设可信 HTTPS 地址，自定义服务会收到 Key 和模型输入
+
+[providers.openai_default.llm]
+model = "your-openai-model"
+reasoning_effort = "low"  # 支持的值取决于所选模型
+
+[providers.minimax_cn]
+adapter = "minimax"
+api_key = "your-minimax-api-key"
+region = "cn"  # cn 或 global（应与 MiniMax API 账号的区域一致）
+
+[providers.minimax_cn.asr]
+model = "asr-1.0"  # 可省略；当前适配器只支持原有的 asr-1.0 请求
+
+[providers.minimax_cn.tts]
+model = "speech-2.8-turbo"
+voice_id = "male-qn-qingse"
 
 # 飞书模式启用后，把以下占位符换成同一个 CLI 应用下的实际 ID。
 # [feishu]
@@ -32,10 +58,6 @@ reasoning_effort = "disabled"  # DeepSeek 关闭思考；启用时按其模型�
 # mode = "text"
 # cli = "lark-cli"
 # cli_timeout = 20  # 必须小于 runtime.delivery_timeout
-
-[minimax]
-region = "cn"  # cn 或 global（应与 MiniMax API 账号的区域一致）
-asr_timeout = 30
 
 # 仅 [feishu].mode = "voice" 时打开设备。需要两条不同的虚拟线路。
 # [voice]
@@ -49,7 +71,4 @@ asr_timeout = 30
 # playback_rate = 44100  # MiniMax 与 PortAudio 共同使用；输入固定 16000
 # prefetch_seconds = 0.4
 # buffer_seconds = 2
-# delivery_timeout = 90  # 必须小于 runtime.delivery_timeout，与 model_timeout 无关
-# tts_timeout = 25       # 单次网络读写、等待响应的时限
-# tts_model = "speech-2.8-turbo"
-# voice_id = "male-qn-qingse"
+# delivery_timeout = 90  # 必须小于 runtime.delivery_timeout，与 timeouts.llm 无关

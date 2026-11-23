@@ -31,22 +31,27 @@ python -m venv .venv
 
 最后一条是统一离线验收入口：不需要模型密钥、飞书登录或音频设备；集成用例使用项目内临时 SQLite，结束后清理。安装依赖若不能访问公开索引，可从准备好的本地 wheel 目录安装：`.venv/bin/python -m pip install --no-index --find-links <wheel目录> .`（还需包含 `pyproject.toml` 的构建依赖）。精简环境若缺 `ensurepip`，需先提供带 pip 的虚拟环境；目标 Mac 建议使用完整的 Python 发行版。
 
-`.venv/bin/python -m agent_companion` 和 `.venv/bin/python -m agent_companion --demo-subtasks` 可单独运行两个简短演示；不需要 `[llm]`，始终使用内存数据库，不等同于全量验收。可传 `--config config.example.toml` 验证其他模拟配置；只有 `--run` 使用配置中的数据库路径。单次模型请求总时限默认 60 秒。
+`.venv/bin/python -m agent_companion` 和 `.venv/bin/python -m agent_companion --demo-subtasks` 可单独运行两个简短演示；不需要生产 Provider 或密钥，始终使用内存数据库，不等同于全量验收。可传 `--config config.example.toml` 验证其他模拟配置；只有 `--run` 使用配置中的数据库路径和 Provider。
 
-## 选择 LLM
+## 选择 Provider
 
-正式启动必须在 `[llm]` 指定 `adapter` 和 `reasoning_effort`，两项均无默认值。删除旧的 `[deepseek]` 段；旧配置不兼容。已有 SQLite 会话历史保留。
+正式启动通过顶层 `llm_provider`、`asr_provider` 引用 `[providers.<名字>]`；`voice` 还需 `tts_provider`，`text` 不使用它。名字是任意配置 ID，`adapter` 才是实际适配器。每套 Provider 在本机配置中直接填写 `api_key`，不从环境变量读取；未选用的 Provider 不需要密钥。改引用后重启即可切换。
 
-| `adapter` | 配置与凭据 |
+旧的 `[llm]`、`[deepseek]`、`[minimax]` 及旧语音模型字段不再兼容，请按 [config.example.toml](config.example.toml) 迁移。已有 SQLite 会话历史保留。`adapter` 必须显式指定，`.llm.reasoning_effort` 必填。
+
+请求时限统一配置在 `[timeouts]`，单位秒：`llm` 是单次模型请求总时限（默认 60），`asr` 是单次转写总时限（默认 30），`tts` 是单次网络读写及等待响应的时限（默认 25，仅 `voice` 启用）。切换 Provider 不改变这些值。旧的 `runtime.model_timeout` 和 Provider 能力表里的 `timeout` 不再兼容；投递看门狗和飞书 CLI 时限仍在各自的配置段。
+
+| `adapter` | 配置 |
 | --- | --- |
-| `deepseek` | `model` 可省略，默认 `deepseek-flash`。`reasoning_effort = "disabled"` 显式关闭思考；其他值由所选模型解释。凭据仅从 `DEEPSEEK_API_KEY` 读取。历史切到思考开启时，如有不兼容旧记录，用摘要承接，原文仍可查。 |
-| `openai_responses` | 必填 `model`。可选 `base_url`，默认 `https://api.openai.com/v1`，请求时在其后追加 `/responses`。`reasoning_effort` 原样传给 Responses，例如 `low`，或选用明确支持 `none` 的模型来关闭推理。凭据仅从 `OPENAI_API_KEY` 读取。 |
+| `deepseek` | `.llm.model` 可省略，默认 `deepseek-flash`。`reasoning_effort = "disabled"` 显式关闭思考；其他值由所选模型解释。历史切到思考开启时，如有不兼容旧记录，用摘要承接，原文仍可查。 |
+| `openai_responses` | `.llm.model` 必填。可选 Provider 层 `base_url`，默认 `https://api.openai.com/v1`，请求时在其后追加 `/responses`。`reasoning_effort` 原样传给 Responses，例如 `low`，或选用明确支持 `none` 的模型来关闭推理。 |
+| `minimax` | Provider 层 `region` 选 `cn`（默认）或 `global`。`.asr` 默认并仅支持原有 `asr-1.0` 请求；`.tts` 配置模型和音色。ASR、TTS 可以共用一套 Provider，也可以分别使用不同区域和 Key。 |
 
-**只配置可信的 HTTPS 地址**：自定义服务会收到 `OPENAI_API_KEY` 和发送给模型的输入。地址不要包含凭据、查询参数或片段；客户端不跟随重定向。DeepSeek 不支持 `base_url`。
+**只配置可信的 HTTPS 地址**：自定义服务会收到所选 Provider 的 API Key 和发送给模型的输入。地址不要包含凭据、查询参数或片段；客户端不跟随重定向。其他适配器不支持 `base_url`。
 
 Responses 请求设置 `store: false` 并显式请求加密推理项，不使用 `previous_response_id`，也不主动请求可读推理摘要。请求正常完成后原样保存有效密文，按原生项顺序回传；可读摘要若随协议返回，只作为私有回传字段。SQLite 中的私有回传记录与回复、工具结果和回执原子提交，不进入正文、搜索、日志或会话摘要。不要共享历史数据库或提取并分享私有记录。
 
-本地用数据库级随机盐、API Key、规范化后的 `base_url` 和 `model` 自动生成指纹。更换 Key（包括同一项目轮换）、地址、模型或 `reasoning_effort` 后，不回传不匹配的密文，但仍可使用通用聊天历史。旧手工标签下的回传记录不再读取，原数据库与通用历史保留。
+本地用数据库级随机盐、API Key、规范化后的 `base_url` 和 `model` 自动生成指纹，Provider 名字不参与计算。更换 Key（包括同一项目轮换）、地址、模型或 `reasoning_effort` 后，不回传不匹配的密文，但仍可使用通用聊天历史。旧手工标签下的回传记录不再读取，原数据库与通用历史保留。
 
 工具定义和请求前缀变化不阻止回传；续轮仍按通用预算压缩历史或替换图片，已纳入摘要的私有记录不再加载。语音零投递或部分投递不回传未确认正文，保留其他有效推理项及配对的工具调用和结果。私有记录缺失或损坏时可使用通用历史；供应商是否利用密文由其决定。预算不足或服务端拒绝时结束当前请求，不自动重试、切换供应商或重跑工具。按 [Mac 实机验收清单](docs/acceptance/mac-checklist.md)分别核对私有项入库、出站携带和供应商实际利用。
 
@@ -67,7 +72,7 @@ python scripts/build_source_zip.py
 
 1. 使用 [lark-cli v1.0.100](https://github.com/larksuite/cli/releases/tag/v1.0.100) 或保留同等协议的版本；在本机完成飞书用户登录，并确认应用有指定聊天的列表、媒体下载和发消息权限。程序不会发起登录或读取 CLI 的凭据文件。参考 [CLI JSON 输出契约](https://github.com/larksuite/cli/blob/v1.0.100/README.md#json-output-contract)和[飞书消息列表 API](https://open.feishu.cn/document/server-docs/im-v1/message/list)。
 2. 复制 `config.example.toml` 为 `config.local.toml`，取消 `[feishu]` 注释，填写目标对话 `chat_id`、业务对端 `sender_open_id` 与登录账号 `own_open_id`，使用同一 CLI 应用下的 Open ID；两者必须不同。`mode="text"` 不打开音频设备。`cli_timeout` 必须短于 Runtime 的投递时限。每个数据库只允许一个飞书主 Session 绑定，首次绑定要求全库没有历史或入站状态。日后要更换主 Session ID、对话、对端或账号，或旧数据库已有数据但未绑定，请配置新的数据库路径，不要覆盖旧库。仅切换输出模式不影响绑定。
-3. 按[选择 LLM](#选择-llm)配置模型、本机模型环境变量及 `MINIMAX_API_KEY`，不写到配置或日志。MiniMax 区域按账号选择 `cn`（[国内 API](https://platform.minimax.cn/docs/api-reference/speech-to-text)）或 `global`（[国际 API](https://platform.minimax.io/docs/api-reference/speech-to-text)）。工作目录需要允许建立用于资源下载的短期目录。
+3. 按[选择 Provider](#选择-provider)填好所选 LLM 和 MiniMax ASR 的 `api_key`；只在本机私有配置填写真实 Key，不要分享或提交该文件。MiniMax 区域按账号选择 `cn`（[国内 API](https://platform.minimax.cn/docs/api-reference/speech-to-text)）或 `global`（[国际 API](https://platform.minimax.io/docs/api-reference/speech-to-text)）。工作目录需要允许建立用于资源下载的短期目录。
 
 ```sh
 .venv/bin/python -m agent_companion --run --config config.local.toml
@@ -92,7 +97,7 @@ python scripts/build_source_zip.py
    ```
 
 3. 从 [Silero VAD 官方源码](https://github.com/snakers4/silero-vad/blob/master/src/silero_vad/data/silero_vad.onnx)单独取得 `silero_vad.onnx`（使用带 `input/state/sr` 接口的 v6 系列模型，不选只支持其他输入形状的变体），放在本机配置指定路径。程序只加载已有文件，不下载模型，不需要 PyTorch；相对路径以 TOML 文件所在目录为准。音频和 ONNX 依赖不在 `text` 或模拟模式下加载。
-4. 沿用已配置的飞书 CLI 和 MiniMax，设置 `[feishu].mode = "voice"` 并填写 `config.example.toml` 中的 `[voice]` 设备与模型路径。用同一个 `--run --config config.local.toml` 命令重启程序，手动用飞书接听和挂断；切回 `text` 同样修改配置并重启。同一数据库和主 Session 历史保留。不判断通话状态：`voice` 模式即使没有通话，也只向虚拟设备播报模型回复，不自动发飞书文字。飞书文本、图文和语音条仍轮询；语音条失败通知始终通过飞书文字发送。
+4. 设置 `[feishu].mode = "voice"`，检查 `tts_provider` 所选 MiniMax 配置含 `.tts` 配置表和 `api_key`，再按 `config.example.toml` 填写 `[voice]` 的设备与 VAD 模型路径。用同一个 `--run --config config.local.toml` 命令重启程序，手动用飞书接听和挂断；切回 `text` 同样修改配置并重启。同一数据库和主 Session 历史保留。不判断通话状态：`voice` 模式即使没有通话，也只向虚拟设备播报模型回复，不自动发飞书文字。飞书文本、图文和语音条仍轮询；语音条失败通知始终通过飞书文字发送。
 
 程序在启动时检查两路设备是否支持所需流格式。输入为 16 kHz 单声道有符号 16-bit PCM（512 样本一帧），直接供 Silero 和 WAV 文件转写使用。输出为 MiniMax 相同采样率的单声道 16-bit PCM，默认 44.1 kHz，可配 16/24/32/44.1 kHz。CoreAudio 在需要且支持时转换设备格式，程序不更改设备全局采样率、不再做第二次重采样。若报 `voice_input_pcm_16khz_mono_not_supported` 或 `voice_output_pcm_rate_or_channels_not_supported`，在「音频 MIDI 设置」和 `sounddevice` 列表核对两条线路；输出可选一个双方支持的采样率，输入需选择能提供 16 kHz 单声道流的设备或系统转换。若通话对端无声，核对虚拟设备首个单声道的路由、飞书麦克风/扬声器选项和设备权限。
 
@@ -100,7 +105,7 @@ VAD 默认连续 3 个 32 ms 人声窗口触发打断，默认静默 1 秒结束
 
 运行时若设备流断开或 VAD 推理出错，实时语音停用并记日志：丢弃尚未提交的录音，取消在途实时转写，忽略迟到结果，不等待取消清理。当前播报仍保留已交设备的确认前缀。模型、工具、飞书输入轮询和飞书语音条转写不受影响。不会自动切成文字输出或重连设备；排查后需重启。
 
-MiniMax 流式合成也可能以 HTTP 200 返回 JSON 业务错误而不是 SSE。该响应最多读取 64 KiB，受 `tts_timeout` 限制；适配器使用固定错误码分类，不输出响应正文。
+MiniMax 流式合成也可能以 HTTP 200 返回 JSON 业务错误而不是 SSE。该响应最多读取 64 KiB，受 `timeouts.tts` 限制；适配器使用固定错误码分类，不输出响应正文。
 
 实机需验证：两路可独立收发且无自触发；真实 ASR、流式 PCM 和设备格式匹配；说完到开始回答的延迟可接受；用户打断后旧播报在 ASR 成功/失败时都不恢复，历史只记交给本机设备的确认前缀，不代表飞书对端已听到。最后挂断、切回 `text` 并重启，验证历史与 CLI 文字回复仍可用。离线模拟结果不替代这些本机检查。
 

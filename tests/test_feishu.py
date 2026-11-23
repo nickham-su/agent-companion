@@ -16,7 +16,8 @@ from agent_companion.__main__ import _serve
 from agent_companion.app import run_feishu, running_agent
 from agent_companion.channels.feishu.channel import FeishuChannel, FeishuPoller
 from agent_companion.channels.feishu.cli import CliError, CliStdoutLimit, CommandResult, FeishuCLI, run_command
-from agent_companion.config import FeishuSettings, LLMSettings, Settings, VoiceSettings, load_settings
+from agent_companion.config import (ASRSettings, FeishuSettings, LLMSettings, MiniMaxConnection, Settings, TTSSettings,
+                                    VoiceSettings, load_settings)
 from agent_companion.protocol import (OMITTED_INPUT_IMAGE, DeliveryStatus, Image, Message, ReplyInfo,
                                       ReplyStream, Text, TextDelta)
 from agent_companion.speech.asr import AsrError
@@ -645,7 +646,8 @@ print(json.dumps({"ok": True, "identity": "user", "data": page}))
         runner = _Runner()
         cli = FeishuCLI("lark-cli", _CHAT, timeout=2, runner=runner)
         identity = FeishuSettings(_CHAT, _PEER, _SELF)
-        settings = Settings(feishu=identity, llm=LLMSettings("deepseek", "disabled"))
+        settings = Settings(feishu=identity, llm=LLMSettings("deepseek", "disabled", api_key="synthetic"),
+                            asr=ASRSettings(MiniMaxConnection("synthetic")))
         with TemporaryDirectory(dir=Path.cwd()) as temp:
             path = Path(temp) / "synthetic.sqlite"
             with closing(History(path)) as history, patch.object(FeishuPoller, "run") as run:
@@ -667,7 +669,7 @@ print(json.dumps({"ok": True, "identity": "user", "data": page}))
             wrong_startup = replace(settings, database=path, feishu=replace(identity, chat_id="oc_other"))
             with patch("agent_companion.__main__.httpx.AsyncClient") as open_client:
                 with self.assertRaises(FeishuBindingError):
-                    await _serve(wrong_startup, "synthetic", "synthetic")
+                    await _serve(wrong_startup)
                 open_client.assert_not_called()
             with closing(History(path)) as history, patch.object(FeishuPoller, "run") as run:
                 voice = replace(settings, feishu=replace(identity, mode="voice"))
@@ -708,15 +710,19 @@ print(json.dumps({"ok": True, "identity": "user", "data": page}))
     def test_sample_config_offline_and_id_validation(self):
         settings = load_settings(Path("config.example.toml"))
         self.assertIsNone(settings.feishu)
-        self.assertEqual(settings.minimax.region, "cn")
+        self.assertIsNone(settings.llm)
+        self.assertIsNone(settings.asr)
+        self.assertIsNone(settings.tts)
         with self.assertRaises(ValueError):
             FeishuSettings(_CHAT, _SELF, _SELF)
 
 
 class FeishuProductionBindingTests(unittest.IsolatedAsyncioTestCase):
     def settings(self, path, *, mode="text"):
+        speech = MiniMaxConnection("synthetic")
         return Settings(database=path, feishu=FeishuSettings(_CHAT, _PEER, _SELF, mode=mode),
-                        llm=LLMSettings("deepseek", "disabled"),
+                        llm=LLMSettings("deepseek", "disabled", api_key="synthetic"),
+                        asr=ASRSettings(speech), tts=TTSSettings(speech) if mode == "voice" else None,
                         voice=VoiceSettings(input_device=1, output_device=2, vad_model=Path("synthetic.onnx")))
 
     def create_legacy_db(self, path, *, used=False):
@@ -732,7 +738,7 @@ class FeishuProductionBindingTests(unittest.IsolatedAsyncioTestCase):
               patch("agent_companion.channels.audio.macos.MacAudioDevice") as audio,
               patch("agent_companion.app.running_agent") as start):
             with self.assertRaisesRegex(FeishuBindingError, message):
-                await _serve(settings, "", "")
+                await _serve(settings)
             client.assert_not_called()
             audio.assert_not_called()
             start.assert_not_called()
@@ -754,7 +760,7 @@ class FeishuProductionBindingTests(unittest.IsolatedAsyncioTestCase):
             path = Path(folder) / "bound.sqlite"
             settings = self.settings(path)
             with (patch("agent_companion.__main__.httpx.AsyncClient"), patch.object(FeishuPoller, "run") as poll):
-                await _serve(settings, "", "")
+                await _serve(settings)
                 poll.assert_awaited_once()
             with closing(sqlite3.connect(path)) as db:
                 original = db.execute("SELECT * FROM feishu_bindings").fetchall()
@@ -773,18 +779,19 @@ class FeishuProductionBindingTests(unittest.IsolatedAsyncioTestCase):
                   patch("agent_companion.channels.audio.macos.MacAudioDevice") as audio,
                   patch("agent_companion.app.SileroVAD"), patch("agent_companion.app.VoiceChannel") as voice_channel,
                   patch.object(FeishuPoller, "run") as poll):
-                await _serve(settings, "", "")
+                await _serve(settings)
                 audio.assert_not_called()
                 with closing(sqlite3.connect(path)) as db:
                     original = db.execute("SELECT * FROM feishu_bindings").fetchall()
                     self.assertEqual([session_id for session_id, _ in original], [settings.main_session_id])
                     self.assertTrue({"assistant_message_id", "model_error"} <= {
                         row[1] for row in db.execute("PRAGMA table_info(reply_outcomes)")})
-                await _serve(self.settings(path, mode="voice"), "", "")
-                await _serve(settings, "", "")
+                await _serve(replace(self.settings(path, mode="voice"), asr_timeout=4.5))
+                await _serve(settings)
                 self.assertEqual(poll.await_count, 3)
                 audio.assert_called_once()
                 voice_channel.return_value.connected.assert_called_once()
+                self.assertEqual(voice_channel.call_args.kwargs["asr_timeout"], 4.5)
             with closing(sqlite3.connect(path)) as db:
                 self.assertEqual(db.execute("SELECT * FROM feishu_bindings").fetchall(), original)
 

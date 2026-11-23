@@ -1,6 +1,5 @@
 import asyncio
 from contextlib import closing
-from io import StringIO
 import json
 import logging
 from pathlib import Path
@@ -11,8 +10,9 @@ from unittest.mock import AsyncMock, patch
 
 import httpx
 
-from agent_companion.__main__ import _serve, main
-from agent_companion.config import FeishuSettings, LLMSettings, RuntimeSettings, Settings, load_settings
+from agent_companion.__main__ import _serve
+from agent_companion.app import running_agent
+from agent_companion.config import LLMSettings, RuntimeSettings, load_settings
 from agent_companion.models.deepseek import CHAT_COMPLETIONS, DeepSeek
 from agent_companion.models.openai_responses import OpenAIResponses
 from agent_companion.protocol import (OMITTED_INPUT_IMAGE, DeliveryStatus, Image, Message, ModelError, Receipt,
@@ -682,22 +682,63 @@ class OpenAIResponsesTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(history.read_after("main", replay_scope=scope), entries)
             self.assertEqual(history._db.execute("SELECT count(*) FROM model_replays").fetchone()[0], before_count)
 
-    async def test_production_composes_selected_openai_adapter(self):
+    async def test_production_switches_named_providers_without_changing_replay_identity_rules(self):
+        endpoint = "https://responses.example.invalid/api/responses"
+        default = (_KEY, "HTTPS://RESPONSES.EXAMPLE.INVALID:443/api/", "fixture-model", "low")
+        profiles = {
+            "initial": default,
+            "renamed": (_KEY, "https://responses.example.invalid/api", "fixture-model", "low"),
+            "other_key": ("synthetic-rotation", *default[1:]),
+            "other_address": (_KEY, "https://other.example.invalid/api", *default[2:]),
+            "other_model": (*default[:2], "other-model", "low"),
+            "other_effort": (*default[:3], "future-value"),
+        }
+        tables = """
+asr_provider = "speech"
+[timeouts]
+llm = 0.75
+[feishu]
+chat_id = "oc_fixture"
+sender_open_id = "ou_peer"
+own_open_id = "ou_self"
+[providers.speech]
+adapter = "minimax"
+api_key = "synthetic-speech-test"
+[providers.speech.asr]
+"""
+        for name, (key, address, model, effort) in profiles.items():
+            tables += (f'[providers.{name}]\nadapter = "openai_responses"\napi_key = "{key}"\nbase_url = "{address}"\n'
+                       f'[providers.{name}.llm]\nmodel = "{model}"\nreasoning_effort = "{effort}"\n')
+
+        async def exercise(settings, history, model, asr, *, tts):
+            self.assertIsInstance(model, OpenAIResponses)
+            self.assertIsNone(tts)
+            async with running_agent(settings, history, model, _Channel()) as (runtime, _):
+                self.assertEqual(runtime._settings.model_timeout, 0.75)
+                runtime.submit_batch([Message("user", "synthetic prompt")])
+                await asyncio.wait_for(runtime.wait_idle(), 2)
+                self.assertIsNone(runtime.last_failure)
+
+        actual_client = httpx.AsyncClient
         with TemporaryDirectory(dir=Path.cwd()) as folder:
-            settings = Settings(database=Path(folder) / "synthetic.sqlite",
-                                llm=LLMSettings("openai_responses", "none", "fixture-model", "https://responses.example.invalid/api/"),
-                                feishu=FeishuSettings("oc_fixture", "ou_peer", "ou_self"))
-            with patch("agent_companion.__main__.run_feishu", new_callable=AsyncMock) as run:
-                await _serve(settings, "synthetic-model-test", "synthetic-speech-test")
-                run.assert_awaited_once()
-                model = run.await_args.args[2]
-                self.assertIsInstance(model, OpenAIResponses)
-                self.assertEqual(model._endpoint, "https://responses.example.invalid/api/responses")
-                self.assertEqual(model.replay_scope.reasoning_effort, "none")
-                with closing(History(settings.database)) as history:
-                    expected = _model(model._client, history=history, api_key=_KEY, effort="none",
-                                      base_url="https://responses.example.invalid/api")
-                self.assertEqual(model.replay_scope, expected.replay_scope)
+            config = Path(folder) / "synthetic.toml"
+            for name, (key, _, model, effort) in profiles.items():
+                with self.subTest(provider=name):
+                    config.write_text(f'llm_provider = "{name}"\n' + tables, encoding="utf-8")
+                    settings = load_settings(config, for_run=True)
+                    answer = (_reason(), _answer("old confirmed")) if name == "initial" else (_answer("follow-up"),)
+                    target = "https://other.example.invalid/api/responses" if name == "other_address" else endpoint
+                    fixture = _Fixture(self, [_completed(*answer)], api_key=key, endpoint=target)
+                    with (patch("agent_companion.__main__.run_feishu", side_effect=exercise),
+                          patch("agent_companion.__main__.httpx.AsyncClient",
+                                side_effect=lambda **opts: actual_client(transport=fixture.transport, **opts))):
+                        await _serve(settings)
+                    request, = fixture.requests
+                    self.assertEqual(request["model"], model)
+                    self.assertEqual(request["reasoning"]["effort"], effort)
+                    body = json.dumps(request["input"])
+                    self.assertEqual(_CIPHER in body, name == "renamed")
+                    self.assertEqual("old confirmed" in body, name != "initial")
 
     async def test_deepseek_explicit_effort_and_disabled_use_existing_wire(self):
         captured = []
@@ -721,7 +762,7 @@ class OpenAIResponsesTests(unittest.IsolatedAsyncioTestCase):
 
 class LLMSettingsTests(unittest.TestCase):
     def test_base_url_normalization_and_validation(self):
-        llm = LLMSettings("openai_responses", "low", "fixture", "HTTPS://[2001:DB8::1]:8443/model/v1///")
+        llm = LLMSettings("openai_responses", "low", "fixture", "HTTPS://[2001:DB8::1]:8443/model/v1///", api_key=_KEY)
         self.assertEqual(llm.base_url, "https://[2001:db8::1]:8443/model/v1")
         self.assertNotIn("base_url", repr(llm))
         for url in ("http://localhost/v1", "https://token@example.invalid/v1", "https://example.invalid/v1?",
@@ -729,51 +770,5 @@ class LLMSettingsTests(unittest.TestCase):
                     "https://example.invalid\\v1", "https://example.invalid/with space", "https:///v1",
                     "https://example.invalid/" + "路" * 300):
             with self.subTest(url=url), self.assertRaises(ValueError) as exc:
-                LLMSettings("openai_responses", "low", "fixture", url)
+                LLMSettings("openai_responses", "low", "fixture", url, api_key=_KEY)
             self.assertTrue(url not in str(exc.exception))
-
-    def test_rejects_old_or_incomplete_configuration(self):
-        sections = ('[deepseek]\nthinking = false', '[llm]\nadapter = "deepseek"',
-                    '[llm]\nreasoning_effort = "none"', '[llm]\nadapter = "deepseek"\nreasoning_effort = " "',
-                    '[llm]\nadapter = "openai_responses"\nreasoning_effort = "low"',
-                    '[llm]\nadapter = "openai_responses"\nreasoning_effort = "low"\nmodel = "synthetic"\nreplay_profile = "legacy"',
-                    '[llm]\nadapter = "deepseek"\nreasoning_effort = "high"\nbase_url = "https://example.invalid/api"')
-        with TemporaryDirectory(dir=Path.cwd()) as folder:
-            config = Path(folder) / "config.toml"
-            for section in sections:
-                with self.subTest(section=section):
-                    config.write_text(section, encoding="utf-8")
-                    with self.assertRaises((TypeError, ValueError)):
-                        load_settings(config)
-        with patch("sys.argv", ["agent-companion", "--run"]), patch("sys.stderr"), patch("os.getenv") as getenv:
-            with self.assertRaises(SystemExit) as exc:
-                main()
-            self.assertEqual(exc.exception.code, 2)
-            getenv.assert_not_called()
-
-        with (patch("sys.argv", ["agent-companion", "--run"]), patch("sys.stderr", new_callable=StringIO) as stderr,
-              patch("agent_companion.__main__.load_settings", side_effect=ValueError("synthetic-invalid-value")),
-              patch("agent_companion.__main__.os.getenv") as getenv):
-            with self.assertRaises(SystemExit) as exc:
-                main()
-            self.assertEqual(exc.exception.code, 2)
-            self.assertIn("无法加载配置（ValueError）", stderr.getvalue())
-            self.assertNotIn("synthetic-invalid-value", stderr.getvalue())
-            getenv.assert_not_called()
-
-    def test_startup_reads_only_selected_llm_environment_variable(self):
-        with TemporaryDirectory(dir=Path.cwd()) as folder:
-            config = Path(folder) / "synthetic.toml"
-            for adapter, variable, extra in [("deepseek", "DEEPSEEK_API_KEY", ""),
-                                             ("openai_responses", "OPENAI_API_KEY",
-                                              'model="synthetic"\n')]:
-                with self.subTest(adapter=adapter):
-                    config.write_text(f'[llm]\nadapter="{adapter}"\nreasoning_effort="example"\n{extra}'
-                                      '[feishu]\nchat_id="oc_test"\nsender_open_id="ou_peer"\nown_open_id="ou_self"\n',
-                                      encoding="utf-8")
-                    with (patch("sys.argv", ["agent-companion", "--run", "--config", str(config)]),
-                          patch("agent_companion.__main__.os.getenv", return_value="synthetic-only") as getenv,
-                          patch("agent_companion.__main__._serve", new_callable=AsyncMock) as serve):
-                        self.assertEqual(main(), 0)
-                        self.assertEqual([call.args[0] for call in getenv.call_args_list], [variable, "MINIMAX_API_KEY"])
-                        self.assertEqual(serve.await_args.args[0].llm.adapter, adapter)

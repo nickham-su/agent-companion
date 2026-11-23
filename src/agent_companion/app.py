@@ -8,7 +8,7 @@ import json
 
 from .channels.feishu.channel import FeishuChannel, FeishuPoller
 from .channels.feishu.cli import FeishuCLI
-from .config import FeishuSettings, Settings
+from .config import FeishuSettings, Settings, require_delivery_timeout
 from .protocol import Channel, Message, Model
 from .runtime.engine import Runtime
 from .runtime.subtasks import Subtasks
@@ -49,8 +49,7 @@ def feishu_identity(settings: Settings) -> tuple[FeishuSettings, str]:
     feishu = settings.feishu
     if feishu is None:
         raise ValueError("missing Feishu settings")
-    if feishu.cli_timeout >= settings.runtime.delivery_timeout:
-        raise ValueError("CLI timeout must be shorter than Runtime delivery timeout")
+    require_delivery_timeout(feishu.cli_timeout, settings.runtime.delivery_timeout, "feishu.cli_timeout")
     # 校验归属必须早于设备、轮询和子任务恢复；mode 不属于身份。
     identity = (feishu.chat_id, feishu.sender_open_id, feishu.own_open_id)
     return feishu, sha256(json.dumps(identity, separators=(",", ":")).encode()).hexdigest()
@@ -65,8 +64,8 @@ async def run_feishu(settings: Settings, history: History, model: Model, asr: Fi
     local_voice = None
     if feishu.mode == "voice" and voice_output is None and tts is not None:
         voice = settings.voice
-        if voice.delivery_timeout >= settings.runtime.delivery_timeout:
-            raise VoiceSetupError("voice_delivery_timeout_must_be_below_runtime_watchdog")
+        require_delivery_timeout(voice.delivery_timeout, settings.runtime.delivery_timeout, "voice.delivery_timeout",
+                                 error_type=VoiceSetupError)
         if audio is None:
             if voice.input_device is None or voice.output_device is None:
                 raise VoiceSetupError("voice_input_and_output_devices_required")
@@ -77,7 +76,7 @@ async def run_feishu(settings: Settings, history: History, model: Model, asr: Fi
             if voice.vad_model is None:
                 raise VoiceSetupError("voice_vad_model_required")
             vad = SileroVAD(voice.vad_model)
-        local_voice = VoiceChannel(asr, tts, vad, voice, asr_timeout=settings.minimax.asr_timeout)
+        local_voice = VoiceChannel(asr, tts, vad, voice, asr_timeout=settings.asr_timeout)
         voice_output = local_voice
 
     cli = cli if cli is not None else FeishuCLI(feishu.cli, feishu.chat_id, timeout=feishu.cli_timeout)
