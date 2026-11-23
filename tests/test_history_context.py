@@ -79,16 +79,16 @@ class HistoryTest(unittest.TestCase):
 
     def test_default_and_explicit_configuration(self):
         default = load_settings()
-        self.assertFalse(default.deepseek.thinking)
+        self.assertIsNone(default.llm)
         self.assertEqual(default.runtime.model_timeout, 60)
         with tempfile.TemporaryDirectory(dir=Path.cwd()) as folder:
             path = Path(folder) / "test.toml"
-            path.write_text('database = "project-local.sqlite"\n[deepseek]\nthinking = true\n'
+            path.write_text('database = "project-local.sqlite"\n[llm]\nadapter = "deepseek"\nreasoning_effort = "high"\n'
                             '[runtime]\nmodel_timeout = 1.25\n', encoding="utf-8")
             actual = load_settings(path)
             self.assertEqual(actual.database, path.parent / "project-local.sqlite")
             self.assertEqual(actual.runtime.model_timeout, 1.25)
-            self.assertTrue(actual.deepseek.thinking)
+            self.assertEqual(actual.llm.reasoning_effort, "high")
             path.write_text('[runtime]\nmodel_timeout = nan\n', encoding="utf-8")
             with self.assertRaisesRegex(ValueError, "model_timeout"):
                 load_settings(path)

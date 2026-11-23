@@ -16,7 +16,7 @@ from agent_companion.__main__ import _serve
 from agent_companion.app import run_feishu, running_agent
 from agent_companion.channels.feishu.channel import FeishuChannel, FeishuPoller
 from agent_companion.channels.feishu.cli import CliError, CliStdoutLimit, CommandResult, FeishuCLI, run_command
-from agent_companion.config import FeishuSettings, Settings, VoiceSettings, load_settings
+from agent_companion.config import FeishuSettings, LLMSettings, Settings, VoiceSettings, load_settings
 from agent_companion.protocol import (OMITTED_INPUT_IMAGE, DeliveryStatus, Image, Message, ReplyInfo,
                                       ReplyStream, Text, TextDelta)
 from agent_companion.speech.asr import AsrError
@@ -645,7 +645,7 @@ print(json.dumps({"ok": True, "identity": "user", "data": page}))
         runner = _Runner()
         cli = FeishuCLI("lark-cli", _CHAT, timeout=2, runner=runner)
         identity = FeishuSettings(_CHAT, _PEER, _SELF)
-        settings = Settings(feishu=identity)
+        settings = Settings(feishu=identity, llm=LLMSettings("deepseek", "disabled"))
         with TemporaryDirectory(dir=Path.cwd()) as temp:
             path = Path(temp) / "synthetic.sqlite"
             with closing(History(path)) as history, patch.object(FeishuPoller, "run") as run:
@@ -716,6 +716,7 @@ print(json.dumps({"ok": True, "identity": "user", "data": page}))
 class FeishuProductionBindingTests(unittest.IsolatedAsyncioTestCase):
     def settings(self, path, *, mode="text"):
         return Settings(database=path, feishu=FeishuSettings(_CHAT, _PEER, _SELF, mode=mode),
+                        llm=LLMSettings("deepseek", "disabled"),
                         voice=VoiceSettings(input_device=1, output_device=2, vad_model=Path("synthetic.onnx")))
 
     def create_legacy_db(self, path, *, used=False):

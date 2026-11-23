@@ -11,7 +11,7 @@
 | `__main__.py`、`app.py`、`config.py` | 程序组装、启动与配置 | 已实现 |
 | `protocol.py` | 模型、通道与消息的共同契约 | 已实现 |
 | `runtime/engine.py`、`runtime/context.py`、`runtime/tools.py` | 运行编排、上下文投影与工具注册 | 已实现 |
-| `storage/sqlite.py`、`models/deepseek.py` | SQLite 历史存储、DeepSeek LLM 适配 | 已实现 |
+| `storage/sqlite.py`、`models/` | SQLite 历史存储、DeepSeek 和 OpenAI Responses LLM 适配 | 离线模拟通过，真实调用待验 |
 | `runtime/subtasks.py` | 异步委派与结果回投 | 已实现 |
 | `channels/feishu/` | CLI、轮询、消息解析与通道路由 | 两种模式保留飞书输入，待实机验收 |
 | `speech/` | 与 IM 无关的文件 ASR、VAD、TTS 和实时语音调度 | 离线模拟通过，待实机验收 |
@@ -31,9 +31,28 @@ python -m venv .venv
 
 最后一条是统一离线验收入口：不需要模型密钥、飞书登录或音频设备；集成用例使用项目内临时 SQLite，结束后清理。安装依赖若不能访问公开索引，可从准备好的本地 wheel 目录安装：`.venv/bin/python -m pip install --no-index --find-links <wheel目录> .`（还需包含 `pyproject.toml` 的构建依赖）。精简环境若缺 `ensurepip`，需先提供带 pip 的虚拟环境；目标 Mac 建议使用完整的 Python 发行版。
 
-`.venv/bin/python -m agent_companion` 和 `.venv/bin/python -m agent_companion --demo-subtasks` 可单独运行两个简短演示；始终使用内存数据库，不等同于全量验收。可传 `--config config.example.toml` 验证其他模拟配置；只有 `--run` 使用配置中的数据库路径。单次模型请求总时限默认 60 秒。思考模式默认显式关闭，旧会话切换到开启时，必要情况下先对不兼容的历史做摘要，原文仍可查。
+`.venv/bin/python -m agent_companion` 和 `.venv/bin/python -m agent_companion --demo-subtasks` 可单独运行两个简短演示；不需要 `[llm]`，始终使用内存数据库，不等同于全量验收。可传 `--config config.example.toml` 验证其他模拟配置；只有 `--run` 使用配置中的数据库路径。单次模型请求总时限默认 60 秒。
+
+## 选择 LLM
+
+正式启动必须在 `[llm]` 指定 `adapter` 和 `reasoning_effort`，两项均无默认值。删除旧的 `[deepseek]` 段；旧配置不兼容。已有 SQLite 会话历史保留。
+
+| `adapter` | 配置与凭据 |
+| --- | --- |
+| `deepseek` | `model` 可省略，默认 `deepseek-flash`。`reasoning_effort = "disabled"` 显式关闭思考；其他值由所选模型解释。凭据仅从 `DEEPSEEK_API_KEY` 读取。历史切到思考开启时，如有不兼容旧记录，用摘要承接，原文仍可查。 |
+| `openai_responses` | 必填 `model`、`replay_profile`。`reasoning_effort` 原样传给 Responses，例如 `low`，或选用明确支持 `none` 的模型来关闭推理。凭据仅从 `OPENAI_API_KEY` 读取。 |
+
+`replay_profile` 使用稳定、不敏感的本地项目标识，例如 `personal-project`；**换 OpenAI 账户或项目时要换标识**，不要填 API key。模型不支持所填强度时不会自动改用其他值或供应商。
+
+OpenAI 只使用官方 `/v1/responses`，设置 `store: false` 并显式请求加密推理项，不使用 `previous_response_id`，也不主动请求可读推理摘要。完成后原样保存密文，按原生 item 顺序回传；可读摘要若随协议返回，只作为私有回传字段。SQLite 中的回传记录与回复、工具结果和回执原子提交，不进入正文、搜索、日志或会话摘要。不要共享历史数据库或提取并分享私有记录。
+
+旧回传仅用于相同适配器、模型、`replay_profile` 和 `reasoning_effort`，且实际请求前缀匹配的请求。切换配置、压缩或替换图片会让受影响的旧回传失效，仍可使用通用历史。早期不含强度指纹的回传记录也只使用对应的通用历史，不改写原数据库。语音零投递或部分投递只保留改写前的原生顺序，改写后的尾部仅用通用项，不回传未确认正文或受影响的密文。
+
+活动工具续轮在上下文估算和实际 JSON 均可容纳时，优先保留上一请求的投影再追加工具组和安全边界的新输入，不主动压缩或替换原图。若终态明确没有推理项，必要时可以改用稳定 `call_id` 的通用工具组；若必需回传缺失、不兼容或放不下，则结束续轮，不重跑工具、不自动重试。按 [Mac 实机验收清单](docs/acceptance/mac-checklist.md)分别核对密文入库、出站请求携带密文和模型端可观察行为。
 
 ## 交付包与验收索引
+
+现有 `dist/agent-companion-mvp.zip` 和下方离线记录对应首版交付，不含后来新增的 OpenAI Responses 适配器。验证当前适配器请使用当前源码。下列命令用于制作新包，会覆盖同名产物；仅校验旧包时无需执行。
 
 ```sh
 python scripts/build_source_zip.py
@@ -48,7 +67,7 @@ python scripts/build_source_zip.py
 
 1. 使用 [lark-cli v1.0.100](https://github.com/larksuite/cli/releases/tag/v1.0.100) 或保留同等协议的版本；在本机完成飞书用户登录，并确认应用有指定聊天的列表、媒体下载和发消息权限。程序不会发起登录或读取 CLI 的凭据文件。参考 [CLI JSON 输出契约](https://github.com/larksuite/cli/blob/v1.0.100/README.md#json-output-contract)和[飞书消息列表 API](https://open.feishu.cn/document/server-docs/im-v1/message/list)。
 2. 复制 `config.example.toml` 为 `config.local.toml`，取消 `[feishu]` 注释，填写目标对话 `chat_id`、业务对端 `sender_open_id` 与登录账号 `own_open_id`，使用同一 CLI 应用下的 Open ID；两者必须不同。`mode="text"` 不打开音频设备。`cli_timeout` 必须短于 Runtime 的投递时限。每个数据库只允许一个飞书主 Session 绑定，首次绑定要求全库没有历史或入站状态。日后要更换主 Session ID、对话、对端或账号，或旧数据库已有数据但未绑定，请配置新的数据库路径，不要覆盖旧库。仅切换输出模式不影响绑定。
-3. 用本机环境变量提供 `DEEPSEEK_API_KEY` 和 `MINIMAX_API_KEY`，不写到配置或日志。MiniMax 区域按账号选择 `cn`（[国内 API](https://platform.minimax.cn/docs/api-reference/speech-to-text)）或 `global`（[国际 API](https://platform.minimax.io/docs/api-reference/speech-to-text)）。工作目录需要允许建立用于资源下载的短期目录。
+3. 按[选择 LLM](#选择-llm)配置模型、本机模型环境变量及 `MINIMAX_API_KEY`，不写到配置或日志。MiniMax 区域按账号选择 `cn`（[国内 API](https://platform.minimax.cn/docs/api-reference/speech-to-text)）或 `global`（[国际 API](https://platform.minimax.io/docs/api-reference/speech-to-text)）。工作目录需要允许建立用于资源下载的短期目录。
 
 ```sh
 .venv/bin/python -m agent_companion --run --config config.local.toml
@@ -94,6 +113,6 @@ MiniMax 流式合成也可能以 HTTP 200 返回 JSON 业务错误而不是 SSE�
 
 用 `History.subtask_run(child_session_id, run_id)` 可追溯受理、开始、完成和回投入队时间。`enqueued_at` 只表示已入内存队列，不代表已被主会话处理。终态写入最多尝试三次，不重跑模型；持续失败会记录运行 ID、异常类型和未回投，不写假终态，数据库可能保留最后一次状态。退出开始时同步停止接收新委派和回投；可写时将未结束的记录标为中断，异常退出后由下次启动标记。不补跑、不重放；原有子会话 ID 仍可用于新委派。
 
-历史查找可叠加时间范围和 FTS5 关键词筛选，默认使用 SQLite 的分词规则，不承诺中文短词的子串查找。上下文 token 预算为本地估算。DeepSeek 普通和摘要请求另有 40 MiB 正文硬上限。Runtime 只在本轮请求需要裁剪图片时，从批次中位置靠后的图片开始尝试（同一富文本内也一样）；某张放不下就继续尝试更早的图。选定后仍按原顺序发送图文，并保留省略提示、普通文字及完整工具组，不改 SQLite 原文。不根据“第一张”等自然语言改变选择，也不会补下载在飞书入口已被省略的图片。旧历史或摘要可按预算缩减；若本轮文字和完整工具块仍放不下，结束该次运行，后续输入照常处理。实际发送前检查序列化后的字节数。
+历史查找可叠加时间范围和 FTS5 关键词筛选，默认使用 SQLite 的分词规则，不承诺中文短词的子串查找。上下文 token 预算为本地估算。DeepSeek 请求另有 40 MiB 正文硬上限，OpenAI Responses 有 32 MiB 本机请求上限（不是供应商的协议承诺）；包括摘要请求。Runtime 只在本轮请求需要裁剪图片时，从批次中位置靠后的图片开始尝试（同一富文本内也一样）；某张放不下就继续尝试更早的图。选定后仍按原顺序发送图文，并保留省略提示、普通文字及完整工具组，不改 SQLite 原文。不根据“第一张”等自然语言改变选择，也不会补下载在飞书入口已被省略的图片。旧历史或摘要可按预算缩减；若本轮文字和完整工具块仍放不下，结束该次运行，后续输入照常处理。实际发送前检查序列化后的字节数。
 
 方案见 [首版架构方案](<docs/design/0001-MVP方案/飞书多模态 Agent 首版架构方案.md>)和[首版实施与验收计划](<docs/design/0001-MVP方案/飞书多模态 Agent 首版实施与验收计划.md>)。

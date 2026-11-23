@@ -13,7 +13,8 @@ import httpx
 
 from .app import feishu_identity, run_feishu, running_agent
 from .config import Settings, load_settings
-from .models.deepseek import DeepSeek
+from .models.deepseek import MODEL_NAME, DeepSeek
+from .models.openai_responses import OpenAIResponses
 from .protocol import (DeliveryStatus, Message, ModelEvent, ReasoningDelta, Receipt, ReplyStream,
                        TextDelta, ToolCall, ToolReady, ToolSpec)
 from .runtime.subtasks import DELEGATE_TOOL_NAME, RESULT_PREFIX
@@ -69,12 +70,15 @@ async def run_demo(settings: Settings, *, delegate: bool = False) -> bool:
             return runtime.last_failure is None and (not delegate or model.received_subtask_result)
 
 
-async def _serve(settings: Settings, deepseek_key: str, minimax_key: str) -> None:
+async def _serve(settings: Settings, model_key: str, minimax_key: str) -> None:
     feishu, identity = feishu_identity(settings)
+    llm = settings.llm
+    if llm is None:
+        raise ValueError("missing llm settings")
     with closing(History(settings.database, feishu_binding=(settings.main_session_id, identity))) as history:
         # 独立客户端，避免任一平台收到另一平台的凭据。不接受网络重定向。
         async with (
-            httpx.AsyncClient(headers={"Authorization": f"Bearer {deepseek_key}"},
+            httpx.AsyncClient(headers={"Authorization": f"Bearer {model_key}"},
                               follow_redirects=False, trust_env=False, timeout=None) as model_client,
             httpx.AsyncClient(headers={"Authorization": f"Bearer {minimax_key}"},
                               follow_redirects=False, trust_env=False, timeout=None) as speech_client,
@@ -84,7 +88,14 @@ async def _serve(settings: Settings, deepseek_key: str, minimax_key: str) -> Non
             if feishu.mode == "voice":
                 tts = MiniMaxTTS(speech_client, region=settings.minimax.region, model=settings.voice.tts_model,
                                  voice_id=settings.voice.voice_id, timeout=settings.voice.tts_timeout)
-            await run_feishu(settings, history, DeepSeek(model_client), asr, tts=tts)
+            if llm.adapter == "deepseek":
+                model = DeepSeek(model_client, model=llm.model or MODEL_NAME,
+                                 reasoning_effort=llm.reasoning_effort)
+            else:
+                assert llm.model is not None and llm.replay_profile is not None
+                model = OpenAIResponses(model_client, model=llm.model, replay_profile=llm.replay_profile,
+                                        reasoning_effort=llm.reasoning_effort)
+            await run_feishu(settings, history, model, asr, tts=tts)
 
 
 def main() -> int:
@@ -100,18 +111,21 @@ def main() -> int:
         # 不输出可能含有访问路径或原始配置内容的异常。
         parser.error(f"无法加载配置（{type(exc).__name__}）")
     if args.run:
+        if settings.llm is None:
+            parser.error("正式启动需要 --config 中的 [llm] adapter 和 reasoning_effort")
         if settings.feishu is None:
             parser.error("运行飞书模式需要 --config 中的 [feishu] 配置")
         if settings.feishu.cli_timeout >= settings.runtime.delivery_timeout:
             parser.error("feishu.cli_timeout 必须小于 runtime.delivery_timeout")
         if settings.database == Path(":memory:"):
             parser.error("运行飞书模式需要持久化 SQLite 数据库路径")
-        deepseek_key = os.getenv("DEEPSEEK_API_KEY")
+        key_name = "DEEPSEEK_API_KEY" if settings.llm.adapter == "deepseek" else "OPENAI_API_KEY"
+        model_key = os.getenv(key_name)
         minimax_key = os.getenv("MINIMAX_API_KEY")
-        if not deepseek_key or not minimax_key:
-            parser.error("需要设置 DEEPSEEK_API_KEY 与 MINIMAX_API_KEY 环境变量")
+        if not model_key or not minimax_key:
+            parser.error(f"需要设置 {key_name} 与 MINIMAX_API_KEY 环境变量")
         try:
-            asyncio.run(_serve(settings, deepseek_key, minimax_key))
+            asyncio.run(_serve(settings, model_key, minimax_key))
         except KeyboardInterrupt:
             return 0
         except FeishuBindingError as exc:

@@ -34,12 +34,29 @@ class RuntimeSettings:
 
 
 @dataclass(frozen=True, slots=True)
-class DeepSeekSettings:
-    thinking: bool = False
+class LLMSettings:
+    adapter: str
+    reasoning_effort: str
+    model: str | None = None
+    replay_profile: str | None = None
 
     def __post_init__(self) -> None:
-        if type(self.thinking) is not bool:
-            raise ValueError("thinking must be a boolean")
+        if self.adapter not in ("deepseek", "openai_responses"):
+            raise ValueError("llm.adapter must be deepseek or openai_responses")
+        if (not isinstance(self.reasoning_effort, str) or not self.reasoning_effort.strip()
+                or self.reasoning_effort != self.reasoning_effort.strip() or len(self.reasoning_effort) > 64
+                or not self.reasoning_effort.isprintable()):
+            raise ValueError("llm.reasoning_effort must be a non-empty setting")
+        if self.model is not None and (not isinstance(self.model, str)
+                                       or not re.fullmatch(r"[A-Za-z0-9_.:-]{1,128}", self.model)):
+            raise ValueError("invalid llm.model")
+        if self.adapter == "openai_responses":
+            if self.model is None:
+                raise ValueError("llm.model is required for openai_responses")
+            if not isinstance(self.replay_profile, str) or not re.fullmatch(r"[A-Za-z0-9_.-]{1,64}", self.replay_profile):
+                raise ValueError("llm.replay_profile is required for openai_responses")
+        elif self.replay_profile is not None:
+            raise ValueError("llm.replay_profile is only used by openai_responses")
 
 
 @dataclass(frozen=True, slots=True)
@@ -124,7 +141,7 @@ class Settings:
     database: Path = Path("db.sqlite3")
     main_session_id: str = "main"
     runtime: RuntimeSettings = field(default_factory=RuntimeSettings)
-    deepseek: DeepSeekSettings = field(default_factory=DeepSeekSettings)
+    llm: LLMSettings | None = None
     feishu: FeishuSettings | None = None
     minimax: MiniMaxSettings = field(default_factory=MiniMaxSettings)
     voice: VoiceSettings = field(default_factory=VoiceSettings)
@@ -151,6 +168,8 @@ def load_settings(path: Path | None = None) -> Settings:
         database = str(path.parent / database)
     feishu_data = data.get("feishu")
     feishu = FeishuSettings(**_section(feishu_data, FeishuSettings)) if feishu_data is not None else None
+    llm_data = data.get("llm")
+    llm = LLMSettings(**_section(llm_data, LLMSettings)) if llm_data is not None else None
     voice = _section(data.get("voice", {}), VoiceSettings).copy()
     if "vad_model" in voice:
         model = voice["vad_model"]
@@ -161,7 +180,7 @@ def load_settings(path: Path | None = None) -> Settings:
         database=Path(database),
         main_session_id=session_id,
         runtime=RuntimeSettings(**_section(data.get("runtime", {}), RuntimeSettings)),
-        deepseek=DeepSeekSettings(**_section(data.get("deepseek", {}), DeepSeekSettings)),
+        llm=llm,
         feishu=feishu,
         minimax=MiniMaxSettings(**_section(data.get("minimax", {}), MiniMaxSettings)),
         voice=VoiceSettings(**voice),

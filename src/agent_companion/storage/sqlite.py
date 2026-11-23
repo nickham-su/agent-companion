@@ -7,7 +7,8 @@ from pathlib import Path
 import sqlite3
 from time import time
 
-from ..protocol import DeliveryStatus, Image, Message, Text, ToolCall
+from ..protocol import (MAX_REPLAY_BYTES, DeliveryStatus, Image, Message, ProviderReplay, ReplayItem,
+                        ReplayScope, Text, ToolCall)
 
 
 _SCHEMA = """
@@ -36,6 +37,15 @@ CREATE TABLE IF NOT EXISTS reply_outcomes (
     delivery_status TEXT,
     assistant_message_id INTEGER REFERENCES messages(message_id),
     model_error TEXT
+);
+CREATE TABLE IF NOT EXISTS provider_replays (
+    assistant_message_id INTEGER PRIMARY KEY REFERENCES messages(message_id) ON DELETE CASCADE,
+    protocol TEXT NOT NULL,
+    profile TEXT NOT NULL,
+    model TEXT NOT NULL,
+    version INTEGER NOT NULL,
+    prefix_digest TEXT NOT NULL,
+    items TEXT NOT NULL
 );
 CREATE TABLE IF NOT EXISTS subtask_runs (
     run_id TEXT PRIMARY KEY,
@@ -140,11 +150,36 @@ def _decode_content(encoded: str) -> str | tuple[Text | Image, ...]:
     )
 
 
-def _decode(row: sqlite3.Row) -> HistoryEntry:
+def _decode_replay(row: sqlite3.Row, scope: ReplayScope) -> ProviderReplay | None:
+    if row["replay_version"] != 2:
+        return None
+    try:
+        data = json.loads(row["replay_items"])
+        if (type(data) is not dict or type(data.get("items")) is not list
+                or type(data.get("has_reasoning")) is not bool):
+            raise ValueError
+        items = data["items"]
+        parsed = []
+        for item in items:
+            if (type(item) is not dict or type(item["parts"]) is not list or type(item["summary"]) is not list
+                    or any(type(part) is not list for part in item["parts"])):
+                raise ValueError
+            parsed.append(ReplayItem(
+                kind=item["kind"], item_id=item["item_id"], call_id=item["call_id"], phase=item["phase"],
+                parts=tuple(tuple(part) for part in item["parts"]), encrypted_content=item["encrypted_content"],
+                summary=tuple(item["summary"]),
+            ))
+        return ProviderReplay(scope, row["replay_prefix"], tuple(parsed), data["has_reasoning"])
+    except (ValueError, TypeError, KeyError, RecursionError):
+        return None  # 缺失与损坏都不能证明该响应没有推理项。
+
+
+def _decode(row: sqlite3.Row, replay: ProviderReplay | None = None) -> HistoryEntry:
     return HistoryEntry(
         row["message_id"], row["session_id"], row["created_at"],
         Message(row["role"], _decode_content(row["content"]),
-                tuple(ToolCall(**item) for item in json.loads(row["tool_calls"])), row["tool_call_id"], row["reasoning"]),
+                tuple(ToolCall(**item) for item in json.loads(row["tool_calls"])), row["tool_call_id"], row["reasoning"],
+                replay=replay),
     )
 
 
@@ -257,7 +292,7 @@ class History:
                     recorded.add(external_id)
                     if message is not None:
                         if (message.role != "user" or message.tool_calls or message.tool_call_id is not None
-                                or message.reasoning is not None):
+                                or message.reasoning is not None or message.replay is not None or message.replay_required):
                             raise ValueError("inbound batches require plain user messages")
                         contents.append(_encode(message)[0])
             if contents:
@@ -285,18 +320,29 @@ class History:
             return self._append(session_id, (Message("user", _decode_content(content))
                                              for content in json.loads(row["contents"])))
 
-    def finalize_reply(self, outcome: ReplyOutcome, messages: Sequence[Message]) -> None:
+    def finalize_reply(self, outcome: ReplyOutcome, messages: Sequence[Message]) -> list[int]:
         # 原子提交响应及对应结果，不在崩溃后暴露只有调用、没有结果的组。
         if messages and messages[0].role != "assistant":
             raise ValueError("reply history must start with an assistant message")
         with self._db:
             ids = self._append(outcome.session_id, messages)
+            replay = messages[0].replay if messages else None
+            if replay is not None and outcome.model_status == "complete":
+                data = {"has_reasoning": replay.has_reasoning, "items": [asdict(item) for item in replay.items]}
+                items = json.dumps(data, ensure_ascii=False, separators=(",", ":"))
+                if len(items.encode("utf-8")) > MAX_REPLAY_BYTES:
+                    raise ValueError("provider replay exceeds storage limit")
+                scope = replay.scope
+                self._db.execute("INSERT INTO provider_replays VALUES (?, ?, ?, ?, ?, ?, ?)", (
+                    ids[0], scope.protocol, scope.profile, scope.model, replay.version, replay.prefix_digest, items,
+                ))
             self._db.execute("INSERT INTO reply_outcomes"
                              " (reply_id, session_id, run_id, model_status, delivery_status, assistant_message_id, model_error)"
                              " VALUES (?, ?, ?, ?, ?, ?, ?)", (
                 outcome.reply_id, outcome.session_id, outcome.run_id, outcome.model_status,
                 outcome.delivery_status, ids[0] if ids else None, outcome.model_error,
             ))
+        return ids
 
     def outcomes(self, session_id: str) -> list[ReplyOutcome]:
         return [ReplyOutcome(row["reply_id"], row["session_id"], row["run_id"], row["model_status"],
@@ -371,7 +417,16 @@ class History:
             if self._db.execute(sql, params).rowcount != 1:
                 raise ValueError("invalid subtask state transition")
 
-    def read_after(self, session_id: str, after: int = 0) -> list[HistoryEntry]:
+    def read_after(self, session_id: str, after: int = 0, *,
+                   replay_scope: ReplayScope | None = None) -> list[HistoryEntry]:
+        if replay_scope is not None:
+            return [_decode(row, _decode_replay(row, replay_scope)) for row in self._db.execute(
+                "SELECT m.*, r.version AS replay_version, r.prefix_digest AS replay_prefix,"
+                " CASE WHEN length(CAST(r.items AS BLOB)) <= ? THEN r.items END AS replay_items"
+                " FROM messages m LEFT JOIN provider_replays r ON r.assistant_message_id = m.message_id"
+                " AND r.protocol = ? AND r.profile = ? AND r.model = ?"
+                " WHERE m.session_id = ? AND m.message_id > ? ORDER BY m.message_id",
+                (MAX_REPLAY_BYTES, replay_scope.protocol, replay_scope.profile, replay_scope.model, session_id, after))]
         return [_decode(row) for row in self._db.execute(
             "SELECT * FROM messages WHERE session_id = ? AND message_id > ? ORDER BY message_id",
             (session_id, after))]

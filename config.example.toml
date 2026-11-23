@@ -11,8 +11,17 @@ tail_budget = 16000
 summary_budget = 4000
 max_tool_rounds = 8
 
-[deepseek]
-thinking = false
+# 正式启动必须显式选择适配器及推理强度。
+[llm]
+adapter = "deepseek"
+reasoning_effort = "disabled"  # DeepSeek 关闭思考；启用时按其模型填写强度
+# model = "deepseek-flash"  # 只有 DeepSeek 可省略模型名
+
+# 要使用 OpenAI Responses，请替换上面的 [llm] 内容：
+# adapter = "openai_responses"
+# model = "your-openai-model"
+# reasoning_effort = "low"   # 支持的值取决于所选模型
+# replay_profile = "local-project"  # 非敏感本地标识，不要填写 API key
 
 # 飞书模式启用后，把以下占位符换成同一个 CLI 应用下的实际 ID。
 # [feishu]

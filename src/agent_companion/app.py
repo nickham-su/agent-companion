@@ -27,10 +27,13 @@ async def running_agent(
     def return_result(message: Message) -> None:
         main.submit_subtask_result(message)
 
+    llm = settings.llm
+    thinking = llm is not None and llm.adapter == "deepseek" and llm.reasoning_effort != "disabled"
+
     subtasks = Subtasks(settings.main_session_id, history, model, return_result,
-                        settings=settings.runtime, thinking=settings.deepseek.thinking)
+                        settings=settings.runtime, thinking=thinking)
     main = Runtime(settings.main_session_id, history, model, channel, tools=subtasks.tools,
-                   settings=settings.runtime, thinking=settings.deepseek.thinking)
+                   settings=settings.runtime, thinking=thinking)
     try:
         yield main, subtasks
     finally:
