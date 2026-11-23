@@ -227,7 +227,7 @@ class MVPIntegrationTest(unittest.IsolatedAsyncioTestCase):
         settings = Settings(
             database=database, main_session_id="mvp-main",
             feishu=FeishuSettings(_CHAT, _PEER, _OWN, cli_timeout=1),
-            runtime=RuntimeSettings(model_timeout=3, delivery_timeout=3),
+            runtime=RuntimeSettings(model_timeout=3),
             asr=ASRSettings(MiniMaxConnection("synthetic"), max_audio_seconds=500),
             voice=VoiceSettings(output_sample_rate=INPUT_RATE, silence_seconds=0.06, delivery_timeout=2),
         )
@@ -238,7 +238,7 @@ class MVPIntegrationTest(unittest.IsolatedAsyncioTestCase):
             async with _service(settings, history, model, transport, asr):
                 transport.push(_USER)
                 await model.child_started.wait()
-                self.assertEqual(await _outcome(history, session, 2), (DeliveryStatus.FULL, _ACCEPTED))
+                self.assertEqual(await _outcome(history, session, 2), (None, _ACCEPTED))
                 tool_result = next(row.message for row in history.read_after(session) if row.message.role == "tool")
                 accepted = json.loads(tool_result.content)
                 self.assertEqual(tool_result.tool_call_id, "synthetic-call")
@@ -247,7 +247,7 @@ class MVPIntegrationTest(unittest.IsolatedAsyncioTestCase):
 
                 # The main session has settled. Completion alone must wake it; no new CLI message.
                 model.finish_child.set()
-                self.assertEqual(await _outcome(history, session, 3), (DeliveryStatus.FULL, _RETURNED))
+                self.assertEqual(await _outcome(history, session, 3), (None, _RETURNED))
                 returned = next(row.message.content for row in history.read_after(session)
                                 if isinstance(row.message.content, str) and row.message.content.startswith(RESULT_PREFIX))
                 self.assertEqual(json.loads(returned.removeprefix(RESULT_PREFIX)), {
@@ -258,9 +258,11 @@ class MVPIntegrationTest(unittest.IsolatedAsyncioTestCase):
                 self.assertNotIn(_PROMPT, [row.message.content for row in history.read_after(session)])
 
                 transport.push("明确失败测试")
-                self.assertEqual(await _outcome(history, session, 4), (DeliveryStatus.FAILED, ""))
+                self.assertEqual(await _outcome(history, session, 4), (None, _FAILED))
                 transport.push("未知投递测试")
-                self.assertEqual(await _outcome(history, session, 5), (DeliveryStatus.UNKNOWN, ""))
+                self.assertEqual(await _outcome(history, session, 5), (None, _UNKNOWN))
+                while len(transport.sends) < 4:
+                    await asyncio.sleep(0.002)
                 self.assertEqual(transport.sends, [_ACCEPTED, _RETURNED, _FAILED, _UNKNOWN])
 
         voice_settings = replace(settings, feishu=replace(settings.feishu, mode="voice"))
@@ -300,14 +302,15 @@ class MVPIntegrationTest(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(history.read_after(session), before_restart)
             async with _service(settings, history, restart_model, transport, asr):
                 transport.push("重启后的新输入")
-                self.assertEqual(await _outcome(history, session, 8), (DeliveryStatus.FULL, _RESTARTED))
+                self.assertEqual(await _outcome(history, session, 8), (None, _RESTARTED))
+                while len(transport.sends) < 5:
+                    await asyncio.sleep(0.002)
                 self.assertEqual(transport.sends, [_ACCEPTED, _RETURNED, _FAILED, _UNKNOWN, _RESTARTED])
                 messages = [row.message.content for row in history.read_after(session)]
                 self.assertEqual(messages.count(_ASR_TEXT), 1)
                 self.assertEqual(messages.count(_USER), 1)
                 self.assertEqual(history.subtask_run(child, run).status, "completed")
                 model_history = [message.content for message in restart_model.restart_request]
-                for confirmed in (_ACCEPTED, _RETURNED, prefix, _ASR_TEXT, _NEW_VOICE):
-                    self.assertIn(confirmed, model_history)
-                for unconfirmed in (_OLD_VOICE, _FAILED, _UNKNOWN):
-                    self.assertNotIn(unconfirmed, model_history)
+                for recorded in (_ACCEPTED, _RETURNED, _FAILED, _UNKNOWN, prefix, _ASR_TEXT, _NEW_VOICE):
+                    self.assertIn(recorded, model_history)
+                self.assertNotIn(_OLD_VOICE, model_history)

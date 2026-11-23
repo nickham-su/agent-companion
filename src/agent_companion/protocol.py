@@ -1,7 +1,7 @@
 """通道、运行时与模型共享的值和最薄接口。"""
 
 import asyncio
-from collections.abc import AsyncGenerator, AsyncIterator, Sequence
+from collections.abc import AsyncGenerator, AsyncIterator, Callable, Sequence
 from dataclasses import dataclass, field
 from enum import StrEnum
 import re
@@ -174,9 +174,16 @@ class ReplyInfo:
 class ReplyStream(AsyncIterator[str]):
     """单消费者文本流；首个片段发布时通道才收到流，纯工具响应不经过通道。"""
 
-    def __init__(self, info: ReplyInfo) -> None:
+    def __init__(self, info: ReplyInfo, *, validate_progress: Callable[[str], bool] | None = None) -> None:
         self.info = info
         self._segments: asyncio.Queue[str | None] = asyncio.Queue()
+        self._progress: tuple[int, str] = (0, "")
+        self._validate_progress = validate_progress
+        self._delivery_deadline = 0.0
+        self._idle_timeout: float | None = None
+        self._arm_idle: Callable[[float, float | None], float] | None = None
+        self._read_playback: Callable[[], tuple[float, float, str]] | None = None
+        self.delivery_finished_at: float | None = None
         self._closed = False
         self._exhausted = False
         self._abandoned = False
@@ -191,6 +198,49 @@ class ReplyStream(AsyncIterator[str]):
     @property
     def overflowed(self) -> bool:
         return self._overflowed
+
+    @property
+    def progress(self) -> tuple[int, str]:
+        """本条回复最新的设备消费字节数及已确认正文前缀。"""
+        return self._progress
+
+    def bind_playback(self, arm_idle: Callable[[float, float | None], float],
+                      snapshot: Callable[[], tuple[float, float, str]]) -> None:
+        """绑定本回复的同步设备证据；快照含同一锁下的时刻、截止和截止前缀。"""
+        self._arm_idle, self._read_playback = arm_idle, snapshot
+        if self._idle_timeout is not None:
+            arm_idle(self._idle_timeout, self._delivery_deadline)
+
+    def start_delivery_wait(self, idle_timeout: float | None, fallback: float) -> None:
+        self._idle_timeout = idle_timeout
+        if idle_timeout is not None and self._arm_idle is not None:
+            self._delivery_deadline = self._arm_idle(idle_timeout, None)
+        else:
+            timeout = fallback if idle_timeout is None else idle_timeout
+            self._delivery_deadline = asyncio.get_running_loop().time() + timeout
+
+    def delivery_snapshot(self) -> tuple[float, float, str]:
+        if self._idle_timeout is not None and self._read_playback is not None:
+            return self._read_playback()
+        confirmed = self._progress[1] if self._idle_timeout is not None else ""
+        return asyncio.get_running_loop().time(), self._delivery_deadline, confirmed
+
+    def report_progress(self, reply_id: str, played_bytes: int, confirmed: str) -> None:
+        """仅在事件循环线程上报；迟到、回退或重复的进展不能覆盖快照。"""
+        previous_bytes, previous_text = self._progress
+        if (self._abandoned or reply_id != self.info.reply_id or type(played_bytes) is not int
+                or played_bytes <= 0 or played_bytes < previous_bytes or not isinstance(confirmed, str)
+                or not confirmed.startswith(previous_text) or (played_bytes, confirmed) == self._progress):
+            return
+        if confirmed != previous_text and self._validate_progress is not None and not self._validate_progress(confirmed):
+            return
+        if self._idle_timeout is not None:
+            now = asyncio.get_running_loop().time()
+            if now >= self._delivery_deadline:
+                return
+            if played_bytes > previous_bytes:
+                self._delivery_deadline = now + self._idle_timeout
+        self._progress = (played_bytes, confirmed)
 
     def limit_text(self, chars: int) -> None:
         """可选通道限额：不阻塞模型流，限制该回复还会排入多少文本。"""
@@ -221,6 +271,7 @@ class ReplyStream(AsyncIterator[str]):
             return
         self._abandoned = True
         self._closed = True
+        self._validate_progress = None
         while not self._segments.empty():
             self._segments.get_nowait()
         self._segments.put_nowait(None)
@@ -238,10 +289,15 @@ class Channel(Protocol):
     async def deliver(self, reply: ReplyStream) -> Receipt:
         """消费一个回复并给出唯一终态，允许在模型流结束前返回。
 
-        Runtime 从模型流关闭起用看门狗等待回执；通道应自行设定更短的时限，
-        及时返回终态及已确认前缀，包括部分投递、已知失败和结果未知。
-        Runtime 不推测通道进度，也不接纳超时后的回执。通道取消后只做清理，
-        不再开始外部发送；若捕获取消，可用 ``reply.abandoned`` 判断该回复
-        是否已放弃。
+        Runtime 从模型流关闭起等待回执，不接纳放弃后的进展和回执。
+        通道取消后只做清理，不再开始外部发送；若捕获取消，可查看
+        ``reply.abandoned``。通道可另设不可续期的总时限。
         """
+        ...
+
+
+@runtime_checkable
+class BackgroundChannel(Protocol):
+    def enqueue(self, info: ReplyInfo, text: str) -> None:
+        """落库后尽力交给通道后台发送；不得阻塞或产生投递回执。"""
         ...

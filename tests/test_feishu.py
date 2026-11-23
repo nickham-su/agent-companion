@@ -2,6 +2,7 @@ import asyncio
 from base64 import b64decode
 from contextlib import closing
 from dataclasses import replace
+from functools import partial
 import io
 import json
 from pathlib import Path
@@ -18,8 +19,7 @@ from agent_companion.channels.feishu.channel import FeishuChannel, FeishuPoller
 from agent_companion.channels.feishu.cli import CliError, CliStdoutLimit, CommandResult, FeishuCLI, run_command
 from agent_companion.config import (ASRSettings, FeishuSettings, LLMSettings, MiniMaxConnection, Settings, TTSSettings,
                                     VoiceSettings, load_settings)
-from agent_companion.protocol import (OMITTED_INPUT_IMAGE, DeliveryStatus, Image, Message, ReplyInfo,
-                                      ReplyStream, Text, TextDelta)
+from agent_companion.protocol import OMITTED_INPUT_IMAGE, DeliveryStatus, Image, Message, ReplyInfo, Text, TextDelta
 from agent_companion.speech.asr import AsrError
 from agent_companion.storage.sqlite import FeishuBindingError, History
 
@@ -187,14 +187,8 @@ class FeishuCLITests(unittest.IsolatedAsyncioTestCase):
                         raise raw
                     return raw
 
-                channel = FeishuChannel(FeishuCLI("lark-cli", _CHAT, timeout=2, runner=runner), mode="text")
-                reply = ReplyStream(ReplyInfo("reply", "main", "run", 0))
-                reply.publish("第一")
-                reply.publish("第二")
-                reply.close()
-                receipt = await channel.deliver(reply)
-                self.assertEqual((receipt.reply_id, receipt.status, num), ("reply", expected, 1))
-                self.assertEqual(receipt.confirmed, "第一第二" if expected == DeliveryStatus.FULL else "")
+                cli = FeishuCLI("lark-cli", _CHAT, timeout=2, runner=runner)
+                self.assertEqual((await cli.send_text("第一第二"), num), (expected, 1))
 
     async def test_bad_resources_are_not_read_or_sent(self):
         runner = _Runner()
@@ -268,6 +262,212 @@ print(json.dumps({"ok": True, "identity": "user", "data": {"size_bytes": peak}})
             await run_command((sys.executable, "-c", "import time; time.sleep(30)"), None, 0.05)
 
 
+class FeishuBackgroundDeliveryTests(unittest.IsolatedAsyncioTestCase):
+    async def test_slow_cli_does_not_block_runtime_fifo_or_later_sends_after_failures(self):
+        first_started, release_first, finished = (asyncio.Event() for _ in range(3))
+        sent = []
+
+        class CLI:
+            async def send_text(self, text):
+                sent.append(text)
+                if text == "回复 0":
+                    first_started.set()
+                    await release_first.wait()
+                if text == "回复 1":
+                    return DeliveryStatus.UNKNOWN
+                if text == "回复 2":
+                    raise RuntimeError("synthetic raw diagnostic")
+                if text == "回复 8":
+                    finished.set()
+                return DeliveryStatus.FULL
+
+        class Echo:
+            async def stream(self, messages, tools, *, thinking):
+                yield TextDelta(f"回复 {messages[-1].content}")
+
+        channel = FeishuChannel(CLI(), mode="text")
+        self.addAsyncCleanup(channel.close)
+        with closing(History(":memory:")) as history:
+            async with running_agent(Settings(), history, Echo(), channel) as (main, _):
+                main.submit_batch([Message("user", "0")], wait_for_delivery=False)
+                await asyncio.wait_for(first_started.wait(), 1)
+                with self.assertLogs("agent_companion.channels.feishu.channel", level="WARNING") as logs:
+                    for i in range(1, 10):
+                        main.submit_batch([Message("user", str(i))], wait_for_delivery=False)
+                    await asyncio.wait_for(main.wait_idle(), 1)
+                    self.assertEqual(sent, ["回复 0"])
+                    self.assertEqual([row.message.content for row in history.read_after("main") if
+                                      row.message.role == "assistant"], [f"回复 {i}" for i in range(10)])
+                    self.assertEqual([outcome.delivery_status for outcome in history.outcomes("main")], [None] * 10)
+                    release_first.set()
+                    await asyncio.wait_for(finished.wait(), 1)
+                self.assertEqual(sent, [f"回复 {i}" for i in range(9)])
+                self.assertEqual(len(logs.output), 3)
+                self.assertIn("queue_full", logs.output[0])
+                self.assertNotIn("回复", "".join(logs.output))
+                self.assertNotIn("synthetic raw diagnostic", "".join(logs.output))
+
+    async def test_shutdown_discards_queue_and_waits_for_active_cli_cancellation_cleanup(self):
+        entered, cancelling, release, cleaned = (asyncio.Event() for _ in range(4))
+        sent = []
+
+        class CLI:
+            async def send_text(self, text):
+                sent.append(text)
+                entered.set()
+                try:
+                    await asyncio.Event().wait()
+                finally:
+                    cancelling.set()
+                    await release.wait()
+                    cleaned.set()
+
+        channel = FeishuChannel(CLI(), mode="text")
+        info = ReplyInfo("simulated", "main", "run", 0)
+        channel.enqueue(info, "当前")
+        await asyncio.wait_for(entered.wait(), 1)
+        channel.enqueue(info, "待发")
+        with self.assertLogs("agent_companion.channels.feishu.channel", level="WARNING") as logs:
+            shutdown = asyncio.create_task(channel.close())
+            try:
+                await asyncio.wait_for(cancelling.wait(), 1)
+                self.assertFalse(shutdown.done())
+                channel.enqueue(info, "关闭后")
+            finally:
+                release.set()
+                await asyncio.wait_for(shutdown, 1)
+        self.assertTrue(cleaned.is_set())
+        self.assertEqual(sent, ["当前"])
+        self.assertIn("count=1", logs.output[0])
+        self.assertIn("closed", logs.output[1])
+
+
+    async def test_application_stops_ingress_and_sends_before_async_poll_cleanup(self):
+        active, poll_ready, poll_cleaning, release_poll = (asyncio.Event() for _ in range(4))
+        release_send, send_cancelled, send_cleaned = (asyncio.Event() for _ in range(3))
+        sent = []
+        submit = None
+
+        class CLI:
+            async def send_text(self, text):
+                sent.append(text)
+                active.set()
+                try:
+                    await release_send.wait()
+                except asyncio.CancelledError:
+                    send_cancelled.set()
+                    await release_send.wait()
+                finally:
+                    send_cleaned.set()
+                return DeliveryStatus.FULL
+
+        async def poll(poller):
+            nonlocal submit
+            submit = poller._submit
+            info = ReplyInfo("simulated", "main", "run", 0)
+            poller._channel.enqueue(info, "当前")
+            await active.wait()
+            poller._channel.enqueue(info, "不能开始")
+            poll_ready.set()
+            try:
+                await asyncio.Future()
+            finally:
+                poll_cleaning.set()
+                await release_poll.wait()
+
+        settings = Settings(feishu=FeishuSettings(_CHAT, _PEER, _SELF))
+        with (closing(History(":memory:")) as history, patch.object(FeishuPoller, "run", poll),
+              self.assertLogs("agent_companion.channels.feishu.channel", level="WARNING")):
+            app = asyncio.create_task(run_feishu(settings, history, _Model(), _ASR(), cli=CLI()))
+            try:
+                await asyncio.wait_for(poll_ready.wait(), 1)
+                app.cancel()
+                await asyncio.wait_for(poll_cleaning.wait(), 1)
+                self.assertTrue(send_cancelled.is_set())
+                with self.assertRaisesRegex(RuntimeError, "runtime is closed"):
+                    submit(-1)
+                release_send.set()
+                await asyncio.wait_for(send_cleaned.wait(), 1)
+                self.assertFalse(app.done())
+                self.assertEqual(sent, ["当前"])
+            finally:
+                release_send.set()
+                release_poll.set()
+                with self.assertRaises(asyncio.CancelledError):
+                    await asyncio.wait_for(app, 1)
+
+    async def test_poll_failure_stops_replies_before_fixed_notice_cleanup(self):
+        active, release_send, send_cleaned = (asyncio.Event() for _ in range(3))
+        send_cancelled, notice_cleaning = asyncio.Event(), asyncio.Event()
+        sent = []
+        clock = [100]
+        submit = None
+
+        class Runner(_Runner):
+            async def __call__(self, argv, data, timeout):
+                if argv[1:3] != ("api", "POST"):
+                    return await super().__call__(argv, data, timeout)
+                text = json.loads(json.loads(data)["content"])["text"]
+                if text == _NOTICE:
+                    self.notice_entered.set()
+                    try:
+                        await asyncio.Future()
+                    finally:
+                        notice_cleaning.set()
+                        await self.release_notice.wait()
+                else:
+                    sent.append(text)
+                    if text == "当前":
+                        active.set()
+                        try:
+                            await release_send.wait()
+                        except asyncio.CancelledError:
+                            send_cancelled.set()
+                            await release_send.wait()
+                        finally:
+                            send_cleaned.set()
+                return self.send_result
+
+        runner, asr = Runner(), _ASR()
+        runner.pages[None] = {"items": [_raw("om_bad_audio", 101_000, "audio", {"file_key": "file_a"})],
+                              "has_more": False}
+        asr.error = AsrError("asr_transport")
+        cli = FeishuCLI("lark-cli", _CHAT, timeout=2, runner=runner)
+        real_poll_once = FeishuPoller.poll_once
+
+        async def poll_once(poller):
+            nonlocal submit
+            submit = poller._submit
+            await real_poll_once(poller)
+            clock[0] = 110
+            await real_poll_once(poller)  # 走真实 ASR 失败路径，启动固定通知。
+            info = ReplyInfo("simulated", "main", "run", 0)
+            poller._channel.enqueue(info, "当前")
+            poller._channel.enqueue(info, "不能开始")
+            await active.wait()
+            await runner.notice_entered.wait()
+            raise RuntimeError("synthetic poll failure")
+
+        settings = Settings(feishu=FeishuSettings(_CHAT, _PEER, _SELF))
+        with (closing(History(":memory:")) as history, patch.object(FeishuPoller, "poll_once", poll_once),
+              patch("agent_companion.app.FeishuPoller", partial(FeishuPoller, clock=lambda: clock[0]))):
+            app = asyncio.create_task(run_feishu(settings, history, _Model(), asr, cli=cli))
+            try:
+                await asyncio.wait_for(notice_cleaning.wait(), 1)
+                release_send.set()
+                await asyncio.wait_for(send_cleaned.wait(), 1)
+                self.assertFalse(app.done())
+                self.assertEqual(sent, ["当前"])
+                self.assertTrue(send_cancelled.is_set())
+                with self.assertRaisesRegex(RuntimeError, "runtime is closed"):
+                    submit(-1)
+            finally:
+                release_send.set()
+                runner.release_notice.set()
+                with self.assertRaisesRegex(RuntimeError, "synthetic poll failure"):
+                    await asyncio.wait_for(app, 1)
+
+
 class FeishuPollingTests(unittest.IsolatedAsyncioTestCase):
     async def test_across_pages_order_filter_post_and_delayed_voice(self):
         clock = [100]
@@ -289,8 +489,11 @@ class FeishuPollingTests(unittest.IsolatedAsyncioTestCase):
                                  "has_more": False}}
         asr.release.clear()
         with closing(History(":memory:")) as history:
-            async with running_agent(Settings(), history, model, FeishuChannel(cli, mode="text")) as (main, _):
-                poller = _poller(history, main.submit_persisted_batch, cli, asr, clock)
+            channel = FeishuChannel(cli, mode="text")
+            self.addAsyncCleanup(channel.close)
+            async with running_agent(Settings(), history, model, channel) as (main, _):
+                submit = partial(main.submit_persisted_batch, wait_for_delivery=False)
+                poller = _poller(history, submit, cli, asr, clock)
                 await poller.poll_once()
                 clock[0] = 110
                 polling = asyncio.create_task(poller.poll_once())
@@ -575,10 +778,13 @@ print(json.dumps({"ok": True, "identity": "user", "data": page}))
         runner.pages[None] = {"items": [_raw("om_next", 101_000, "text", {"text": "稍后处理"})],
                               "has_more": False}
         with closing(History(":memory:")) as history:
-            async with running_agent(Settings(), history, model, FeishuChannel(cli, mode="text")) as (main, _):
-                poller = _poller(history, main.submit_persisted_batch, cli, asr, clock)
+            channel = FeishuChannel(cli, mode="text")
+            self.addAsyncCleanup(channel.close)
+            async with running_agent(Settings(), history, model, channel) as (main, _):
+                submit = partial(main.submit_persisted_batch, wait_for_delivery=False)
+                poller = _poller(history, submit, cli, asr, clock)
                 await poller.poll_once()
-                main.submit_batch([Message("user", "先处理")])
+                main.submit_batch([Message("user", "先处理")], wait_for_delivery=False)
                 await asyncio.wait_for(started.wait(), 1)
                 clock[0] = 110
                 await poller.poll_once()
@@ -609,8 +815,11 @@ print(json.dumps({"ok": True, "identity": "user", "data": page}))
             for expected_calls in (1, 1):
                 clock[0] += 1
                 with closing(History(path)) as history:
-                    async with running_agent(Settings(), history, model, FeishuChannel(cli, mode="text")) as (main, _):
-                        await _poller(history, main.submit_persisted_batch, cli, asr, clock).poll_once()
+                    channel = FeishuChannel(cli, mode="text")
+                    self.addAsyncCleanup(channel.close)
+                    async with running_agent(Settings(), history, model, channel) as (main, _):
+                        submit = partial(main.submit_persisted_batch, wait_for_delivery=False)
+                        await _poller(history, submit, cli, asr, clock).poll_once()
                         await main.wait_idle()
                         self.assertEqual(len(model.calls), expected_calls)
                         self.assertEqual([row.message.content for row in history.tail("main", 20)],
@@ -626,9 +835,11 @@ print(json.dumps({"ok": True, "identity": "user", "data": page}))
         ]]})
         with closing(History(":memory:")) as history:
             channel = FeishuChannel(cli, mode="text")
+            self.addAsyncCleanup(channel.close)
             async with running_agent(Settings(), history, model, channel) as (main, _):
+                submit = partial(main.submit_persisted_batch, wait_for_delivery=False)
                 poller = FeishuPoller(cli, asr, channel, chat_id=_CHAT, sender_id=_PEER, own_id=_SELF,
-                                      session_id="main", history=history, submit=main.submit_persisted_batch,
+                                      session_id="main", history=history, submit=submit,
                                       clock=lambda: clock[0], batch_budget=470)
                 await poller.poll_once()
                 runner.pages[None]["items"] = [post, _raw("om_text_budget", 101_000, "text", {"text": "同批文字"})]

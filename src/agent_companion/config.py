@@ -66,23 +66,15 @@ def _config_seconds(value: float, name: str) -> None:
     raise ConfigError(f"{name} 必须是有限正数")
 
 
-def require_delivery_timeout(value: float, limit: float, name: str, *,
-                             error_type: type[Exception] = ConfigError) -> None:
-    if value >= limit:
-        raise error_type(f"{name} 必须小于 runtime.delivery_timeout")
-
-
 @dataclass(frozen=True, slots=True)
 class RuntimeSettings:
     model_timeout: float = DEFAULT_MODEL_TIMEOUT
-    delivery_timeout: float = 120
     context_budget: int = 64_000
     tail_budget: int = 16_000
     max_tool_rounds: int = 8
 
     def __post_init__(self) -> None:
         _config_seconds(self.model_timeout, "timeouts.llm")
-        _config_seconds(self.delivery_timeout, "runtime.delivery_timeout")
         for name in ("context_budget", "tail_budget", "max_tool_rounds"):
             value = getattr(self, name)
             if type(value) is not int or value <= 0:
@@ -197,7 +189,8 @@ class VoiceSettings:
     output_sample_rate: int = 44_100
     prefetch_seconds: float = 0.4
     buffer_seconds: float = 2
-    delivery_timeout: float = 90
+    idle_timeout: float = 30
+    delivery_timeout: float = 600
 
     def __post_init__(self) -> None:
         for name in ("input_device", "output_device"):
@@ -207,7 +200,7 @@ class VoiceSettings:
             )):
                 raise ConfigError(f"voice.{name} 必须是有效的设备名称或非负整数索引")
         for name in ("vad_threshold", "silence_seconds", "prefetch_seconds",
-                     "buffer_seconds", "delivery_timeout"):
+                     "buffer_seconds", "idle_timeout", "delivery_timeout"):
             _config_seconds(getattr(self, name), f"voice.{name}")
         if self.vad_threshold >= 1:
             raise ConfigError("voice.vad_threshold 必须小于 1")
@@ -374,9 +367,6 @@ def _parse_settings(data: dict[str, Any], path: Path, *, for_run: bool) -> Setti
     if for_run:
         if feishu is None:
             raise ConfigError("正式启动需要 [feishu] 配置，请参考 config.example.toml")
-        require_delivery_timeout(feishu.cli_timeout, runtime.delivery_timeout, "feishu.cli_timeout")
-        if use_voice:
-            require_delivery_timeout(voice.delivery_timeout, runtime.delivery_timeout, "voice.delivery_timeout")
         llm, asr, tts = _load_providers(data, voice=use_voice)
     return Settings(
         database=Path(database),

@@ -237,11 +237,210 @@ class VoiceOutputTest(unittest.IsolatedAsyncioTestCase):
                     if failure:
                         release.set()
                     receipt = await task
-                    self.assertEqual((receipt.status, receipt.confirmed), (expected, "甲乙"))
+                    self.assertEqual((receipt.status, receipt.confirmed), (expected, "甲乙" if failure else ""))
                     await _until(closed.is_set)
                     self.assertEqual(device.pull(1), b"\0\0")
                 finally:
                     await output.close()
+
+
+    async def test_hard_deadline_decides_by_worker_completion_not_observation(self):
+        loop = asyncio.get_running_loop()
+        for on_time in (False, True):
+            with self.subTest(on_time=on_time):
+                buffered, drained, release = (asyncio.Event() for _ in range(3))
+                clock = [loop.time()]
+
+                def jump():
+                    clock[0] += 3
+
+                class TTS:
+                    async def synthesize(self, text, *, sample_rate):
+                        yield _A * 4
+                        buffered.set()
+
+                class Output(VoiceOutput):
+                    async def _produce(self, reply, state):
+                        await super()._produce(reply, state)
+                        drained.set()
+                        await release.wait()
+                        if on_time:
+                            loop.call_soon(jump)
+                        else:
+                            jump()
+
+                output = Output(TTS(), replace(_SETTINGS, delivery_timeout=2))
+                self.addAsyncCleanup(output.close)
+                device = _Device()
+                device.render = output.render
+                with (patch.object(loop, "time", new=lambda: clock[0]),
+                      patch.object(loop, "slow_callback_duration", float("inf"))):
+                    task = asyncio.create_task(output.deliver(_reply("hard", "已播正文。")))
+                    await buffered.wait()
+                    self.assertEqual(device.pull(4), _A * 4)
+                    clock[0] += .02  # 唤醒生产任务的设备排空轮询。
+                    await drained.wait()
+                    release.set()
+                    receipt = await task
+                self.assertEqual((receipt.status, receipt.confirmed), (
+                    DeliveryStatus.FULL if on_time else DeliveryStatus.UNKNOWN, "已播正文。"))
+
+    async def test_hard_deadline_excludes_segment_only_completed_after_cutoff(self):
+        buffered, finish = asyncio.Event(), asyncio.Event()
+
+        class TTS:
+            async def synthesize(self, text, *, sample_rate):
+                yield _A * 4
+                buffered.set()
+                await finish.wait()
+
+        loop = asyncio.get_running_loop()
+        clock = [loop.time()]
+        output = VoiceOutput(TTS(), replace(_SETTINGS, delivery_timeout=2))
+        self.addAsyncCleanup(output.close)
+        device = _Device()
+        device.render = output.render
+        with (patch.object(loop, "time", new=lambda: clock[0]),
+              patch.object(loop, "slow_callback_duration", float("inf"))):
+            task = asyncio.create_task(output.deliver(_reply("hard", "迟到的合成终态。")))
+            await buffered.wait()
+            self.assertEqual(device.pull(4), _A * 4)
+            clock[0] += 3
+            finish.set()
+            receipt = await task
+        self.assertEqual((receipt.status, receipt.confirmed), (DeliveryStatus.UNKNOWN, ""))
+
+
+class VoiceDeliveryWatchdogTest(unittest.IsolatedAsyncioTestCase):
+    def setup_runtime(self, output, model, settings):
+        history = History(":memory:")
+        self.addCleanup(history.close)
+        runtime = Runtime("main", history, model, output, delivery_idle_timeout=settings.idle_timeout)
+        self.addAsyncCleanup(output.close)
+        self.addAsyncCleanup(runtime.close)
+        device = _Device()
+        device.render = output.render
+        return runtime, history, device
+
+    async def test_no_pcm_starts_idle_timer_only_after_model_closes(self):
+        model_close, tts_started = asyncio.Event(), asyncio.Event()
+
+        class Model:
+            async def stream(self, messages, tools, *, thinking):
+                yield TextDelta("未开始。")
+                await model_close.wait()
+
+        class TTS:
+            async def synthesize(self, text, *, sample_rate):
+                tts_started.set()
+                await asyncio.Event().wait()
+                yield _A
+
+        settings = replace(_SETTINGS, idle_timeout=.05)
+        runtime, history, device = self.setup_runtime(VoiceOutput(TTS(), settings), Model(), settings)
+        runtime.submit_batch([Message("user", "合成测试")])
+        await asyncio.wait_for(tts_started.wait(), 1)
+        await asyncio.sleep(.08)
+        self.assertEqual(history.outcomes("main"), [])
+        model_close.set()
+        async with asyncio.timeout(.4):
+            while not history.outcomes("main"):
+                self.assertEqual(device.pull(4), bytes(8))
+                await asyncio.sleep(.01)
+        self.assertEqual(history.outcomes("main")[0].delivery_status, DeliveryStatus.UNKNOWN)
+        self.assertEqual(history.tail("main", 1)[0].message, Message("assistant", ""))
+
+    async def test_playback_stalls_during_second_segment_next_request_only_sees_first(self):
+        requests = []
+
+        class Model:
+            async def stream(self, messages, tools, *, thinking):
+                requests.append(list(messages))
+                if len(requests) == 1:
+                    yield TextDelta("已交给设备。只播了一点。")
+
+        tts = _TTS()
+        settings = replace(_SETTINGS, idle_timeout=.08)
+        runtime, history, device = self.setup_runtime(VoiceOutput(tts, settings), Model(), settings)
+        runtime.submit_batch([Message("user", "先问")])
+        await _until(lambda: len(tts.calls) == 2)
+        self.assertEqual(device.pull(5), _A * 5)
+        runtime.submit_batch([Message("user", "再问")])
+        await asyncio.wait_for(runtime.wait_idle(), .5)
+        self.assertEqual(history.outcomes("main")[0].delivery_status, DeliveryStatus.UNKNOWN)
+        self.assertEqual(requests[1], [Message("user", "先问"), Message("assistant", "已交给设备。"),
+                                       Message("user", "再问")])
+        self.assertEqual(device.pull(4), bytes(8))
+
+    async def test_device_keeps_pre_cutoff_chain_without_event_loop_sampling(self):
+        buffered = asyncio.Event()
+
+        class Model:
+            async def stream(self, messages, tools, *, thinking):
+                yield TextDelta("第一句。第二句。迟到句。")
+
+        class TTS:
+            async def synthesize(self, text, *, sample_rate):
+                yield _A * 4
+                if text == "迟到句。":
+                    buffered.set()
+
+        settings = replace(_SETTINGS, idle_timeout=2, delivery_timeout=50)
+        runtime, history, device = self.setup_runtime(VoiceOutput(TTS(), settings), Model(), settings)
+        loop = asyncio.get_running_loop()
+        clock = [loop.time()]
+        with (patch.object(loop, "time", new=lambda: clock[0]),
+              patch.object(loop, "slow_callback_duration", float("inf"))):
+            runtime.submit_batch([Message("user", "测试")])
+            await buffered.wait()
+            # 两次消费都发生在各自的滚动截止前；第二次已过原始截止。
+            clock[0] += 1.75
+            self.assertEqual(device.pull(4), _A * 4)
+            clock[0] += 1.75
+            self.assertEqual(device.pull(4), _A * 4)
+            # 已过第二次消费延长后的截止：第三次不能掩盖证据或扩大确认前缀。
+            clock[0] += 2.25
+            self.assertEqual(device.pull(4), bytes(8))
+            await runtime.wait_idle()
+        self.assertEqual(history.outcomes("main")[0].delivery_status, DeliveryStatus.UNKNOWN)
+        self.assertEqual(history.tail("main", 1)[0].message.content, "第一句。第二句。")
+
+    async def test_real_progress_renews_idle_but_never_the_hard_deadline(self):
+        for continuous in (False, True):
+            with self.subTest(continuous=continuous):
+                produced = asyncio.Event()
+
+                class Model:
+                    async def stream(self, messages, tools, *, thinking):
+                        yield TextDelta("持续播放。不会播完。" if continuous else "持续播放。")
+
+                class TTS:
+                    async def synthesize(self, text, *, sample_rate):
+                        if text == "持续播放。":
+                            yield _A * 120
+                            produced.set()
+                        else:
+                            while True:
+                                yield _B * 64
+                                await asyncio.sleep(.005)
+
+                settings = replace(_SETTINGS, idle_timeout=.10, delivery_timeout=.34 if continuous else .9)
+                runtime, history, device = self.setup_runtime(VoiceOutput(TTS(), settings), Model(), settings)
+                runtime.submit_batch([Message("user", "播放器合成测试")])
+                await asyncio.wait_for(produced.wait(), 1)
+                a, b = 0, 0
+                async with asyncio.timeout(.7):
+                    while not history.outcomes("main"):
+                        pcm = device.pull(8)
+                        a += pcm.count(_A)
+                        b += pcm.count(_B)
+                        await asyncio.sleep(.014)
+                self.assertEqual(a, 120)  # 15 次带真实音频的回调，跨越两个空闲窗口。
+                if continuous:
+                    self.assertGreater(b, 0)
+                self.assertEqual(history.outcomes("main")[0].delivery_status,
+                                 DeliveryStatus.UNKNOWN if continuous else DeliveryStatus.FULL)
+                self.assertEqual(history.tail("main", 1)[0].message, Message("assistant", "持续播放。"))
 
 
 class VoiceInputTest(unittest.IsolatedAsyncioTestCase):

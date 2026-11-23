@@ -185,8 +185,7 @@ api_key = 123
             (_CONFIG.replace('"ou_self"', '"ou_peer"'), 'feishu.sender_open_id 与 feishu.own_open_id 必须不同'),
             (_CONFIG.replace('mode = "text"', f'mode = "{_KEY}"'), 'feishu.mode 必须是 text 或 voice'),
             (_CONFIG.replace('mode = "text"', 'mode = "text"\ncli_timeout = false'), 'feishu.cli_timeout 必须是有限正数'),
-            (_CONFIG + '\n[runtime]\ndelivery_timeout = 0\n', 'runtime.delivery_timeout 必须是有限正数'),
-            (_CONFIG + f'\n[runtime]\ndelivery_timeout = {10 ** 320}\n', 'runtime.delivery_timeout 必须是有限正数'),
+            (_CONFIG + '\n[runtime]\ndelivery_timeout = 120\n', 'runtime 配置字段无效'),
             (_CONFIG + '\n[runtime]\ncontext_budget = 42\n',
              'runtime.tail_budget 必须小于 runtime.context_budget'),
             (_CONFIG + '\n[runtime]\nsummary_budget = 4000\n', 'runtime 配置字段无效'),
@@ -206,8 +205,10 @@ api_key = 123
             ('max_turn_seconds = 60', 'voice 配置字段无效'),
             ('silence_seconds = 11', 'voice.silence_seconds 不得超过 10 秒'),
             ('buffer_seconds = 8', 'voice.buffer_seconds 必须在 0.032–5 秒之间'),
-            ('prefetch_seconds = 3', 'voice.prefetch_seconds 必须小于 voice.buffer_seconds'),
-            ('delivery_timeout = nan', 'voice.delivery_timeout 必须是有限正数'),
+             ('prefetch_seconds = 3', 'voice.prefetch_seconds 必须小于 voice.buffer_seconds'),
+             ('idle_timeout = 0', 'voice.idle_timeout 必须是有限正数'),
+             ('idle_timeout = inf', 'voice.idle_timeout 必须是有限正数'),
+             ('delivery_timeout = nan', 'voice.delivery_timeout 必须是有限正数'),
         ):
             with self.subTest(diagnostic=diagnostic):
                 self.assert_startup_error(voice.replace('[voice]', f'[voice]\n{setting}'), diagnostic)
@@ -215,17 +216,22 @@ api_key = 123
                                   'voice.output_sample_rate 必须是 16000、24000、32000 或 44100')
         self.assert_startup_error(voice.replace('output_sample_rate', 'playback_rate'), 'voice 配置字段无效')
 
-    def test_delivery_timeout_diagnostics_apply_before_startup_in_active_modes(self):
-        common = _CONFIG + '\n[runtime]\ndelivery_timeout = 20\n'
+    def test_delivery_timeouts_are_independent_and_have_defaults(self):
+        self.path.write_text(_CONFIG.replace('mode = "text"', 'mode = "voice"'), encoding="utf-8")
+        settings = load_settings(self.path, for_run=True)
+        self.assertEqual((settings.feishu.cli_timeout, settings.voice.idle_timeout, settings.voice.delivery_timeout),
+                         (20, 30, 600))
+        common = _CONFIG.replace('[feishu]', '[feishu]\ncli_timeout = 300').replace(
+            '[voice]', '[voice]\ndelivery_timeout = 700\nidle_timeout = 45')
         for mode in ('text', 'voice'):
             with self.subTest(mode=mode):
-                self.assert_startup_error(common.replace('mode = "text"', f'mode = "{mode}"'),
-                                          'feishu.cli_timeout 必须小于 runtime.delivery_timeout')
-        voice_limit = _CONFIG.replace('[voice]', '[voice]\ndelivery_timeout = 120')
-        self.path.write_text(voice_limit, encoding="utf-8")
-        self.assertEqual(load_settings(self.path, for_run=True).voice, VoiceSettings())
-        self.assert_startup_error(voice_limit.replace('mode = "text"', 'mode = "voice"'),
-                                  'voice.delivery_timeout 必须小于 runtime.delivery_timeout')
+                self.path.write_text(common.replace('mode = "text"', f'mode = "{mode}"'), encoding="utf-8")
+                settings = load_settings(self.path, for_run=True)
+                self.assertEqual(settings.feishu.cli_timeout, 300)
+                if mode == 'voice':
+                    self.assertEqual((settings.voice.idle_timeout, settings.voice.delivery_timeout), (45, 700))
+                else:
+                    self.assertEqual(settings.voice, VoiceSettings())
 
     def test_explicit_llm_settings_and_adapter_specific_model_and_address(self):
         for before, after, message in (

@@ -2,7 +2,7 @@
 
 import asyncio
 from collections import deque
-from collections.abc import AsyncGenerator
+from collections.abc import AsyncGenerator, Callable
 from contextlib import aclosing
 from dataclasses import dataclass, field
 import logging
@@ -38,13 +38,40 @@ class _Segment:
     text: str
     received: int = 0
     played: int = 0
-    complete: bool = False
+    completed_at: float | None = None
+    end: int = 0  # 完整合成后，所在音频在本回复中的末尾偏移
 
 
 @dataclass(eq=False, slots=True)
 class _PlaybackReply:
     signal: asyncio.Future[DeliveryStatus]
+    clock: Callable[[], float]
+    hard_deadline: float
     segments: list[_Segment] = field(default_factory=list)
+    # 由 PCM 锁保护；一旦过期，设备不能再推进本条回复的证据。
+    played_bytes: int = 0
+    idle_deadline: float = float("inf")
+    idle_timeout: float = 0.0
+    offered_bytes: int = 0
+    stopped_at: float | None = None
+    worker_finished_at: float | None = None
+
+    def complete(self, part: _Segment) -> None:
+        self.offered_bytes += part.received
+        part.end = self.offered_bytes
+        part.completed_at = self.clock()
+
+    def confirmed_prefix(self, played_bytes: int, cutoff: float) -> str:
+        if not played_bytes:
+            return ""
+        end = 0
+        for index, part in enumerate(self.segments, start=1):
+            if part.completed_at is None or part.completed_at >= cutoff or part.end > played_bytes:
+                break
+            # 未独立合成的标点/空白只作为后续已交付段落之前的格式保留。
+            if part.received:
+                end = index
+        return "".join(part.text for part in self.segments[:end])
 
     def confirmation(self, bytes_per_second: int) -> str:
         # 只在先从设备队列摘除本回复后读计数，回调不会再更改它们。
@@ -52,7 +79,7 @@ class _PlaybackReply:
         played = 0
         voiced_chars = 0
         for segment in self.segments:
-            if segment.complete and segment.played == segment.received:
+            if segment.completed_at is not None and segment.played == segment.received:
                 text.append(segment.text)
                 if segment.played:
                     played += segment.played
@@ -60,7 +87,7 @@ class _PlaybackReply:
                 continue
             if segment.played:
                 # 总时长未知时先参考已播整段语速，再回退到每秒四字。
-                estimate = (len(segment.text) * segment.played // segment.received if segment.complete else
+                estimate = (len(segment.text) * segment.played // segment.received if segment.completed_at is not None else
                             voiced_chars * segment.played // played if played else
                             int(4 * segment.played / bytes_per_second))
                 count = max(1, min(estimate, len(segment.text) - 1))
@@ -93,6 +120,19 @@ class _PcmQueue:
         with self._lock:
             return self._queued if self._active is state else 0
 
+    def arm_idle(self, state: _PlaybackReply, timeout: float, deadline: float | None) -> float:
+        with self._lock:
+            state.idle_timeout = timeout
+            state.idle_deadline = state.clock() + timeout if deadline is None else deadline
+            return state.idle_deadline
+
+    def idle_snapshot(self, state: _PlaybackReply) -> tuple[float, float, str]:
+        with self._lock:
+            now, deadline, played = state.clock(), state.idle_deadline, state.played_bytes
+        # 扫描既有、有上限的段落表，不持 PCM 锁；段落只在同一事件循环更新。
+        prefix = state.confirmed_prefix(played, min(deadline, state.hard_deadline)) if now >= deadline else ""
+        return now, deadline, prefix
+
     def offer(self, state: _PlaybackReply, part: _Segment, pcm: memoryview) -> int:
         with self._lock:
             if self._active is not state:
@@ -110,6 +150,13 @@ class _PcmQueue:
         if not self._lock.acquire(blocking=False):
             return  # 与事件循环冲突时只补静音，设备线程不等待
         try:
+            state = self._active
+            if state is None or not self._packets:
+                return
+            # 一次设备回调的消费在 PCM 锁内取同一个时刻；过期后只补静音。
+            now = state.clock()
+            if now >= min(state.hard_deadline, state.idle_deadline):
+                return
             offset = 0
             while offset < len(output) and self._packets:
                 part, pcm = self._packets[0]
@@ -122,6 +169,10 @@ class _PcmQueue:
                     self._packets.popleft()
                 else:
                     self._packets[0] = (part, pcm[size:])
+            if offset:
+                state.played_bytes += offset
+                if state.idle_timeout:
+                    state.idle_deadline = now + state.idle_timeout
         finally:
             self._lock.release()
 
@@ -154,6 +205,7 @@ class VoiceOutput:
         state = self._active
         if state is not None and not state.signal.done():
             self._pcm.detach(state)  # 现在清除待播，不等待 HTTP 或回执任务
+            state.stopped_at = state.clock()
             state.signal.set_result(status)
 
     def _finished(self, task: asyncio.Task[None]) -> None:
@@ -172,19 +224,31 @@ class VoiceOutput:
         if self._closed or self._active is not None or len(self._workers) >= 2:
             reply.abandon()
             return Receipt(reply_id, DeliveryStatus.FAILED)
-        state = _PlaybackReply(asyncio.get_running_loop().create_future())
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + self._settings.delivery_timeout
+        state = _PlaybackReply(loop.create_future(), loop.time, deadline)
+        reply.bind_playback(lambda timeout, cutoff: self._pcm.arm_idle(state, timeout, cutoff),
+                            lambda: self._pcm.idle_snapshot(state))
         self._active = state
         self._pcm.attach(state)
-        worker = asyncio.create_task(self._produce(reply, state))
+
+        async def produce() -> None:
+            try:
+                await self._produce(reply, state)
+            finally:
+                state.worker_finished_at = state.clock()
+
+        worker = asyncio.create_task(produce())
         self._workers.add(worker)
         worker.add_done_callback(self._finished)
         status: DeliveryStatus
         try:
-            await asyncio.wait((worker, state.signal), timeout=self._settings.delivery_timeout,
-                               return_when=asyncio.FIRST_COMPLETED)
-            if state.signal.done():
+            while not worker.done() and not state.signal.done() and loop.time() < deadline:
+                await asyncio.wait((worker, state.signal), timeout=max(0, deadline - loop.time()),
+                                   return_when=asyncio.FIRST_COMPLETED)
+            if state.stopped_at is not None and state.stopped_at < deadline:
                 status = state.signal.result()
-            elif not worker.done():
+            elif state.worker_finished_at is None or state.worker_finished_at >= deadline:
                 status = DeliveryStatus.UNKNOWN
                 _LOG.warning("voice delivery deadline reached")
             else:
@@ -204,7 +268,9 @@ class VoiceOutput:
                 worker.cancel()
             if not state.signal.done():
                 state.signal.cancel()
-        prefix = state.confirmation(self._bytes_per_second)
+        # 只有语音硬超时用保守的完整段落前缀；保留已有打断等终态的确认方式。
+        prefix = (state.confirmed_prefix(state.played_bytes, deadline) if status == DeliveryStatus.UNKNOWN else
+                  state.confirmation(self._bytes_per_second))
         if not prefix and status in (DeliveryStatus.PARTIAL, DeliveryStatus.FULL):
             status = DeliveryStatus.ZERO
         return Receipt(reply_id, status, prefix)
@@ -218,7 +284,7 @@ class VoiceOutput:
             spoken = text.strip()
             # 一串连续句末标点或空行不单独触发一条无法合成的请求。
             if not spoken or all(char.isspace() or category(char).startswith("P") for char in spoken):
-                part.complete = True
+                state.complete(part)
                 continue
             while self._pcm.size(state) >= self._prefetch:
                 await asyncio.sleep(_TICK)
@@ -238,7 +304,7 @@ class VoiceOutput:
                             await asyncio.sleep(_TICK)
             if not part.received:
                 raise TtsError("tts_empty_audio")
-            part.complete = True
+            state.complete(part)
         while self._pcm.size(state):
             await asyncio.sleep(_TICK)
         if reply.overflowed:

@@ -1,5 +1,6 @@
 import asyncio
 import unittest
+from unittest.mock import patch
 
 from agent_companion.config import RuntimeSettings
 from agent_companion.models.deepseek import build_request
@@ -201,12 +202,52 @@ class RuntimeTest(unittest.IsolatedAsyncioTestCase):
                 await release.wait()
 
         model = ScriptModel(events(TextDelta("unknown")), events())
-        runtime, history = self.setup_runtime(model, UnresponsiveChannel(), settings=RuntimeSettings(delivery_timeout=.01))
-        runtime.submit_batch([Message("user", "one")])
-        runtime.submit_batch([Message("user", "two")])
-        await self.idle(runtime)
+        runtime, history = self.setup_runtime(model, UnresponsiveChannel())
+        with patch("agent_companion.runtime.engine._DELIVERY_TIMEOUT", .01):
+            runtime.submit_batch([Message("user", "one")])
+            runtime.submit_batch([Message("user", "two")])
+            await self.idle(runtime)
         self.assertEqual(history.outcomes("main")[0].delivery_status, DeliveryStatus.UNKNOWN)
         self.assertEqual([m.content for m in model.requests[1][0]], ["one", "two"])
+
+    async def test_terminal_uses_completion_time_and_rejects_late_progress(self):
+        loop = asyncio.get_running_loop()
+        for idle in (None, 2):
+            for on_time in (False, True):
+                with self.subTest(idle=idle, on_time=on_time):
+                    clock = [loop.time()]
+                    entered, release = asyncio.Event(), asyncio.Event()
+
+                    def jump():
+                        clock[0] += 3
+
+                    class TimedChannel:
+                        async def deliver(self, reply):
+                            full = "".join([part async for part in reply])
+                            reply.report_progress(reply.info.reply_id, 2, "early")
+                            entered.set()
+                            await release.wait()
+                            if on_time:
+                                # 任务结束后、等待方恢复前让时钟跨过截止。
+                                loop.call_soon(jump)
+                            else:
+                                jump()
+                                reply.report_progress(reply.info.reply_id, 4, full)
+                            return Receipt(reply.info.reply_id, DeliveryStatus.FULL, full)
+
+                    model = ScriptModel(events(TextDelta("early late")))
+                    runtime, history = self.setup_runtime(model, TimedChannel(), delivery_idle_timeout=idle)
+                    with (patch.object(loop, "time", new=lambda: clock[0]),
+                          patch.object(loop, "slow_callback_duration", float("inf")),
+                          patch("agent_companion.runtime.engine._DELIVERY_TIMEOUT", 2)):
+                        runtime.submit_batch([Message("user", "one")])
+                        await entered.wait()
+                        release.set()
+                        await runtime.wait_idle()
+                    expected = (DeliveryStatus.FULL, "early late") if on_time else (
+                        DeliveryStatus.UNKNOWN, "early" if idle is not None else "")
+                    self.assertEqual((history.outcomes("main")[0].delivery_status,
+                                      history.tail("main", 1)[0].message.content), expected)
 
     async def test_downstream_cancellation_does_not_cancel_the_queue_worker(self):
         async def tool(args, context):
@@ -236,23 +277,34 @@ class RuntimeTest(unittest.IsolatedAsyncioTestCase):
                     async def deliver(self, reply):
                         prefix = await anext(reply)
                         if prefix != "first":
+                            reply.report_progress("wrong reply", 2, "next")
+                            if reply.progress != (0, ""):
+                                raise AssertionError("accepted another reply's progress")
                             text = prefix + "".join([part async for part in reply])
                             return Receipt(reply.info.reply_id, DeliveryStatus.FULL, text)
+                        reply.report_progress(reply.info.reply_id, 10, "first")
+                        reply.report_progress(reply.info.reply_id, 20, "first invalid")
+                        reply.report_progress(reply.info.reply_id, 5, "first stale")
                         try:
-                            await asyncio.Event().wait()
+                            while True:
+                                reply.report_progress(reply.info.reply_id, 10, "first")
+                                await asyncio.sleep(.002)
                         except asyncio.CancelledError:
                             abandoned.append(reply.abandoned)
                             remaining.extend([part async for part in reply])
                             cancelled.set()
                             await release.wait()
+                            reply.report_progress(reply.info.reply_id, 30, "first stale buffer")
+                            self_snapshot.append(reply.progress)
                             cleaned.set()
                             if cleanup_error:
                                 raise RuntimeError("late cleanup")
                             return Receipt(reply.info.reply_id, DeliveryStatus.FULL, "first stale buffer")
 
+                self_snapshot = []
                 model = ScriptModel(events(TextDelta("first"), TextDelta(" stale buffer")), events(TextDelta("next")))
                 runtime, history = self.setup_runtime(model, SlowCleanupChannel(),
-                                                      settings=RuntimeSettings(delivery_timeout=.01))
+                                                      delivery_idle_timeout=.02)
                 runtime.submit_batch([Message("user", "one")])
                 runtime.submit_batch([Message("user", "two")])
                 try:
@@ -268,7 +320,48 @@ class RuntimeTest(unittest.IsolatedAsyncioTestCase):
                     release.set()
                 await asyncio.wait_for(cleaned.wait(), 2)
                 self.assertEqual(history.outcomes("main"), outcomes)
-                self.assertEqual([row.message.content for row in history.read_after("main")], ["one", "", "two", "next"])
+                self.assertEqual(self_snapshot, [(10, "first")])
+                self.assertEqual([m.content for m in model.requests[1][0]], ["one", "first", "two"])
+                self.assertEqual([row.message.content for row in history.read_after("main")], ["one", "first", "two", "next"])
+
+    async def test_background_reply_is_queued_only_after_atomic_history_and_tool_completion(self):
+        tool_started, tool_released = asyncio.Event(), asyncio.Event()
+
+        async def tool(args, context):
+            tool_started.set()
+            await tool_released.wait()
+            return "ok"
+
+        class Background(Channel):
+            def enqueue(self, info, text):
+                self.replies.append((info, text, history.read_after("main")))
+
+        async def failed():
+            yield TextDelta("unfinished")
+            raise ModelError("model_transport")
+
+        model = ScriptModel(events(TextDelta("start"), ToolReady(CALL)), events(TextDelta("end")), failed(),
+                            events(TextDelta("not committed")))
+        channel = Background()
+        runtime, history = self.setup_runtime(model, channel, tools=Tools([Tool(SPEC, tool)]))
+        runtime.submit_batch([Message("user", "one")], wait_for_delivery=False)
+        await asyncio.wait_for(tool_started.wait(), 1)
+        self.assertEqual(channel.replies, [])
+        tool_released.set()
+        await self.idle(runtime)
+        self.assertEqual([item[1] for item in channel.replies], ["start", "end"])
+        self.assertEqual([row.message.role for row in channel.replies[0][2]], ["user", "assistant", "tool"])
+        self.assertEqual([item.delivery_status for item in history.outcomes("main")], [None, None])
+
+        runtime.submit_batch([Message("user", "two")], wait_for_delivery=False)
+        await asyncio.wait_for(runtime.wait_idle(), 2)
+        self.assertEqual(runtime.last_failure, "model_failed")
+        self.assertNotIn("unfinished", [row.message.content for row in history.read_after("main")])
+        with patch.object(history, "finalize_reply", side_effect=ValueError("simulated write failure")):
+            runtime.submit_batch([Message("user", "three")], wait_for_delivery=False)
+            await asyncio.wait_for(runtime.wait_idle(), 2)
+            self.assertEqual(runtime.last_failure, "runtime_failed")
+        self.assertEqual([item[1] for item in channel.replies], ["start", "end"])
 
     async def test_runtime_close_still_cancels_parent_instead_of_committing_child_failures(self):
         delivery_started, delivery_cancelled, tool_started, tool_cancelled = (asyncio.Event() for _ in range(4))

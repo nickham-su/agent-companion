@@ -1,13 +1,14 @@
 """飞书按固定窗口轮询；通知独立发送，模型输出按启动模式路由。"""
 
 import asyncio
+from collections import deque
 from collections.abc import Callable
 from dataclasses import dataclass, field
 import json
 import logging
 from time import time
 
-from ...protocol import Channel, DeliveryStatus, Receipt, ReplyStream
+from ...protocol import Channel, DeliveryStatus, Receipt, ReplyInfo, ReplyStream
 from ...speech.asr import FileASR
 from ...storage.sqlite import History
 from .cli import MAX_PAGE_SIZE, MIN_PAGE_SIZE, CliError, CliStdoutLimit, FeishuCLI
@@ -22,6 +23,7 @@ _MAX_WINDOW_PAGES = 1_000
 _MAX_WINDOW_MESSAGES = 20_000
 _MAX_WINDOW_RAW_BYTES = 32 * 1024 * 1024
 _VOICE_FAILURE = "语音接收失败，请重新发送。"
+_MAX_PENDING_REPLIES = 8
 
 
 class FeishuChannel:
@@ -30,15 +32,55 @@ class FeishuChannel:
             raise ValueError("voice mode requires an audio output")
         self._cli = cli
         self._voice_output = voice_output if mode == "voice" else None
+        self._pending: deque[str] = deque()
+        self._sender: asyncio.Task[None] | None = None
+        self._closed = False
 
     async def deliver(self, reply: ReplyStream) -> Receipt:
+        if self._voice_output is None:
+            raise RuntimeError("Feishu text replies require background delivery")
+        return await self._voice_output.deliver(reply)
+
+    def enqueue(self, info: ReplyInfo, text: str) -> None:
         if self._voice_output is not None:
-            return await self._voice_output.deliver(reply)
-        text = "".join([part async for part in reply])
-        if not text or reply.abandoned:
-            return Receipt(reply.info.reply_id, DeliveryStatus.ZERO)
-        status = await self._cli.send_text(text)
-        return Receipt(reply.info.reply_id, status, text if status == DeliveryStatus.FULL else "")
+            raise RuntimeError("Feishu voice replies require a receipt")
+        if self._closed or len(self._pending) >= _MAX_PENDING_REPLIES:
+            _LOG.warning("Feishu text reply dropped (%s); reply=%s",
+                         "closed" if self._closed else "queue_full", info.reply_id)
+            return
+        self._pending.append(text)
+        if self._sender is None:
+            self._sender = asyncio.create_task(self._send_pending())
+
+    async def _send_pending(self) -> None:
+        try:
+            while not self._closed and self._pending:
+                text = self._pending.popleft()
+                try:
+                    if await self._cli.send_text(text) != DeliveryStatus.FULL:
+                        _LOG.warning("Feishu text send not confirmed")
+                except Exception:
+                    _LOG.warning("Feishu text send failed")
+        finally:
+            self._sender = None
+
+    def stop_accepting(self) -> None:
+        """在让出事件循环前关停发送入口和在途任务。"""
+        if self._closed:
+            return
+        self._closed = True
+        if self._pending:
+            _LOG.warning("Feishu text replies dropped at shutdown; count=%d", len(self._pending))
+            self._pending.clear()
+        if self._sender is not None:
+            self._sender.cancel()
+
+    async def close(self) -> None:
+        self.stop_accepting()
+        sender = self._sender
+        if sender is not None:
+            await asyncio.gather(sender, return_exceptions=True)
+            self._sender = None
 
     async def notify_audio_failure(self) -> None:
         if await self._cli.send_text(_VOICE_FAILURE) != DeliveryStatus.FULL:
@@ -71,7 +113,7 @@ class FeishuPoller:
     def __init__(self, cli: FeishuCLI, asr: FileASR, channel: FeishuChannel, *,
                  chat_id: str, sender_id: str, own_id: str, session_id: str, history: History,
                  submit: Callable[[int], None], clock: Callable[[], float] = time,
-                 batch_budget: int = MAX_BATCH_BYTES) -> None:
+                 batch_budget: int = MAX_BATCH_BYTES, before_close: Callable[[], None] | None = None) -> None:
         self._cli = cli
         self._normalizer = MessageNormalizer(cli, asr)
         self._batch_budget = batch_budget
@@ -83,6 +125,7 @@ class FeishuPoller:
         self._source = json.dumps(["feishu", chat_id, sender_id, own_id])
         self._history = history
         self._submit = submit
+        self._before_close = before_close
         self._clock = clock
         self._poll_lock = asyncio.Lock()
         self._notices: set[asyncio.Task[None]] = set()
@@ -202,7 +245,11 @@ class FeishuPoller:
                     next_tick += (int((now - next_tick) // _POLL_SECONDS) + 1) * _POLL_SECONDS
                 await asyncio.sleep(max(0, next_tick - loop.time()))
         finally:
-            await self.close()
+            try:
+                if self._before_close is not None:
+                    self._before_close()  # 入口与发送先同步关闭，再等待固定通知的取消清理。
+            finally:
+                await self.close()
 
     async def close(self) -> None:
         pending = tuple(self._notices)

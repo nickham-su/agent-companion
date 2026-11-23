@@ -13,7 +13,6 @@ asr = 30  # 单次转写总时限
 tts = 25  # 单次网络读写、等待响应的时限
 
 [runtime]
-delivery_timeout = 120  # 模型输出结束后，等待回复投递完成的最长时间（秒）
 context_budget = 64000  # 模型输入的总预算（本地估算，不是实际 token 数）
 tail_budget = 16000  # 压缩历史时保留最近消息原文的预算，须小于 context_budget
 max_tool_rounds = 8  # 一次运行的模型请求轮数上限，含首轮
@@ -56,7 +55,7 @@ voice_id = "male-qn-qingse"
 # own_open_id = "ou_self_example"
 # mode = "text"
 # cli = "lark-cli"
-# cli_timeout = 20  # 必须小于 runtime.delivery_timeout
+# cli_timeout = 20  # 单次飞书 CLI 调用时限（秒）
 
 # 仅 [feishu].mode = "voice" 时打开设备。需要两条不同的虚拟线路。
 # [voice]
@@ -69,4 +68,5 @@ voice_id = "male-qn-qingse"
 # output_sample_rate = 44100  # TTS 合成与本机播放共用的采样率（Hz）；录音固定 16000 Hz
 # prefetch_seconds = 0.4  # 待播音频少于此时长才合成下一段（秒）
 # buffer_seconds = 2  # 待播音频缓存上限（秒），须大于 prefetch_seconds
-# delivery_timeout = 90  # 单条语音回复的合成与播放总时限（秒），须小于 runtime.delivery_timeout
+# idle_timeout = 30  # 模型输出结束后，允许多久没有实际播放进展（秒）
+# delivery_timeout = 600  # 从语音投递开始算的总时限，不续期（秒）

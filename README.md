@@ -39,7 +39,7 @@ python -m venv .venv
 
 旧的 `[llm]`、`[deepseek]`、`[minimax]` 及旧语音模型字段不再兼容，请按 [config.example.toml](config.example.toml) 迁移。已有 SQLite 会话历史保留。`adapter` 必须显式指定，`.llm.reasoning_effort` 必填。
 
-请求时限统一配置在 `[timeouts]`，单位秒：`llm` 是单次模型请求总时限（默认 60），`asr` 是单次转写总时限（默认 30），`tts` 是单次网络读写及等待响应的时限（默认 25，仅 `voice` 启用）。切换 Provider 不改变这些值。旧的 `runtime.model_timeout` 和 Provider 能力表里的 `timeout` 不再兼容；投递看门狗和飞书 CLI 时限仍在各自的配置段。
+请求时限统一配置在 `[timeouts]`，单位秒：`llm` 是单次模型请求总时限（默认 60），`asr` 是单次转写总时限（默认 30），`tts` 是单次网络读写及等待响应的时限（默认 25，仅 `voice` 启用）。切换 Provider 不改变这些值。旧的 `runtime.model_timeout` 和 Provider 能力表里的 `timeout` 不再兼容；语音投递与飞书 CLI 的时限独立配置。升级时删除 `[runtime]` 中旧的 `delivery_timeout`。
 
 | `adapter` | 配置 |
 | --- | --- |
@@ -73,7 +73,7 @@ python scripts/build_source_zip.py
 ## 本机启动飞书文字模式
 
 1. 使用 [lark-cli v1.0.100](https://github.com/larksuite/cli/releases/tag/v1.0.100) 或保留同等协议的版本；在本机完成飞书用户登录，并确认应用有指定聊天的列表、媒体下载和发消息权限。程序不会发起登录或读取 CLI 的凭据文件。参考 [CLI JSON 输出契约](https://github.com/larksuite/cli/blob/v1.0.100/README.md#json-output-contract)和[飞书消息列表 API](https://open.feishu.cn/document/server-docs/im-v1/message/list)。
-2. 复制 `config.example.toml` 为 `config.local.toml`，取消 `[feishu]` 注释，填写目标对话 `chat_id`、业务对端 `sender_open_id` 与登录账号 `own_open_id`，使用同一 CLI 应用下的 Open ID；两者必须不同。`mode="text"` 不打开音频设备。`cli_timeout` 必须短于 Runtime 的投递时限。每个数据库只允许一个飞书主 Session 绑定，首次绑定要求全库没有历史或入站状态。日后要更换主 Session ID、对话、对端或账号，或旧数据库已有数据但未绑定，请配置新的数据库路径，不要覆盖旧库。仅切换输出模式不影响绑定。
+2. 复制 `config.example.toml` 为 `config.local.toml`，取消 `[feishu]` 注释，填写目标对话 `chat_id`、业务对端 `sender_open_id` 与登录账号 `own_open_id`，使用同一 CLI 应用下的 Open ID；两者必须不同。`mode="text"` 不打开音频设备。`cli_timeout` 限制单次 CLI 调用（默认 20 秒）。每个数据库只允许一个飞书主 Session 绑定，首次绑定要求全库没有历史或入站状态。日后要更换主 Session ID、对话、对端或账号，或旧数据库已有数据但未绑定，请配置新的数据库路径，不要覆盖旧库。仅切换输出模式不影响绑定。
 3. 按[选择 Provider](#选择-provider)填好所选 LLM 和 MiniMax ASR 的 `api_key`；只在本机私有配置填写真实 Key，不要分享或提交该文件。MiniMax 区域按账号选择 `cn`（[国内 API](https://platform.minimax.cn/docs/api-reference/speech-to-text)）或 `global`（[国际 API](https://platform.minimax.io/docs/api-reference/speech-to-text)）。工作目录需要允许建立用于资源下载的短期目录。
 
 ```sh
@@ -84,7 +84,9 @@ python scripts/build_source_zip.py
 
 每个新窗口默认每页 50 条。列表 CLI 标准输出超过 4 MiB 时，将页大小减半（最低 1 条），丢弃该窗口未提交的消息及游标，下次轮询从同一时间窗口的第一页重读。每页仅 1 条仍超限时报告 `cli_single_result_output_limit`，不提交部分结果、不推进水位，也不跳过消息。
 
-图片按文件头识别（JPEG、PNG、GIF、WebP；单张本机上限 8 MiB）；语音条下载后验证容器和 50 MB 文件上限，提交一次完整文件，不做截断。WAV 超过 `max_audio_seconds` 时在本机拒绝；非 WAV 时长仍由服务端检查。飞书入口按原处理顺序执行现有单图和同批媒体限额，受限图片用文字占位，不挤掉同批可用文本；不会为了找更新的图片突破下载限额。macOS/Linux 的 CLI 下载子进程在写文件前已设置相应文件大小硬上限。富文本链接保留为普通文字，不发起下载。语音条失败或超时不重试，原对话尝试发送一次「语音接收失败，请重新发送。」，通知不走模型、不阻塞同批成功输入，崩溃后不补发。文字回复发送成功才写入确认正文；只有已知明确未送达的错误才记失败，通用 API 错误或无法确认的结果记未知，不重发。
+图片按文件头识别（JPEG、PNG、GIF、WebP；单张本机上限 8 MiB）；语音条下载后验证容器和 50 MB 文件上限，提交一次完整文件，不做截断。WAV 超过 `max_audio_seconds` 时在本机拒绝；非 WAV 时长仍由服务端检查。飞书入口按原处理顺序执行现有单图和同批媒体限额，受限图片用文字占位，不挤掉同批可用文本；不会为了找更新的图片突破下载限额。macOS/Linux 的 CLI 下载子进程在写文件前已设置相应文件大小硬上限。富文本链接保留为普通文字，不发起下载。语音条失败或超时不重试，原对话尝试发送一次「语音接收失败，请重新发送。」，通知不走模型、不阻塞同批成功输入，崩溃后不补发。
+
+文字回复成功生成后，先将完整正文与对应工具结果落库，再进入通道的内存队列，由一个后台任务按顺序尽力发送。Runtime 不等 CLI；历史里的全文只表示已生成，投递状态为空，不代表已送达。队列最多 8 条待发，另有最多 1 条发送中；满时丢弃新回复，发送失败只记日志，不重试。关闭时丢弃待发并取消当前发送，不等待队列排空；重启不会补发。
 
 如果在轮询批次落库前进程中断，下次会重新查询窗口；未落库的内容可能重新下载或转写。此时没有已接受的输入或失败通知需要恢复。命令兼容性还依赖于 [raw API 的 `--data -` stdin 支持](https://github.com/larksuite/cli/blob/v1.0.100/cmd/api/api.go)与[资源下载快捷命令](https://github.com/larksuite/cli/blob/v1.0.100/skills/lark-im/references/lark-im-messages-resources-download.md)。
 
@@ -109,7 +111,9 @@ VAD 默认连续 3 个 32 ms 人声窗口触发打断，默认静默 1 秒结束
 
 若 `max_audio_seconds` 短到放不下一个 16 kHz 采样点，实时语音无法启动，并报告 `voice_asr_max_audio_seconds_below_one_sample`。
 
-MiniMax TTS 用 [`/v1/t2a_v2` HTTP SSE](https://platform.minimax.cn/docs/api-reference/speech-t2a-http)逐段发送，首块到达即可播放；每段流结束且待播放低于 `prefetch_seconds` 时才提交下一段。默认首次输出起 `voice.delivery_timeout = 90` 秒，低于 Runtime 的投递看门狗，独立于 LLM 请求的 60 秒默认时限。
+MiniMax TTS 用 [`/v1/t2a_v2` HTTP SSE](https://platform.minimax.cn/docs/api-reference/speech-t2a-http)逐段发送，首块到达即可播放；每段流结束且待播放低于 `prefetch_seconds` 时才提交下一段。从语音通道开始处理起，`voice.delivery_timeout`（默认 600 秒）是不可续期的总上限。模型输出结束后，Runtime 启动 `voice.idle_timeout`（默认 30 秒）；只有设备实际取走本条回复的 PCM 才续期，补静音或只在合成不算。任一时限到期，投递记为 `UNKNOWN`，历史只保留已确认的连续完整段落，不估算半句。空闲超时由 Runtime 取消投递任务，不等清理或迟到回执。已确认的正文仍进入后续会话历史，不代表对端一定听到了。
+
+如果本机的 `[voice]` 仍显式使用旧示例的 `delivery_timeout = 90`，可改为 `600` 或删除这行使用新默认值。
 
 运行时若设备流断开或 VAD 推理出错，实时语音停用并记日志：丢弃尚未提交的录音，取消在途实时转写，忽略迟到结果，不等待取消清理。当前播报仍保留已交设备的确认前缀。模型、工具、飞书输入轮询和飞书语音条转写不受影响。不会自动切成文字输出或重连设备；排查后需重启。
 
@@ -125,8 +129,7 @@ MiniMax 流式合成也可能以 HTTP 200 返回 JSON 业务错误而不是 SSE�
 
 ## 运行时边界
 
-通道通过 `Runtime.submit_batch()` 原子提交输入批次，按 `ReplyInfo` 区分回复、运行和会话。单个 `ReplyStream` 的时间戳是请求开始前的事件循环单调时间，可供后续音频通道判断首个文本片段到达时该回复是否已经过时。通道消费文本流并返回唯一终态回执；纯工具响应不创建通道任务。SQLite 原子提交助手记录和对应的工具结果，不自动重放已中断的模型调用或外部发送。阶段一的待处理输入和工具执行不跨进程恢复。
-通道应在 Runtime 投递看门狗之前结束，并随终态回传已确认的正文前缀。看门狗到期则记为结果未知，丢弃迟到回执，不等待取消清理。
+通道每次提交输入时指定是否等待投递确认，工具续轮沿用本次运行的策略：语音等待回执，飞书文字落库后后台发送。按 `ReplyInfo` 区分回复、运行和会话；其中时间戳是模型请求开始前的事件循环单调时间。纯工具响应不投递。SQLite 原子提交助手记录和对应工具结果，不自动重放已中断的模型调用或外部发送。
 
 `delegate_subtask` 是主会话唯一注册的工具。它只返回本地受理标识，不等待任务完成。同一子会话的各次运行串行，不同子会话可并行；子会话没有工具或用户通道，只将终态结果回投主队列。仅由后台回投触发且尚未纳入新用户输入的主会话运行不能再次委派；已包含用户输入的运行不受此限。
 

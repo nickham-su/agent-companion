@@ -10,7 +10,7 @@ from pathlib import Path
 from uuid import uuid4
 
 from ..config import RuntimeSettings
-from ..protocol import (Channel, DeliveryStatus, Message, Model, ModelError, ModelEvent,
+from ..protocol import (BackgroundChannel, Channel, DeliveryStatus, Message, Model, ModelError, ModelEvent,
                         ReasoningDelta, Receipt, ReplayReady, ReplayScope, ReplyInfo, ReplyStream,
                         RequestBudget, RequestTooLarge, TextDelta, ToolCall, ToolReady, ToolSpec)
 from ..storage.sqlite import History, ReplyOutcome
@@ -20,12 +20,14 @@ from .tools import ToolContext, Tools
 
 
 _LOG = logging.getLogger(__name__)
+_DELIVERY_TIMEOUT = 120  # 无播放进展语义的回执通道（例如离线控制台）
 
 
 @dataclass(frozen=True, slots=True)
 class _InputBatch:
     messages: tuple[Message, ...]
     has_user_input: bool
+    wait_for_delivery: bool
     persisted_id: int | None = None
 
 
@@ -34,13 +36,14 @@ class Runtime:
 
     def __init__(self, session_id: str, history: History, model: Model, channel: Channel | None, *,
                  tools: Tools | None = None, settings: RuntimeSettings | None = None,
-                 thinking: bool = False, instructions: str = "") -> None:
+                 thinking: bool = False, instructions: str = "", delivery_idle_timeout: float | None = None) -> None:
         if not session_id:
             raise ValueError("session_id must be non-empty")
         self.session_id = session_id
         self.history = history
         self._model = model
         self._channel = channel
+        self._delivery_idle_timeout = delivery_idle_timeout
         self._tools = tools if tools is not None else Tools()
         self._settings = settings if settings is not None else RuntimeSettings()
         self._thinking = thinking
@@ -59,21 +62,24 @@ class Runtime:
         self._idle.set()
         self.last_failure: str | None = None
 
-    def submit_batch(self, messages: Sequence[Message]) -> None:
+    def submit_batch(self, messages: Sequence[Message], *, wait_for_delivery: bool = True) -> None:
         """在事件循环内整批追加用户输入；不阻塞当前响应。"""
-        self._submit(messages, has_user_input=True)
+        self._submit(messages, has_user_input=True, wait_for_delivery=wait_for_delivery)
 
-    def submit_subtask_result(self, message: Message) -> None:
+    def submit_subtask_result(self, message: Message, *, wait_for_delivery: bool = True) -> None:
         """后台回投也走同一个队列，但不会被当成新用户输入授权委派。"""
-        self._submit((message,), has_user_input=False)
+        self._submit((message,), has_user_input=False, wait_for_delivery=wait_for_delivery)
 
-    def _check_user_channel(self) -> None:
+    def _check_user_channel(self, wait_for_delivery: bool) -> None:
         if self._closed:
             raise RuntimeError("runtime is closed")
         if self._channel is None:
             raise RuntimeError("internal runs must be scheduled by the subtask dispatcher")
-    def _submit(self, messages: Sequence[Message], *, has_user_input: bool) -> None:
-        self._check_user_channel()
+        if not wait_for_delivery and not isinstance(self._channel, BackgroundChannel):
+            raise ValueError("channel does not support background delivery")
+
+    def _submit(self, messages: Sequence[Message], *, has_user_input: bool, wait_for_delivery: bool) -> None:
+        self._check_user_channel(wait_for_delivery)
         batch = tuple(messages)
         if not batch:
             return
@@ -81,13 +87,13 @@ class Runtime:
                or item.replay is not None
                for item in batch):
             raise ValueError("runtime inputs must be plain user messages")
-        self._enqueue(_InputBatch(batch, has_user_input))
+        self._enqueue(_InputBatch(batch, has_user_input, wait_for_delivery))
 
-    def submit_persisted_batch(self, batch_id: int) -> None:
+    def submit_persisted_batch(self, batch_id: int, *, wait_for_delivery: bool = True) -> None:
         """由持久化入口移交批次；不在安全边界之前改变模型可读历史。"""
-        self._check_user_channel()
+        self._check_user_channel(wait_for_delivery)
         if batch_id not in self._queued_inbound:
-            self._enqueue(_InputBatch((), True, batch_id))
+            self._enqueue(_InputBatch((), True, wait_for_delivery, batch_id))
             self._queued_inbound.add(batch_id)
 
     def _enqueue(self, batch: _InputBatch) -> None:
@@ -104,7 +110,7 @@ class Runtime:
         """运行独立的子会话话轮，返回失败代码；由调用方保证同会话串行。"""
         if self._closed or self._channel is not None or self._tools.specs:
             raise RuntimeError("internal runs require a runtime without a user channel or tools")
-        await self._process(_InputBatch((Message("user", prompt),), False), run_id)
+        await self._process(_InputBatch((Message("user", prompt),), has_user_input=False, wait_for_delivery=False), run_id)
         return self.last_failure
 
     def stop_accepting(self) -> None:
@@ -143,7 +149,8 @@ class Runtime:
         try:
             message_ids = self._record_input(batch)
             if message_ids:
-                await self._run(run_id, message_ids[0], has_user_input=batch.has_user_input)
+                await self._run(run_id, message_ids[0], has_user_input=batch.has_user_input,
+                                wait_for_delivery=batch.wait_for_delivery)
         except ProtectedContextTooLarge:
             self.last_failure = "protected_context_too_large"
         except ProtectedRequestTooLarge:
@@ -158,7 +165,8 @@ class Runtime:
             self.last_failure = "runtime_failed"
             _LOG.error("session runtime could not finish the current input")
 
-    async def _run(self, run_id: str, protected_from: int, *, has_user_input: bool) -> None:
+    async def _run(self, run_id: str, protected_from: int, *, has_user_input: bool,
+                   wait_for_delivery: bool) -> None:
         for index in range(self._settings.max_tool_rounds):
             try:
                 messages = await self._context.prepare(self.session_id, thinking=self._thinking,
@@ -171,7 +179,8 @@ class Runtime:
                                      else "protected_request_too_large")
                 _LOG.warning("tool continuation not sent (%s); run=%s", self.last_failure, run_id)
                 return
-            model_status, has_calls = await self._reply(run_id, messages, has_user_input=has_user_input)
+            model_status, has_calls = await self._reply(run_id, messages, has_user_input=has_user_input,
+                                                       wait_for_delivery=wait_for_delivery)
             if model_status != "complete":
                 self.last_failure = model_status
                 return
@@ -195,14 +204,36 @@ class Runtime:
                     yield event
 
     async def _reply(self, run_id: str, messages: Sequence[Message], *,
-                     has_user_input: bool) -> tuple[str, bool]:
+                     has_user_input: bool, wait_for_delivery: bool) -> tuple[str, bool]:
         loop = asyncio.get_running_loop()
         info = ReplyInfo(uuid4().hex, self.session_id, run_id, loop.time())
         text: list[str] = []
         reasoning: list[str] = []
         replay = None
         scheduled: dict[str, tuple[ToolCall, asyncio.Task[str]]] = {}
-        reply = ReplyStream(info)
+
+        def is_generated_prefix(prefix: str) -> bool:
+            offset = 0
+            for delta in text:
+                part = delta[:len(prefix) - offset]
+                if not prefix.startswith(part, offset):
+                    return False
+                offset += len(part)
+                if offset == len(prefix):
+                    return True
+            return False
+
+        validate_progress = is_generated_prefix if wait_for_delivery and self._delivery_idle_timeout is not None else None
+        reply = ReplyStream(info, validate_progress=validate_progress)
+        channel = self._channel
+
+        async def deliver() -> Receipt:
+            assert channel is not None
+            try:
+                return await channel.deliver(reply)
+            finally:
+                reply.delivery_finished_at = loop.time()
+
         delivery: asyncio.Task[Receipt] | None = None
         model_status = "complete"
         model_error = None
@@ -214,9 +245,9 @@ class Runtime:
                         async for event in events:
                             if isinstance(event, TextDelta) and event.text:
                                 text.append(event.text)
-                                if self._channel is not None:
+                                if self._channel is not None and wait_for_delivery:
                                     if delivery is None:
-                                        delivery = loop.create_task(self._channel.deliver(reply))
+                                        delivery = loop.create_task(deliver())
                                     if not delivery.done():
                                         reply.publish(event.text)
                             elif isinstance(event, ReasoningDelta) and self._thinking:
@@ -245,13 +276,15 @@ class Runtime:
                 model_status = "model_failed"
                 _LOG.error("model adapter failed")
             finally:
+                if delivery is not None:
+                    reply.start_delivery_wait(self._delivery_idle_timeout, _DELIVERY_TIMEOUT)
                 reply.close()
 
             generated = "".join(text)
             # 工具和投递一直独立运行；这个汇合点只提交成套的终态数据。
             receipt = await self._delivery_result(reply, delivery, generated)
-            # 内部会话的完成正文不对外投递，也不制造回执。
-            internal_text = generated if self._channel is None and model_status == "complete" else ""
+            # 内部会话与后台发送都只保存成功生成的全文，不制造回执。
+            generated_text = generated if not wait_for_delivery and model_status == "complete" else ""
             calls = tuple(call for call, _ in scheduled.values())
             if scheduled:
                 await asyncio.wait([task for _, task in scheduled.values()])
@@ -259,14 +292,19 @@ class Runtime:
                                  tool_call_id=call.id) for call, task in scheduled.values()]
             if model_status != "complete":
                 replay = None
-            rows = ([Message("assistant", receipt.confirmed if receipt else internal_text, calls,
+            rows = ([Message("assistant", receipt.confirmed if receipt else generated_text, calls,
                               reasoning="".join(reasoning) if model_status == "complete" and reasoning else None,
                               replay=replay),
                        *results]
-                      if receipt is not None or calls or internal_text or replay is not None else [])
+                       if receipt is not None or calls or generated_text or replay is not None else [])
             self.history.finalize_reply(
                 ReplyOutcome(info.reply_id, info.session_id, run_id, model_status,
                              receipt.status if receipt else None, model_error=model_error), rows)
+            if generated_text and isinstance(self._channel, BackgroundChannel):
+                try:
+                    self._channel.enqueue(info, generated_text)
+                except Exception:
+                    _LOG.warning("background reply could not be queued; reply=%s", info.reply_id)
             return model_status, bool(calls)
         finally:
             unfinished = [task for _, task in scheduled.values() if not task.done()]
@@ -292,16 +330,31 @@ class Runtime:
         if not task.cancelled():
             task.exception()  # 消化迟到异常；不改变已结算回复。
 
+    async def _wait_delivery(self, reply: ReplyStream, delivery: asyncio.Task[Receipt]) -> str | None:
+        """返回超时时的确认前缀；正常结束返回 None。"""
+        clock = asyncio.get_running_loop().time
+        while True:
+            now, deadline, confirmed = reply.delivery_snapshot()
+            finished = reply.delivery_finished_at
+            if delivery.done() and (now if finished is None else finished) < deadline:
+                return None
+            if now >= deadline:
+                return confirmed
+            # 设备只会延后截止；按旧截止唤醒时，重新同步取证即可。
+            await asyncio.wait((delivery,), timeout=max(0, deadline - clock()))
+
     async def _delivery_result(self, reply: ReplyStream, delivery: asyncio.Task[Receipt] | None,
                                generated: str) -> Receipt | None:
         if delivery is None:
             return None
         info = reply.info
         failed = Receipt(info.reply_id, DeliveryStatus.UNKNOWN)
-        done, _ = await asyncio.wait((delivery,), timeout=self._settings.delivery_timeout)
-        if delivery not in done:
+        timeout_prefix = await self._wait_delivery(reply, delivery)
+        if timeout_prefix is not None:
             self._abandon_delivery(reply, delivery)
-            return failed
+            if self._delivery_idle_timeout is not None:
+                _LOG.warning("reply delivery idle deadline reached; reply=%s", info.reply_id)
+            return Receipt(info.reply_id, DeliveryStatus.UNKNOWN, timeout_prefix if generated.startswith(timeout_prefix) else "")
         if delivery.cancelled():
             return failed
         try:
