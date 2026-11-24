@@ -377,6 +377,7 @@ class IncomingCallTests(unittest.IsolatedAsyncioTestCase):
             await asyncio.sleep(0.03)
             self.assertFalse(self.asrs[0].files)
             self.assertFalse(tts.calls)
+            self.assertFalse(self.runner.posts)
             self.desktop.connect(101)
             await asyncio.sleep(0.025)
             _talk(device)
@@ -389,6 +390,9 @@ class IncomingCallTests(unittest.IsolatedAsyncioTestCase):
             await _eventually(lambda: len(self.runner.sent[_CHATS[0]]) == 2)
             self.assertEqual(self.runner.sent[_CHATS[0]][1], "通话中发文字。")
             self.assertEqual(tts.calls[-1], ("通话中发文字。", 16000))
+            self.assertEqual(dict(self.runner.posts), {_CHATS[0]: [{"zh_cn": {"content": [[
+                {"tag": "text", "text": "测试语音1", "style": ["bold"]}
+            ]]}}]})
             self.assertEqual(agents.call_count, 1)
             self.assertEqual(self.runner.lookups, 1)
             self.assertEqual([row.message.content for row in history.tail(_session(sender), 10)],
@@ -695,6 +699,10 @@ class IncomingCallTests(unittest.IsolatedAsyncioTestCase):
             await asyncio.wait_for(next_sample.wait(), 2)
             self.assertEqual(pulled, [bytes(64)])
             await _eventually(lambda: device.closed)
+            self.assertEqual(self.runner.sent[_CHATS[0]], [])  # voice_text_copy=False 不发送模型副本。
+            self.assertEqual(self.runner.posts[_CHATS[0]], [{"zh_cn": {"content": [[
+                {"tag": "text", "text": "测试语音1", "style": ["bold"]}
+            ]]}}])
 
     async def test_window_errors_and_verified_route_revocation(self):
         async with self._serve(_Echo()) as (_, agents):
@@ -1028,10 +1036,14 @@ class IncomingCallTests(unittest.IsolatedAsyncioTestCase):
                 old_stop()
                 await asyncio.sleep(0)
                 self.assertEqual(model.calls, [("挂断前补充",)])
+                self.assertFalse(self.runner.posts)
                 new.release.set()
                 await _eventually(lambda: any(self.devices[1].pull(32)))
                 await _eventually(lambda: self.runner.sent[_CHATS[0]] == ["挂断前补充。", "新通转写。"])
                 self.assertEqual(model.calls[-1], ("挂断前补充", "新通补充", "新通转写"))
+                self.assertEqual(dict(self.runner.posts), {_CHATS[0]: [{"zh_cn": {"content": [[
+                    {"tag": "text", "text": "新通转写", "style": ["bold"]}
+                ]]}}]})
 
     async def test_voice_selected_at_first_handoff_cannot_fall_back_before_player_runs(self):
         model, tts = _Echo(), _TTS()
@@ -1127,6 +1139,7 @@ class IncomingCallTests(unittest.IsolatedAsyncioTestCase):
             await _eventually(lambda: self.runner.sent[_CHATS[0]] == ["挂断前补充。"])
             self.assertTrue(binding.closed)
             self.assertFalse(resume.is_set())
+            self.assertFalse(self.runner.posts)
             self.assertEqual(model.calls, [("挂断前补充",)])
 
     async def test_capped_turn_holds_feishu_and_internal_input_until_silence(self):

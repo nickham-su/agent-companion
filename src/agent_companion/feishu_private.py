@@ -102,9 +102,12 @@ class _Route:
         return True
 
     def call_input(self, stop: Callable[[], None], text: str | None, input_active: bool | None) -> None:
-        if self._scheduler is not None:
-            items = (Message("user", text),) if text else ()
-            self._scheduler.call_input(stop, items, input_active=input_active)
+        scheduler = self._scheduler
+        if self._closed or self._stop_call != stop or scheduler is None:
+            return
+        items = (Message("user", text),) if text else ()
+        if scheduler.call_input(stop, items, input_active=input_active) and text:
+            self._channel.enqueue_transcript(text)
 
     def call_ended(self, stop: Callable[[], None]) -> None:
         if self._stop_call != stop:

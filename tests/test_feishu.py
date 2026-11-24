@@ -59,6 +59,8 @@ class _Runner:
         self.pages = {None: {"items": [], "has_more": False}}
         self.calls = []
         self.sent = []
+        self.posts = []
+        self.transcript_sent = asyncio.Event()
         self.files = {"img_a": _PNG, "file_a": _wave()}
         self.notice_entered = asyncio.Event()
         self.release_notice = asyncio.Event()
@@ -78,7 +80,13 @@ class _Runner:
                 target.write_bytes(blob)
                 return _success({"saved_path": "ignored", "size_bytes": len(blob)})
             return _failure("api", 230026)
-        text = json.loads(json.loads(data)["content"])["text"]
+        payload = json.loads(data)
+        content = json.loads(payload["content"])
+        if payload["msg_type"] == "post":
+            self.posts.append(content)
+            self.transcript_sent.set()
+            return self.send_result
+        text = content["text"]
         self.sent.append(text)
         if text == _NOTICE:
             self.notice_entered.set()
@@ -145,6 +153,34 @@ class FeishuCLITests(unittest.IsolatedAsyncioTestCase):
         body = json.loads(stdin)
         self.assertEqual((body["receive_id"], body["msg_type"], json.loads(body["content"])),
                           (_CHAT, "text", {"text": text}))
+
+    async def test_transcript_uses_literal_bold_post_in_stdin(self):
+        calls = []
+
+        async def runner(argv, stdin, timeout):
+            calls.append((argv, stdin))
+            return _success({"message_id": "om_post", "chat_id": _CHAT})
+
+        cli = FeishuCLI("lark-cli", _CHAT, timeout=2, runner=runner)
+        text = '  多行 "hello" &amp; **注意**\r\n<at>\\路径\n🙂\n'
+        payload = cli.prepare_transcript(text)
+        assert payload is not None
+        self.assertEqual(await cli.send_prepared_transcript(payload), DeliveryStatus.FULL)
+        (argv, stdin), = calls
+        self.assertIs(stdin, payload)
+        self.assertEqual(argv, ("lark-cli", "api", "POST", "/open-apis/im/v1/messages", "--params",
+                                '{"receive_id_type":"chat_id"}', "--data", "-", "--as", "user", "--format", "json"))
+        body = json.loads(stdin)
+        self.assertEqual((body["receive_id"], body["msg_type"], json.loads(body["content"])),
+                         (_CHAT, "post", {"zh_cn": {"content": [[{"tag": "text", "text": text, "style": ["bold"]}]]}}))
+
+    def test_transcript_preparation_rejects_invalid_encoding_or_oversized_post(self):
+        runner = _Runner()
+        cli = FeishuCLI("lark-cli", _CHAT, timeout=2, runner=runner)
+        for text in ("\ud800", "字" * 10_000, '"' * 10_000, "a" * 30_001):
+            with self.subTest(length=len(text)):
+                self.assertIsNone(cli.prepare_transcript(text))
+        self.assertEqual(runner.calls, [])
 
     async def test_list_page_size_bounds(self):
         runner = _Runner()
@@ -258,6 +294,96 @@ print(json.dumps({"ok": True, "identity": "user", "data": {"size_bytes": peak}})
 
 
 class FeishuBackgroundDeliveryTests(unittest.IsolatedAsyncioTestCase):
+    async def test_rejected_transcripts_do_not_take_queue_slots(self):
+        for reason, invalid in (("多字节超限", "字" * 10_000), ("转义超限", '"' * 10_000),
+                                ("无效编码", "\ud800")):
+            with self.subTest(reason=reason):
+                runner = _Runner()
+                channel = FeishuChannel(FeishuCLI("lark-cli", _CHAT, timeout=2, runner=runner))
+                self.addAsyncCleanup(channel.close)
+                with self.assertLogs("agent_companion.channels.feishu.channel", level="WARNING") as logs:
+                    for _ in range(8):
+                        channel.enqueue_transcript(invalid)
+                    channel.enqueue_transcript("有效短转写")
+                    self.assertEqual(runner.calls, [])  # 没有让出事件循环，发送只能在后台发生。
+                    await asyncio.sleep(0)
+                self.assertEqual(runner.posts, [{"zh_cn": {"content": [[
+                    {"tag": "text", "text": "有效短转写", "style": ["bold"]}
+                ]]}}])
+                self.assertEqual(len(runner.calls), 1)
+                self.assertEqual([record.getMessage() for record in logs.records],
+                                 ["Feishu transcript dropped (invalid_payload)"] * 8)
+
+    async def test_transcript_backlog_does_not_block_model_reply_and_sends_fifo_without_retry(self):
+        first_started, release_first, reply_sent, last_started = (asyncio.Event() for _ in range(4))
+        attempts = []
+
+        async def runner(argv, data, timeout):
+            payload = json.loads(data)
+            content = json.loads(payload["content"])
+            if payload["msg_type"] == "text":
+                self.assertEqual(content, {"text": "模拟回复"})
+                reply_sent.set()
+            else:
+                text = content["zh_cn"]["content"][0][0]["text"]
+                attempts.append(text)
+                if text == "转写 0":
+                    first_started.set()
+                    await release_first.wait()
+                    raise RuntimeError("synthetic raw diagnostic")
+                if text == "转写 1":
+                    raise CliError("cli_timeout")
+                if text == "转写 8":
+                    last_started.set()
+            return _success({"message_id": "om_reply"})
+
+        model = _Model()
+        channel = FeishuChannel(FeishuCLI("lark-cli", _CHAT, timeout=2, runner=runner))
+        self.addAsyncCleanup(channel.close)
+        with closing(History(":memory:")) as history:
+            async with running_agent(Settings(), history, model, channel, session_id="main") as (main, _):
+                channel.enqueue_transcript("转写 0")
+                await asyncio.wait_for(first_started.wait(), 1)
+                with self.assertLogs("agent_companion.channels.feishu.channel", level="WARNING") as logs:
+                    for i in range(1, 10):
+                        channel.enqueue_transcript(f"转写 {i}")
+                    main.submit_batch([Message("user", "文字纠正")])
+                    await asyncio.wait_for(reply_sent.wait(), 1)
+                    self.assertEqual(attempts, ["转写 0"])
+                    self.assertEqual(model.calls[0][-1], Message("user", "文字纠正"))
+                    self.assertEqual([(row.message.role, row.message.content) for row in history.read_after("main")],
+                                     [("user", "文字纠正"), ("assistant", "模拟回复")])
+                    release_first.set()
+                    await asyncio.wait_for(last_started.wait(), 1)
+                self.assertEqual(attempts, [f"转写 {i}" for i in range(9)])
+                self.assertEqual(len(logs.output), 3)
+                self.assertIn("queue_full", logs.output[0])
+                self.assertIn("status=unknown", logs.output[2])
+                self.assertNotIn("转写", "".join(logs.output))
+                self.assertNotIn("synthetic raw diagnostic", "".join(logs.output))
+
+    async def test_close_cancels_inflight_transcript_and_discards_waiting_transcripts(self):
+        started, cancelled = asyncio.Event(), asyncio.Event()
+        calls = []
+
+        async def runner(argv, data, timeout):
+            calls.append(json.loads(json.loads(data)["content"]))
+            started.set()
+            try:
+                await asyncio.Event().wait()
+            finally:
+                cancelled.set()
+
+        channel = FeishuChannel(FeishuCLI("lark-cli", _CHAT, timeout=2, runner=runner))
+        self.addAsyncCleanup(channel.close)
+        channel.enqueue_transcript("发送中")
+        await asyncio.wait_for(started.wait(), 1)
+        channel.enqueue_transcript("待发")
+        await asyncio.wait_for(channel.close(), 1)
+        channel.enqueue_transcript("已经关闭")
+        self.assertTrue(cancelled.is_set())
+        self.assertEqual(len(calls), 1)
+
     async def test_slow_cli_does_not_block_runtime_fifo_or_later_sends_after_failures(self):
         first_started, release_first, finished = (asyncio.Event() for _ in range(3))
         sent, committed_before_send = [], []
@@ -574,13 +700,22 @@ class FeishuPollingTests(unittest.IsolatedAsyncioTestCase):
                 poller = _poller(history, submit, cli, asr, clock)
                 await poller.poll_once()
                 clock[0] = 110
-                polling = asyncio.create_task(poller.poll_once())
-                await asyncio.wait_for(asr.entered.wait(), 1)
-                self.assertEqual(model.calls, [])
-                self.assertEqual(history.tail("main", 20), [])
-                asr.release.set()
-                await polling
+                with patch.object(history, "record_inbound", side_effect=sqlite3.OperationalError("database is locked")):
+                    polling = asyncio.create_task(poller.poll_once())
+                    await asyncio.wait_for(asr.entered.wait(), 1)
+                    self.assertEqual(model.calls, [])
+                    self.assertEqual(history.tail("main", 20), [])
+                    self.assertEqual(runner.posts, [])
+                    asr.release.set()
+                    with self.assertRaisesRegex(sqlite3.OperationalError, "database is locked"):
+                        await polling
+                self.assertEqual(runner.posts, [])
+                await poller.poll_once()
+                await asyncio.wait_for(runner.transcript_sent.wait(), 1)
                 await main.wait_idle()
+                self.assertEqual(runner.posts, [{"zh_cn": {"content": [[
+                    {"tag": "text", "text": "模拟转写", "style": ["bold"]}
+                ]]}}])
                 self.assertEqual(asr.calls, 1)
                 self.assertEqual(len(model.calls), 1)
                 text, voice, post, image = model.calls[0][-4:]
@@ -589,10 +724,15 @@ class FeishuPollingTests(unittest.IsolatedAsyncioTestCase):
                                                 Text("后 (https://example.invalid/link)"), Text("\n"), Text("次行")))
                 self.assertIsInstance(image.content[0], Image)
                 self.assertEqual(b64decode(image.content[0].url.split(",", 1)[1]), _PNG)
+                # 模拟下一轮列表读到自己刚发送的回显，既不能喂给模型也不能再发。
+                runner.pages["next"]["items"].append(_raw("om_echo", 108_000, "post", runner.posts[0], sender=_SELF))
                 clock[0] = 120
                 await poller.poll_once()
                 await main.wait_idle()
                 self.assertEqual((len(model.calls), asr.calls), (1, 1))
+                self.assertEqual(len(runner.posts), 1)
+                self.assertFalse(history.inbound_seen("main", "feishu-private", "om_echo"))
+                self.assertEqual([row.message.content for row in history.tail("main", 20)].count("模拟转写"), 1)
                 self.assertEqual(runner.sent, ["模拟回复"])
                 await poller.close()
 
@@ -628,6 +768,7 @@ class FeishuPollingTests(unittest.IsolatedAsyncioTestCase):
                     await poller.poll_once()
                     await asyncio.sleep(0)
                     self.assertEqual((runner.sent, asr.calls, len(accepted)), ([_NOTICE], 1, 1))
+                    self.assertEqual(runner.posts, [])
                     await poller.close()
 
     async def test_failed_page_does_not_advance_window_or_publish(self):

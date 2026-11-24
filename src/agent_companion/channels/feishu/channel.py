@@ -1,4 +1,4 @@
-"""飞书私聊按时间窗口轮询，文字回复和通知独立发送。"""
+"""飞书私聊按时间窗口轮询，文字回复、转写回显和通知独立发送。"""
 
 import asyncio
 from collections import deque
@@ -24,6 +24,7 @@ _MAX_WINDOW_MESSAGES = 20_000
 _MAX_WINDOW_RAW_BYTES = 32 * 1024 * 1024
 _VOICE_FAILURE = "语音接收失败，请重新发送。"
 _MAX_PENDING_REPLIES = 8
+_MAX_PENDING_TRANSCRIPTS = 8
 
 
 class FeishuChannel:
@@ -33,6 +34,8 @@ class FeishuChannel:
         self._select_voice = select_voice
         self._pending: deque[tuple[str, str]] = deque()
         self._sender: asyncio.Task[None] | None = None
+        self._transcripts: deque[bytes] = deque()
+        self._transcript_sender: asyncio.Task[None] | None = None
         self._closed = False
 
     def select_delivery(self, reply: ReplyStream) -> ReplyDelivery:
@@ -81,6 +84,34 @@ class FeishuChannel:
         finally:
             self._sender = None
 
+    def enqueue_transcript(self, text: str) -> None:
+        """回显已接收的转写，不等待发送，也不占用模型回复队列。"""
+        if self._closed:
+            return
+        if len(self._transcripts) >= _MAX_PENDING_TRANSCRIPTS:
+            _LOG.warning("Feishu transcript dropped (queue_full)")
+            return
+        payload = self._cli.prepare_transcript(text)
+        if payload is None:
+            _LOG.warning("Feishu transcript dropped (invalid_payload)")
+            return
+        self._transcripts.append(payload)
+        if self._transcript_sender is None:
+            self._transcript_sender = asyncio.create_task(self._send_transcripts())
+
+    async def _send_transcripts(self) -> None:
+        try:
+            while not self._closed and self._transcripts:
+                payload = self._transcripts.popleft()
+                try:
+                    status = await self._cli.send_prepared_transcript(payload)
+                    if status != DeliveryStatus.FULL:
+                        _LOG.warning("Feishu transcript send not confirmed; status=%s", status)
+                except Exception:
+                    _LOG.warning("Feishu transcript send failed")
+        finally:
+            self._transcript_sender = None
+
     def stop_accepting(self) -> None:
         """在让出事件循环前关停发送入口和在途任务。"""
         if self._closed:
@@ -91,13 +122,19 @@ class FeishuChannel:
             self._pending.clear()
         if self._sender is not None:
             self._sender.cancel()
+        if self._transcripts:
+            _LOG.warning("Feishu transcripts dropped at shutdown; count=%d", len(self._transcripts))
+            self._transcripts.clear()
+        if self._transcript_sender is not None:
+            self._transcript_sender.cancel()
 
     async def close(self) -> None:
         self.stop_accepting()
-        sender = self._sender
-        if sender is not None:
-            await asyncio.gather(sender, return_exceptions=True)
-            self._sender = None
+        senders = tuple(task for task in (self._sender, self._transcript_sender) if task is not None)
+        if senders:
+            await asyncio.gather(*senders, return_exceptions=True)
+        self._sender = None
+        self._transcript_sender = None
 
     async def notify_audio_failure(self) -> None:
         if self._closed:
@@ -255,6 +292,10 @@ class FeishuPoller:
                            len(normalized_items), accepted, len(failed_audio),
                            (asyncio.get_running_loop().time() - started) * 1000)
             self._window = None
+            for message_id, message in normalized_items:
+                if (message_id in recorded and window.messages[message_id].kind == "audio"
+                        and message is not None and isinstance(message.content, str)):
+                    self._channel.enqueue_transcript(message.content)
             try:
                 await self._submit_pending()
             finally:

@@ -23,6 +23,7 @@ MAX_PAGE_SIZE = 50
 _JSON_LIMIT = 4 * 1024 * 1024
 _ERROR_LIMIT = 64 * 1024
 _TEXT_LIMIT = 150_000
+_POST_LIMIT = 30_000
 _FILE_LIMIT_ENTRY = Path(__file__).with_name("_file_limit.py")
 # 飞书登录会话由 CLI 自行管理；不把 Agent 的模型凭据交给 CLI 子进程。
 _CLI_ENV = ("PATH", "HOME", "LANG", "LC_ALL", "LC_CTYPE", "TMPDIR", "XDG_CONFIG_HOME",
@@ -132,8 +133,8 @@ async def run_command(argv: tuple[str, ...], data: bytes | None, timeout: float)
                 await protocol.done
 
 
-def _json_bytes(value: dict) -> bytes:
-    return json.dumps(value, ensure_ascii=True, separators=(",", ":")).encode("ascii")
+def _json_bytes(value: dict, *, ensure_ascii: bool = True) -> bytes:
+    return json.dumps(value, ensure_ascii=ensure_ascii, separators=(",", ":")).encode("utf-8")
 
 
 def _check_exit(result: CommandResult) -> None:
@@ -351,6 +352,26 @@ class FeishuCLI(_UserCLI):
         if oversized:
             return DeliveryStatus.FAILED
         payload = _json_bytes({"receive_id": self._chat_id, "msg_type": "text", "content": content})
+        return await self._send_message(payload)
+
+    def prepare_transcript(self, text: str) -> bytes | None:
+        """将正文作为字面富文本编码，并按最终发送的请求大小校验。"""
+        if len(text) > _POST_LIMIT:
+            return None
+        content = json.dumps({"zh_cn": {"content": [[{"tag": "text", "text": text, "style": ["bold"]}]]}},
+                             ensure_ascii=False, separators=(",", ":"))
+        try:
+            payload = _json_bytes({"receive_id": self._chat_id, "msg_type": "post", "content": content},
+                                  ensure_ascii=False)
+        except UnicodeError:
+            return None
+        return payload if len(payload) <= _POST_LIMIT else None
+
+    async def send_prepared_transcript(self, payload: bytes) -> DeliveryStatus:
+        """直接发送已校验的回显请求，不重复编码。"""
+        return await self._send_message(payload)
+
+    async def _send_message(self, payload: bytes) -> DeliveryStatus:
         try:
             result = await self._run(("api", "POST", _MESSAGES, "--params", '{"receive_id_type":"chat_id"}',
                                       "--data", "-"), data=payload)

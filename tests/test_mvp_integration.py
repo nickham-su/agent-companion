@@ -59,6 +59,7 @@ class _CLITransport:
         self.first_tick = asyncio.Event()
         self.inbox = []
         self.sends = []
+        self.posts = []
         self.meeting_lookups = []
 
     def clock(self):
@@ -96,8 +97,13 @@ class _CLITransport:
             return _success({"items": items, "has_more": False})
         assert argv[1:3] == ("api", "POST")
         payload = json.loads(data)
-        assert payload["receive_id"] == _CHAT and payload["msg_type"] == "text"
-        text = json.loads(payload["content"])["text"]
+        assert payload["receive_id"] == _CHAT
+        content = json.loads(payload["content"])
+        if payload["msg_type"] == "post":
+            self.posts.append(content)
+            return _success({"message_id": f"om_post_{len(self.posts)}", "chat_id": _CHAT})
+        assert payload["msg_type"] == "text"
+        text = content["text"]
         self.sends.append(text)
         if text == _FAILED:
             return CommandResult(1, b"", b'{"ok":false,"error":{"type":"authorization"}}')
@@ -371,6 +377,10 @@ class MVPIntegrationTest(unittest.IsolatedAsyncioTestCase):
                 while len(transport.sends) < 6:
                     await asyncio.sleep(0.002)
                 self.assertEqual(transport.sends, [_ACCEPTED, _RETURNED, _FAILED, _UNKNOWN, prefix, _NEW_VOICE])
+                self.assertEqual(transport.posts, [
+                    {"zh_cn": {"content": [[{"tag": "text", "text": text, "style": ["bold"]}]]}}
+                    for text in (_OLD_INPUT, _ASR_TEXT)
+                ])
                 tts.new_buffered.clear()
                 transport.push(_TEXT_IN_CALL)
                 await tts.new_buffered.wait()

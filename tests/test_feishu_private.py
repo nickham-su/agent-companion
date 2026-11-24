@@ -49,6 +49,7 @@ class _Runner:
         self.windows = defaultdict(list)
         self.fail = set()
         self.sent = defaultdict(list)
+        self.posts = defaultdict(list)
         self.hold_sends = False
         self.hold_destinations = set()
         self.closed_sends = set()
@@ -84,7 +85,12 @@ class _Runner:
         elif op == ("api", "POST", "/open-apis/im/v1/messages"):
             msg = json.loads(data)
             chat = msg["receive_id"]
-            self.sent[chat].append(json.loads(msg["content"])["text"])
+            content = json.loads(msg["content"])
+            if msg["msg_type"] == "post":
+                self.posts[chat].append(content)
+                return CommandResult(0, json.dumps({"ok": True, "identity": "user", "data": {
+                    "chat_id": chat, "message_id": "om_post"}}).encode(), b"")
+            self.sent[chat].append(content["text"])
             if self.hold_sends or chat in self.hold_destinations:
                 try:
                     await asyncio.Event().wait()

@@ -96,9 +96,12 @@ class SessionScheduler:
         self._call = stop
 
     def call_input(self, stop: Callable[[], None], items: Sequence[InputItem], *,
-                   input_active: bool | None) -> None:
-        if self._call == stop:
-            self.session_input(items, input_active=input_active)
+                   input_active: bool | None) -> bool:
+        """返回本通输入是否被接收（也可能暂存在队列中）。"""
+        if self._call != stop:
+            return False
+        self.session_input(items, input_active=input_active)
+        return True
 
     def call_ended(self, stop: Callable[[], None]) -> None:
         if self._call == stop:
