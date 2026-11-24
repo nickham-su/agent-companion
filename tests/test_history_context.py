@@ -14,7 +14,7 @@ from agent_companion.protocol import (DeliveryStatus, Image, InputUsage, Message
 from agent_companion.runtime.context import _SUMMARIZE
 from agent_companion.runtime.engine import Runtime
 from agent_companion.runtime.tools import Tool, Tools
-from agent_companion.storage.sqlite import History, ReplyOutcome, Summary
+from agent_companion.storage.sqlite import DatabaseFormatError, FeishuBindingError, History, ReplyOutcome, Summary
 
 
 SPEC = ToolSpec("test", "test tool", {"type": "object"})
@@ -96,21 +96,46 @@ class HistoryTest(unittest.TestCase):
             assistant_id = db.read_after("main")[1].message_id
             self.assertEqual(db.outcomes("main"), [replace(outcome, assistant_message_id=assistant_id)])
 
-    def test_additive_migration_keeps_old_outcomes_and_links_new_replies(self):
+    def test_rejects_legacy_and_unsupported_databases_without_changes(self):
         with tempfile.TemporaryDirectory(dir=Path.cwd()) as folder:
-            path = Path(folder) / "legacy.sqlite"
-            with closing(sqlite3.connect(path)) as legacy, legacy:
-                legacy.execute("CREATE TABLE reply_outcomes (reply_id TEXT PRIMARY KEY, session_id TEXT NOT NULL,"
-                               " run_id TEXT NOT NULL, model_status TEXT NOT NULL, delivery_status TEXT)")
-                legacy.execute("INSERT INTO reply_outcomes VALUES ('old', 'main', 'run', 'complete', 'full')")
-            with closing(History(path)) as db:
+            legacy = Path(folder) / "legacy.sqlite"
+            future = Path(folder) / "future.sqlite"
+            with closing(sqlite3.connect(legacy)) as db, db:
+                db.execute("CREATE TABLE feishu_private_account (singleton INTEGER PRIMARY KEY,"
+                           " owner_fingerprint TEXT NOT NULL, started_ms INTEGER NOT NULL)")
+                db.execute("INSERT INTO feishu_private_account VALUES (1, 'owner', 0)")
+                db.execute("CREATE TABLE messages (content TEXT NOT NULL)")
+                db.execute("INSERT INTO messages VALUES ('old history')")
+            with closing(sqlite3.connect(future)) as db, db:
+                db.execute("PRAGMA user_version = 999")
+
+            for path in (legacy, future):
+                with self.subTest(path=path.name):
+                    before = path.read_bytes()
+                    with self.assertRaisesRegex(DatabaseFormatError, "请保留原库并配置新的数据库路径"):
+                        History(path, feishu_private_owner="owner")
+                    self.assertEqual(path.read_bytes(), before)
+
+    def test_empty_database_initializes_and_keeps_reply_outcomes_on_reopen(self):
+        with tempfile.TemporaryDirectory(dir=Path.cwd()) as folder:
+            path = Path(folder) / "current.sqlite"
+            path.touch()
+            with closing(History(path, feishu_private_owner="owner")) as db:
+                self.assertIsNone(db.check_feishu_private("owner"))
+                db.bind_feishu_private("owner", started_ms=1)
+                db.finalize_reply(ReplyOutcome("old", "main", "run", "complete", DeliveryStatus.FULL), [])
                 self.assertIsNone(db.last_input_tokens("main"))
                 db.finalize_reply(ReplyOutcome("new", "main", "run", "complete", DeliveryStatus.FULL,
                                                input_tokens=42),
                                   [Message("assistant", "new body")])
                 db.finalize_reply(ReplyOutcome("empty", "main", "run", "model_failed"), [])
                 expected_id = db.tail("main", 1)[0].message_id
-            with closing(History(path)) as db:
+            before = path.read_bytes()
+            with self.assertRaises(FeishuBindingError):
+                History(path, feishu_private_owner="other owner")
+            self.assertEqual(path.read_bytes(), before)
+            with closing(History(path, feishu_private_owner="owner")) as db:
+                self.assertEqual(db.check_feishu_private("owner"), 1)
                 outcomes = db.outcomes("main")
                 self.assertEqual(outcomes[0], ReplyOutcome("old", "main", "run", "complete", DeliveryStatus.FULL))
                 self.assertEqual(outcomes[1].assistant_message_id, expected_id)

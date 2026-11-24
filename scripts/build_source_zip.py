@@ -13,8 +13,11 @@ DESIGN = Path("docs/design/0001-MVP方案")
 FILES = (
     Path("README.md"),
     Path("config.example.toml"),
+    Path("agents/main.example.md"),
+    Path("agents/sub.example.md"),
     Path("pyproject.toml"),
     Path("scripts/build_source_zip.py"),
+    Path("tests/feishu_test_support.py"),
     Path("docs/acceptance/mac-checklist.md"),
     Path("docs/acceptance/offline-results.md"),
     DESIGN / "飞书多模态 Agent 首版架构方案.md",

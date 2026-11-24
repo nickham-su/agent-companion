@@ -80,38 +80,42 @@ class PersistedInput:
     batch_id: int
 
 
-ASYNC_TOOL_RESULT_PREFIX = "[内部子任务结果]\n"
+AGENT_REPLY_PREFIX = "[内部子任务结果]\n"
 
 
 @dataclass(frozen=True, slots=True)
-class AsyncToolResult:
-    """已结束的异步工具任务；不是原调用的第二条 tool 消息。"""
+class DelegationTask:
+    """已受理的父级委派；正文角色与可信来源分别处理。"""
 
-    tool_call_id: str
-    result: str | None = field(default=None, repr=False)
-    error: str | None = None
-    tool_name: str | None = None
-    child_session_id: str | None = None
-    run_id: str | None = None
-
-    def __post_init__(self) -> None:
-        if not self.tool_call_id or (self.result is None) == (self.error is None):
-            raise ValueError("async tool result requires a call ID and exactly one result or error")
+    delegation_id: str
+    prompt: str = field(repr=False)
 
     def to_model_message(self) -> Message:
-        fields = {
-            "tool_call_id": self.tool_call_id,
-            "tool_name": self.tool_name,
-            "child_session_id": self.child_session_id,
-            "run_id": self.run_id,
-        }
-        payload = {key: value for key, value in fields.items() if value is not None}
+        return Message("user", self.prompt)
+
+
+@dataclass(frozen=True, slots=True)
+class AgentReply:
+    """直属子 Agent 的整轮回复，不是原委派调用的第二条工具消息。"""
+
+    agent_id: str
+    run_id: str
+    delegation_ids: tuple[str, ...] = ()
+    result: str | None = field(default=None, repr=False)
+    error: str | None = None
+
+    def __post_init__(self) -> None:
+        if not self.agent_id or not self.run_id or (self.result is None) == (self.error is None):
+            raise ValueError("agent reply requires source IDs and exactly one result or error")
+
+    def to_model_message(self) -> Message:
+        payload = {"agent_id": self.agent_id, "run_id": self.run_id, "delegation_ids": self.delegation_ids}
         if self.error is not None:
             payload.update(status="failed", error=self.error)
         else:
-            assert self.result is not None
             payload.update(status="completed", result=self.result)
-        return Message("user", ASYNC_TOOL_RESULT_PREFIX + json.dumps(payload, ensure_ascii=False))
+        content = json.dumps(payload, ensure_ascii=False).encode("utf-8", "backslashreplace").decode("utf-8")
+        return Message("user", AGENT_REPLY_PREFIX + content)
 
 
 TIMER_EVENT_PREFIX = "[内部定时器事件]\n"
@@ -151,7 +155,7 @@ class TimerFired:
 class InternalInput:
     """可进入模型上下文，但不授予用户输入权限。"""
 
-    content: Message | AsyncToolResult | TimerFired = field(repr=False)
+    content: Message | AgentReply | DelegationTask | TimerFired = field(repr=False)
 
     def to_model_message(self) -> Message:
         return self.content if isinstance(self.content, Message) else self.content.to_model_message()
@@ -169,7 +173,7 @@ def validate_input_items(items: Sequence[InputItem]) -> None:
                 raise ValueError("persisted input requires an integer batch ID")
             continue
         message = item.content if isinstance(item, InternalInput) else item
-        if isinstance(item, InternalInput) and isinstance(message, (AsyncToolResult, TimerFired)):
+        if isinstance(item, InternalInput) and isinstance(message, (AgentReply, DelegationTask, TimerFired)):
             continue
         if (not isinstance(message, Message) or message.role != "user" or message.tool_calls
                 or message.tool_call_id is not None or message.reasoning is not None

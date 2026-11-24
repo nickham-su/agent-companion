@@ -1,15 +1,12 @@
 """按完整工具组规划模型投影，以及增量摘要。"""
 
-import asyncio
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, replace
-from pathlib import Path
 
 from ..config import RuntimeSettings
 from ..protocol import Message, ModelError, Part, ReplayScope, Text, ToolSpec
 from ..storage.sqlite import History, HistoryEntry, Summary, SummaryWriteError
 from .compaction import Compactions, Prefix
-from .instructions import read_agents
 from .sqlite_access import SQLiteAccess
 
 
@@ -114,24 +111,17 @@ def _checked_blocks(summary: Summary | None, entries: Sequence[HistoryEntry], *,
 
 class Context:
     def __init__(self, history: History, settings: RuntimeSettings, compactions: Compactions,
-                 replay_scope: ReplayScope | None = None, *, agents_path: Path, sqlite: SQLiteAccess) -> None:
+                 replay_scope: ReplayScope | None = None, *, sqlite: SQLiteAccess) -> None:
         self._history = history
         self._settings = settings
         self._compactions = compactions
         self._replay_scope = replay_scope
         self._sqlite = sqlite
-        self._agents_path = agents_path
-
-    async def _system_messages(self, instructions: str) -> list[Message]:
-        agents = await asyncio.to_thread(read_agents, self._agents_path)
-        if agents:
-            instructions = f"{instructions}\n\n{agents}" if instructions else agents
-        return [Message("system", instructions)] if instructions else []
 
     async def prepare(self, session_id: str, *, thinking: bool, tools: Sequence[ToolSpec], protected_from: int,
-                      can_send: Callable[[], bool], instructions: str = "",
+                      can_send: Callable[[], bool], instructions: str | None = None,
                       last_input_tokens: int | None = None) -> list[Message] | None:
-        fixed = await self._system_messages(instructions)
+        fixed = [Message("system", instructions)] if instructions is not None else []
         summary, entries = await self._sqlite(self._history.context_snapshot, session_id,
                                               replay_scope=self._replay_scope)
         if not can_send():
@@ -141,7 +131,7 @@ class Context:
         blocks, protected = _checked_blocks(summary, entries, protected_from=protected_from,
                                             keep_reasoning=keep_reasoning)
 
-        # 读取可能等锁或等文件；只有收口且通过路由核对后才进入同步写入/发包边界。
+        # 读取可能等锁；只有收口且通过路由核对后才进入同步写入/发包边界。
         ready = self._compactions.ready(session_id, covered)
         if ready is not None:
             prefix, candidate = ready

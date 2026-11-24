@@ -15,9 +15,9 @@ from agent_companion.app import private_feishu_identity, run_feishu, running_age
 from agent_companion.channels.feishu.cli import CliError, CommandResult, FeishuDiscovery
 from agent_companion.config import (ASRSettings, ConfigError, FeishuSettings, LLMSettings, MiniMaxConnection, Settings,
                                     load_settings)
-from agent_companion.protocol import Message, TextDelta, ToolCall, ToolReady
-from agent_companion.runtime.subtasks import DELEGATE_TOOL_NAME, RESULT_PREFIX, Subtasks
-from agent_companion.storage.sqlite import FeishuBindingError, History, is_sqlite_lock_error
+from agent_companion.protocol import AGENT_REPLY_PREFIX, Message, TextDelta, ToolCall, ToolReady
+from agent_companion.runtime.subtasks import AgentTree, DELEGATE_TOOL_NAME, demo_roles
+from agent_companion.storage.sqlite import AgentReplyInput, DelegatedInput, FeishuBindingError, History, is_sqlite_lock_error
 
 
 _OWN = "ou_private_service"
@@ -120,10 +120,10 @@ class _Model:
             self.a_waiting.set()
             await self.release_a.wait()
         if last.content == "first B" and tools:
-            yield ToolReady(ToolCall("delegate_b", DELEGATE_TOOL_NAME, '{"prompt":"child B"}'))
+            yield ToolReady(ToolCall("delegate_b", DELEGATE_TOOL_NAME, '{"agent":"general","prompt":"child B"}'))
         elif last.role == "tool":
             yield TextDelta("delegated B")
-        elif isinstance(last.content, str) and last.content.startswith(RESULT_PREFIX):
+        elif isinstance(last.content, str) and last.content.startswith(AGENT_REPLY_PREFIX):
             yield TextDelta("returned B")
         else:
             yield TextDelta("reply: " + last.content)
@@ -139,7 +139,7 @@ class _SlowRetiringChild(_Model):
     async def stream(self, messages, tools, *, thinking):
         last = messages[-1]
         if tools and last.content == "delegate slow A":
-            yield ToolReady(ToolCall("slow-child-a", DELEGATE_TOOL_NAME, '{"prompt":"slow child A"}'))
+            yield ToolReady(ToolCall("slow-child-a", DELEGATE_TOOL_NAME, '{"agent":"general","prompt":"slow child A"}'))
         elif not tools and last.content == "slow child A":
             self.started.set()
             try:
@@ -159,7 +159,8 @@ async def _serve_private(settings, history, model, runner, clock):
           patch("agent_companion.feishu_private._DISCOVERY_SECONDS", 0.02),
           patch("agent_companion.channels.feishu.channel._POLL_SECONDS", 0.02),
           patch("agent_companion.app.running_agent", wraps=running_agent) as agents):
-        task = asyncio.create_task(run_feishu(settings, history, model, object(), discovery=runner.discovery()))
+        task = asyncio.create_task(run_feishu(settings, history, model, object(), discovery=runner.discovery(),
+                                              roles=demo_roles()))
         try:
             yield agents
         finally:
@@ -201,11 +202,13 @@ class FeishuPrivateTests(unittest.IsolatedAsyncioTestCase):
                 history.bind_feishu_private(owner, started_ms=99_000)
                 other = Settings(feishu=FeishuSettings(own_open_id="ou_another_account"))
                 with self.assertRaisesRegex(FeishuBindingError, "服务账号与数据库绑定不一致"):
-                    await run_feishu(other, history, _Model(), object(), discovery=self.runner.discovery())
+                    await run_feishu(other, history, _Model(), object(), discovery=self.runner.discovery(),
+                                     roles=demo_roles())
                 self.assertEqual(self.runner.commands, [])
                 self.runner.account = "ou_unexpected_account"
                 with self.assertRaisesRegex(FeishuBindingError, "CLI 当前登录账号"):
-                    await run_feishu(self.settings, history, _Model(), object(), discovery=self.runner.discovery())
+                    await run_feishu(self.settings, history, _Model(), object(), discovery=self.runner.discovery(),
+                                     roles=demo_roles())
                 self.assertEqual(self.runner.queries, [])
                 self.assertEqual(self.runner.sent, {})
             unbound = Path(tmp) / "unbound.db"
@@ -342,14 +345,14 @@ class FeishuPrivateTests(unittest.IsolatedAsyncioTestCase):
         runner.messages[a] = [_message("delegate_a", a, sa, "delegate slow A")]
         runner.hold_destinations.add(b)
         session_a = "feishu-private:" + sha256(sa.encode()).hexdigest()
-        close = Subtasks.close
+        close = AgentTree.close
 
         async def close_with_fault(subtasks):
             await close(subtasks)
-            if subtasks._parent == session_a:
+            if subtasks._root.session_id == session_a:
                 raise RuntimeError("synthetic exception body not for logs")
 
-        with (closing(History(":memory:")) as history, patch.object(Subtasks, "close", close_with_fault)):
+        with (closing(History(":memory:")) as history, patch.object(AgentTree, "close", close_with_fault)):
             async with _serve_private(self.settings, history, model, runner, clock):
                 try:
                     await _eventually(lambda: runner.queries)
@@ -381,7 +384,7 @@ class FeishuPrivateTests(unittest.IsolatedAsyncioTestCase):
         runner.pages = verified
         runner.messages[a] = [_message("delegate_a", a, sa, "delegate slow A")]
         with closing(History(":memory:")) as history:
-            with patch.object(history, "bind_feishu_private_route", wraps=history.bind_feishu_private_route) as bind:
+            with patch.object(history, "bind_feishu_private_agent", wraps=history.bind_feishu_private_agent) as bind:
                 async with _serve_private(self.settings, history, model, runner, clock) as agents:
                     try:
                         await _eventually(lambda: runner.queries)
@@ -403,8 +406,8 @@ class FeishuPrivateTests(unittest.IsolatedAsyncioTestCase):
 
                         runner.pages = {None: ([], None)}
                         model.release_retirement.set()
-                        await _eventually(lambda: history.subtask_run(
-                            accepted["child_session_id"], accepted["run_id"]).status == "interrupted")
+                        run_id = history.delegation(accepted["delegation_id"]).run_id
+                        await _eventually(lambda: history.agent_run(run_id).status == "interrupted")
                         count = len(runner.queries)
                         await _eventually(lambda: len(runner.queries) >= count + 2)
                         self.assertEqual((bind.call_count, agents.call_count), (1, 1))
@@ -431,7 +434,7 @@ class FeishuPrivateTests(unittest.IsolatedAsyncioTestCase):
                     finally:
                         self.cancelled[last.content].set()
                 if last.content == "start child A" and tools:
-                    yield ToolReady(ToolCall("delegate_a", DELEGATE_TOOL_NAME, '{"prompt":"hold child A"}'))
+                    yield ToolReady(ToolCall("delegate_a", DELEGATE_TOOL_NAME, '{"agent":"general","prompt":"hold child A"}'))
                 elif last.tool_call_id == "delegate_a":
                     yield TextDelta("queued reply A")
                 else:
@@ -494,8 +497,9 @@ class FeishuPrivateTests(unittest.IsolatedAsyncioTestCase):
                 runner.pages = {None: ([_chat(a, sa, mode="group"), _chat(b, sb)], None)}
                 await _eventually(lambda: a in runner.closed_sends and all(event.is_set() for event in model.cancelled.values()))
                 self.assertFalse(channel_a._pending)
-                await _eventually(lambda: history.subtask_run(child["child_session_id"], child["run_id"]).status == "interrupted")
-                self.assertIsNone(history.subtask_run(child["child_session_id"], child["run_id"]).enqueued_at)
+                run_id = history.delegation(child["delegation_id"]).run_id
+                await _eventually(lambda: history.agent_run(run_id).status == "interrupted")
+                self.assertIsNone(history.agent_run(run_id).reply_enqueued_at)
                 before = len(runner.windows[a])
                 runner.messages[b].append(_message("revoked_a_b", b, sb, "first B", stamp=104_100))
                 clock[0] = 105.0
@@ -552,11 +556,12 @@ class FeishuPrivateTests(unittest.IsolatedAsyncioTestCase):
             path = Path(tmp) / "new.db"
             with closing(History(path)) as history:
                 with self.assertRaisesRegex(FeishuBindingError, "CLI 当前登录账号"):
-                    await run_feishu(wrong, history, model, object(), discovery=runner.discovery())
+                    await run_feishu(wrong, history, model, object(), discovery=runner.discovery(), roles=demo_roles())
                 self.assertIsNone(history.check_feishu_private(owner))
                 runner.account_failed = True
                 with self.assertRaisesRegex(CliError, "cli_result_unknown"):
-                    await run_feishu(self.settings, history, model, object(), discovery=runner.discovery())
+                    await run_feishu(self.settings, history, model, object(), discovery=runner.discovery(),
+                                     roles=demo_roles())
                 self.assertIsNone(history.check_feishu_private(owner))
                 self.assertFalse(runner.queries)
             with closing(History(path, feishu_private_owner=owner)) as history:
@@ -579,12 +584,17 @@ class FeishuPrivateTests(unittest.IsolatedAsyncioTestCase):
     async def test_production_checks_owner_and_uses_single_cli_verification_before_providers(self):
         runner = self.runner
         owner = private_feishu_identity(self.settings.feishu)
-        with TemporaryDirectory() as tmp:
-            settings = replace(self.settings, database=Path(tmp) / "production.db",
+        with TemporaryDirectory(dir=Path.cwd()) as tmp:
+            workdir = Path(tmp)
+            agents = workdir / "agents"
+            agents.mkdir()
+            (agents / "main.md").write_text("+++\ntools=[]\n+++\n离线角色", encoding="utf-8")
+            settings = replace(self.settings, database=workdir / "production.db",
                                llm=LLMSettings("openai_responses", "disabled", model="synthetic", api_key="synthetic"),
                                asr=ASRSettings(MiniMaxConnection("synthetic"), max_audio_seconds=120))
             wrong = replace(settings, feishu=FeishuSettings(own_open_id="ou_wrong_service"))
-            with (patch("agent_companion.app.FeishuDiscovery", return_value=runner.discovery()) as discover,
+            with (patch("agent_companion.__main__.Path.cwd", return_value=workdir),
+                  patch("agent_companion.app.FeishuDiscovery", return_value=runner.discovery()) as discover,
                   patch("agent_companion.app.run_private_chats") as run_chats,
                   patch("agent_companion.__main__.httpx.AsyncClient") as client,
                   patch.object(History, "replay_salt", autospec=True) as get_salt):
@@ -627,7 +637,7 @@ class FeishuPrivateTests(unittest.IsolatedAsyncioTestCase):
         a_attempts, c_attempts = [], []
         busy_a = busy_c = True
         with closing(History(":memory:")) as history:
-            store, bind = history.record_inbound, history.bind_feishu_private_route
+            store, bind = history.record_inbound, history.bind_feishu_private_agent
 
             def save_window(session, source, through, items):
                 if session == session_a:
@@ -646,7 +656,7 @@ class FeishuPrivateTests(unittest.IsolatedAsyncioTestCase):
                 return bind(session, chat)
 
             with (patch.object(history, "record_inbound", side_effect=save_window),
-                  patch.object(history, "bind_feishu_private_route", side_effect=register),
+                  patch.object(history, "bind_feishu_private_agent", side_effect=register),
                   self.assertLogs("agent_companion", level="WARNING") as logs):
                 async with _serve_private(self.settings, history, model, runner, clock):
                     await _eventually(lambda: runner.queries)
@@ -689,7 +699,7 @@ class FeishuPrivateTests(unittest.IsolatedAsyncioTestCase):
         runner.pages = {None: ([_chat(a, sa), _chat(b, sb)], None)}
         blocked, attempts, committed = True, [], []
         with closing(History(":memory:")) as history:
-            consume = history.consume_inbound
+            consume = history._consume_inbound
 
             def consume_batch(session, batch):
                 if session != session_a:
@@ -703,7 +713,7 @@ class FeishuPrivateTests(unittest.IsolatedAsyncioTestCase):
                 committed.append(batch)
                 return ids
 
-            with patch.object(history, "consume_inbound", side_effect=consume_batch):
+            with patch.object(history, "_consume_inbound", side_effect=consume_batch):
                 async with _serve_private(self.settings, history, model, runner, clock):
                     await _eventually(lambda: runner.queries)
                     runner.messages[a] = [_message("a1", a, sa, "queued A1")]
@@ -751,7 +761,7 @@ class FeishuPrivateTests(unittest.IsolatedAsyncioTestCase):
                 write = getattr(history, method)
 
                 def attempt(*args, **kwargs):
-                    stage = stage_for(*args)
+                    stage = stage_for(*args, **kwargs)
                     if stage:
                         attempts[stage].append((args, kwargs))
                         if stage in blocked:
@@ -763,15 +773,23 @@ class FeishuPrivateTests(unittest.IsolatedAsyncioTestCase):
 
                 patches.enter_context(patch.object(history, method, side_effect=attempt))
 
-            for method, stage in (("accept_subtask", "accept"), ("start_subtask", "start"),
-                                  ("finish_subtask", "finish"), ("mark_subtask_enqueued", "mark")):
-                intercept(method, lambda *args, stage=stage: stage)
+            def input_stage(agent_id, run_id, rows, *, start):
+                if any(isinstance(row, DelegatedInput) for row in rows):
+                    return "start"
+                if any(isinstance(row, AgentReplyInput) for row in rows):
+                    return "result_input"
+                return "tool_input" if not start else None
+
+            def finish_stage(run_id, *, result, error):
+                return "finish" if history.agent(history.agent_run(run_id).agent_id).parent_agent_id else None
+
+            intercept("accept_delegation", lambda *args, **kwargs: "accept")
+            intercept("append_agent_inputs", input_stage)
+            intercept("finish_agent_run", finish_stage)
+            intercept("mark_agent_reply_enqueued", lambda _: "mark")
             intercept("finalize_reply", lambda outcome, rows: "tool_reply" if rows and rows[0].tool_calls else None)
-            intercept("consume_inbound", lambda *_: "tool_input" if attempts.get("tool_reply") else None)
-            intercept("append", lambda session, rows: "result_input" if session == session_b
-                      and rows[0].content.startswith(RESULT_PREFIX) else None)
-            delegate = patches.enter_context(patch.object(Subtasks, "_delegate", autospec=True,
-                                                           side_effect=Subtasks._delegate))
+            delegate = patches.enter_context(patch.object(AgentTree, "_delegate", autospec=True,
+                                                           side_effect=AgentTree._delegate))
             async with _serve_private(self.settings, history, model, runner, clock):
                 await _eventually(lambda: runner.queries)
                 runner.messages[b] = [_message("tool", b, sb, "first B")]
@@ -793,24 +811,27 @@ class FeishuPrivateTests(unittest.IsolatedAsyncioTestCase):
                 await _eventually(lambda: len(runner.sent[b]) >= 2)
                 tool = next(e.message for e in history.read_after(session_b) if e.message.role == "tool")
                 accepted = json.loads(tool.content)
-                child, run_id = accepted["child_session_id"], accepted["run_id"]
-                self.assertEqual(history.subtask_run(child, run_id).status, "queued")
+                delegation_id = accepted["delegation_id"]
+                child = history.agent(accepted["agent_id"]).session_id
+                self.assertEqual(history.delegation(delegation_id).status, "queued")
+                self.assertIsNone(history.delegation(delegation_id).run_id)
 
                 blocked.remove("start")
                 await _eventually(lambda: len(attempts["finish"]) >= 4)
-                self.assertEqual(history.subtask_run(child, run_id).status, "running")
+                run_id = history.delegation(delegation_id).run_id
+                self.assertEqual(history.agent_run(run_id).status, "running")
                 self.assertEqual(attempts["result_input"], [])
                 blocked.remove("finish")
                 await _eventually(lambda: len(attempts["result_input"]) >= 2 and len(attempts["mark"]) >= 2)
-                self.assertEqual(history.subtask_run(child, run_id).status, "completed")
-                self.assertIsNone(history.subtask_run(child, run_id).enqueued_at)
+                self.assertEqual(history.agent_run(run_id).status, "completed")
+                self.assertIsNone(history.agent_run(run_id).reply_enqueued_at)
                 self.assertEqual(runner.sent[b], ["tool-stage B", "reply: during tool B"])
                 blocked.remove("result_input")
                 await _eventually(lambda: "returned B" in runner.sent[b])
                 # 标记仍锁住时，主 Runtime 已能消费回投；释放标记不能重复回投。
-                self.assertIsNone(history.subtask_run(child, run_id).enqueued_at)
+                self.assertIsNone(history.agent_run(run_id).reply_enqueued_at)
                 blocked.remove("mark")
-                await _eventually(lambda: history.subtask_run(child, run_id).enqueued_at is not None)
+                await _eventually(lambda: history.agent_run(run_id).reply_enqueued_at is not None)
 
                 delegate.assert_awaited_once()
                 self.assertEqual(len(model.calls), 4)  # 主会话三轮、子会话一轮
@@ -833,7 +854,7 @@ class FeishuPrivateTests(unittest.IsolatedAsyncioTestCase):
         runner.pages = {None: (chats, None)}
         attempts, shutdowns = [], []
         with closing(History(":memory:")) as history:
-            finalize, interrupt = history.finalize_reply, history.interrupt_subtasks
+            finalize, interrupt = history.finalize_reply, history.interrupt_agent_tree
 
             def commit(outcome, rows):
                 if outcome.session_id == session_a and rows[0].content == "reply: cancelled A":
@@ -841,14 +862,15 @@ class FeishuPrivateTests(unittest.IsolatedAsyncioTestCase):
                     raise sqlite3.OperationalError("database is locked")
                 return finalize(outcome, rows)
 
-            def interrupt_jobs(session, *, reason):
-                if session == session_a and reason == "shutdown":
-                    shutdowns.append(session)
+            def interrupt_jobs(agent_id, *, reason):
+                if history.agent(agent_id).session_id == session_a and reason == "shutdown":
+                    shutdowns.append(agent_id)
                     raise sqlite3.OperationalError("database is locked")
-                return interrupt(session, reason=reason)
+                return interrupt(agent_id, reason=reason)
 
             with (patch.object(history, "finalize_reply", side_effect=commit),
-                  patch.object(history, "interrupt_subtasks", side_effect=interrupt_jobs),
+                  patch.object(history, "interrupt_agent_tree", side_effect=interrupt_jobs),
+                  patch("agent_companion.runtime.sqlite_access._LOCK_RETRIES", 5),
                   self.assertLogs("agent_companion.feishu_private", level="WARNING") as logs):
                 async with _serve_private(self.settings, history, model, runner, clock):
                     await _eventually(lambda: runner.queries)
@@ -891,7 +913,7 @@ class FeishuPrivateTests(unittest.IsolatedAsyncioTestCase):
         with TemporaryDirectory() as tmp:
             database = Path(tmp) / "result.db"
             with closing(History(database)) as history, closing(sqlite3.connect(database, timeout=0)) as blocker:
-                finalize, run_text = history.finalize_reply, history.run_text
+                finalize, read_links = history.finalize_reply, history.run_delegation_ids
 
                 def commit(outcome, rows):
                     ids = finalize(outcome, rows)
@@ -900,15 +922,15 @@ class FeishuPrivateTests(unittest.IsolatedAsyncioTestCase):
                         blocker.execute("BEGIN EXCLUSIVE")
                     return ids
 
-                def read_result(child, run_id):
+                def read_result(run_id):
                     try:
-                        return run_text(child, run_id)
+                        return read_links(run_id)
                     except sqlite3.OperationalError as exc:
-                        failures.append((child, run_id, exc.sqlite_errorcode))
+                        failures.append((run_id, exc.sqlite_errorcode))
                         raise
 
                 with (patch.object(history, "finalize_reply", side_effect=commit),
-                      patch.object(history, "run_text", side_effect=read_result)):
+                      patch.object(history, "run_delegation_ids", side_effect=read_result)):
                     async with _serve_private(self.settings, history, model, runner, clock):
                         await _eventually(lambda: runner.queries)
                         runner.messages[b] = [_message("delegate", b, sb, "first B")]
@@ -916,11 +938,13 @@ class FeishuPrivateTests(unittest.IsolatedAsyncioTestCase):
                         await _eventually(lambda: runner.sent[b] == ["delegated B"])
                         tool = next(e.message for e in history.read_after(session) if e.message.role == "tool")
                         accepted = json.loads(tool.content)
-                        child, run_id = accepted["child_session_id"], accepted["run_id"]
+                        child = history.agent(accepted["agent_id"]).session_id
+                        delegation_id = accepted["delegation_id"]
+                        run_id = history.delegation(delegation_id).run_id
                         try:
                             release_child.set()
                             await _eventually(lambda: len(failures) >= 2)
-                            self.assertEqual(set(failures), {(child, run_id, sqlite3.SQLITE_BUSY)})
+                            self.assertEqual(set(failures), {(run_id, sqlite3.SQLITE_BUSY)})
                             self.assertEqual(runner.sent[b], ["delegated B"])
                         finally:
                             blocker.rollback()
@@ -929,14 +953,14 @@ class FeishuPrivateTests(unittest.IsolatedAsyncioTestCase):
                         self.assertEqual(len(model.calls), 4)
                         self.assertEqual(sum(not tools for tools, _ in model.calls), 1)
                         self.assertEqual([outcome.run_id for outcome in history.outcomes(child)], [run_id])
-                        payloads = [json.loads(e.message.content.removeprefix(RESULT_PREFIX))
-                                    for e in history.read_after(session) if e.message.content.startswith(RESULT_PREFIX)]
-                        run = history.subtask_run(child, run_id)
-                        self.assertEqual(payloads, [{"child_session_id": child, "run_id": run_id,
+                        payloads = [json.loads(e.message.content.removeprefix(AGENT_REPLY_PREFIX))
+                                    for e in history.read_after(session) if e.message.content.startswith(AGENT_REPLY_PREFIX)]
+                        run = history.agent_run(run_id)
+                        self.assertEqual(payloads, [{"agent_id": accepted["agent_id"], "run_id": run_id,
                                                      "status": "completed", "result": "reply: child B",
-                                                     "tool_call_id": run.tool_call_id, "tool_name": DELEGATE_TOOL_NAME}])
+                                                     "delegation_ids": [delegation_id]}])
                         self.assertEqual(run.status, "completed")
-                        self.assertIsNotNone(run.enqueued_at)
+                        self.assertIsNotNone(run.reply_enqueued_at)
 
     async def test_runtime_retries_real_sqlite_commit_contention_after_rollback(self):
         a, sa = _CHATS[0], _SENDERS[0]
@@ -1029,7 +1053,7 @@ class FeishuPrivateTests(unittest.IsolatedAsyncioTestCase):
               self.assertLogs("agent_companion.channels.feishu.channel", level="ERROR") as logs):
             with self.assertRaises(ExceptionGroup) as caught:
                 await asyncio.wait_for(run_feishu(self.settings, history, _Model(), object(),
-                                                  discovery=runner.discovery()), 3)
+                                                  discovery=runner.discovery(), roles=demo_roles()), 3)
         self.assertEqual(caught.exception.exceptions, (error,))
         record.assert_called_once()
         self.assertTrue(any("inbox storage failed" in line for line in logs.output))

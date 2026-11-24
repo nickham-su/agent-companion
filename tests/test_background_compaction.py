@@ -18,10 +18,10 @@ from agent_companion.models import _http_stream
 from agent_companion.models.deepseek import DeepSeek
 from agent_companion.protocol import (InputUsage, Message, ProviderReplay, ReplayItem, ReplayScope,
                                       TextDelta, ToolCall, ToolReady)
+from agent_companion.runtime.subtasks import demo_roles
 from agent_companion.runtime.compaction import Compactions, Prefix
 from agent_companion.runtime.context import _SUMMARIZE
 from agent_companion.runtime.engine import Runtime
-from agent_companion.runtime.subtasks import DELEGATE_TOOL_NAME
 from agent_companion.runtime.tools import Tool, ToolContext, Tools
 from agent_companion.storage.sqlite import History, ReplyOutcome, Summary
 from test_history_context import Sink, SPEC
@@ -208,26 +208,29 @@ class BackgroundCompactionTest(unittest.IsolatedAsyncioTestCase):
         model = _GatedModel(reply)
         settings = Settings(runtime=_SETTINGS)
         with closing(History(":memory:")) as history:
-            async with running_agent(settings, history, model, Sink(), session_id="main") as (main, subtasks):
-                async def delegate(label, prompt, child=None):
-                    args = {"prompt": prompt}
-                    if child is not None:
-                        args["child_session_id"] = child
-                    call = ToolCall(label, DELEGATE_TOOL_NAME, json.dumps(args))
-                    accepted = json.loads(await subtasks.tools.execute(call, ToolContext("main", "test", label, True)))
-                    self.assertEqual(accepted["status"], "accepted")
-                    return accepted["child_session_id"]
+            async with running_agent(settings, history, model, Sink(), session_id="main",
+                                     roles=demo_roles()) as (main, tree):
+                agent_id = main.agent.agent_id
+                history.append_agent_inputs(agent_id, "test", [Message("user", "fixture parent input")], start=True)
 
-                child = await delegate("start", first_child_text)
-                await _idle(subtasks)
+                async def delegate(label, prompt, child=None):
+                    args = {"prompt": prompt, **({"agent_id": child} if child else {"agent": "general"})}
+                    context = ToolContext("main", "test", label, True, agent_id=agent_id)
+                    accepted = json.loads(await tree._delegate(args, context))
+                    self.assertEqual(accepted["status"], "accepted")
+                    return accepted["agent_id"]
+
+                child_agent = await delegate("start", first_child_text)
+                child = history.agent(child_agent).session_id
+                await _idle(tree)
                 await _idle(main)
-                await delegate("generate", "child while generating", child)
+                await delegate("generate", "child while generating", child_agent)
                 await _wait(model.generating)
                 task = main._compactions._generating
                 self.assertIsNotNone(task)
-                await _idle(subtasks)
+                await _idle(tree)
                 await _idle(main)
-                self.assertNotIn(child, subtasks._workers)
+                self.assertTrue(tree._bindings[child_agent].runtime.idle)
                 self.assertIsNone(history.summary(child))
                 self.assertFalse(task.done())
 
@@ -240,14 +243,15 @@ class BackgroundCompactionTest(unittest.IsolatedAsyncioTestCase):
                 await self._finish(model, task)
                 self.assertIsNone(history.summary(child))
 
-                other = await delegate("other", "other child")
-                await _idle(subtasks)
+                other_agent = await delegate("other", "other child")
+                other = history.agent(other_agent).session_id
+                await _idle(tree)
                 await _idle(main)
                 self.assertIsNone(history.summary(other))
                 self.assertIsNone(history.summary("main"))
                 self.assertTrue(all(_SUMMARY not in request for request in model.requests))
-                await delegate("reuse", "reuse original child", child)
-                await _idle(subtasks)
+                await delegate("reuse", "reuse original child", child_agent)
+                await _idle(tree)
                 await _idle(main)
                 applied = [request for request in model.requests if _SUMMARY in request]
                 self.assertEqual(len(applied), 1)
@@ -277,8 +281,8 @@ class BackgroundCompactionTest(unittest.IsolatedAsyncioTestCase):
                 history.append(session_id, [_OLD])
                 _report_high_usage(history, session_id)
 
-            async with open_agent("main-b", Sink()) as (second, _):
-                async with open_agent("main-a", Sink()) as (first, _):
+            async with open_agent(history.ensure_main_agent("main-b"), Sink()) as (second, _):
+                async with open_agent(history.ensure_main_agent("main-a"), Sink()) as (first, _):
                     first_task = await self._begin(first, model, "first group input")
                     await _idle(first)
                     second.submit_batch([Message("user", "second group while occupied")])
@@ -304,7 +308,7 @@ class BackgroundCompactionTest(unittest.IsolatedAsyncioTestCase):
 
         with closing(History(":memory:")) as history:
             with patch("agent_companion.app.run_private_chats", side_effect=run_groups):
-                run_private = await prepare_private_feishu(settings, history, discovery=Discovery())
+                run_private = await prepare_private_feishu(settings, history, discovery=Discovery(), roles=demo_roles())
                 await run_private(model, object(), None)
             self.assertTrue(model.cancelled.is_set())
             self.assertIsNone(history.summary("main-b"))
@@ -337,14 +341,14 @@ class BackgroundCompactionTest(unittest.IsolatedAsyncioTestCase):
                 await self._finish(model, task)
                 self.assertIsNone(history.summary("main"))
 
-                original = revoked._context._system_messages
+                original = revoked._context._sqlite
 
-                async def slow_read(*args):
+                async def slow_read(*args, **kwargs):
                     reading.set()
                     await allow_read.wait()
-                    return await original(*args)
+                    return await original(*args, **kwargs)
 
-                with patch.object(revoked._context, "_system_messages", side_effect=slow_read):
+                with patch.object(revoked._context, "_sqlite", side_effect=slow_read):
                     revoked.submit_batch([Message("user", "revoked during preparation")])
                     await _wait(reading)
                     revoked.stop_accepting()
@@ -365,7 +369,8 @@ class BackgroundCompactionTest(unittest.IsolatedAsyncioTestCase):
         with closing(History(":memory:")) as history:
             history.append("main", [_OLD])
             _report_high_usage(history, "main")
-            async with running_agent(Settings(runtime=_SETTINGS), history, model, Sink(), session_id="main") as (main, _):
+            async with running_agent(Settings(runtime=_SETTINGS), history, model, Sink(), session_id="main",
+                                     roles=demo_roles()) as (main, _):
                 task = await self._begin(main, model)
                 await _idle(main)
                 self.assertFalse(task.done())

@@ -16,10 +16,10 @@ from .channels.feishu.channel import FeishuChannel, FeishuPoller
 from .channels.feishu.cli import CliError, FeishuDiscovery, PrivateChat
 from .protocol import Message, PersistedInput, ReplyDelivery, ReplyStream
 from .runtime.engine import Runtime
-from .runtime.subtasks import Subtasks
+from .runtime.subtasks import AgentTree
 from .session_scheduler import SessionScheduler, SessionSchedulers
 from .speech.asr import FileASR
-from .storage.sqlite import History, is_sqlite_lock_error
+from .storage.sqlite import Agent, History, is_sqlite_lock_error
 
 if TYPE_CHECKING:
     from .feishu_calls import IncomingCalls
@@ -28,7 +28,7 @@ if TYPE_CHECKING:
 
 _LOG = logging.getLogger(__name__)
 _DISCOVERY_SECONDS = 10
-_OpenAgent = Callable[[str, FeishuChannel], AbstractAsyncContextManager[tuple[Runtime, Subtasks]]]
+_OpenAgent = Callable[[Agent, FeishuChannel], AbstractAsyncContextManager[tuple[Runtime, AgentTree]]]
 
 
 def _fingerprint(value: str) -> str:
@@ -36,15 +36,16 @@ def _fingerprint(value: str) -> str:
 
 
 class _Route:
-    def __init__(self, discovery: FeishuDiscovery, chat: PrivateChat, session_id: str, *, history: History,
+    def __init__(self, discovery: FeishuDiscovery, chat: PrivateChat, agent: Agent, *, history: History,
                  asr: FileASR, own_id: str, started_ms: int, open_agent: _OpenAgent,
                  schedulers: SessionSchedulers) -> None:
-        self._session_id = session_id
+        self._identity = agent
+        self._session_id = agent.session_id
         self._schedulers = schedulers
         self._scheduler: SessionScheduler | None = None
         self._revoke_input: Callable[[], None] | None = None
         self._stack = AsyncExitStack()
-        self._agent: tuple[Runtime, Subtasks] | None = None
+        self._agent: tuple[Runtime, AgentTree] | None = None
         self._agent_lock = asyncio.Lock()
         self._closed = False
         self._stop_call: Callable[[], None] | None = None
@@ -53,7 +54,7 @@ class _Route:
         cli = discovery.for_chat(chat.chat_id)
         self._channel = FeishuChannel(cli, select_voice=self._select_voice)
         self._poller = FeishuPoller(cli, asr, self._channel, chat_id=chat.chat_id, sender_id=chat.sender_id,
-                                    own_id=own_id, session_id=session_id, history=history, clock=time,
+                                    own_id=own_id, session_id=agent.session_id, history=history, clock=time,
                                     private_started_ms=started_ms, submit=self._submit,
                                     before_close=self.stop_accepting)
 
@@ -65,8 +66,10 @@ class _Route:
                 return False
             if self._agent is None:
                 # 文字批次和来电使用同一个入口；发现私聊时尚不创建 Runtime。
-                self._agent = await self._stack.enter_async_context(self._open_agent(self._session_id, self._channel))
-                if not self._closed:
+                self._agent = await self._stack.enter_async_context(self._open_agent(self._identity, self._channel))
+                if self._closed:
+                    self._agent[1].stop_accepting()
+                else:
                     self._scheduler = self._schedulers.get_or_create(self._session_id)
                     self._revoke_input = self._scheduler.input_revoker()
             return not self._closed
@@ -132,9 +135,8 @@ class _Route:
         if self._stop_call is not None:
             self._stop_call()
         if self._agent is not None:
-            main, subtasks = self._agent
-            main.stop_accepting()
-            subtasks.stop_accepting()
+            _, tree = self._agent
+            tree.stop_accepting()
 
     async def run(self) -> None:
         try:
@@ -150,8 +152,8 @@ class _Route:
         except OperationalError as exc:
             if not is_sqlite_lock_error(exc):
                 raise
-            # 轮询内部已处理遇锁；若收尾时无法标记子任务，下次打开该会话再标记中断。
-            _LOG.warning("Feishu private route cleanup storage busy; deferred subtask recovery")
+            # 轮询内部已处理遇锁；若关停时无法标记运行及委派，下次启动或重新打开该路由时收尾。
+            _LOG.warning("Feishu private route cleanup storage busy; deferred agent recovery")
 
 
 def _conflicts(chats: set[PrivateChat]) -> tuple[set[str], set[str]]:
@@ -216,7 +218,7 @@ async def run_private_chats(discovery: FeishuDiscovery, history: History, asr: F
                         continue  # 旧 Runtime 可能仍持有父会话；下次发现重新核验。
                     session_id = "feishu-private:" + _fingerprint(chat.sender_id)
                     try:
-                        bound = history.bind_feishu_private_route(session_id, _fingerprint(chat.chat_id))
+                        agent = history.bind_feishu_private_agent(session_id, _fingerprint(chat.chat_id))
                     except OperationalError as exc:
                         if not is_sqlite_lock_error(exc):
                             _LOG.error("Feishu private route storage failed; sqlite_code=%s",
@@ -224,10 +226,10 @@ async def run_private_chats(discovery: FeishuDiscovery, history: History, asr: F
                             raise
                         _LOG.warning("Feishu private route storage busy; retrying on next discovery")
                         continue
-                    if not bound:
+                    if agent is None:
                         _LOG.warning("Feishu private chat route conflict; conflicting route ignored")
                         continue
-                    route = _Route(discovery, chat, session_id, history=history, asr=asr, own_id=own_id,
+                    route = _Route(discovery, chat, agent, history=history, asr=asr, own_id=own_id,
                                    started_ms=started_ms, open_agent=open_agent, schedulers=schedulers)
                     by_sender[chat.sender_id] = route
                     active[chat] = route, group.create_task(run_route(chat, route))

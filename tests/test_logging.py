@@ -59,7 +59,7 @@ class LoggingTests(unittest.TestCase):
         output = self.run_cli("--demo-subtasks")
         debug = "\n".join(line for line in output.splitlines() if " DEBUG " in line)
         for event in ("runtime input recorded", "model request started", "model request finished", "reply committed",
-                      "subtask accepted", "subtask result queued"):
+                      "delegation accepted", "agent reply queued"):
             self.assertIn(event, debug)
         self.assertIn("INFO agent_companion.__main__ agent companion started", output)
         self.assertIn("output_chars=", debug)

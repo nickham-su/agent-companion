@@ -2,21 +2,23 @@
 
 import asyncio
 from collections import deque
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from contextlib import aclosing
 from dataclasses import dataclass
 import logging
-from pathlib import Path
+from sqlite3 import OperationalError
+from typing import Literal
 from uuid import uuid4
 
 from ..config import RuntimeSettings
-from ..protocol import (Channel, DeliveryStatus, InputItem, InputUsage, InternalInput, Message, Model, ModelClosing,
-                         ModelError, PersistedInput, ReasoningDelta, Receipt, ReplayReady, ReplayScope, ReplyDelivery,
-                         ReplyInfo, ReplyStream, SelectableChannel, TextDelta, ToolCall, ToolReady, validate_input_items)
-from ..storage.sqlite import History, ReplyOutcome, RetryableInputWrite
+from ..protocol import (AgentReply, Channel, DelegationTask, DeliveryStatus, InputItem, InputUsage, InternalInput,
+                         Message, Model, ModelClosing, ModelError, PersistedInput, ReasoningDelta, Receipt, ReplayReady,
+                         ReplayScope, ReplyDelivery, ReplyInfo, ReplyStream, SelectableChannel, TextDelta, ToolCall,
+                         ToolReady, validate_input_items)
+from ..storage.sqlite import (Agent, AgentReplyInput, DelegatedInput, History, ReplyOutcome, RetryableInputWrite,
+                              is_sqlite_lock_error)
 from .compaction import Compactions
 from .context import Context
-from .instructions import InstructionsError
 from .model_deadline import ModelDeadline, model_deadline_at
 from .sqlite_access import SQLiteAccess
 from .tools import ToolContext, Tools
@@ -43,10 +45,19 @@ class Runtime:
 
     def __init__(self, session_id: str, history: History, model: Model, channel: Channel | None, *,
                  tools: Tools | None = None, settings: RuntimeSettings | None = None,
-                 thinking: bool = False, instructions: str = "", delivery_idle_timeout: float | None = None,
-                 retry_sqlite_locks: bool = False, compactions: Compactions | None = None) -> None:
+                 thinking: bool = False, instructions: str | None = None, delivery_idle_timeout: float | None = None,
+                 retry_sqlite_locks: bool = False, compactions: Compactions | None = None,
+                 agent: Agent | None = None, reply_to_parent: Callable[[AgentReply], bool] | None = None) -> None:
         if not session_id:
             raise ValueError("session_id must be non-empty")
+        if agent is not None and agent.session_id != session_id:
+            raise ValueError("agent session does not match runtime session")
+        if (reply_to_parent is not None) != (agent is not None and agent.parent_agent_id is not None):
+            raise ValueError("only a child agent requires a parent reply destination")
+        if reply_to_parent is not None and channel is not None:
+            raise ValueError("child agent cannot have a user channel")
+        self.agent = agent
+        self._reply_to_parent = reply_to_parent
         self.session_id = session_id
         self.history = history
         self._model = model
@@ -60,7 +71,8 @@ class Runtime:
         self._replay_scope = replay_scope if isinstance(replay_scope, ReplayScope) else None
         self._pending: deque[_InputBatch] = deque()
         self._queued_inbound: set[int] = set()
-        self._input_blocked = False
+        self._input_blocked: Literal["retryable", "unsafe"] | None = None
+        self._input_retry_requested = False
         self._worker: asyncio.Task[None] | None = None
         self._retired_deliveries: set[asyncio.Task[Receipt]] = set()
         self._retired_models: set[asyncio.Task[bool]] = set()
@@ -70,7 +82,7 @@ class Runtime:
         self._compactions = compactions if compactions is not None else Compactions(history, model)
         self._compactions.check_owner(history, model)
         self._context = Context(history, self._settings, self._compactions, sqlite=self._sqlite,
-                                replay_scope=self._replay_scope, agents_path=Path.cwd() / "AGENTS.md")
+                                replay_scope=self._replay_scope)
         self._idle = asyncio.Event()
         self._idle.set()
         self.last_failure: str | None = None
@@ -87,10 +99,11 @@ class Runtime:
         """在同一个事件循环同步接收有序混合批次；不立即写入历史。"""
         if self._closed:
             raise RuntimeError("runtime is closed")
-        if self._channel is None:
-            raise RuntimeError("internal runs must be scheduled by the subtask dispatcher")
         items = tuple(items)
         validate_input_items(items)
+        if self.agent is None and any(isinstance(item, InternalInput) and
+                                      isinstance(item.content, (DelegationTask, AgentReply)) for item in items):
+            raise ValueError("agent inputs require an agent binding")
         inputs: list[InputItem] = []
         persisted_ids: set[int] = set()
         for item in items:
@@ -104,6 +117,10 @@ class Runtime:
         loop = asyncio.get_running_loop()
         self._pending.append(_InputBatch(tuple(inputs), frozenset(persisted_ids)))
         self._queued_inbound.update(persisted_ids)
+        # 只以真正入队的输入唤醒。轮询重复移交同一个持久批次不会反复消耗重试预算。
+        self._input_retry_requested = True
+        if self._input_blocked == "retryable":
+            self._input_blocked = None
         _LOG.debug("runtime input queued; items=%d persisted=%d pending=%d",
                    len(inputs), len(persisted_ids), len(self._pending))
         self._start_worker(loop)
@@ -131,16 +148,17 @@ class Runtime:
         if self.last_failure == "model_cleanup_blocked" and not self._closed:
             self.last_failure = None
 
+    @property
+    def idle(self) -> bool:
+        return self._idle.is_set()
+
+    @property
+    def input_retry_forbidden(self) -> bool:
+        return self._input_blocked == "unsafe"
+
     async def wait_idle(self) -> None:
         """等待队列停转；输入故障或模型清理达到上限时也会返回，原因见 last_failure。"""
         await self._idle.wait()
-
-    async def run_internal(self, run_id: str, prompt: str) -> str | None:
-        """运行独立的子会话话轮，返回失败代码；由调用方保证同会话串行。"""
-        if self._closed or self._channel is not None or self._tools.specs:
-            raise RuntimeError("internal runs require a runtime without a user channel or tools")
-        await self._process(Message("user", prompt), run_id)
-        return self.last_failure
 
     def stop_accepting(self) -> None:
         """同步关停入口；可以在调度异步清理之前调用。"""
@@ -168,76 +186,91 @@ class Runtime:
     async def _drain(self) -> None:
         try:
             while self._pending and not self._closed and not self._input_blocked and self._has_model_slot():
-                await self._process(self._pending[0], uuid4().hex)
+                await self._process(uuid4().hex)
         finally:
             self._worker = None
             self._idle.set()
 
-    async def _record_head(self, run_id: str) -> tuple[list[int], bool]:
+    async def _record_head(self, run_id: str, *, start: bool = False) -> tuple[list[int], bool, bool]:
         batch = self._pending[0]
-        recorded = await self._record_input(batch, run_id)
+        # 写入期间才到达的新输入，可以给这条队首再提供一次有界尝试；之前的入队不累积预算。
+        self._input_retry_requested = False
+        recorded = await self._record_input(batch, run_id, start=start)
         # 确认写入、空批次或旧路由作废后才能交还队首；失败时保留输入和去重。
         self._pending.popleft()
         self._queued_inbound.difference_update(batch.persisted_ids)
         return recorded
 
-    async def _record_input(self, batch: _InputBatch, run_id: str) -> tuple[list[int], bool]:
-        rows: list[Message | int] = []
+    async def _record_input(self, batch: _InputBatch, run_id: str, *, start: bool) -> tuple[list[int], bool, bool]:
+        rows: list[Message | int | DelegatedInput | AgentReplyInput] = []
         has_memory_user = False
         for item in batch.items:
             if isinstance(item, PersistedInput):
                 rows.append(item.batch_id)
             elif isinstance(item, InternalInput):
-                rows.append(item.to_model_message())
+                content = item.content
+                message = item.to_model_message()
+                if isinstance(content, DelegationTask):
+                    rows.append(DelegatedInput(content.delegation_id, message))
+                elif isinstance(content, AgentReply):
+                    rows.append(AgentReplyInput(content.agent_id, content.run_id, message))
+                else:
+                    rows.append(message)
             else:
                 rows.append(item)
                 has_memory_user = True
 
-        def append() -> tuple[list[int], bool]:
+        def append() -> tuple[list[int], bool, bool]:
+            if self.agent is not None:
+                ids, consumed_user, consumed_agent = self.history.append_agent_inputs(
+                    self.agent.agent_id, run_id, rows, start=start)
+                return ids, has_memory_user or consumed_user, consumed_agent
             if not batch.persisted_ids:
                 messages = tuple(row for row in rows if isinstance(row, Message))
-                return self.history.append(self.session_id, messages, retryable_io=True), has_memory_user
+                return self.history.append(self.session_id, messages, retryable_io=True), has_memory_user, False
             if len(rows) == 1 and isinstance(rows[0], int):
                 ids = self.history.consume_inbound(self.session_id, rows[0])
-                return ids, bool(ids)
-            ids, consumed_user = self.history.append_with_inbound(self.session_id, rows)
-            return ids, has_memory_user or consumed_user
+                return ids, bool(ids), False
+            ordinary_rows = [row for row in rows if isinstance(row, (Message, int))]
+            ids, consumed_user = self.history.append_with_inbound(self.session_id, ordinary_rows)
+            return ids, has_memory_user or consumed_user, False
 
         try:
-            ids, has_user_input = await self._sqlite.write_input(append)
+            ids, has_user_input, has_agent_input = await self._sqlite.write_input(append)
         except Exception as exc:
             raise _InputWriteFailed from exc
-        _LOG.debug("runtime input recorded; run=%s persisted=%d messages=%d user_input=%s",
-                   run_id, len(batch.persisted_ids), len(ids), has_user_input)
-        return ids, has_user_input
+        _LOG.debug("runtime input recorded; run=%s persisted=%d messages=%d user_input=%s agent_input=%s",
+                   run_id, len(batch.persisted_ids), len(ids), has_user_input, has_agent_input)
+        return ids, has_user_input, has_agent_input
 
-    async def _process(self, entry: _InputBatch | Message, run_id: str) -> None:
+    async def _process(self, run_id: str) -> None:
         self.last_failure = None
         clock = asyncio.get_running_loop().time
         started = clock()
+        message_ids: list[int] = []
+        result = None
         try:
-            if isinstance(entry, _InputBatch):
-                message_ids, has_user_input = await self._record_head(run_id)
-            else:
-                # 独立子任务由 dispatcher 管理，不走队首的有界重试或重新投放。
-                message_ids = await self._sqlite(self.history.append, self.session_id, (entry,))
-                has_user_input = False
+            message_ids, has_user_input, has_agent_input = await self._record_head(run_id, start=True)
             if message_ids:
-                await self._run(run_id, message_ids[0], has_user_input=has_user_input)
+                result = await self._run(run_id, message_ids[0], has_user_input=has_user_input,
+                                         has_agent_input=has_agent_input)
         except _InputWriteFailed as exc:
             self.last_failure = "input_write_failed"
-            self._input_blocked = True
             cause = exc.__cause__
+            safe_to_retry = isinstance(cause, RetryableInputWrite) or (
+                isinstance(cause, OperationalError) and is_sqlite_lock_error(cause))
+            # 提交结果不确定或回滚失败不能重试；到达写入边界的新输入不会覆盖这条底线。
+            self._input_blocked = "retryable" if safe_to_retry else "unsafe"
+            if safe_to_retry and self._input_retry_requested:
+                self._input_blocked = None
             if isinstance(cause, RetryableInputWrite):
                 cause = cause.__cause__
-            _LOG.error("runtime input write failed; queue blocked; run=%s error_type=%s sqlite_code=%s",
-                       run_id, type(cause).__name__, getattr(cause, "sqlite_errorcode", None))
+            _LOG.error("runtime input write failed; queue=%s run=%s error_type=%s sqlite_code=%s",
+                       self._input_blocked or "retry_requested", run_id, type(cause).__name__,
+                       getattr(cause, "sqlite_errorcode", None))
         except asyncio.CancelledError:
             _LOG.debug("runtime run cancelled; run=%s", run_id)
             raise
-        except InstructionsError as exc:
-            self.last_failure = exc.diagnostic
-            _LOG.warning("Local system instructions unavailable (%s); run=%s", exc.diagnostic, run_id)
         except (ModelError, TimeoutError) as exc:
             self.last_failure = "context_failed"
             _LOG.warning("runtime context failed (%s); run=%s",
@@ -246,45 +279,85 @@ class Runtime:
             self.last_failure = "runtime_failed"
             _LOG.error("session runtime could not finish the current input; run=%s error_type=%s",
                        run_id, type(exc).__name__)
+        if self.agent is not None and message_ids and not self._closed:
+            await self._finish_agent_run(run_id, result)
         _LOG.debug("runtime run finished; run=%s status=%s elapsed_ms=%.0f",
                    run_id, self.last_failure or "complete", (clock() - started) * 1000)
 
-    async def _run(self, run_id: str, protected_from: int, *, has_user_input: bool) -> None:
+    async def _finish_agent_run(self, run_id: str, result: str | None) -> None:
+        error = self.last_failure
+        if self._reply_to_parent is not None and error is None and (not result or not result.strip()):
+            error = self.last_failure = "empty_result"
+        if error is not None:
+            result = None
+        try:
+            delegation_ids = ()
+            if self._reply_to_parent is not None:
+                delegation_ids = await self._sqlite.write_input(lambda: self.history.run_delegation_ids(run_id))
+            await self._sqlite.write_input(lambda: self.history.finish_agent_run(run_id, result=result, error=error))
+        except Exception as exc:
+            self.last_failure = "run_terminal_write_failed"
+            _LOG.error("agent terminal write failed; run=%s error_type=%s", run_id, type(exc).__name__)
+            return
+        if self._reply_to_parent is None or self._closed:
+            return
+        assert self.agent is not None
+        notice = AgentReply(self.agent.agent_id, run_id, delegation_ids, result=result, error=error)
+        if self._reply_to_parent(notice):
+            _LOG.debug("agent reply queued; agent=%s run=%s", self.agent.agent_id, run_id)
+            try:
+                await self._sqlite.write_input(lambda: self.history.mark_agent_reply_enqueued(run_id))
+            except Exception as exc:
+                _LOG.warning("agent reply enqueue could not be recorded; run=%s error_type=%s",
+                             run_id, type(exc).__name__)
+
+    async def _run(self, run_id: str, protected_from: int, *, has_user_input: bool,
+                   has_agent_input: bool) -> str | None:
         def can_send() -> bool:
             return not self._closed
 
         for index in range(self._settings.max_tool_rounds):
             if not can_send():
-                return
-            last_input_tokens = await self._sqlite(self.history.last_input_tokens, self.session_id)
-            messages = await self._context.prepare(self.session_id, thinking=self._thinking,
-                                                    tools=self._tools.specs, instructions=self._instructions,
-                                                    protected_from=protected_from, can_send=can_send,
-                                                    last_input_tokens=last_input_tokens)
+                return None
+            try:
+                last_input_tokens = await self._sqlite(self.history.last_input_tokens, self.session_id)
+                messages = await self._context.prepare(self.session_id, thinking=self._thinking,
+                                                       tools=self._tools.specs, instructions=self._instructions,
+                                                       protected_from=protected_from, can_send=can_send,
+                                                       last_input_tokens=last_input_tokens)
+            except OperationalError as exc:
+                if not is_sqlite_lock_error(exc):
+                    raise
+                self.last_failure = "context_lock_timeout"
+                _LOG.warning("runtime context lock retries exhausted; run=%s sqlite_code=%s",
+                             run_id, getattr(exc, "sqlite_errorcode", None))
+                return None
             if messages is None:
-                return
-            model_status, continue_tools = await self._reply(
-                run_id, messages, has_user_input=has_user_input)
+                return None
+            model_status, continue_tools, final_text = await self._reply(
+                run_id, messages, has_user_input=has_user_input, has_agent_input=has_agent_input)
             if model_status != "complete":
-                if model_status != "model_interrupted":
+                if model_status != "model_interrupted" or self._reply_to_parent is not None:
                     self.last_failure = model_status
-                return
+                return None
             if not continue_tools:
-                return
+                return final_text
             if index + 1 == self._settings.max_tool_rounds:
                 self.last_failure = "tool_round_limit"
-                return
+                return None
             if not can_send():
-                return
+                return None
             await self._wait_for_model_slot()
             if not can_send():
-                return
+                return None
             while self._pending:
-                _, recorded_user_input = await self._record_head(run_id)
+                _, recorded_user_input, recorded_agent_input = await self._record_head(run_id)
                 has_user_input = has_user_input or recorded_user_input
+                has_agent_input = has_agent_input or recorded_agent_input
+        return None
 
     async def _reply(self, run_id: str, messages: Sequence[Message], *,
-                     has_user_input: bool) -> tuple[str, bool]:
+                     has_user_input: bool, has_agent_input: bool) -> tuple[str, bool, str | None]:
         loop = asyncio.get_running_loop()
         info = ReplyInfo(uuid4().hex, self.session_id, run_id, loop.time())
         text: list[str] = []
@@ -318,7 +391,7 @@ class Runtime:
                 reply.delivery_finished_at = loop.time()
 
         delivery: asyncio.Task[Receipt] | None = None
-        queued_run = self._channel is not None
+        has_user_channel = self._channel is not None
         model_complete = False
         reply_closed = False
         input_tokens: int | None = None
@@ -360,7 +433,7 @@ class Runtime:
                             raise TimeoutError
                         if isinstance(event, ModelClosing):
                             reader_closing = True
-                            if event.complete and queued_run:
+                            if event.complete and has_user_channel:
                                 deadline.disarm()
                                 model_complete = True
                                 finish_reply_stream()  # 回执可先于连接关闭结算；完整投递仍等连接收尾。
@@ -394,12 +467,12 @@ class Runtime:
                                 raise ModelError("invalid_sse_event")
                             replay = event.replay
                         elif isinstance(event, ToolReady):
-                            if self._channel is None:
-                                raise ModelError("internal_tool_call")
                             call = event.call
                             if call.id in scheduled:
                                 raise ModelError("duplicate_tool_id")
-                            context = ToolContext(self.session_id, run_id, call.id, has_user_input)
+                            context = ToolContext(self.session_id, run_id, call.id, has_user_input,
+                                                  self.agent.agent_id if self.agent is not None else None,
+                                                  has_agent_input)
                             scheduled[call.id] = (call, loop.create_task(self._tools.execute(call, context)))
             return True
 
@@ -412,27 +485,25 @@ class Runtime:
                 read_deadline.disarm()
             self._retired_models.add(task)
             task.add_done_callback(self._model_cleanup_finished)
-            if not reader_closing or not queued_run:
+            if not reader_closing or not has_user_channel:
                 if (stop_stream is None or not stop_stream(task)) and not task.cancelling():
                     task.cancel()
 
         async def complete_model() -> str:
             nonlocal model_task
-            if not queued_run and stop_stream is None:
-                return "complete" if await read_model() else "model_interrupted"
             model_task = loop.create_task(read_model())
             while not model_task.done():
                 if voice_interrupted():
                     retire_reader(model_task)
                     return "complete" if model_complete else "model_interrupted"
                 signal = delivery if delivery is not None else delivery_started
-                # wait 不会把分派 worker 的取消直接传给原生读流；由 retire_reader 启动关闭预算。
-                waiting = (model_task,) if not queued_run or signal.done() else (model_task, signal)
+                # wait 不会把 Runtime worker 的取消直接传给原生读流；由 retire_reader 启动关闭预算。
+                waiting = (model_task,) if not has_user_channel or signal.done() else (model_task, signal)
                 await asyncio.wait(waiting, return_when=asyncio.FIRST_COMPLETED)
             if model_complete:
                 self._report_model_cleanup(model_task)
                 return "complete"
-            if queued_run and model_task.cancelled():
+            if model_task.cancelled():
                 # 只观察子任务的取消；真正的外层取消由 asyncio.wait 继续抛出。
                 return "model_cancelled"
             return "complete" if model_task.result() else "model_interrupted"
@@ -475,7 +546,7 @@ class Runtime:
             if model_status == "model_cancelled" and voice_interrupted():
                 model_status = "model_interrupted"
             # 内部会话不经过用户投递，只保留完整模型正文。
-            generated_text = generated if not queued_run and model_status == "complete" else ""
+            generated_text = generated if not has_user_channel and model_status == "complete" else ""
             confirmed_text = receipt.confirmed if receipt else ""
             calls = tuple(call for call, _ in scheduled.values())
             if scheduled:
@@ -496,7 +567,7 @@ class Runtime:
             outcome = ReplyOutcome(info.reply_id, info.session_id, run_id, model_status,
                                    receipt.status if receipt else None, model_error=model_error,
                                    input_tokens=input_tokens if model_status == "complete" else None)
-            await self._sqlite(self.history.finalize_reply, outcome, rows)
+            await self._sqlite.write_input(lambda: self.history.finalize_reply(outcome, rows))
             _LOG.debug("reply committed; reply=%s receipt=%s confirmed_chars=%d tool_results=%d elapsed_ms=%.0f",
                        info.reply_id, receipt.status if receipt else None, len(confirmed_text), len(results),
                        (loop.time() - info.started_at) * 1000)
@@ -507,14 +578,14 @@ class Runtime:
                     selected.after_commit(info, confirmed_text)
             except Exception:
                 _LOG.warning("background reply could not be queued; reply=%s", info.reply_id)
-            return model_status, bool(calls) and not voice_incomplete
+            return model_status, bool(calls) and not voice_incomplete, generated_text or confirmed_text or None
         finally:
             delivery_started.cancel()
             unfinished = [task for _, task in scheduled.values() if not task.done()]
             if accept_model_events and model_task is not None:
                 if not model_task.done():
                     retire_reader(model_task)
-                    if not queued_run:
+                    if not has_user_channel:
                         # 子任务仍持有串行执行权，原生传输收尾或耗尽预算后才能退出。
                         await asyncio.wait((model_task,))
                 elif not model_task.cancelled():

@@ -20,6 +20,7 @@ from agent_companion.channels.feishu.cli import CliError, CliStdoutLimit, Comman
 from agent_companion.config import FeishuSettings, Settings, load_settings
 from agent_companion.protocol import (OMITTED_INPUT_IMAGE, DeliveryStatus, Image, Message, Receipt, ReplyDelivery, ReplyInfo,
                                       Text, TextDelta)
+from agent_companion.runtime.subtasks import demo_roles
 from agent_companion.speech.asr import AsrError
 from agent_companion.storage.sqlite import History
 
@@ -341,7 +342,8 @@ class FeishuBackgroundDeliveryTests(unittest.IsolatedAsyncioTestCase):
         channel = FeishuChannel(FeishuCLI("lark-cli", _CHAT, timeout=2, runner=runner))
         self.addAsyncCleanup(channel.close)
         with closing(History(":memory:")) as history:
-            async with running_agent(Settings(), history, model, channel, session_id="main") as (main, _):
+            async with running_agent(Settings(), history, model, channel, session_id="main",
+                                     roles=demo_roles()) as (main, _):
                 channel.enqueue_transcript("转写 0")
                 await asyncio.wait_for(first_started.wait(), 1)
                 with self.assertLogs("agent_companion.channels.feishu.channel", level="WARNING") as logs:
@@ -410,7 +412,8 @@ class FeishuBackgroundDeliveryTests(unittest.IsolatedAsyncioTestCase):
         channel = FeishuChannel(FeishuCLI("lark-cli", _CHAT, timeout=2, runner=runner))
         self.addAsyncCleanup(channel.close)
         with closing(History(":memory:")) as history:
-            async with running_agent(Settings(), history, Echo(), channel, session_id="main") as (main, _):
+            async with running_agent(Settings(), history, Echo(), channel, session_id="main",
+                                     roles=demo_roles()) as (main, _):
                 main.submit_batch([Message("user", "0")])
                 await asyncio.wait_for(first_started.wait(), 1)
                 with self.assertLogs("agent_companion.channels.feishu.channel", level="WARNING") as logs:
@@ -527,7 +530,7 @@ class FeishuBackgroundDeliveryTests(unittest.IsolatedAsyncioTestCase):
                 try:
                     with patch.object(history, "finalize_reply", finalize):
                         async with running_agent(Settings(), history, Model(), channel,
-                                                 session_id="main") as (main, _):
+                                                 session_id="main", roles=demo_roles()) as (main, _):
                             main.submit_batch([Message("user", "测试输入")])
                             await asyncio.wait_for(main.wait_idle(), 1)
                             if expected_to_send:
@@ -581,7 +584,8 @@ class FeishuBackgroundDeliveryTests(unittest.IsolatedAsyncioTestCase):
         discovery = private_discovery(_CHAT, _PEER, _SELF, cli=CLI("lark-cli", _CHAT, timeout=2))
         with (closing(History(":memory:")) as history, patch.object(FeishuPoller, "run", poll),
               self.assertLogs("agent_companion.channels.feishu.channel", level="WARNING")):
-            app = asyncio.create_task(run_feishu(settings, history, _Model(), _ASR(), discovery=discovery))
+            app = asyncio.create_task(run_feishu(settings, history, _Model(), _ASR(), discovery=discovery,
+                                                 roles=demo_roles()))
             try:
                 await asyncio.wait_for(poll_ready.wait(), 1)
                 app.cancel()
@@ -655,7 +659,8 @@ class FeishuBackgroundDeliveryTests(unittest.IsolatedAsyncioTestCase):
         with (closing(History(":memory:")) as history, patch.object(FeishuPoller, "poll_once", poll_once),
               patch("agent_companion.app.time", return_value=clock[0]),
               patch("agent_companion.feishu_private.FeishuPoller", partial(FeishuPoller, clock=lambda: clock[0]))):
-            app = asyncio.create_task(run_feishu(settings, history, _Model(), asr, discovery=discovery))
+            app = asyncio.create_task(run_feishu(settings, history, _Model(), asr, discovery=discovery,
+                                                 roles=demo_roles()))
             try:
                 await asyncio.wait_for(notice_cleaning.wait(), 1)
                 release_send.set()
@@ -695,7 +700,8 @@ class FeishuPollingTests(unittest.IsolatedAsyncioTestCase):
         with closing(History(":memory:")) as history:
             channel = FeishuChannel(cli)
             self.addAsyncCleanup(channel.close)
-            async with running_agent(Settings(), history, model, channel, session_id="main") as (main, _):
+            async with running_agent(Settings(), history, model, channel, session_id="main",
+                                     roles=demo_roles()) as (main, _):
                 submit = main.submit_persisted_batch
                 poller = _poller(history, submit, cli, asr, clock)
                 await poller.poll_once()
@@ -999,7 +1005,8 @@ print(json.dumps({"ok": True, "identity": "user", "data": page}))
         with closing(History(":memory:")) as history:
             channel = FeishuChannel(cli)
             self.addAsyncCleanup(channel.close)
-            async with running_agent(Settings(), history, model, channel, session_id="main") as (main, _):
+            async with running_agent(Settings(), history, model, channel, session_id="main",
+                                     roles=demo_roles()) as (main, _):
                 submit = main.submit_persisted_batch
                 poller = _poller(history, submit, cli, asr, clock)
                 await poller.poll_once()
@@ -1036,7 +1043,8 @@ print(json.dumps({"ok": True, "identity": "user", "data": page}))
                 with closing(History(path)) as history:
                     channel = FeishuChannel(cli)
                     self.addAsyncCleanup(channel.close)
-                    async with running_agent(Settings(), history, model, channel, session_id="main") as (main, _):
+                    async with running_agent(Settings(), history, model, channel, session_id="main",
+                                             roles=demo_roles()) as (main, _):
                         submit = main.submit_persisted_batch
                         await _poller(history, submit, cli, asr, clock).poll_once()
                         await main.wait_idle()
@@ -1055,7 +1063,8 @@ print(json.dumps({"ok": True, "identity": "user", "data": page}))
         with closing(History(":memory:")) as history:
             channel = FeishuChannel(cli)
             self.addAsyncCleanup(channel.close)
-            async with running_agent(Settings(), history, model, channel, session_id="main") as (main, _):
+            async with running_agent(Settings(), history, model, channel, session_id="main",
+                                     roles=demo_roles()) as (main, _):
                 submit = main.submit_persisted_batch
                 poller = FeishuPoller(cli, asr, channel, chat_id=_CHAT, sender_id=_PEER, own_id=_SELF,
                                       session_id="main", history=history, submit=submit,

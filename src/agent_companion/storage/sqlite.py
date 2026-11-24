@@ -1,4 +1,4 @@
-"""SQLite 中的原始会话历史、摘要与独立投递记录。"""
+"""SQLite 中的 Agent、会话历史、摘要和投递记录。"""
 
 from collections.abc import Iterable, Iterator, Sequence
 from contextlib import contextmanager
@@ -8,11 +8,13 @@ from pathlib import Path
 from secrets import token_bytes
 import sqlite3
 from time import time
+from uuid import uuid4
 
 from ..protocol import (MAX_REPLAY_BYTES, DeliveryStatus, Image, Message, ProviderReplay, ReplayItem,
                         ReplayScope, Text, ToolCall)
 
 
+_SCHEMA_VERSION = 1
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS messages (
     message_id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -53,21 +55,6 @@ CREATE TABLE IF NOT EXISTS model_replays (
     reasoning_effort TEXT NOT NULL,
     items TEXT NOT NULL
 );
-CREATE TABLE IF NOT EXISTS subtask_runs (
-    run_id TEXT PRIMARY KEY,
-    child_session_id TEXT NOT NULL,
-    parent_session_id TEXT NOT NULL,
-    parent_run_id TEXT NOT NULL,
-    tool_call_id TEXT NOT NULL,
-    status TEXT NOT NULL CHECK (status IN ('queued', 'running', 'completed', 'failed', 'interrupted')),
-    accepted_at REAL NOT NULL,
-    started_at REAL,
-    finished_at REAL,
-    enqueued_at REAL,
-    result TEXT,
-    error TEXT
-);
-CREATE INDEX IF NOT EXISTS subtask_parent_child ON subtask_runs(parent_session_id, child_session_id);
 CREATE TABLE IF NOT EXISTS inbound_windows (
     session_id TEXT NOT NULL,
     source TEXT NOT NULL,
@@ -97,6 +84,42 @@ CREATE TABLE IF NOT EXISTS feishu_private_routes (
     session_id TEXT PRIMARY KEY,
     chat_fingerprint TEXT UNIQUE NOT NULL
 );
+CREATE TABLE IF NOT EXISTS agents (
+    agent_id TEXT PRIMARY KEY NOT NULL,
+    session_id TEXT UNIQUE NOT NULL,
+    role_id TEXT NOT NULL,
+    parent_agent_id TEXT REFERENCES agents(agent_id),
+    CHECK ((parent_agent_id IS NULL) = (role_id = 'main')),
+    CHECK (parent_agent_id IS NULL OR parent_agent_id <> agent_id)
+);
+CREATE INDEX IF NOT EXISTS agents_parent ON agents(parent_agent_id);
+CREATE TABLE IF NOT EXISTS agent_runs (
+    run_id TEXT PRIMARY KEY NOT NULL,
+    agent_id TEXT NOT NULL REFERENCES agents(agent_id),
+    status TEXT NOT NULL CHECK (status IN ('running', 'completed', 'failed', 'interrupted')),
+    started_at REAL NOT NULL,
+    finished_at REAL,
+    result TEXT,
+    error TEXT,
+    reply_enqueued_at REAL,
+    reply_consumed_run_id TEXT REFERENCES agent_runs(run_id),
+    UNIQUE (agent_id, run_id)
+);
+CREATE TABLE IF NOT EXISTS delegations (
+    delegation_id TEXT PRIMARY KEY NOT NULL,
+    agent_id TEXT NOT NULL REFERENCES agents(agent_id),
+    parent_agent_id TEXT NOT NULL,
+    parent_run_id TEXT NOT NULL,
+    tool_call_id TEXT NOT NULL,
+    accepted_at REAL NOT NULL,
+    status TEXT NOT NULL CHECK (status IN ('queued', 'consumed', 'interrupted')),
+    run_id TEXT,
+    error TEXT,
+    CHECK ((status = 'consumed') = (run_id IS NOT NULL)),
+    FOREIGN KEY (parent_agent_id, parent_run_id) REFERENCES agent_runs(agent_id, run_id),
+    FOREIGN KEY (agent_id, run_id) REFERENCES agent_runs(agent_id, run_id)
+);
+CREATE INDEX IF NOT EXISTS delegations_by_run ON delegations(run_id);
 """
 
 
@@ -127,19 +150,54 @@ class ReplyOutcome:
 
 
 @dataclass(frozen=True, slots=True)
-class SubtaskRun:
-    run_id: str
-    child_session_id: str
-    parent_session_id: str
+class Agent:
+    agent_id: str
+    session_id: str
+    role_id: str
+    parent_agent_id: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class Delegation:
+    delegation_id: str
+    agent_id: str
+    parent_agent_id: str
     parent_run_id: str
     tool_call_id: str
-    status: str
     accepted_at: float
-    started_at: float | None
+    status: str
+    run_id: str | None = None
+    error: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class AgentRun:
+    run_id: str
+    agent_id: str
+    status: str
+    started_at: float
     finished_at: float | None
-    enqueued_at: float | None
     result: str | None = field(repr=False)
     error: str | None
+    reply_enqueued_at: float | None
+    reply_consumed_run_id: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class DelegatedInput:
+    delegation_id: str
+    message: Message = field(repr=False)
+
+
+@dataclass(frozen=True, slots=True)
+class AgentReplyInput:
+    source_agent_id: str
+    source_run_id: str
+    message: Message = field(repr=False)
+
+
+def _has_reply_text(value: str | None) -> bool:
+    return isinstance(value, str) and bool(value.strip())
 
 
 def _encode(message: Message) -> tuple[str, str]:
@@ -202,6 +260,10 @@ class FeishuBindingError(ValueError):
     """飞书账号或会话的数据库归属无法确认。"""
 
 
+class DatabaseFormatError(ValueError):
+    """数据库不是空库或当前支持的版本。"""
+
+
 class SummaryWriteError(Exception):
     """摘要写入未提交，可以继续使用已存历史。"""
 
@@ -230,19 +292,20 @@ class History:
         try:
             self._db.execute("PRAGMA foreign_keys = ON")
             with self._db:
-                # BEGIN 放在脚本内，避免 executescript 的隐式提交拆开归属校验和迁移。
-                self._db.executescript("BEGIN IMMEDIATE;\n" + _SCHEMA)
+                # 串行化首次初始化。检查格式后才可写入 schema，并且版本标记与建表一起提交。
+                self._db.execute("BEGIN IMMEDIATE")
+                version = self._db.execute("PRAGMA user_version").fetchone()[0]
+                if version != _SCHEMA_VERSION:
+                    if version != 0 or self._db.execute("SELECT 1 FROM sqlite_schema LIMIT 1").fetchone():
+                        raise DatabaseFormatError("不支持当前 SQLite 数据库格式；请保留原库并配置新的数据库路径。")
+                    # _SCHEMA 仅包含独立 DDL；不能用 executescript，否则会隐式提交上面的事务。
+                    for statement in _SCHEMA.split(";"):
+                        if statement.strip():
+                            self._db.execute(statement)
+                    self._db.execute(f"PRAGMA user_version = {_SCHEMA_VERSION}")
                 if feishu_private_owner is not None:
                     # 只预检已有归属；空库须等实际 CLI 账号核验后绑定。
                     self.check_feishu_private(feishu_private_owner)
-                columns = {row["name"] for row in self._db.execute("PRAGMA table_info(reply_outcomes)")}
-                if "assistant_message_id" not in columns:
-                    self._db.execute("ALTER TABLE reply_outcomes ADD COLUMN"
-                                     " assistant_message_id INTEGER REFERENCES messages(message_id)")
-                if "model_error" not in columns:
-                    self._db.execute("ALTER TABLE reply_outcomes ADD COLUMN model_error TEXT")
-                if "input_tokens" not in columns:
-                    self._db.execute("ALTER TABLE reply_outcomes ADD COLUMN input_tokens INTEGER")
         except BaseException:
             self.close()
             raise
@@ -274,9 +337,9 @@ class History:
     def _has_history(self) -> bool:
         return self._db.execute("""
             SELECT 1 FROM messages
+            UNION ALL SELECT 1 FROM agents
             UNION ALL SELECT 1 FROM summaries
             UNION ALL SELECT 1 FROM reply_outcomes
-            UNION ALL SELECT 1 FROM subtask_runs
             UNION ALL SELECT 1 FROM inbound_windows
             UNION ALL SELECT 1 FROM inbound_seen
             UNION ALL SELECT 1 FROM inbound_batches
@@ -307,13 +370,84 @@ class History:
             raise FeishuBindingError("现有数据库有历史但没有飞书账号绑定；请保留旧数据库并配置新的数据库路径。")
         return None
 
-    def bind_feishu_private_route(self, session_id: str, chat_fingerprint: str) -> bool:
-        """已见过的发送者和私聊之间必须仍是原来的一对一关系，禁止重绑。"""
-        with self._db:
-            self._db.execute("INSERT INTO feishu_private_routes VALUES (?, ?) ON CONFLICT DO NOTHING",
-                             (session_id, chat_fingerprint))
-            return self._db.execute("SELECT 1 FROM feishu_private_routes WHERE session_id = ? AND chat_fingerprint = ?",
-                                    (session_id, chat_fingerprint)).fetchone() is not None
+    def _bind_feishu_private_route(self, session_id: str, chat_fingerprint: str) -> bool:
+        self._db.execute("INSERT INTO feishu_private_routes VALUES (?, ?) ON CONFLICT DO NOTHING",
+                         (session_id, chat_fingerprint))
+        return self._db.execute("SELECT 1 FROM feishu_private_routes WHERE session_id = ? AND chat_fingerprint = ?",
+                                (session_id, chat_fingerprint)).fetchone() is not None
+
+    def bind_feishu_private_agent(self, session_id: str, chat_fingerprint: str) -> Agent | None:
+        """绑定已核验的私聊路由并取得主 Agent；路由冲突时不创建 Agent。"""
+        with self._input_transaction(retryable_io=False):
+            if not self._bind_feishu_private_route(session_id, chat_fingerprint):
+                return None
+            return self._ensure_main_agent(session_id)
+
+    def ensure_main_agent(self, session_id: str) -> Agent:
+        """给非飞书入口按内部 Session 键建立可复用的主 Agent。"""
+        with self._input_transaction(retryable_io=False):
+            return self._ensure_main_agent(session_id)
+
+    def _ensure_main_agent(self, session_id: str) -> Agent:
+        self._db.execute("INSERT INTO agents (agent_id, session_id, role_id) VALUES (?, ?, 'main')"
+                         " ON CONFLICT(session_id) DO NOTHING", (f"agent-{uuid4().hex}", session_id))
+        row = self._db.execute("SELECT * FROM agents WHERE session_id = ?", (session_id,)).fetchone()
+        if row["parent_agent_id"] is not None:
+            raise ValueError("session belongs to a child agent")
+        return Agent(**dict(row))
+
+    def agent(self, agent_id: str) -> Agent | None:
+        row = self._db.execute("SELECT * FROM agents WHERE agent_id = ?", (agent_id,)).fetchone()
+        return Agent(**dict(row)) if row is not None else None
+
+    def accept_delegation(self, parent_agent_id: str, parent_run_id: str, tool_call_id: str, *,
+                          role_id: str | None = None, agent_id: str | None = None) -> tuple[Agent, Delegation] | None:
+        """原子建立子 Agent 和委派，或复用直属子 Agent；非直属/未知目标返回 None。"""
+        if (role_id is None) == (agent_id is None) or role_id in ("", "main"):
+            raise ValueError("invalid delegation target")
+        with self._input_transaction(retryable_io=False):
+            self._db.execute("BEGIN IMMEDIATE")
+            if not self._agent_run_active(parent_agent_id, parent_run_id):
+                raise ValueError("delegation requires an active parent run")
+            if role_id is not None:
+                child = Agent(f"agent-{uuid4().hex}", f"child-{uuid4().hex}", role_id, parent_agent_id)
+                self._db.execute("INSERT INTO agents VALUES (?, ?, ?, ?)",
+                                 (child.agent_id, child.session_id, child.role_id, child.parent_agent_id))
+            else:
+                assert agent_id is not None
+                child = self.agent(agent_id)
+                if child is None or child.parent_agent_id != parent_agent_id:
+                    return None
+            delegation = Delegation(f"delegation-{uuid4().hex}", child.agent_id, parent_agent_id, parent_run_id,
+                                    tool_call_id, time(), "queued")
+            self._db.execute("INSERT INTO delegations"
+                             " (delegation_id, agent_id, parent_agent_id, parent_run_id, tool_call_id, accepted_at, status)"
+                             " VALUES (?, ?, ?, ?, ?, ?, ?)",
+                             (delegation.delegation_id, child.agent_id, parent_agent_id, parent_run_id, tool_call_id,
+                              delegation.accepted_at, delegation.status))
+            return child, delegation
+
+    def delegation(self, delegation_id: str) -> Delegation | None:
+        row = self._db.execute("SELECT * FROM delegations WHERE delegation_id = ?", (delegation_id,)).fetchone()
+        return Delegation(**dict(row)) if row is not None else None
+
+    def run_delegation_ids(self, run_id: str) -> tuple[str, ...]:
+        return tuple(row[0] for row in self._db.execute(
+            "SELECT delegation_id FROM delegations WHERE run_id = ? ORDER BY rowid", (run_id,)))
+
+    def interrupt_delegation(self, delegation_id: str, *, reason: str) -> None:
+        """提交后若入口已关闭，将尚未进入运行的委派标记中断。"""
+        with self._input_transaction(retryable_io=False):
+            self._db.execute("UPDATE delegations SET status = 'interrupted', error = ?"
+                             " WHERE delegation_id = ? AND status = 'queued'", (reason, delegation_id))
+
+    def _agent_run_active(self, agent_id: str, run_id: str) -> bool:
+        return self._db.execute("SELECT 1 FROM agent_runs WHERE agent_id = ? AND run_id = ? AND status = 'running'",
+                                (agent_id, run_id)).fetchone() is not None
+
+    def agent_run(self, run_id: str) -> AgentRun | None:
+        row = self._db.execute("SELECT * FROM agent_runs WHERE run_id = ?", (run_id,)).fetchone()
+        return AgentRun(**dict(row)) if row is not None else None
 
     def _append(self, session_id: str, messages: Iterable[Message]) -> list[int]:
         created_at = time()
@@ -434,6 +568,64 @@ class History:
                     ids.extend(self._append(session_id, (item,)))
         return ids, consumed
 
+    def append_agent_inputs(self, agent_id: str, run_id: str,
+                            items: Sequence[Message | int | DelegatedInput | AgentReplyInput], *,
+                            start: bool) -> tuple[list[int], bool, bool]:
+        """按顺序写输入；返回消息 ID、是否消费飞书输入、是否消费可信 Agent 输入。"""
+        ids: list[int] = []
+        consumed_inbound = consumed_agent = False
+        with self._input_transaction(retryable_io=True):
+            self._db.execute("BEGIN IMMEDIATE")
+            agent = self.agent(agent_id)
+            if agent is None:
+                raise ValueError("unknown input agent")
+            if start:
+                self._db.execute("INSERT INTO agent_runs (run_id, agent_id, status, started_at)"
+                                 " VALUES (?, ?, 'running', ?)", (run_id, agent_id, time()))
+            elif not self._agent_run_active(agent_id, run_id):
+                raise ValueError("cannot append to an inactive agent run")
+            for item in items:
+                if isinstance(item, int):
+                    inbound_ids = self._consume_inbound(agent.session_id, item)
+                    ids.extend(inbound_ids)
+                    consumed_inbound = consumed_inbound or bool(inbound_ids)
+                elif isinstance(item, (DelegatedInput, AgentReplyInput)):
+                    if self._consume_agent_input(agent_id, run_id, item):
+                        ids.extend(self._append(agent.session_id, (item.message,)))
+                        consumed_agent = True
+                else:
+                    ids.extend(self._append(agent.session_id, (item,)))
+            if start and not ids:
+                # 作废的批次或重复回投不产生运行；删除仍在同一事务内。
+                self._db.execute("DELETE FROM agent_runs WHERE run_id = ?", (run_id,))
+        return ids, consumed_inbound, consumed_agent
+
+    def _consume_agent_input(self, agent_id: str, run_id: str, item: DelegatedInput | AgentReplyInput) -> bool:
+        if isinstance(item, DelegatedInput):
+            cursor = self._db.execute("UPDATE delegations SET run_id = ?, status = 'consumed'"
+                                      " WHERE delegation_id = ? AND agent_id = ? AND status = 'queued'",
+                                      (run_id, item.delegation_id, agent_id))
+        else:
+            source = self._db.execute("""
+                SELECT r.status, r.result, r.error FROM agent_runs AS r
+                JOIN agents AS a ON a.agent_id = r.agent_id
+                WHERE r.agent_id = ? AND r.run_id = ? AND a.parent_agent_id = ?
+                  AND r.status IN ('completed', 'failed') AND r.reply_consumed_run_id IS NULL
+                """, (item.source_agent_id, item.source_run_id, agent_id)).fetchone()
+            if source is None:
+                return False
+            result, error = source["result"], source["error"]
+            if source["status"] == "completed":
+                valid = error is None and _has_reply_text(result)
+            else:
+                valid = result is None and _has_reply_text(error)
+            if not valid:
+                return False
+            # 调用方已持有写事务；校验、去重标记与消息写入不会被拆开。
+            cursor = self._db.execute("UPDATE agent_runs SET reply_consumed_run_id = ? WHERE run_id = ?",
+                                      (run_id, item.source_run_id))
+        return cursor.rowcount == 1
+
     def _consume_inbound(self, session_id: str, batch_id: int) -> list[int]:
         key = (session_id, batch_id)
         row = self._db.execute("SELECT contents FROM inbound_batches WHERE session_id = ? AND batch_id = ?",
@@ -449,7 +641,7 @@ class History:
         # 原子提交响应及对应结果，不在崩溃后暴露只有调用、没有结果的组。
         if messages and messages[0].role != "assistant":
             raise ValueError("reply history must start with an assistant message")
-        with self._db:
+        with self._input_transaction(retryable_io=False):
             ids = self._append(outcome.session_id, messages)
             replay = messages[0].replay if messages else None
             if replay is not None and outcome.model_status == "complete":
@@ -468,6 +660,55 @@ class History:
             ))
         return ids
 
+    def finish_agent_run(self, run_id: str, *, result: str | None = None, error: str | None = None) -> None:
+        """持久化整轮终态；子 Agent 必须有正文或错误，提交成功后才能回投。"""
+        if result is not None and error is not None:
+            raise ValueError("a run cannot finish with both result and error")
+        if result is not None and not isinstance(result, str):
+            raise ValueError("a run result must be text")
+        if error is not None and not _has_reply_text(error):
+            raise ValueError("a run error must be non-blank text")
+        has_reply = _has_reply_text(result) or error is not None
+        with self._input_transaction(retryable_io=False):
+            cursor = self._db.execute("UPDATE agent_runs SET status = ?, finished_at = ?, result = ?, error = ?"
+                                      " WHERE run_id = ? AND status = 'running'"
+                                      " AND (? OR EXISTS (SELECT 1 FROM agents AS a"
+                                      " WHERE a.agent_id = agent_runs.agent_id AND a.parent_agent_id IS NULL))",
+                                      ("failed" if error is not None else "completed", time(), result, error, run_id,
+                                       has_reply))
+            if cursor.rowcount != 1:
+                raise ValueError("invalid agent run state transition or missing child reply")
+
+    def mark_agent_reply_enqueued(self, run_id: str) -> None:
+        """记录已回投，不参与消费判断；父级可能先消费才写入此诊断。"""
+        with self._input_transaction(retryable_io=False):
+            self._db.execute("UPDATE agent_runs SET reply_enqueued_at = ? WHERE run_id = ?"
+                             " AND status IN ('completed', 'failed') AND reply_enqueued_at IS NULL", (time(), run_id))
+
+    def interrupt_agent_work(self, *, reason: str, agent_id: str | None = None) -> None:
+        """中断单个 Agent 的排队委派及运行，或在应用启动/关闭时收尾全库。"""
+        scope = " AND agent_id = ?" if agent_id is not None else ""
+        args = (agent_id,) if agent_id is not None else ()
+        with self._input_transaction(retryable_io=False):
+            self._db.execute("UPDATE delegations SET status = 'interrupted', error = ? WHERE status = 'queued'" + scope,
+                             (reason, *args))
+            self._db.execute("UPDATE agent_runs SET status = 'interrupted', finished_at = ?, error = ?"
+                             " WHERE status = 'running'" + scope, (time(), reason, *args))
+
+    def interrupt_agent_tree(self, root_id: str, *, reason: str) -> None:
+        """撤销单条已核验路由时，只收尾这棵树。"""
+        tree = """WITH RECURSIVE tree(id) AS (
+            SELECT agent_id FROM agents WHERE agent_id = ?
+            UNION ALL SELECT a.agent_id FROM agents AS a JOIN tree ON a.parent_agent_id = tree.id
+        ) """
+        # Python 的 SQLite 不会为以 WITH 开头的 UPDATE 隐式启动事务。
+        with self._input_transaction(retryable_io=False):
+            self._db.execute("BEGIN IMMEDIATE")
+            self._db.execute(tree + "UPDATE delegations SET status = 'interrupted', error = ?"
+                             " WHERE status = 'queued' AND agent_id IN tree", (root_id, reason))
+            self._db.execute(tree + "UPDATE agent_runs SET status = 'interrupted', finished_at = ?, error = ?"
+                             " WHERE status = 'running' AND agent_id IN tree", (root_id, time(), reason))
+
     def outcomes(self, session_id: str) -> list[ReplyOutcome]:
         return [ReplyOutcome(row["reply_id"], row["session_id"], row["run_id"], row["model_status"],
                              DeliveryStatus(row["delivery_status"]) if row["delivery_status"] else None,
@@ -481,72 +722,6 @@ class History:
             " ORDER BY rowid DESC LIMIT 1", (session_id,),
         ).fetchone()
         return row["input_tokens"] if row is not None else None
-
-    def run_text(self, session_id: str, run_id: str) -> str | None:
-        row = self._db.execute(
-            "SELECT m.content FROM reply_outcomes AS r JOIN messages AS m"
-            " ON m.message_id = r.assistant_message_id"
-            " WHERE r.session_id = ? AND r.run_id = ? AND r.model_status = 'complete'"
-            " ORDER BY r.rowid DESC LIMIT 1", (session_id, run_id),
-        ).fetchone()
-        if row is None:
-            return None
-        content = json.loads(row[0])
-        return content if isinstance(content, str) and content.strip() else None
-
-    def can_resume_subtask(self, parent_session_id: str, child_session_id: str) -> bool:
-        return self._db.execute(
-            "SELECT 1 FROM subtask_runs WHERE parent_session_id = ? AND child_session_id = ? LIMIT 1",
-            (parent_session_id, child_session_id),
-        ).fetchone() is not None
-
-    def accept_subtask(self, child_session_id: str, run_id: str, parent_session_id: str,
-                       parent_run_id: str, tool_call_id: str) -> None:
-        with self._db:
-            self._db.execute(
-                "INSERT INTO subtask_runs (child_session_id, run_id, parent_session_id, parent_run_id,"
-                " tool_call_id, status, accepted_at) VALUES (?, ?, ?, ?, ?, 'queued', ?)",
-                (child_session_id, run_id, parent_session_id, parent_run_id, tool_call_id, time()),
-            )
-
-    def start_subtask(self, run_id: str) -> None:
-        self._update_subtask(
-            "UPDATE subtask_runs SET status = 'running', started_at = ? WHERE run_id = ? AND status = 'queued'",
-            (time(), run_id),
-        )
-
-    def finish_subtask(self, run_id: str, *, result: str | None, error: str | None) -> None:
-        if (result is None) == (error is None):
-            raise ValueError("subtask requires exactly one result or error")
-        self._update_subtask(
-            "UPDATE subtask_runs SET status = ?, finished_at = ?, result = ?, error = ?"
-            " WHERE run_id = ? AND status = 'running'",
-            ("failed" if error is not None else "completed", time(), result, error, run_id),
-        )
-
-    def mark_subtask_enqueued(self, run_id: str) -> None:
-        self._update_subtask(
-            "UPDATE subtask_runs SET enqueued_at = ? WHERE run_id = ? AND enqueued_at IS NULL"
-            " AND status IN ('completed', 'failed')", (time(), run_id),
-        )
-
-    def interrupt_subtasks(self, parent_session_id: str, *, reason: str) -> None:
-        with self._db:
-            self._db.execute(
-                "UPDATE subtask_runs SET status = 'interrupted', finished_at = ?, error = ?"
-                " WHERE parent_session_id = ? AND status IN ('queued', 'running')",
-                (time(), reason, parent_session_id),
-            )
-
-    def subtask_run(self, child_session_id: str, run_id: str) -> SubtaskRun | None:
-        row = self._db.execute("SELECT * FROM subtask_runs WHERE child_session_id = ? AND run_id = ?",
-                               (child_session_id, run_id)).fetchone()
-        return SubtaskRun(**dict(row)) if row is not None else None
-
-    def _update_subtask(self, sql: str, params: tuple) -> None:
-        with self._db:
-            if self._db.execute(sql, params).rowcount != 1:
-                raise ValueError("invalid subtask state transition")
 
     def read_after(self, session_id: str, after: int = 0, *,
                    replay_scope: ReplayScope | None = None) -> list[HistoryEntry]:

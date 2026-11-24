@@ -1,8 +1,7 @@
 """按会话暂存输入；调度器及其同步提交回调都由同一个 asyncio 事件循环驱动。"""
 
 import asyncio
-from collections.abc import Awaitable, Callable, Iterator, Sequence
-from contextlib import contextmanager
+from collections.abc import Callable, Sequence
 import logging
 
 from .protocol import (DeliveryStatus, InputItem, InternalInput, PersistedInput, Receipt, ReplyDelivery, ReplyStream,
@@ -11,7 +10,6 @@ from .protocol import (DeliveryStatus, InputItem, InternalInput, PersistedInput,
 
 _LOG = logging.getLogger(__name__)
 _Submit = Callable[[tuple[InputItem, ...]], None]
-_RunChild = Callable[[str, str], Awaitable[str | None]]
 
 
 async def _reject_voice(reply: ReplyStream) -> Receipt:
@@ -24,7 +22,6 @@ class SessionScheduler:
         self._agent_owner: object | None = None
         self._submit: _Submit | None = None
         self._revoke_input: Callable[[], None] | None = None
-        self._run_child: _RunChild | None = None
         self._call: Callable[[], None] | None = None
         self._input_active = False
         self._obsolete_until = -float("inf")
@@ -32,7 +29,7 @@ class SessionScheduler:
         self._pending_inbound: set[int] = set()
 
     def _ensure_unbound(self, owner: object | None = None) -> None:
-        if self._agent_owner is not owner or self._submit is not None or self._run_child is not None:
+        if self._agent_owner is not owner or self._submit is not None:
             raise RuntimeError("session scheduler already bound or owned")
 
     def reserve_agent(self) -> object:
@@ -41,11 +38,13 @@ class SessionScheduler:
         owner = self._agent_owner = object()
         return owner
 
-    def release_agent(self, owner: object) -> None:
+    def release_agent(self, owner: object) -> bool:
         if self._agent_owner is not None and self._agent_owner is owner:
             if self._revoke_input is not None:
                 self._revoke_input()
             self._agent_owner = None
+            return True
+        return False
 
     def bind(self, submit: _Submit, *, owner: object | None = None,
              on_revoke: Callable[[], None] | None = None) -> Callable[[], None]:
@@ -73,21 +72,6 @@ class SessionScheduler:
         if self._revoke_input is None:
             raise RuntimeError("session scheduler is not bound")
         return self._revoke_input
-
-    @contextmanager
-    def bind_child(self, run_child: _RunChild) -> Iterator[None]:
-        self._ensure_unbound()
-        self._run_child = run_child
-        try:
-            yield
-        finally:
-            self._run_child = None
-
-    async def run_child(self, run_id: str, prompt: str) -> str | None:
-        """直接放行已获准的子任务；准入、名额和串行仍由 dispatcher 负责。"""
-        if self._run_child is None:
-            raise RuntimeError("child session scheduler is not bound")
-        return await self._run_child(run_id, prompt)
 
     def call_started(self, stop: Callable[[], None]) -> None:
         # 每通电话各自的绑定方法同时是撤销入口和通话身份。
@@ -166,7 +150,7 @@ class SessionScheduler:
 
 
 class SessionSchedulers:
-    """应用持有实例表；路由撤销可解除绑定，但不回收调度器。"""
+    """应用持有实例表；主路由保留调度器，子调度器由所属 Agent 树回收。"""
 
     def __init__(self) -> None:
         self._sessions: dict[str, SessionScheduler] = {}
@@ -177,6 +161,11 @@ class SessionSchedulers:
         if scheduler is None:
             scheduler = self._sessions[session_id] = SessionScheduler()
         return scheduler
+
+    def release_child(self, session_id: str, scheduler: SessionScheduler, owner: object) -> None:
+        """只回收仍由该树持有的子调度器；检查和删除之间不让出事件循环。"""
+        if self._sessions.get(session_id) is scheduler and scheduler.release_agent(owner):
+            del self._sessions[session_id]
 
     def submit_internal(self, session_id: str, item: InternalInput) -> bool:
         scheduler = self._sessions.get(session_id)

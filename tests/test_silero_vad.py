@@ -110,6 +110,7 @@ class SileroVADTest(unittest.TestCase):
             from agent_companion.app import run_feishu
             from agent_companion.channels.feishu.channel import FeishuPoller
             from agent_companion.config import FeishuSettings, Settings
+            from agent_companion.runtime.subtasks import demo_roles
             from agent_companion.storage.sqlite import History
 
             sys.path.insert(0, "tests")
@@ -124,7 +125,8 @@ class SileroVADTest(unittest.TestCase):
 
                 discovery = private_discovery("oc_fake", "ou_peer", "ou_self")
                 with closing(History(":memory:")) as history, patch.object(FeishuPoller, "run", poll):
-                    task = asyncio.create_task(run_feishu(settings, history, object(), object(), discovery=discovery))
+                    task = asyncio.create_task(run_feishu(settings, history, object(), object(),
+                                                         discovery=discovery, roles=demo_roles()))
                     try:
                         await asyncio.wait_for(started.wait(), 1)
                         assert not task.done()

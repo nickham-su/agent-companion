@@ -271,10 +271,12 @@ class SessionSchedulerTest(unittest.IsolatedAsyncioTestCase):
                 self.assertIsNone(runtime.last_failure)
                 self.assertEqual(history.pending_inbound("main", "test"), [])
 
-    async def test_permanent_or_exhausted_input_failure_blocks_queue_without_restarting(self):
-        for code, expected_attempts in ((sqlite3.SQLITE_CORRUPT, 1), (sqlite3.SQLITE_IOERR, 2)):
-            with self.subTest(code=code):
-                model = _Model()
+    async def test_failed_input_waits_for_new_submission_and_only_retries_when_safe(self):
+        cases = ((sqlite3.SQLITE_CORRUPT, 1, False), (sqlite3.SQLITE_IOERR, 2, True),
+                 (sqlite3.SQLITE_IOERR, 2, False))
+        for code, expected_attempts, recovers in cases:
+            with self.subTest(code=code, recovers=recovers):
+                model = _Model(*([(TextDelta("reply"),)] * 3))
                 runtime, history = self.make_runtime(model, retry_sqlite_locks=True)
                 ref = self.record_inbound(history, "A persistent")
                 speech = Message("user", "A speech")
@@ -282,6 +284,7 @@ class SessionSchedulerTest(unittest.IsolatedAsyncioTestCase):
                 error.sqlite_errorcode = code
                 append = history._append
                 attempts = 0
+                failed = True
 
                 def fail_statement(session_id, messages):
                     nonlocal attempts
@@ -289,7 +292,8 @@ class SessionSchedulerTest(unittest.IsolatedAsyncioTestCase):
                     ids = append(session_id, messages)
                     if messages == (speech,):
                         attempts += 1
-                        raise error
+                        if failed:
+                            raise error
                     return ids
 
                 with (patch.object(history, "_append", side_effect=fail_statement),
@@ -305,16 +309,33 @@ class SessionSchedulerTest(unittest.IsolatedAsyncioTestCase):
                 failed_batch = runtime._pending[0]
                 self.assertEqual(failed_batch.items, (ref, speech))
 
-                # 故障消失后重投也不能越过队首，或自行重启 worker。
+                # 飞书轮询重投同一批次不能唤醒；真正的新输入才提供重试机会。
                 runtime.submit_persisted_batch(ref.batch_id)
-                runtime.submit_batch((Message("user", "new C"),))
                 await asyncio.wait_for(runtime.wait_idle(), 2)
-                self.assertIs(runtime._pending[0], failed_batch)
-                self.assertEqual(len(runtime._pending), 3)
                 self.assertIsNone(runtime._worker)
-                self.assertEqual(runtime.last_failure, "input_write_failed")
-                self.assertEqual(history.read_after("main"), [])
-                self.assertEqual(model.requests, [])
+                failed = not recovers
+                with patch.object(history, "_append", side_effect=fail_statement):
+                    if code == sqlite3.SQLITE_IOERR and not recovers:
+                        with self.assertLogs("agent_companion.runtime.engine", "ERROR"):
+                            runtime.submit_batch((Message("user", "new C"),))
+                            await asyncio.wait_for(runtime.wait_idle(), 2)
+                    else:
+                        runtime.submit_batch((Message("user", "new C"),))
+                        await asyncio.wait_for(runtime.wait_idle(), 2)
+                if recovers:
+                    self.assertEqual(attempts, expected_attempts + 1)
+                    expected = ["A persistent", "A speech", "later B", "new C"]
+                    self.assertEqual([[m.content for m in request if m.role == "user"] for request in model.requests],
+                                     [expected[:2], expected[:3], expected])
+                    self.assertIsNone(runtime.last_failure)
+                else:
+                    self.assertEqual(attempts, expected_attempts * (2 if code == sqlite3.SQLITE_IOERR else 1))
+                    self.assertIs(runtime._pending[0], failed_batch)
+                    self.assertEqual(len(runtime._pending), 3)
+                    self.assertIsNone(runtime._worker)
+                    self.assertEqual(runtime.last_failure, "input_write_failed")
+                    self.assertEqual(history.read_after("main"), [])
+                    self.assertEqual(model.requests, [])
 
     async def test_ioerr_from_commit_is_not_replayed_because_outcome_is_unknown(self):
         model = _Model()
@@ -338,6 +359,11 @@ class SessionSchedulerTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(runtime.last_failure, "input_write_failed")
         self.assertEqual([row.message.content for row in history.read_after("main")], ["A persistent", "A speech"])
         self.assertEqual(history.pending_inbound("main", "test"), [])
+        self.assertEqual(model.requests, [])
+        runtime.submit_batch((Message("user", "new C"),))
+        await asyncio.wait_for(runtime.wait_idle(), 2)
+        self.assertEqual(runtime.last_failure, "input_write_failed")
+        self.assertEqual([row.message.content for row in history.read_after("main")], ["A persistent", "A speech"])
         self.assertEqual(model.requests, [])
 
     async def test_rollback_failure_isolates_the_shared_connection_even_if_close_fails(self):
@@ -402,12 +428,12 @@ class SessionSchedulerTest(unittest.IsolatedAsyncioTestCase):
                     self.assertEqual([row.message.content for row in reopened.read_after("other")],
                                      ["already committed B"])
 
-    async def test_run_internal_keeps_legacy_lock_retry_and_does_not_replay_ioerr(self):
+    async def test_child_runtime_retries_and_records_inputs_atomically_in_shared_queue(self):
         for code in (sqlite3.SQLITE_BUSY, sqlite3.SQLITE_IOERR):
             with self.subTest(code=code), closing(History(":memory:")) as history:
                 model = _Model((TextDelta("done"),))
                 child = Runtime("child", history, model, None, retry_sqlite_locks=True)
-                error = sqlite3.OperationalError("synthetic subtask write failure")
+                error = sqlite3.OperationalError("synthetic child write failure")
                 error.sqlite_errorcode = code
                 append = history._append
                 attempts = 0
@@ -423,22 +449,13 @@ class SessionSchedulerTest(unittest.IsolatedAsyncioTestCase):
                     return ids
 
                 try:
-                    with (patch.object(history, "_append", side_effect=fail_once),
-                          patch("agent_companion.runtime.sqlite_access._INPUT_LOCK_RETRIES", 0)):
-                        if code == sqlite3.SQLITE_BUSY:
-                            self.assertIsNone(await asyncio.wait_for(child.run_internal("run", "prompt"), 2))
-                            self.assertEqual(attempts, 2)
-                            self.assertEqual([row.message.content for row in history.read_after("child")],
-                                             ["prompt", "done"])
-                        else:
-                            with self.assertLogs("agent_companion.runtime.engine", "ERROR") as logs:
-                                result = await asyncio.wait_for(child.run_internal("run", "prompt"), 2)
-                            self.assertEqual(result, "runtime_failed")
-                            self.assertEqual(attempts, 1)
-                            self.assertEqual(history.read_after("child"), [])
-                            self.assertEqual(model.requests, [])
-                            self.assertIn("error_type=OperationalError", logs.output[0])
-                            self.assertNotIn("synthetic", logs.output[0])
+                    with patch.object(history, "_append", side_effect=fail_once):
+                        child.submit_batch((Message("user", "prompt"),))
+                        await asyncio.wait_for(child.wait_idle(), 2)
+                    self.assertIsNone(child.last_failure)
+                    self.assertEqual(attempts, 2)
+                    self.assertEqual([row.message.content for row in history.read_after("child")], ["prompt", "done"])
+                    self.assertEqual(len(model.requests), 1)
                 finally:
                     await child.close()
 
@@ -457,8 +474,9 @@ class SessionSchedulerTest(unittest.IsolatedAsyncioTestCase):
 
             try:
                 with patch.object(history, "_append", side_effect=cancelled_after_write):
+                    child.submit_batch((Message("user", "prompt"),))
                     with self.assertRaises(asyncio.CancelledError):
-                        await asyncio.wait_for(child.run_internal("run", "prompt"), 2)
+                        await asyncio.wait_for(child._worker, 2)
                 wrapped.close.assert_called_once()
                 wrapped.commit.assert_not_called()
                 with self.assertRaises(sqlite3.ProgrammingError):

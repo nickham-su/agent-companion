@@ -376,8 +376,10 @@ class DeepSeekTest(unittest.IsolatedAsyncioTestCase):
             async with httpx.AsyncClient(transport=httpx.MockTransport(endpoint)) as client:
                 runtime = Runtime("diagnostics", history, DeepSeek(client), None)
                 with self.assertLogs("agent_companion.runtime.engine", level="WARNING") as logs:
-                    for i in range(2):
-                        self.assertEqual(await runtime.run_internal(str(i), "synthetic user content"), "model_failed")
+                    for _ in range(2):
+                        runtime.submit_batch((Message("user", "synthetic user content"),))
+                        await runtime.wait_idle()
+                        self.assertEqual(runtime.last_failure, "model_failed")
                 self.assertEqual([row.model_error for row in history.outcomes("diagnostics")], ["http_401", "http_429"])
                 lines = " ".join(logs.output)
                 self.assertIn("http_401", lines)
@@ -408,15 +410,21 @@ class DeepSeekTest(unittest.IsolatedAsyncioTestCase):
             async with httpx.AsyncClient(transport=httpx.MockTransport(endpoint)) as client:
                 runtime = Runtime("child", history, DeepSeek(client), None, settings=settings)
                 try:
-                    self.assertIsNone(await runtime.run_internal("first", "首次请求"))
+                    runtime.submit_batch((Message("user", "首次请求"),))
+                    await runtime.wait_idle()
+                    self.assertIsNone(runtime.last_failure)
                     self.assertIsNone(history.summary("child"))
                     self.assertEqual(history.last_input_tokens("child"), 300)
-                    self.assertIsNone(await runtime.run_internal("next", "新的文字"))
+                    runtime.submit_batch((Message("user", "新的文字"),))
+                    await runtime.wait_idle()
+                    self.assertIsNone(runtime.last_failure)
                     task = runtime._compactions._generating
                     if task is not None:
                         await asyncio.wait_for(asyncio.shield(task), 2)
                     self.assertIsNone(history.summary("child"))
-                    self.assertIsNone(await runtime.run_internal("apply", "应用摘要"))
+                    runtime.submit_batch((Message("user", "应用摘要"),))
+                    await runtime.wait_idle()
+                    self.assertIsNone(runtime.last_failure)
                 finally:
                     await runtime.close()
             self.assertEqual(len(requests), 4)

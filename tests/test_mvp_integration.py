@@ -17,8 +17,8 @@ from agent_companion.channels.feishu.cli import CommandResult, FeishuDiscovery
 from agent_companion.channels.feishu.macos_calls import RingingWindow, WindowIdentity
 from agent_companion.config import (ASRSettings, FeishuSettings, MiniMaxConnection, RuntimeSettings, Settings,
                                     VoiceSettings)
-from agent_companion.protocol import DeliveryStatus, TextDelta, ToolCall, ToolReady
-from agent_companion.runtime.subtasks import DELEGATE_TOOL_NAME, RESULT_PREFIX
+from agent_companion.protocol import AGENT_REPLY_PREFIX, DeliveryStatus, TextDelta, ToolCall, ToolReady
+from agent_companion.runtime.subtasks import DELEGATE_TOOL_NAME, demo_roles
 from agent_companion.runtime.timers import CANCEL_TIMER_TOOL_NAME, SET_TIMER_TOOL_NAME
 from agent_companion.speech.audio import AudioFormat
 from agent_companion.speech.vad import INPUT_FRAMES, INPUT_RATE
@@ -129,8 +129,8 @@ class _ScriptedModel:
             yield TextDelta(_ACCEPTED)
         elif last.content == _USER:
             assert {tool.name for tool in tools} == {DELEGATE_TOOL_NAME, SET_TIMER_TOOL_NAME, CANCEL_TIMER_TOOL_NAME}
-            yield ToolReady(ToolCall("synthetic-call", DELEGATE_TOOL_NAME, json.dumps({"prompt": _PROMPT})))
-        elif last.content.startswith(RESULT_PREFIX):
+            yield ToolReady(ToolCall("synthetic-call", DELEGATE_TOOL_NAME, json.dumps({"agent": "general", "prompt": _PROMPT})))
+        elif last.content.startswith(AGENT_REPLY_PREFIX):
             yield TextDelta(_RETURNED)
         elif last.content == "明确失败测试":
             yield TextDelta(_FAILED)
@@ -272,7 +272,8 @@ async def _service(settings, history, model, transport, asr, *, desktop=None, tt
           patch("agent_companion.feishu_calls._POLL_SECONDS", 0.01),
           patch("agent_companion.channels.feishu.macos_calls.MacCallDesktop", side_effect=make_desktop),
           patch("agent_companion.app._make_voice", side_effect=make_voice)):
-        task = asyncio.create_task(run_feishu(settings, history, model, asr, discovery=discovery, tts=tts))
+        task = asyncio.create_task(run_feishu(settings, history, model, asr, discovery=discovery, tts=tts,
+                                              roles=demo_roles()))
         try:
             await transport.first_tick.wait()
             yield
@@ -317,20 +318,23 @@ class MVPIntegrationTest(unittest.IsolatedAsyncioTestCase):
                 tool_result = next(row.message for row in history.read_after(session) if row.message.role == "tool")
                 accepted = json.loads(tool_result.content)
                 self.assertEqual(tool_result.tool_call_id, "synthetic-call")
-                child, run = accepted["child_session_id"], accepted["run_id"]
-                self.assertEqual((accepted["status"], history.subtask_run(child, run).status), ("accepted", "running"))
+                child, delegation_id = accepted["agent_id"], accepted["delegation_id"]
+                self.assertEqual(set(accepted), {"status", "agent_id", "delegation_id"})
+                delegation = history.delegation(delegation_id)
+                run = delegation.run_id
+                self.assertEqual((accepted["status"], history.agent_run(run).status), ("accepted", "running"))
 
                 # The main session has settled. Completion alone must wake it; no new CLI message.
                 model.finish_child.set()
                 self.assertEqual(await _outcome(history, session, 3), (DeliveryStatus.FULL, _RETURNED))
                 returned = next(row.message.content for row in history.read_after(session)
-                                if isinstance(row.message.content, str) and row.message.content.startswith(RESULT_PREFIX))
-                self.assertEqual(json.loads(returned.removeprefix(RESULT_PREFIX)), {
-                    "child_session_id": child, "run_id": run, "status": "completed", "result": _RESULT,
-                    "tool_call_id": history.subtask_run(child, run).tool_call_id, "tool_name": DELEGATE_TOOL_NAME,
+                                if isinstance(row.message.content, str) and row.message.content.startswith(AGENT_REPLY_PREFIX))
+                self.assertEqual(json.loads(returned.removeprefix(AGENT_REPLY_PREFIX)), {
+                    "agent_id": child, "run_id": run, "status": "completed", "result": _RESULT,
+                    "delegation_ids": [delegation_id],
                 })
-                self.assertIsNotNone(history.subtask_run(child, run).enqueued_at)
-                self.assertEqual([row.message.content for row in history.read_after(child)], [_PROMPT, _RESULT])
+                self.assertIsNotNone(history.agent_run(run).reply_enqueued_at)
+                self.assertEqual([row.message.content for row in history.read_after(history.agent(child).session_id)], [_PROMPT, _RESULT])
                 self.assertNotIn(_PROMPT, [row.message.content for row in history.read_after(session)])
 
                 transport.push("明确失败测试")
@@ -411,7 +415,7 @@ class MVPIntegrationTest(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(messages.count(_ASR_TEXT), 1)
                 self.assertEqual(messages.count(_USER), 1)
                 self.assertEqual(transport.meeting_lookups, ["list", "detail"])
-                self.assertEqual(history.subtask_run(child, run).status, "completed")
+                self.assertEqual(history.agent_run(run).status, "completed")
                 model_history = [message.content for message in restart_model.restart_request]
                 for recorded in (_ACCEPTED, _RETURNED, _FAILED, _UNKNOWN, prefix, _ASR_TEXT, _NEW_VOICE):
                     self.assertIn(recorded, model_history)

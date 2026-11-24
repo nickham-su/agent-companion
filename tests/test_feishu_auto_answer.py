@@ -14,8 +14,8 @@ from agent_companion.channels.feishu.macos_calls import DesktopCallError, MacCal
 from agent_companion.config import ASRSettings, FeishuSettings, MiniMaxConnection, Settings
 from agent_companion.feishu_calls import IncomingCalls
 from agent_companion.feishu_private import _Route
-from agent_companion.protocol import DeliveryStatus, InternalInput, Message, TextDelta, ToolCall, ToolReady
-from agent_companion.runtime.subtasks import DELEGATE_TOOL_NAME, RESULT_PREFIX
+from agent_companion.protocol import AGENT_REPLY_PREFIX, DeliveryStatus, InternalInput, Message, TextDelta, ToolCall, ToolReady
+from agent_companion.runtime.subtasks import DELEGATE_TOOL_NAME, demo_roles
 from agent_companion.speech.vad import INPUT_FRAMES, INPUT_RATE
 from agent_companion.speech.voice import VoiceChannel
 from agent_companion.storage.sqlite import History
@@ -323,7 +323,7 @@ class IncomingCallTests(unittest.IsolatedAsyncioTestCase):
               patch("agent_companion.feishu_calls._POLL_SECONDS", 0.005),
               patch("agent_companion.feishu_calls._CONNECT_SECONDS", 0.12)):
             task = asyncio.create_task(run_feishu(settings, history, model, object(), tts=tts,
-                                                discovery=self.runner.discovery()))
+                                                discovery=self.runner.discovery(), roles=demo_roles()))
             try:
                 yield history, agents
             finally:
@@ -888,11 +888,11 @@ class IncomingCallTests(unittest.IsolatedAsyncioTestCase):
                     await child_release.wait()
                     yield TextDelta("子任务结果。")
                 elif last.content == "开始委派":
-                    yield ToolReady(ToolCall("voice-child", DELEGATE_TOOL_NAME, '{"prompt":"后台任务"}'))
+                    yield ToolReady(ToolCall("voice-child", DELEGATE_TOOL_NAME, '{"agent":"general","prompt":"后台任务"}'))
                     parent_wait.set()
                     await parent_release.wait()
-                elif isinstance(last.content, str) and last.content.startswith(RESULT_PREFIX):
-                    notices.append(json.loads(last.content.removeprefix(RESULT_PREFIX)))
+                elif isinstance(last.content, str) and last.content.startswith(AGENT_REPLY_PREFIX):
+                    notices.append(json.loads(last.content.removeprefix(AGENT_REPLY_PREFIX)))
                     yield TextDelta("收到任务结果。")
                 else:
                     async for event in super().stream(messages, tools, thinking=thinking):
@@ -919,11 +919,13 @@ class IncomingCallTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(agents.call_count, 1)
                 rows = history.tail(_session(sender), 20)
                 accepted, = (json.loads(row.message.content) for row in rows if row.message.role == "tool")
-                child = history.subtask_run(accepted["child_session_id"], accepted["run_id"])
+                delegation = history.delegation(accepted["delegation_id"])
+                child = history.agent_run(delegation.run_id)
                 self.assertEqual(child.status, "completed")
-                self.assertIsNotNone(child.enqueued_at)
+                self.assertIsNotNone(child.reply_enqueued_at)
                 notice, = notices
-                self.assertEqual(notice["tool_call_id"], "voice-child")
+                self.assertEqual(delegation.tool_call_id, "voice-child")
+                self.assertEqual(notice["delegation_ids"], [delegation.delegation_id])
                 self.assertEqual(notice["result"], "子任务结果。")
                 self.assertIn("挂断前排队转写", [row.message.content for row in rows])
 

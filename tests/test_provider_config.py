@@ -17,6 +17,7 @@ from agent_companion.app import prepare_private_feishu, running_agent
 from agent_companion.config import ConfigError, VoiceSettings, load_settings
 from agent_companion.models.deepseek import CHAT_COMPLETIONS
 from agent_companion.protocol import DeliveryStatus, Message, Receipt
+from agent_companion.runtime.subtasks import demo_roles
 from agent_companion.speech.asr import AudioFile
 from agent_companion.speech.minimax_tts import MiniMaxTTS
 
@@ -353,7 +354,7 @@ timeout = false
         with (patch("sys.argv", ["agent-companion", "--demo-subtasks", "--config", str(self.path)]),
               patch("sys.stdout", new_callable=StringIO) as stdout):
             self.assertEqual(main(), 0)
-            self.assertIn("离线模拟：主会话已收到子任务回投。", stdout.getvalue())
+            self.assertIn("离线模拟：主会话已收到同一子 Agent 的结果。", stdout.getvalue())
         with (patch("sys.argv", ["agent-companion", "--run"]),
               patch("sys.stderr", new_callable=StringIO) as stderr, self.assertRaises(SystemExit)):
             main()
@@ -480,9 +481,9 @@ class ProviderCompositionTests(unittest.IsolatedAsyncioTestCase):
             clients.append(result)
             return result
 
-        async def prepare(settings, history, *, discovery):
+        async def prepare(settings, history, *, discovery, roles):
             async def run(model, asr, tts):
-                async with running_agent(settings, history, model, Voice(), session_id="transport") as (runtime, _):
+                async with running_agent(settings, history, model, Voice(), session_id="transport", roles=roles) as (runtime, _):
                     runtime.submit_batch([Message("user", "fixture input")])
                     await asyncio.wait_for(runtime.wait_idle(), 2)
                     outcome, = history.outcomes("transport")
@@ -500,7 +501,7 @@ class ProviderCompositionTests(unittest.IsolatedAsyncioTestCase):
             with (patch("agent_companion.__main__.httpx.AsyncClient", side_effect=client),
                   patch("agent_companion.__main__.prepare_private_feishu", side_effect=prepare),
                   self.assertLogs("agent_companion", level="WARNING") as logged):
-                serving = asyncio.create_task(_serve(settings))
+                serving = asyncio.create_task(_serve(settings, roles=demo_roles()))
                 initial = (["body-eof", "wire-close-start", "voice-zero"] if eof_first else
                            ["voice-zero", "body-read-cancelled", "wire-close-start"])
                 try:
@@ -577,9 +578,9 @@ class ProviderCompositionTests(unittest.IsolatedAsyncioTestCase):
                     clients.append(result)
                     return result
 
-                async def prepare(settings, history, *, discovery):
+                async def prepare(settings, history, *, discovery, roles):
                     async def run(model, asr, tts):
-                        async with running_agent(settings, history, model, Voice(), session_id="eof") as (runtime, _):
+                        async with running_agent(settings, history, model, Voice(), session_id="eof", roles=roles) as (runtime, _):
                             runtime.submit_batch([Message("user", "prompt")])
                             await asyncio.wait_for(runtime.wait_idle(), 2)
                             outcome, = history.outcomes("eof")
@@ -595,7 +596,7 @@ class ProviderCompositionTests(unittest.IsolatedAsyncioTestCase):
                 with (patch("agent_companion.__main__.httpx.AsyncClient", side_effect=client),
                       patch("agent_companion.__main__.prepare_private_feishu", side_effect=prepare),
                       self.assertLogs("agent_companion.runtime.engine", level="WARNING") as logged):
-                    serving = asyncio.create_task(_serve(settings))
+                    serving = asyncio.create_task(_serve(settings, roles=demo_roles()))
                     try:
                         # 真实的旧 1 秒 Runtime 宽限已耗尽，原生关闭和客户端必须还活着。
                         await asyncio.wait_for(runtime_stopped.wait(), 4)
@@ -674,8 +675,8 @@ voice_id = "synthetic-other-voice"
                         chunks = tts.synthesize("合成输出", sample_rate=settings.voice.output_sample_rate)
                         self.assertEqual([chunk async for chunk in chunks], [b"\x01\x00"])
 
-                async def prepare(settings, history, *, discovery):
-                    run = await prepare_private_feishu(settings, history, discovery=discovery)
+                async def prepare(settings, history, *, discovery, roles):
+                    run = await prepare_private_feishu(settings, history, discovery=discovery, roles=roles)
 
                     async def exercise(model, asr, tts):
                         await drive(model, asr, tts)
@@ -688,7 +689,8 @@ voice_id = "synthetic-other-voice"
                       patch("agent_companion.__main__.prepare_private_feishu", side_effect=prepare),
                       patch("agent_companion.channels.feishu.macos_calls.MacCallDesktop") as desktop,
                       patch("agent_companion.app.run_private_chats", new_callable=AsyncMock) as run_chats):
-                    await _serve(settings, discovery=private_discovery("oc_fixture", "ou_peer", "ou_self"))
+                    await _serve(settings, discovery=private_discovery("oc_fixture", "ou_peer", "ou_self"),
+                                 roles=demo_roles())
                 run_chats.assert_awaited_once()
                 self.assertEqual(desktop.call_count, int(mode != "text"))
                 self.assertEqual(run_chats.await_args.kwargs["incoming"] is not None, mode != "text")

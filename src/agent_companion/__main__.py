@@ -2,11 +2,12 @@
 
 import argparse
 import asyncio
-from collections.abc import AsyncGenerator, Sequence
+from collections.abc import AsyncGenerator, Mapping, Sequence
 from contextlib import AsyncExitStack, closing
 import json
 import logging
 from pathlib import Path
+import sys
 
 import httpx
 
@@ -16,12 +17,13 @@ from .config import ConfigError, Settings, load_settings
 from .logging_setup import stdout_logging
 from .models.deepseek import MODEL_NAME, DeepSeek
 from .models.openai_responses import OpenAIResponses
-from .protocol import (DeliveryStatus, Message, ModelEvent, ReasoningDelta, Receipt, ReplyStream,
+from .protocol import (AGENT_REPLY_PREFIX, DeliveryStatus, Message, ModelEvent, ReasoningDelta, Receipt, ReplyStream,
                        TextDelta, ToolCall, ToolReady, ToolSpec)
-from .runtime.subtasks import DELEGATE_TOOL_NAME, RESULT_PREFIX
+from .runtime.instructions import load_roles
+from .runtime.subtasks import AgentRole, DELEGATE_TOOL_NAME, demo_roles
 from .speech.minimax import MiniMaxASR
 from .speech.vad import VoiceSetupError
-from .storage.sqlite import FeishuBindingError, History
+from .storage.sqlite import DatabaseFormatError, FeishuBindingError, History
 
 
 # 用固定名称，保证 python -m 启动时也走应用的日志配置。
@@ -33,6 +35,7 @@ _DEMO_DELEGATION = "离线模拟：委派一个后台任务"
 class _DemoModel:
     def __init__(self) -> None:
         self.received_subtask_result = False
+        self.child_agent_id: str | None = None
 
     async def stream(self, messages: Sequence[Message], tools: Sequence[ToolSpec], *,
                      thinking: bool) -> AsyncGenerator[ModelEvent, None]:
@@ -41,16 +44,28 @@ class _DemoModel:
         last = messages[-1]
         if tools and last == Message("user", _DEMO_DELEGATION):
             yield ToolReady(ToolCall("demo-delegate", DELEGATE_TOOL_NAME,
-                                     json.dumps({"prompt": "给出一个模拟子任务结果"})))
+                                     json.dumps({"agent": "general", "prompt": "给出一个模拟子任务结果"})))
         elif last.role == "tool":
             yield TextDelta("离线模拟：委派已受理。")
-        elif isinstance(last.content, str) and last.content.startswith(RESULT_PREFIX):
-            payload = json.loads(last.content.removeprefix(RESULT_PREFIX))
-            self.received_subtask_result = payload.get("result") == "模拟子任务已完成。"
-            yield TextDelta("离线模拟：主会话已收到子任务回投。" if self.received_subtask_result
-                            else "离线模拟：子任务失败。")
+        elif isinstance(last.content, str) and last.content.startswith(AGENT_REPLY_PREFIX):
+            payload = json.loads(last.content.removeprefix(AGENT_REPLY_PREFIX))
+            if self.child_agent_id is None and payload.get("result") == "模拟子任务已完成。":
+                self.child_agent_id = payload["agent_id"]
+                yield ToolReady(ToolCall("demo-reuse", DELEGATE_TOOL_NAME, json.dumps({
+                    "agent_id": self.child_agent_id, "prompt": "基于同一个子 Agent 继续任务",
+                })))
+            else:
+                self.received_subtask_result = (payload.get("agent_id") == self.child_agent_id
+                                                and payload.get("result") == "已续接原子任务历史。")
+                yield TextDelta("离线模拟：主会话已收到同一子 Agent 的结果。" if self.received_subtask_result
+                                else "离线模拟：子任务失败。")
         elif not tools:
-            yield TextDelta("模拟子任务已完成。")
+            if last.content == "基于同一个子 Agent 继续任务":
+                continued = any(item.role == "assistant" and item.content == "模拟子任务已完成。"
+                                for item in messages)
+                yield TextDelta("已续接原子任务历史。" if continued else "未找到原子任务历史。")
+            else:
+                yield TextDelta("模拟子任务已完成。")
         else:
             yield TextDelta("离线模拟：运行时已收到输入。")
 
@@ -65,22 +80,23 @@ class _Console:
 async def run_demo(settings: Settings, *, delegate: bool = False) -> bool:
     model = _DemoModel()
     with closing(History(":memory:")) as history:
-        async with running_agent(settings, history, model, _Console(), session_id=_DEMO_SESSION_ID) as (runtime, subtasks):
+        async with running_agent(settings, history, model, _Console(), session_id=_DEMO_SESSION_ID,
+                                 roles=demo_roles()) as (runtime, tree):
             runtime.submit_batch([Message("user", _DEMO_DELEGATION if delegate else "离线模拟输入")])
-            await runtime.wait_idle()
-            await subtasks.wait_idle()
-            await runtime.wait_idle()
+            await tree.wait_idle()
             return runtime.last_failure is None and (not delegate or model.received_subtask_result)
 
 
-async def _serve(settings: Settings, *, discovery: FeishuDiscovery | None = None) -> None:
+async def _serve(settings: Settings, *, discovery: FeishuDiscovery | None = None,
+                 roles: Mapping[str, AgentRole] | None = None) -> None:
+    roles = load_roles(Path.cwd()) if roles is None else roles
     feishu = feishu_settings(settings)
     llm, asr_settings = settings.llm, settings.asr
     tts_settings = settings.tts if feishu.mode == "voice" else None
     if llm is None or asr_settings is None or (feishu.mode == "voice" and tts_settings is None):
         raise ConfigError("正式启动缺少已选中的 Provider 配置")
     with closing(History(settings.database, feishu_private_owner=private_feishu_identity(feishu))) as history:
-        run_private = await prepare_private_feishu(settings, history, discovery=discovery)
+        run_private = await prepare_private_feishu(settings, history, discovery=discovery, roles=roles)
         # 独立客户端，避免任一平台收到另一平台的凭据。不接受网络重定向。
         async with AsyncExitStack() as stack:
             async def client(key: str | None) -> httpx.AsyncClient:
@@ -145,6 +161,9 @@ def _run(settings: Settings, *, for_run: bool, delegate: bool) -> int:
             asyncio.run(_serve(settings))
         except KeyboardInterrupt:
             return 0
+        except (ConfigError, DatabaseFormatError) as exc:
+            print(f"飞书模式无法启动：{exc}", file=sys.stderr)
+            return 1
         except (FeishuBindingError, CliError) as exc:
             _LOG.error("飞书模式无法启动：%s", exc)
             return 1

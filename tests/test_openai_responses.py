@@ -131,7 +131,7 @@ def _model(client, *, history=None, api_key=_KEY, model="fixture-model", effort=
 
 
 async def _complete(fixture, history, *, prompt=None, channel=None, tools=None, settings=None, session_id="main",
-                    instructions="", followup=None, **model_settings):
+                    instructions=None, followup=None, **model_settings):
     async with httpx.AsyncClient(transport=fixture.transport) as client:
         runtime = Runtime(session_id, history, _model(client, history=history, **model_settings), channel or _Channel(),
                           tools=tools, settings=settings, instructions=instructions)
@@ -223,9 +223,10 @@ class OpenAIResponsesTests(unittest.IsolatedAsyncioTestCase):
                 salt = history.replay_salt()
                 self.assertIsNone(await _complete(first, history, channel=channel))
                 self.assertEqual(channel.replies, [])
-                self.assertEqual(len(history.read_after("main")), 2)
+                records = history.read_after("main")
+                self.assertEqual(len(records), 2)
                 outcome = history.outcomes("main")[0]
-                self.assertIsNone(history.run_text("main", outcome.run_id))
+                self.assertEqual(records[-1].message.content, "")
                 self.assertIsNone(outcome.delivery_status)
                 row = history._db.execute("SELECT fingerprint, items FROM model_replays").fetchone()
                 self.assertEqual(len(row["fingerprint"]), 32)
@@ -872,26 +873,31 @@ max_audio_seconds = 500
             tables += (f'[providers.{name}]\nadapter = "openai_responses"\napi_key = "{key}"\nbase_url = "{address}"\n'
                        f'[providers.{name}.llm]\nmodel = "{model}"\nreasoning_effort = "{effort}"\n')
 
-        async def exercise(settings, history, model, asr, tts):
+        async def exercise(settings, history, model, asr, tts, roles):
             self.assertIsInstance(model, OpenAIResponses)
             self.assertIsNone(tts)
-            async with running_agent(settings, history, model, _Channel(), session_id="test-openai") as (runtime, _):
+            async with running_agent(settings, history, model, _Channel(), session_id="test-openai",
+                                     roles=roles) as (runtime, _):
                 self.assertEqual(runtime._settings.model_timeout, 0.75)
                 runtime.submit_batch([Message("user", "synthetic prompt")])
                 await asyncio.wait_for(runtime.wait_idle(), 2)
                 self.assertIsNone(runtime.last_failure)
 
-        async def prepare(settings, history, *, discovery):
-            await prepare_private_feishu(settings, history, discovery=discovery)
+        async def prepare(settings, history, *, discovery, roles):
+            await prepare_private_feishu(settings, history, discovery=discovery, roles=roles)
 
             async def run(model, asr, tts):
-                await exercise(settings, history, model, asr, tts)
+                await exercise(settings, history, model, asr, tts, roles)
 
             return run
 
         actual_client = httpx.AsyncClient
         with TemporaryDirectory(dir=Path.cwd()) as folder:
             config = Path(folder) / "synthetic.toml"
+            agents = config.parent / "agents"
+            agents.mkdir()
+            role_body = "\r\n离线验收指令\r\n"
+            (agents / "main.md").write_bytes(("+++\r\ntools=[]\r\n+++\r\n" + role_body).encode("utf-8"))
             for name, (key, _, model, effort) in profiles.items():
                 with self.subTest(provider=name):
                     config.write_text(f'llm_provider = "{name}"\n' + tables, encoding="utf-8")
@@ -899,11 +905,14 @@ max_audio_seconds = 500
                     answer = (_reason(), _answer("old confirmed")) if name == "initial" else (_answer("follow-up"),)
                     target = "https://other.example.invalid/api/responses" if name == "other_address" else endpoint
                     fixture = _Fixture(self, [_completed(*answer)], api_key=key, endpoint=target)
-                    with (patch("agent_companion.__main__.prepare_private_feishu", side_effect=prepare),
+                    with (patch("agent_companion.__main__.Path.cwd", return_value=config.parent),
+                          patch("agent_companion.__main__.prepare_private_feishu", side_effect=prepare),
                           patch("agent_companion.__main__.httpx.AsyncClient",
                                 side_effect=lambda **opts: actual_client(transport=fixture.transport, **opts))):
                         await _serve(settings, discovery=private_discovery("oc_fixture", "ou_peer", "ou_self"))
                     request, = fixture.requests
+                    self.assertEqual(request["input"][0], {"role": "system", "content": role_body})
+                    self.assertNotIn("tools", request)
                     self.assertEqual(request["model"], model)
                     self.assertEqual(request["reasoning"]["effort"], effort)
                     body = json.dumps(request["input"])

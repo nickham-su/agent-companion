@@ -33,11 +33,11 @@ python -m venv .venv
 
 最后一条是统一离线验收入口：不需要模型密钥、飞书登录或音频设备；集成用例使用项目内临时 SQLite，结束后清理。安装依赖若不能访问公开索引，可从准备好的本地 wheel 目录安装：`.venv/bin/python -m pip install --no-index --find-links <wheel目录> .`（还需包含 `pyproject.toml` 的构建依赖）。精简环境若缺 `ensurepip`，需先提供带 pip 的虚拟环境；目标 Mac 建议使用完整的 Python 发行版。
 
-`.venv/bin/python -m agent_companion` 和 `.venv/bin/python -m agent_companion --demo-subtasks` 可单独运行两个简短演示；不需要生产 Provider 或密钥，始终使用内存数据库，不等同于全量验收。可传 `--config config.example.toml` 验证其他模拟配置；只有 `--run` 使用配置中的数据库路径和 Provider。
+`.venv/bin/python -m agent_companion` 和 `.venv/bin/python -m agent_companion --demo-subtasks` 可单独运行两个简短演示；不需要生产 Provider 或密钥，始终使用内存数据库和内置角色，不需要 `agents/main.md`，不等同于全量验收。可传 `--config config.example.toml` 验证其他模拟配置；只有 `--run` 使用配置中的数据库路径和 Provider。
 
 ## 运行日志
 
-应用日志只写标准输出，不创建日志文件。在配置顶层设置 `log_level`，修改后重启。默认 `WARNING`，只显示警告和错误，同模块同类警告每 30 秒最多打印一次；`INFO` 另显示启停，`ERROR` 和 `CRITICAL` 可进一步收紧输出。
+应用日志只写标准输出，不创建日志文件。在配置顶层设置 `log_level`，修改后重启。默认 `WARNING`，只显示警告和错误，同模块同类警告每 30 秒最多打印一次；`INFO` 另显示启停，`ERROR` 和 `CRITICAL` 可进一步收紧输出。启动配置错误写到标准错误，不受日志级别影响。
 
 排查时改为 `log_level = "DEBUG"`。用 `run` 和 `reply` ID 串起输入、模型、工具与投递；另外记录上下文压缩、子任务和实时语音的阶段状态。日志只有计数、耗时、状态等诊断信息，不包含消息正文、语音转写、工具参数、原始请求或密钥；不逐 token、逐音频帧或逐空轮询输出。
 
@@ -45,7 +45,7 @@ python -m venv .venv
 
 正式启动通过顶层 `llm_provider`、`asr_provider` 引用 `[providers.<名字>]`；`voice` 还需 `tts_provider`，`text` 不使用它。名字是任意配置 ID，`adapter` 才是实际适配器。每套 Provider 在本机配置中直接填写 `api_key`，不从环境变量读取；未选用的 Provider 不需要密钥。改引用后重启即可切换。
 
-旧的 `[llm]`、`[deepseek]`、`[minimax]` 及旧语音模型字段不再兼容，请按 [config.example.toml](config.example.toml) 迁移。已有 SQLite 会话历史保留。`adapter` 必须显式指定，`.llm.reasoning_effort` 必填。
+旧的 `[llm]`、`[deepseek]`、`[minimax]` 及旧语音模型字段不再兼容，请按 [config.example.toml](config.example.toml) 迁移。`adapter` 必须显式指定，`.llm.reasoning_effort` 必填。
 
 请求时限统一配置在 `[timeouts]`，单位秒：`llm` 是单次模型请求总时限（默认 60），`asr` 是单次转写总时限（默认 30），`tts` 是单次网络读写及等待响应的时限（默认 25，仅 `voice` 启用）。切换 Provider 不改变这些值。旧的 `runtime.model_timeout` 和 Provider 能力表里的 `timeout` 不再兼容；语音投递与飞书 CLI 的时限独立配置。升级时删除 `[runtime]` 中旧的 `delivery_timeout`。
 
@@ -83,18 +83,19 @@ python scripts/build_source_zip.py
 1. 用专用飞书账号在本机完成 CLI **用户身份**登录。需要支持 [`im +chat-list --types p2p`](https://github.com/larksuite/cli/blob/main/skills/lark-im/references/lark-im-chat-list.md) 的 CLI 版本和 `im:chat:read` 权限，并确认已授权查询当前登录用户信息（`GET /open-apis/authen/v1/user_info`）、[读取私聊历史](https://open.feishu.cn/document/server-docs/im-v1/message/list)、下载媒体和发送消息。程序不会发起登录或直接读取凭据文件。运行中不要切换 CLI 登录账号或应用配置。
 2. 复制 `config.example.toml` 为 `config.local.toml`，启用 `[feishu]`，填写同一 CLI 应用下登录账号的 `own_open_id`，使用默认的 `mode = "text"`。`database` 可指向尚不存在的新文件，首次启动自动创建。文字模式不加载音频设备或 TTS，也不监听来电、不查询会议；`cli_timeout` 限制单次飞书 CLI 调用（默认 20 秒）。
 3. 按[选择 Provider](#选择-provider)填好所选 LLM 和 MiniMax ASR 的 `api_key`；只在本机私有配置填写真实 Key，不要分享或提交该文件。MiniMax 区域按账号选择 `cn`（[国内 API](https://platform.minimax.cn/docs/api-reference/speech-to-text)）或 `global`（[国际 API](https://platform.minimax.io/docs/api-reference/speech-to-text)）。工作目录需要允许建立用于资源下载的短期目录。
+4. 在启动工作目录下复制 `agents/main.example.md` 为 `agents/main.md`，并按 [Agent 角色配置](#agent-角色配置)编辑。需要委派时，再从 `agents/sub.example.md` 创建实际子角色。
 
 ```sh
 .venv/bin/python -m agent_companion --run --config config.local.toml
 ```
 
-多私聊模式不设白名单，依赖飞书自身的访问边界。只接受真人的一对一私聊，忽略群聊、机器人和自己的消息。首次收到合格消息或处理来电时，按联系人的 `open_id` 启动独立主 Session；后续恢复同一历史并向原私聊回复。同一用户串行，不同用户可并行；没有新增每人限频或全局并发限制。只处理数据库首次启用后发出的消息，即使该私聊稍晚才被发现；重启不会重设这个基准。
+多私聊模式不设白名单，依赖飞书自身的访问边界。只接受真人的一对一私聊，忽略群聊、机器人和自己的消息。首次收到合格消息或处理来电时，按联系人的 `open_id` 定位独立主 Agent；后续复用它绑定的 Session 历史，并向原私聊回复。同一用户串行，不同用户可并行；没有新增每人限频或全局并发限制。只处理数据库首次启用后发出的消息，即使该私聊稍晚才被发现；重启不会重设这个基准。
 
-启动时先检查数据库归属，再核验 CLI 的登录账号，通过后才绑定空库；核验期间的新消息也纳入首次扫描。只有完整、每条记录都能明确分类的快照才能停用路由。无效的 `chat_id`、无法判定对话类型，或真人私聊的对端 `open_id` 缺失或无效，都会使整轮发现失败并保留旧路由。明确是群聊、话题群、机器人或自身的记录仍会排除对应路由。只有同一私聊与同一对端重新验证通过，才从原水位及待处理批次恢复。
+启动时先校验角色文件，再检查数据库归属和 CLI 登录账号，通过后才绑定空库；核验期间的新消息也纳入首次扫描。只有完整、每条记录都能明确分类的快照才能停用路由。无效的 `chat_id`、无法判定对话类型，或真人私聊的对端 `open_id` 缺失或无效，都会使整轮发现失败并保留旧路由。明确是群聊、话题群、机器人或自身的记录仍会排除对应路由。只有同一私聊与同一对端重新验证通过，才从原水位及待处理批次恢复。
 
 多私聊轮询遇 SQLite 暂时锁冲突时保留尚未提交的窗口，下轮重试。运行中，关键上下文及子任务结果读取只重试遇锁的查询，输入移交、内部回投入历史、回复归档和子任务状态写入只重试遇锁的事务。不阻塞事件循环，也不重跑模型、工具或发送。后续输入不会越过正在等待的输入；停用路由会取消等待，不补发已取消的回复。
 
-同一 CLI 用户可使用同一个数据库在 `text` 和 `voice` 间切换；更换账号请使用新库。不会迁移或清空旧库。
+同一 CLI 用户可使用同一个数据库在 `text` 和 `voice` 间切换；更换账号请使用新库。本版不迁移此前版本的数据库，请为本版使用新库；不会自动清空旧库。
 
 轮询使用用户身份调用原始 `/open-apis/im/v1/messages`，保留 `body.content`、发送者和媒体键；每个对话约每 10 秒扫描一次，单次最多 200 页，未读完时从下一页继续同一个固定时间窗口，不提前入队或推进水位。取齐后按原时间顺序提交一个批次。累计窗口超过状态上限时尝试缩短时间范围重新读取；即使最小可推进范围也超限则报错，不跳过数据。后续查询回看 10 秒并以消息 ID 去重，重启从持久化水位重读未完成窗口。水位、去重和待接收输入在同一事务保存，已接收但尚未进入历史的批次重启后继续移交；用户输入进入历史后不自动重跑未完成的模型或外发操作。一个数据库由一个实例运行，不复制 SQLite 文件到交付包。离线测试使用模拟 CLI、模型与合成音频，真实协议和权限待本机验收。
 
@@ -157,21 +158,23 @@ MiniMax 流式合成也可能以 HTTP 200 返回 JSON 业务错误而不是 SSE�
 
 手工验收：让有私聊的联系人先发文字再从私聊拨号（新库可直接先拨号再发文字），检查同一 Session 和双向音频；通话中验证文字和子任务结果可触发播报，并检查打断、暂存顺序和挂断前后选路。挂断后马上重拨或由另一联系人来电，确认新通话没有上一通的转写或待播音频。另测来电撤回、最小化／遮挡／切桌面和群聊／会议邀请。具体判据见 [Mac 实机验收清单](docs/acceptance/mac-checklist.md#实时语音模式)；目标 Mac 仍待实机验证，离线测试不替代这些步骤。
 
-## 本地系统提示词
+## Agent 角色配置
 
-在启动工作目录下创建 UTF-8 编码的 `AGENTS.md`；Runtime 初始化后固定读取该目录，不向父目录查找。每次组装模型请求时重新读取，包括工具续轮、内部子任务和压缩；文件内容附在原有系统指令之后，修改后下一次请求生效，无需重启。文件缺失或只有空白时维持原行为。不可读、非 UTF-8、超过 32 KiB、符号链接或非普通文件会报固定诊断，停止受影响的请求，不记录文件正文。
+正式启动时，只从进程启动工作目录的 `agents/` 加载顶层 UTF-8 `.md` 文件，不跟随符号链接，不读取旧 `AGENTS.md`。必须有通过校验的 `agents/main.md`，否则启动失败。仓库和部署包只提供 `main.example.md` 和 `sub.example.md`；`*.example.md` 不加载。本机实际角色文件由 Git 忽略。配置修改后重启生效。
 
-仓库根目录的 `AGENTS.md` 已被 Git 忽略，但**正文会作为系统提示词发送给配置的模型服务**。请只在可信工作目录启动，不要在文件中放入密钥、凭据或隐私信息。
+- `main.md` 是主角色。要添加子角色，将 `sub.example.md` 复制为 `review.md` 等实际文件；去掉 `.md` 的文件名就是角色 ID。
+- 每个文件开头用两行独占的 `+++` 包围 TOML 头部：`tools` 必须是工具名数组，可填 `delegate_subtask`、`set_timer`、`cancel_timer`，或填 `[]` 不启用工具；`description` 是角色分工，子角色必填非空描述，主角色可省略。只有主角色也能启动，这时不向模型提供委派工具。
+- 结束分隔线后的 Markdown 正文原样作为该角色的系统提示词，包括空行与换行。角色文件限 32 KiB，格式或工具名无效会在启动时报告对应文件。**角色正文和用于选择子角色的描述会发给模型服务，不要放入密钥、凭据或隐私信息，只在可信工作目录启动。**
 
 ## 运行时边界
 
 每条回复首次交接时单独选路，工具续轮的回复也一样：语音按回执结算，飞书文字落库后后台发送。按 `ReplyInfo` 区分回复、运行和会话；其中时间戳是模型请求开始前的事件循环单调时间。纯工具响应不投递。SQLite 原子提交助手记录和对应工具结果，不自动重放已中断的模型调用或外部发送。
 
-主会话的 `delegate_subtask` 只返回本地受理标识，不等待任务完成。同一子会话的各次运行串行，不同子会话可并行；子会话没有工具或用户通道，只将终态结果回投主队列。仅由后台回投触发且尚未纳入新用户输入的主会话运行不能再次委派；已包含用户输入的运行不受此限。
+允许使用 `delegate_subtask` 的 Agent 可以用 `agent` 选角色创建子 Agent，或用 `agent_id` 复用已有的直属子 Agent，两种方式都须传 `prompt`。受理立即返回 `agent_id` 和 `delegation_id`，不等待结果；`run_id` 在实际运行时生成。每个 Agent 串行处理输入，不同 Agent 可并行。新委派和下级回复进入同一队列，运行中在工具结算后有续轮的安全边界纳入，空闲时开启新运行。子 Agent 的每轮最终回复或错误发至直属父级；角色允许时，可信的下级回投可触发下一次委派。
 
-用 `History.subtask_run(child_session_id, run_id)` 可追溯受理、开始、完成和回投入队时间。`enqueued_at` 只表示已入内存队列，不代表已被主会话处理。终态写入最多尝试三次，不重跑模型；持续失败会记录运行 ID、异常类型和未回投，不写假终态，数据库可能保留最后一次状态。退出开始时同步停止接收新委派和回投；可写时将未结束的记录标为中断，异常退出后由下次启动标记。不补跑、不重放；原有子会话 ID 仍可用于新委派。
+用 `History.delegation(delegation_id)` 和 `History.agent_run(run_id)` 核对受理、运行与回投。`reply_enqueued_at` 表示回投已入队，不代表已消费。终态先写入 SQLite 再回投；持续写入失败只记录诊断，不重复执行模型、工具或回投。关闭时停止受理和回投，未结算工作标记中断，重启不补跑或补投；本版持久化的 Agent 及其历史可继续复用。已绑定角色缺失时不能复用该子 Agent，恢复同名文件并重启后可继续；如果没有任何子角色，则委派工具不提供给模型。
 
-主会话可用 `set_timer` 登记定时器。默认单次触发，`interval_seconds` 必须是有限正数，可以是小数；循环时传 `mode: "repeat"`，间隔至少 1 秒，并指定 `max_fires`（1–100 的整数，含两端）。单次和循环合计每个会话最多 8 个活跃定时器，取消或完成后释放名额。`message` 可选，登记立即返回 `timer_id`。
+主角色白名单包含 `set_timer` 时，主 Agent 可登记定时器。默认单次触发，`interval_seconds` 必须是有限正数，可以是小数；循环时传 `mode: "repeat"`，间隔至少 1 秒，并指定 `max_fires`（1–100 的整数，含两端）。单次和循环合计每个会话最多 8 个活跃定时器，取消或完成后释放名额。`message` 可选，登记立即返回 `timer_id`。
 
 到期只向调度器投递 `timer_fired`，最后一次带 `completed` 状态和说明。消息可唤醒空闲 Runtime，也可能在当前工具续轮被处理；语音输入期间可暂存，模型处理时间不作保证。只有含真实用户输入的运行能登记，`cancel_timer` 可用 `timer_id` 停止本会话的后续触发，不撤回已投递消息。会话解绑即撤销回调，进程重启不会恢复定时器；事件循环延误时，循环定时器从实际交接起计算下一次，不集中补发。
 

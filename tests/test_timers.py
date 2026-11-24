@@ -9,6 +9,7 @@ from agent_companion.app import running_agent
 from agent_companion.config import Settings
 from agent_companion.protocol import (DeliveryStatus, InternalInput, Message, Receipt, TIMER_EVENT_PREFIX,
                                       TextDelta, ToolCall, ToolReady)
+from agent_companion.runtime.subtasks import demo_roles
 from agent_companion.runtime.timers import CANCEL_TIMER_TOOL_NAME, SET_TIMER_TOOL_NAME, Timers
 from agent_companion.runtime.tools import ToolContext, Tools
 from agent_companion.session_scheduler import SessionScheduler, SessionSchedulers
@@ -264,7 +265,7 @@ class TimerTest(unittest.IsolatedAsyncioTestCase):
         model, channel = _Model(answer), _Channel()
         with closing(History(":memory:")) as history:
             async with running_agent(Settings(), history, model, channel, session_id="main",
-                                     schedulers=schedulers) as (runtime, _):
+                                     schedulers=schedulers, roles=demo_roles()) as (runtime, _):
                 scheduler.session_input((Message("user", "synthetic registration"),))
                 await asyncio.wait_for(runtime.wait_idle(), 2)
                 self.assertIsNone(runtime._worker)
@@ -299,7 +300,7 @@ class TimerTest(unittest.IsolatedAsyncioTestCase):
         model, channel = _Model(answer), _Channel()
         with closing(History(":memory:")) as history:
             async with running_agent(Settings(), history, model, channel, session_id="main",
-                                     schedulers=schedulers) as (runtime, _):
+                                     schedulers=schedulers, roles=demo_roles()) as (runtime, _):
                 scheduler.session_input((Message("user", "synthetic registration"),))
                 await asyncio.wait_for(runtime.wait_idle(), 2)
                 timer_id = json.loads(model.requests[-1][-1].content)["timer_id"]
@@ -319,7 +320,7 @@ class TimerTest(unittest.IsolatedAsyncioTestCase):
                 model = _Model(_register_then_finish)
                 scheduler = schedulers.get_or_create("main")
                 async with running_agent(Settings(), history, model, _Channel(), session_id="main",
-                                         schedulers=schedulers) as (runtime, _):
+                                         schedulers=schedulers, roles=demo_roles()) as (runtime, _):
                     scheduler.session_input((Message("user", "synthetic registration"),))
                     await asyncio.wait_for(runtime.wait_idle(), 2)
                     handle, = self.clock.handles
@@ -330,7 +331,7 @@ class TimerTest(unittest.IsolatedAsyncioTestCase):
                 self.assertTrue(handle.cancelled)
                 next_model = _Model(_register_then_finish)
                 async with running_agent(Settings(), history, next_model, _Channel(), session_id="main",
-                                         schedulers=schedulers) as (runtime, _):
+                                         schedulers=schedulers, roles=demo_roles()) as (runtime, _):
                     self.clock.advance(10)
                     await asyncio.wait_for(runtime.wait_idle(), 2)
                     self.assertFalse(next_model.requests)

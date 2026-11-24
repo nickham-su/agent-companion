@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import AsyncIterator, Awaitable, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
 from contextlib import asynccontextmanager
 from hashlib import sha256
 import json
@@ -17,13 +17,13 @@ from .feishu_private import run_private_chats
 from .protocol import Channel, Model
 from .runtime.compaction import Compactions
 from .runtime.engine import Runtime
-from .runtime.subtasks import Subtasks
-from .runtime.timers import Timers
+from .runtime.sqlite_access import SQLiteAccess
+from .runtime.subtasks import AgentRole, AgentTree
 from .session_scheduler import SessionSchedulers
 from .speech.asr import FileASR
 from .speech.tts import StreamingTTS
 from .speech.vad import VoiceSetupError
-from .storage.sqlite import FeishuBindingError, History
+from .storage.sqlite import Agent, FeishuBindingError, History
 
 if TYPE_CHECKING:
     from .speech.audio import AudioDevice
@@ -50,45 +50,39 @@ async def _finish_agent_cleanup(cleanups: list[Awaitable[None]]) -> None:
 @asynccontextmanager
 async def running_agent(
     settings: Settings, history: History, model: Model, channel: Channel, *,
-    session_id: str,
+    session_id: str, roles: Mapping[str, AgentRole], agent: Agent | None = None,
     retry_sqlite_locks: bool = False, compactions: Compactions | None = None,
     schedulers: SessionSchedulers | None = None,
-) -> AsyncIterator[tuple[Runtime, Subtasks]]:
-    """组装一组主、子会话；注入的压缩管理器由应用入口负责关闭。"""
+) -> AsyncIterator[tuple[Runtime, AgentTree]]:
+    """组装一条主路由的 Agent 树；注入的压缩管理器由应用入口关闭。"""
     if schedulers is None:
         schedulers = SessionSchedulers()
     scheduler = schedulers.get_or_create(session_id)
     owner = scheduler.reserve_agent()
-    main = subtasks = revoke_input = None
+    tree = None
     owns_compactions = compactions is None
     try:
         llm = settings.llm
         thinking = llm is not None and llm.adapter == "deepseek" and llm.reasoning_effort != "disabled"
+        sqlite = SQLiteAccess(retry_locks=retry_sqlite_locks, stopped=lambda: False)
+        if agent is None:
+            agent = await sqlite.write_input(lambda: history.ensure_main_agent(session_id))
+        if agent.session_id != session_id or agent.parent_agent_id is not None:
+            raise ValueError("main agent does not match route")
+        await sqlite.write_input(lambda: history.interrupt_agent_tree(agent.agent_id, reason="restart"))
         if compactions is None:
             compactions = Compactions(history, model)
-        subtasks = Subtasks(session_id, history, model, schedulers=schedulers,
-                            settings=settings.runtime, thinking=thinking, retry_sqlite_locks=retry_sqlite_locks,
-                            compactions=compactions)
-        timers = Timers(session_id, scheduler.submit_internal)
-        main = Runtime(session_id, history, model, channel, tools=subtasks.tools.with_tools(timers.tools),
-                       settings=settings.runtime, thinking=thinking, retry_sqlite_locks=retry_sqlite_locks,
-                       compactions=compactions)
-
-        # 路由也可以提前撤销绑定；在重新绑定前同步取消旧会话的定时回调。
-        revoke_input = scheduler.bind(main.submit_inputs, owner=owner, on_revoke=timers.close)
-        yield main, subtasks
+        tree = AgentTree(agent, history, model, roles=roles,
+                         schedulers=schedulers, settings=settings.runtime, thinking=thinking,
+                         retry_sqlite_locks=retry_sqlite_locks, compactions=compactions)
+        yield tree.bind_root(channel, owner), tree
     finally:
         try:
-            # 在首次让出事件循环之前关停入口；保留所有权直到异步收尾结束。
-            if revoke_input is not None:
-                revoke_input()
+            # 首次让出循环前关停全部入口；异步收尾完成前保留会话所有权。
             cleanups = []
-            if subtasks is not None:
-                subtasks.stop_accepting()
-                cleanups.append(subtasks.close())
-            if main is not None:
-                main.stop_accepting()
-                cleanups.append(main.close())
+            if tree is not None:
+                tree.stop_accepting()
+                cleanups.append(tree.close())
             if owns_compactions and compactions is not None:
                 compactions.stop()
                 cleanups.append(compactions.close())
@@ -117,9 +111,10 @@ async def _verified_discovery(feishu: FeishuSettings, discovery: FeishuDiscovery
 
 
 async def prepare_private_feishu(
-    settings: Settings, history: History, *, discovery: FeishuDiscovery | None = None,
+    settings: Settings, history: History, *, roles: Mapping[str, AgentRole],
+    discovery: FeishuDiscovery | None = None,
 ) -> Callable[[Model, FileASR, StreamingTTS | None], Awaitable[None]]:
-    """先确认库的归属和实际登录账号，再提交首次启用基准；不重复查验 CLI。"""
+    """接收已校验的角色，确认库的归属和实际登录账号后提交首次启用基准。"""
     feishu = feishu_settings(settings)
     identity = private_feishu_identity(feishu)
     history.check_feishu_private(identity)
@@ -128,6 +123,8 @@ async def prepare_private_feishu(
     started_ms = history.bind_feishu_private(identity, started_ms=candidate_ms)
 
     async def run(model: Model, asr: FileASR, tts: StreamingTTS | None) -> None:
+        sqlite = SQLiteAccess(retry_locks=True, stopped=lambda: False)
+        await sqlite.write_input(lambda: history.interrupt_agent_work(reason="restart"))
         incoming = None
         if feishu.mode == "voice":
             if tts is None:
@@ -150,8 +147,8 @@ async def prepare_private_feishu(
             await run_private_chats(
                 discovery, history, asr, own_id=feishu.own_open_id, started_ms=started_ms, incoming=incoming,
                 schedulers=schedulers,
-                open_agent=lambda session_id, channel: running_agent(
-                    settings, history, model, channel, session_id=session_id,
+                open_agent=lambda agent, channel: running_agent(
+                    settings, history, model, channel, session_id=agent.session_id, agent=agent, roles=roles,
                     retry_sqlite_locks=True, compactions=compactions, schedulers=schedulers))
         finally:
             await compactions.close()
@@ -160,8 +157,9 @@ async def prepare_private_feishu(
 
 
 async def run_feishu(settings: Settings, history: History, model: Model, asr: FileASR, *,
-                     tts: StreamingTTS | None = None, discovery: FeishuDiscovery | None = None) -> None:
-    run_private = await prepare_private_feishu(settings, history, discovery=discovery)
+                     roles: Mapping[str, AgentRole], tts: StreamingTTS | None = None,
+                     discovery: FeishuDiscovery | None = None) -> None:
+    run_private = await prepare_private_feishu(settings, history, discovery=discovery, roles=roles)
     await run_private(model, asr, tts)
 
 

@@ -14,12 +14,15 @@ class ToolContext:
     run_id: str
     call_id: str
     has_user_input: bool
+    agent_id: str | None = None
+    has_agent_input: bool = False
 
 
 @dataclass(frozen=True, slots=True)
 class Tool:
     spec: ToolSpec
     handler: Callable[[dict[str, Any], ToolContext], Awaitable[str]]
+    advertised: bool = True
 
 
 class Tools:
@@ -29,10 +32,8 @@ class Tools:
             if tool.spec.name in self._tools:
                 raise ValueError("duplicate tool name")
             self._tools[tool.spec.name] = tool
-        self.specs = tuple(tool.spec for tool in self._tools.values())
+        self.specs = tuple(tool.spec for tool in self._tools.values() if tool.advertised)
 
-    def with_tools(self, tools: Iterable[Tool]) -> "Tools":
-        return Tools((*self._tools.values(), *tools))
 
     async def execute(self, call: ToolCall, context: ToolContext) -> str:
         tool = self._tools.get(call.name)
