@@ -2,7 +2,6 @@
 
 import asyncio
 from collections import deque
-from collections.abc import Callable
 from dataclasses import dataclass, field
 import json
 import logging
@@ -10,7 +9,8 @@ from typing import Any
 from uuid import uuid4
 
 from ..config import RuntimeSettings
-from ..protocol import Message, Model, ReplyRoute, ToolSpec
+from ..protocol import ASYNC_TOOL_RESULT_PREFIX, AsyncToolResult, InternalInput, Model, ToolSpec
+from ..session_scheduler import SessionScheduler, SessionSchedulers
 from ..storage.sqlite import History
 from .compaction import Compactions
 from .engine import Runtime
@@ -23,7 +23,7 @@ _FINISH_ATTEMPTS = 3
 _MAX_OUTSTANDING = 8  # 含正在执行和已受理排队的任务
 _MAX_CONCURRENT = 2
 DELEGATE_TOOL_NAME = "delegate_subtask"
-RESULT_PREFIX = "[内部子任务结果]\n"
+RESULT_PREFIX = ASYNC_TOOL_RESULT_PREFIX
 _DELEGATE = ToolSpec(
     DELEGATE_TOOL_NAME,
     "把需要独立分析或撰写的工作提交给后台模型，不执行命令。工具只返回受理信息；"
@@ -43,23 +43,20 @@ _DELEGATE = ToolSpec(
 @dataclass(frozen=True, slots=True)
 class _Job:
     run_id: str
+    tool_call_id: str
     prompt: str = field(repr=False)
-    reply_route: ReplyRoute | None
 
 
 class Subtasks:
-    """一个主会话对应一个调度器；同一子会话共享一条临时队列。"""
+    """负责一个主会话的委派准入；同一子会话共享一条临时队列。"""
 
     def __init__(self, parent_session_id: str, history: History, model: Model,
-                 submit_result: Callable[[Message], None], *, settings: RuntimeSettings,
-                 thinking: bool, retry_sqlite_locks: bool = False,
-                 submit_routed_result: Callable[[Message, ReplyRoute], bool] | None = None,
-                 compactions: Compactions | None = None) -> None:
+                 *, schedulers: SessionSchedulers, settings: RuntimeSettings, thinking: bool,
+                 retry_sqlite_locks: bool = False, compactions: Compactions | None = None) -> None:
         self._parent = parent_session_id
         self._history = history
         self._model = model
-        self._submit_result = submit_result
-        self._submit_routed_result = submit_routed_result
+        self._schedulers = schedulers
         self._settings = settings
         self._thinking = thinking
         self._owns_compactions = compactions is None
@@ -108,7 +105,7 @@ class Subtasks:
             self._accepting -= 1
         self._outstanding += 1
         queue = self._queues.setdefault(child, deque())
-        queue.append(_Job(run_id, prompt, context.reply_route))
+        queue.append(_Job(run_id, context.call_id, prompt))
         _LOG.debug("subtask accepted; run=%s parent_run=%s outstanding=%d",
                    run_id, context.run_id, self._outstanding)
         if child not in self._workers:
@@ -121,29 +118,31 @@ class Subtasks:
                               settings=self._settings, thinking=self._thinking,
                               retry_sqlite_locks=self._retry_sqlite_locks, compactions=self._compactions,
                               instructions="你是内部子会话。完成提交的任务并返回结果，不调用工具或联系用户。")
-            while queue and not self._closed:
-                job = queue.popleft()
-                try:
-                    async with self._slots:
-                        if self._closed:
-                            break
-                        await self._run_job(child, runtime, job)
-                except Exception:
-                    _LOG.error("subtask state or result enqueue could not be recorded")
-                finally:
-                    self._outstanding -= 1
+            session = self._schedulers.get_or_create(child)
+            with session.bind_child(runtime.run_internal):
+                while queue and not self._closed:
+                    job = queue.popleft()
+                    try:
+                        async with self._slots:
+                            if self._closed:
+                                break
+                            await self._run_job(child, session, job)
+                    except Exception:
+                        _LOG.error("subtask state or result enqueue could not be recorded")
+                    finally:
+                        self._outstanding -= 1
         finally:
             self._outstanding -= len(queue)
             self._workers.pop(child, None)
             self._queues.pop(child, None)
 
-    async def _run_job(self, child: str, runtime: Runtime, job: _Job) -> None:
+    async def _run_job(self, child: str, session: SessionScheduler, job: _Job) -> None:
         clock = asyncio.get_running_loop().time
         started = clock()
         await self._sqlite(self._history.start_subtask, job.run_id)
         _LOG.debug("subtask started; run=%s", job.run_id)
         try:
-            error = await runtime.run_internal(job.run_id, job.prompt)
+            error = await session.run_child(job.run_id, job.prompt)
         except asyncio.CancelledError:
             if self._closed:
                 raise
@@ -156,17 +155,11 @@ class Subtasks:
         _LOG.debug("subtask finished; run=%s status=%s elapsed_ms=%.0f",
                    job.run_id, "failed" if error is not None else "completed", (clock() - started) * 1000)
         if not self._closed:
-            payload = {"child_session_id": child, "run_id": job.run_id}
-            if error is not None:
-                payload.update(status="failed", error=error)
-            else:
-                payload.update(status="completed", result=result)
-            # 走主队列，而不是在历史中伪造 tool 结果或直接触碰通道。
-            message = Message("user", RESULT_PREFIX + json.dumps(payload, ensure_ascii=False))
-            if job.reply_route is None:
-                self._submit_result(message)
-            elif self._submit_routed_result is None or not self._submit_routed_result(message, job.reply_route):
-                return  # 保留子任务终态，但不把已挂断的回投转送文字或新通话。
+            notice = AsyncToolResult(job.tool_call_id, result=result, error=error, tool_name=DELEGATE_TOOL_NAME,
+                                     child_session_id=child, run_id=job.run_id)
+            # 只按父会话 ID 回投，不触碰用户通道。父会话没有已核验入口时仅保留终态，不重放。
+            if not self._schedulers.submit_internal(self._parent, InternalInput(notice)):
+                return
             await self._sqlite(self._history.mark_subtask_enqueued, job.run_id)
             _LOG.debug("subtask result queued; run=%s", job.run_id)
 

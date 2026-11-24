@@ -109,6 +109,8 @@ async def _serve(settings: Settings, *, discovery: FeishuDiscovery | None = None
                 model = OpenAIResponses(model_client, model=llm.model, api_key=llm.api_key,
                                          base_url=llm.base_url, reasoning_effort=llm.reasoning_effort,
                                          replay_salt=history.replay_salt())
+            # Runtime 与压缩先关停；客户端退出前，模型收齐仍由它持有的原生响应关闭任务。
+            stack.push_async_callback(model.aclose)
             await run_private(model, asr, tts)
 
 

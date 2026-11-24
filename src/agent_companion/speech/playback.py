@@ -37,7 +37,6 @@ async def _segments(reply: ReplyStream) -> AsyncGenerator[str, None]:
 class _Segment:
     text: str
     received: int = 0
-    played: int = 0
     completed_at: float | None = None
     end: int = 0  # 完整合成后，所在音频在本回复中的末尾偏移
 
@@ -56,6 +55,15 @@ class _PlaybackReply:
     stopped_at: float | None = None
     worker_finished_at: float | None = None
 
+    def terminal_at(self, now: float) -> float | None:
+        events = (self.worker_finished_at, self.stopped_at,
+                  self.hard_deadline if now >= self.hard_deadline else None)
+        return min((event for event in events if event is not None), default=None)
+
+    def worker_finished_first(self) -> bool:
+        return (self.worker_finished_at is not None and self.worker_finished_at < self.hard_deadline
+                and (self.stopped_at is None or self.worker_finished_at < self.stopped_at))
+
     def complete(self, part: _Segment) -> None:
         self.offered_bytes += part.received
         part.end = self.offered_bytes
@@ -73,34 +81,11 @@ class _PlaybackReply:
                 end = index
         return "".join(part.text for part in self.segments[:end])
 
-    def confirmation(self, bytes_per_second: int) -> str:
-        # 只在先从设备队列摘除本回复后读计数，回调不会再更改它们。
-        text: list[str] = []
-        played = 0
-        voiced_chars = 0
-        for segment in self.segments:
-            if segment.completed_at is not None and segment.played == segment.received:
-                text.append(segment.text)
-                if segment.played:
-                    played += segment.played
-                    voiced_chars += len(segment.text)
-                continue
-            if segment.played:
-                # 总时长未知时先参考已播整段语速，再回退到每秒四字。
-                estimate = (len(segment.text) * segment.played // segment.received if segment.completed_at is not None else
-                            voiced_chars * segment.played // played if played else
-                            int(4 * segment.played / bytes_per_second))
-                count = max(1, min(estimate, len(segment.text) - 1))
-                text.append(segment.text[:count])
-                played += segment.played
-            break
-        return "".join(text) if played else ""
-
 
 class _PcmQueue:
     def __init__(self, capacity: int) -> None:
         self._lock = Lock()
-        self._packets: deque[tuple[_Segment, memoryview]] = deque()
+        self._packets: deque[memoryview] = deque()
         self._active: _PlaybackReply | None = None
         self._queued = 0
         self._capacity = capacity
@@ -126,12 +111,14 @@ class _PcmQueue:
             state.idle_deadline = state.clock() + timeout if deadline is None else deadline
             return state.idle_deadline
 
-    def idle_snapshot(self, state: _PlaybackReply) -> tuple[float, float, str]:
+    def idle_snapshot(self, state: _PlaybackReply) -> tuple[float, float, str, float | None]:
         with self._lock:
             now, deadline, played = state.clock(), state.idle_deadline, state.played_bytes
+        terminal = state.terminal_at(now)
         # 扫描既有、有上限的段落表，不持 PCM 锁；段落只在同一事件循环更新。
-        prefix = state.confirmed_prefix(played, min(deadline, state.hard_deadline)) if now >= deadline else ""
-        return now, deadline, prefix
+        expired = now >= deadline and (terminal is None or terminal >= deadline)
+        prefix = state.confirmed_prefix(played, deadline) if expired else ""
+        return now, deadline, prefix, terminal
 
     def offer(self, state: _PlaybackReply, part: _Segment, pcm: memoryview) -> int:
         with self._lock:
@@ -139,7 +126,7 @@ class _PcmQueue:
                 raise asyncio.CancelledError  # 防止旧响应在网络取消时迟到的块碰到新响应
             size = min(len(pcm), self._capacity - self._queued)
             if size:
-                self._packets.append((part, pcm[:size]))
+                self._packets.append(pcm[:size])
                 self._queued += size
                 part.received += size
             return size
@@ -159,16 +146,15 @@ class _PcmQueue:
                 return
             offset = 0
             while offset < len(output) and self._packets:
-                part, pcm = self._packets[0]
+                pcm = self._packets[0]
                 size = min(len(output) - offset, len(pcm))
                 output[offset:offset + size] = pcm[:size]
-                part.played += size
                 self._queued -= size
                 offset += size
                 if size == len(pcm):
                     self._packets.popleft()
                 else:
-                    self._packets[0] = (part, pcm[size:])
+                    self._packets[0] = pcm[size:]
             if offset:
                 state.played_bytes += offset
                 if state.idle_timeout:
@@ -184,8 +170,7 @@ class VoiceOutput:
         self._tts = tts
         self._settings = settings
         sample_rate = settings.output_sample_rate
-        self._bytes_per_second = 2 * sample_rate
-        self._prefetch = max(1, round(settings.prefetch_seconds * self._bytes_per_second))
+        self._prefetch = max(1, round(settings.prefetch_seconds * 2 * sample_rate))
         self._pcm = _PcmQueue(2 * round(settings.buffer_seconds * sample_rate))
         self._active: _PlaybackReply | None = None
         self._workers: set[asyncio.Task[None]] = set()
@@ -214,6 +199,7 @@ class VoiceOutput:
             task.exception()  # 回收已脱离本回复的网络任务异常
 
     async def deliver(self, reply: ReplyStream) -> Receipt:
+        reply.select_voice_delivery()
         reply_id = reply.info.reply_id
         reply.limit_text(_MAX_REPLY_TEXT)
         if reply.overflowed:
@@ -248,14 +234,8 @@ class VoiceOutput:
             while not worker.done() and not state.signal.done() and loop.time() < deadline:
                 await asyncio.wait((worker, state.signal), timeout=max(0, deadline - loop.time()),
                                    return_when=asyncio.FIRST_COMPLETED)
-            if state.stopped_at is not None and state.stopped_at < deadline:
-                status = state.signal.result()
-                if status == DeliveryStatus.PARTIAL:
-                    _LOG.debug("voice playback interrupted; reply=%s", reply_id)
-            elif state.worker_finished_at is None or state.worker_finished_at >= deadline:
-                status = DeliveryStatus.UNKNOWN
-                _LOG.warning("voice delivery deadline reached; reply=%s", reply_id)
-            else:
+            # 任务和停播信号可能在同一次唤醒前均已就绪；比较事件时点，不比较观察顺序。
+            if state.worker_finished_first():
                 cancelled = worker.cancelled()
                 error = None if cancelled else worker.exception()
                 if not cancelled and error is None:
@@ -264,6 +244,13 @@ class VoiceOutput:
                     status = DeliveryStatus.FAILED
                     _LOG.warning("voice synthesis failed (%s); reply=%s",
                                  error.diagnostic if isinstance(error, TtsError) else "tts_failed", reply_id)
+            elif state.stopped_at is not None and state.stopped_at < deadline:
+                status = state.signal.result()
+                if status == DeliveryStatus.PARTIAL:
+                    _LOG.debug("voice playback interrupted; reply=%s", reply_id)
+            else:
+                status = DeliveryStatus.UNKNOWN
+                _LOG.warning("voice delivery deadline reached; reply=%s", reply_id)
         finally:
             self._pcm.detach(state)
             self._active = None
@@ -272,9 +259,13 @@ class VoiceOutput:
                 worker.cancel()
             if not state.signal.done():
                 state.signal.cancel()
-        # 只有语音硬超时用保守的完整段落前缀；保留已有打断等终态的确认方式。
-        prefix = (state.confirmed_prefix(state.played_bytes, deadline) if status == DeliveryStatus.UNKNOWN else
-                  state.confirmation(self._bytes_per_second))
+        # 摘除后设备不会再推进字节数。非完整回执只确认合成完成且已全量交给设备的连续段。
+        if status == DeliveryStatus.FULL:
+            prefix = "".join(part.text for part in state.segments) if state.played_bytes else ""
+        else:
+            cutoff = state.terminal_at(loop.time())
+            assert cutoff is not None
+            prefix = state.confirmed_prefix(state.played_bytes, cutoff)
         if not prefix and status in (DeliveryStatus.PARTIAL, DeliveryStatus.FULL):
             status = DeliveryStatus.ZERO
         _LOG.debug("voice playback finished; reply=%s status=%s confirmed_chars=%d elapsed_ms=%.0f",
@@ -284,7 +275,7 @@ class VoiceOutput:
     async def _produce(self, reply: ReplyStream, state: _PlaybackReply) -> None:
         async for text in _segments(reply):
             if state.signal.done() or reply.abandoned:
-                return
+                raise asyncio.CancelledError
             part = _Segment(text)
             state.segments.append(part)
             spoken = text.strip()
@@ -295,7 +286,7 @@ class VoiceOutput:
             while self._pcm.size(state) >= self._prefetch:
                 await asyncio.sleep(_TICK)
             if state.signal.done() or reply.abandoned:
-                return
+                raise asyncio.CancelledError
             async with aclosing(self._tts.synthesize(spoken, sample_rate=self._settings.output_sample_rate)) as pcm:
                 async for chunk in pcm:
                     if not chunk or len(chunk) % 2 or len(chunk) > _MAX_PCM_CHUNK:
@@ -303,7 +294,7 @@ class VoiceOutput:
                     remaining = memoryview(chunk)
                     while remaining:
                         if state.signal.done() or reply.abandoned:
-                            return
+                            raise asyncio.CancelledError
                         consumed = self._pcm.offer(state, part, remaining)
                         remaining = remaining[consumed:]
                         if remaining:
@@ -313,6 +304,8 @@ class VoiceOutput:
             state.complete(part)
         while self._pcm.size(state):
             await asyncio.sleep(_TICK)
+        if state.signal.done() or reply.abandoned:
+            raise asyncio.CancelledError  # 流提前关闭或设备队列被清空都不代表生产成功。
         if reply.overflowed:
             raise TtsError("voice_reply_text_limit")
 

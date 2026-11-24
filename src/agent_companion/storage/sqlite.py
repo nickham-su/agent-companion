@@ -206,6 +206,14 @@ class SummaryWriteError(Exception):
     """摘要写入未提交，可以继续使用已存历史。"""
 
 
+class RetryableInputWrite(Exception):
+    """输入写语句遇到 IOERR，且提交前已成功回滚。"""
+
+
+class InputRollbackFailed(RuntimeError):
+    """输入事务回滚失败；共享连接已失效。"""
+
+
 def is_sqlite_lock_error(exc: sqlite3.OperationalError) -> bool:
     """按 SQLite 主错误码（含扩展码）判定；兼容未携带错误码的合成异常。"""
     code = getattr(exc, "sqlite_errorcode", None)
@@ -217,7 +225,7 @@ def is_sqlite_lock_error(exc: sqlite3.OperationalError) -> bool:
 
 class History:
     def __init__(self, path: str | Path, *, feishu_private_owner: str | None = None) -> None:
-        self._db = sqlite3.connect(path)
+        self._connection: sqlite3.Connection | None = sqlite3.connect(path)
         self._db.row_factory = sqlite3.Row
         try:
             self._db.execute("PRAGMA foreign_keys = ON")
@@ -236,11 +244,22 @@ class History:
                 if "input_tokens" not in columns:
                     self._db.execute("ALTER TABLE reply_outcomes ADD COLUMN input_tokens INTEGER")
         except BaseException:
-            self._db.close()
+            self.close()
             raise
 
+    @property
+    def _db(self) -> sqlite3.Connection:
+        connection = self._connection
+        if connection is None:
+            raise sqlite3.ProgrammingError("storage connection is closed")
+        return connection
+
     def close(self) -> None:
-        self._db.close()
+        # 先摘除持有的连接；即使 close 抛错，也不能再从本 History 发出读写。
+        connection = self._connection
+        self._connection = None
+        if connection is not None:
+            connection.close()
 
     def replay_salt(self) -> bytes:
         """首次使用建立库级随机盐；重启和不同会话使用同一值。"""
@@ -315,8 +334,43 @@ class History:
             ids.append(message_id)
         return ids
 
-    def append(self, session_id: str, messages: Iterable[Message]) -> list[int]:
-        with self._db:
+    @contextmanager
+    def _input_transaction(self, *, retryable_io: bool) -> Iterator[None]:
+        """区分写语句与提交阶段；不能重试提交结果未知的 IOERR。"""
+        connection = self._db
+        try:
+            yield
+        except BaseException as exc:
+            self._rollback_input(connection, exc)
+            if (retryable_io and isinstance(exc, sqlite3.OperationalError)
+                    and getattr(exc, "sqlite_errorcode", None) == sqlite3.SQLITE_IOERR):
+                raise RetryableInputWrite from exc
+            raise
+        else:
+            try:
+                connection.commit()
+            except BaseException as exc:
+                self._rollback_input(connection, exc)
+                raise
+
+    def _rollback_input(self, connection: sqlite3.Connection, trigger: BaseException) -> None:
+        try:
+            connection.rollback()
+        except BaseException as exc:
+            # 不允许另一会话在同一个连接上提交未成功回滚的事务。
+            try:
+                self.close()
+            except Exception:
+                # 持有者已摘除连接，仍按回滚失败报告，不记录底层异常正文。
+                pass
+            if not isinstance(exc, Exception):
+                raise
+            if isinstance(trigger, Exception):
+                raise InputRollbackFailed("input transaction rollback failed") from exc
+            # 原异常是取消或其他 BaseException，由事务调用点继续抛出。
+
+    def append(self, session_id: str, messages: Iterable[Message], *, retryable_io: bool = False) -> list[int]:
+        with self._input_transaction(retryable_io=retryable_io):
             return self._append(session_id, messages)
 
     def inbound_window(self, session_id: str, source: str, now: int) -> tuple[int, int]:
@@ -363,16 +417,33 @@ class History:
 
     def consume_inbound(self, session_id: str, batch_id: int) -> list[int]:
         """原子移交：提交原始用户历史与移出待处理批次不可分开。"""
-        with self._db:
-            key = (session_id, batch_id)
-            row = self._db.execute("SELECT contents FROM inbound_batches WHERE session_id = ? AND batch_id = ?",
-                                   key).fetchone()
-            if row is None:
-                return []
-            if self._db.execute("DELETE FROM inbound_batches WHERE session_id = ? AND batch_id = ?", key).rowcount != 1:
-                return []
-            return self._append(session_id, (Message("user", _decode_content(content))
-                                             for content in json.loads(row["contents"])))
+        with self._input_transaction(retryable_io=True):
+            return self._consume_inbound(session_id, batch_id)
+
+    def append_with_inbound(self, session_id: str, items: Sequence[Message | int]) -> tuple[list[int], bool]:
+        """按给定顺序写入内存消息与飞书批次，返回消息 ID 和是否确实消费了持久化消息。"""
+        ids = []
+        consumed = False
+        with self._input_transaction(retryable_io=True):
+            for item in items:
+                if isinstance(item, int):
+                    inbound_ids = self._consume_inbound(session_id, item)
+                    ids.extend(inbound_ids)
+                    consumed = consumed or bool(inbound_ids)
+                else:
+                    ids.extend(self._append(session_id, (item,)))
+        return ids, consumed
+
+    def _consume_inbound(self, session_id: str, batch_id: int) -> list[int]:
+        key = (session_id, batch_id)
+        row = self._db.execute("SELECT contents FROM inbound_batches WHERE session_id = ? AND batch_id = ?",
+                               key).fetchone()
+        if row is None:
+            return []
+        if self._db.execute("DELETE FROM inbound_batches WHERE session_id = ? AND batch_id = ?", key).rowcount != 1:
+            return []
+        return self._append(session_id, (Message("user", _decode_content(content))
+                                         for content in json.loads(row["contents"])))
 
     def finalize_reply(self, outcome: ReplyOutcome, messages: Sequence[Message]) -> list[int]:
         # 原子提交响应及对应结果，不在崩溃后暴露只有调用、没有结果的组。

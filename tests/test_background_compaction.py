@@ -9,10 +9,16 @@ from time import monotonic
 import unittest
 from unittest.mock import patch
 
+import httpcore
+import httpx
+
 from agent_companion.app import prepare_private_feishu, running_agent
 from agent_companion.config import FeishuSettings, RuntimeSettings, Settings
+from agent_companion.models import _http_stream
+from agent_companion.models.deepseek import DeepSeek
 from agent_companion.protocol import (InputUsage, Message, ProviderReplay, ReplayItem, ReplayScope,
-                                      ReplyRoute, TextDelta, ToolCall, ToolReady)
+                                      TextDelta, ToolCall, ToolReady)
+from agent_companion.runtime.compaction import Compactions, Prefix
 from agent_companion.runtime.context import _SUMMARIZE
 from agent_companion.runtime.engine import Runtime
 from agent_companion.runtime.subtasks import DELEGATE_TOOL_NAME
@@ -66,6 +72,54 @@ class _GatedModel:
         else:
             async for event in self.reply(self.requests[-1]):
                 yield event
+
+
+class _NativeSummaryTransport:
+    """真实 HTTPX/httpcore，底层连接和阻塞的关闭均在内存里。"""
+
+    def __init__(self, *, complete=False):
+        self.waiting, self.closing, self.release, self.closed, self.interrupted = (asyncio.Event() for _ in range(5))
+        body = b'data: {"choices":[{"index":0,"delta":{"content":"background result"}}]}\n\n'
+        if complete:
+            body += b'data: {"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}\n\ndata: [DONE]\n\n'
+        length = len(body) if complete else len(body) + 100
+        packet = (b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n"
+                  + f"Content-Length: {length}\r\n\r\n".encode() + body)
+        fixture = self
+
+        class Wire(httpcore.AsyncNetworkStream):
+            sent = False
+
+            async def read(self, max_bytes, timeout=None):
+                if not self.sent:
+                    self.sent = True
+                    return packet
+                fixture.waiting.set()
+                await asyncio.Future()
+
+            async def write(self, buffer, timeout=None):
+                pass
+
+            async def start_tls(self, ssl_context, server_hostname=None, timeout=None):
+                return self
+
+            async def aclose(self):
+                fixture.closing.set()
+                try:
+                    await fixture.release.wait()
+                except asyncio.CancelledError:
+                    fixture.interrupted.set()
+                    raise
+                fixture.closed.set()
+
+        class Backend(httpcore.AsyncNetworkBackend):
+            async def connect_tcp(self, host, port, timeout=None, local_address=None, socket_options=None):
+                return Wire()
+
+        pool = httpcore.AsyncConnectionPool
+        with patch.object(httpcore, "AsyncConnectionPool", side_effect=lambda **kw: pool(network_backend=Backend(), **kw)):
+            transport = httpx.AsyncHTTPTransport(trust_env=False)
+        self.client = httpx.AsyncClient(transport=transport, trust_env=False)
 
 
 class BackgroundCompactionTest(unittest.IsolatedAsyncioTestCase):
@@ -255,7 +309,7 @@ class BackgroundCompactionTest(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(model.cancelled.is_set())
             self.assertIsNone(history.summary("main-b"))
 
-    async def test_hangup_only_cancels_foreground_and_route_is_rechecked_before_apply(self):
+    async def test_closing_runtime_preserves_shared_compaction_and_rechecks_before_apply(self):
         requesting, allow_read, reading = asyncio.Event(), asyncio.Event(), asyncio.Event()
 
         async def reply(messages):
@@ -264,51 +318,47 @@ class BackgroundCompactionTest(unittest.IsolatedAsyncioTestCase):
                 await asyncio.Event().wait()
             yield TextDelta("normal reply")
 
-        model = _GatedModel(reply)
-        active = True
-        sink = Sink()
-        route = ReplyRoute(sink, lambda: active, 1)
+        model, sink = _GatedModel(reply), Sink()
         with closing(History(":memory:")) as history:
             history.append("main", [_OLD])
             _report_high_usage(history, "main")
-            runtime = Runtime("main", history, model, sink, settings=_SETTINGS)
+            compactions = Compactions(history, model)
+
+            def new_runtime():
+                return Runtime("main", history, model, sink, settings=_SETTINGS, compactions=compactions)
+
+            first, revoked, next_runtime = new_runtime(), new_runtime(), new_runtime()
             try:
-                runtime.submit_batch([Message("user", "call")], reply_route=route)
+                task = await self._begin(first, model, "call")
                 await _wait(requesting)
-                await _wait(model.generating)
-                task = runtime._compactions._generating
-                active = False
-                runtime.stop_reply_route(route)
-                await _idle(runtime)
-                self.assertEqual(runtime.last_failure, "model_timeout")
+                await first.close()
                 self.assertFalse(task.done())
                 self.assertFalse(model.cancelled.is_set())
                 await self._finish(model, task)
                 self.assertIsNone(history.summary("main"))
 
-                original = runtime._context._system_messages
+                original = revoked._context._system_messages
 
                 async def slow_read(*args):
                     reading.set()
                     await allow_read.wait()
                     return await original(*args)
 
-                active = True
-                next_route = ReplyRoute(sink, lambda: active, 1)
-                with patch.object(runtime._context, "_system_messages", side_effect=slow_read):
-                    runtime.submit_batch([Message("user", "route closes in preparation")], reply_route=next_route)
+                with patch.object(revoked._context, "_system_messages", side_effect=slow_read):
+                    revoked.submit_batch([Message("user", "revoked during preparation")])
                     await _wait(reading)
-                    active = False
+                    revoked.stop_accepting()
                     allow_read.set()
-                    await _idle(runtime)
+                    await _idle(revoked)
                     self.assertIsNone(history.summary("main"))
                     self.assertEqual(len(model.requests), 1)
-                runtime.submit_batch([Message("user", "text afterwards")])
-                await _idle(runtime)
+                next_runtime.submit_batch([Message("user", "text afterwards")])
+                await _idle(next_runtime)
                 self.assertIn(_SUMMARY, model.requests[-1])
-                self.assertIn(Message("user", "route closes in preparation"), model.requests[-1])
+                self.assertIn(Message("user", "revoked during preparation"), model.requests[-1])
             finally:
-                await runtime.close()
+                await asyncio.gather(first.close(), revoked.close(), next_runtime.close())
+                await compactions.close()
 
     async def test_application_shutdown_cancels_generation_and_discards_late_result(self):
         model = _GatedModel(result_after_cancel=True)
@@ -323,6 +373,108 @@ class BackgroundCompactionTest(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(task.done())
             self.assertIsNone(main._compactions.ready("main", 0))
             self.assertIsNone(history.summary("main"))
+
+    async def test_close_falls_back_to_cancel_if_adapter_has_no_matching_request(self):
+        model = _GatedModel(result_after_cancel=True)
+        with (closing(History(":memory:")) as history,
+              patch.object(model, "stop_stream", return_value=False, create=True) as stop_stream):
+            compactions = Compactions(history, model)
+            try:
+                compactions.start("main", Prefix(0, 1, 1), [_SUMMARIZE], (), thinking=False, timeout=5)
+                await _wait(model.generating)
+                task = compactions._generating
+                await asyncio.wait_for(compactions.close(), 0.5)
+                stop_stream.assert_called_once_with(task)
+                self.assertTrue(model.cancelled.is_set())
+                self.assertIsNone(compactions.ready("main", 0))
+            finally:
+                await compactions.close()
+
+    async def test_native_summary_close_starts_transport_budget(self):
+        fixture = _NativeSummaryTransport()
+        async with fixture.client as client:
+            model = DeepSeek(client)
+            with closing(History(":memory:")) as history:
+                compactions = Compactions(history, model)
+                prefix = Prefix(0, 1, 1)
+                stopping = None
+                try:
+                    compactions.start("main", prefix, [_SUMMARIZE], (), thinking=False, timeout=5)
+                    await _wait(fixture.waiting)
+                    with (patch.object(_http_stream, "_RESPONSE_CLOSE_TIMEOUT", 0.02),
+                          self.assertLogs(_http_stream.__name__, "WARNING") as logged):
+                        stopping = asyncio.create_task(compactions.close())
+                        await _wait(fixture.closing)
+                        await asyncio.wait_for(asyncio.shield(stopping), 0.5)
+                    self.assertTrue(fixture.interrupted.is_set())
+                    self.assertFalse(fixture.closed.is_set())
+                    self.assertIn("transport_close_timeout", "\n".join(logged.output))
+                    self.assertIsNone(compactions.ready("main", 0))
+                finally:
+                    fixture.release.set()
+                    if stopping is not None:
+                        await stopping
+                    await compactions.close()
+                    await model.aclose()
+
+    async def test_native_summary_result_is_only_registered_while_open(self):
+        for stopped in (False, True):
+            with self.subTest(stopped=stopped):
+                fixture = _NativeSummaryTransport(complete=True)
+                async with fixture.client as client:
+                    model = DeepSeek(client)
+                    with closing(History(":memory:")) as history:
+                        compactions = Compactions(history, model)
+                        prefix = Prefix(0, 1, 1)
+                        try:
+                            compactions.start("main", prefix, [_SUMMARIZE], (), thinking=False, timeout=5)
+                            task = compactions._generating
+                            await _wait(fixture.closing)
+                            self.assertFalse(compactions.can_start("another", 0, 1))
+                            if stopped:
+                                compactions.stop()
+                            fixture.release.set()
+                            await asyncio.wait_for(asyncio.shield(task), 0.5)
+                            result = None if stopped else (prefix, Summary(1, "background result"))
+                            self.assertEqual(compactions.ready("main", 0), result)
+                            self.assertEqual(compactions.can_start("another", 0, 1), not stopped)
+                            self.assertTrue(fixture.closed.is_set())
+                        finally:
+                            fixture.release.set()
+                            await compactions.close()
+                            await model.aclose()
+
+    async def test_native_generation_timeout_starts_transport_budget(self):
+        for summary in (False, True):
+            with self.subTest(summary=summary):
+                fixture = _NativeSummaryTransport()
+                async with fixture.client as client:
+                    model = DeepSeek(client)
+                    with closing(History(":memory:")) as history:
+                        runtime = Runtime("main", history, model, Sink(), settings=replace(_SETTINGS, model_timeout=0.05))
+                        compactions = runtime._compactions
+                        try:
+                            with (patch.object(_http_stream, "_RESPONSE_CLOSE_TIMEOUT", 0.02),
+                                  self.assertLogs("agent_companion", "WARNING") as logged):
+                                if summary:
+                                    compactions.start("main", Prefix(0, 1, 1), [_SUMMARIZE], (), thinking=False,
+                                                      timeout=0.05)
+                                    settled = asyncio.shield(compactions._generating)
+                                else:
+                                    runtime.submit_batch([Message("user", "fixture input")])
+                                    settled = runtime.wait_idle()
+                                await asyncio.wait_for(settled, 0.5)
+                            self.assertTrue(fixture.interrupted.is_set())
+                            self.assertIn("transport_close_timeout", "\n".join(logged.output))
+                            if summary:
+                                self.assertIsNone(compactions.ready("main", 0))
+                                self.assertFalse(compactions.can_start("main", 0, 1))
+                            else:
+                                self.assertEqual(runtime.last_failure, "model_timeout")
+                        finally:
+                            fixture.release.set()
+                            await runtime.close()
+                            await model.aclose()
 
     async def test_summary_timeout_cools_down_and_discards_late_result(self):
         async def reply(messages):

@@ -8,7 +8,7 @@ import logging
 from sqlite3 import OperationalError
 from time import time
 
-from ...protocol import DeliveryStatus, Message, Receipt, ReplyInfo, ReplyStream
+from ...protocol import DeliveryStatus, Message, Receipt, ReplyDelivery, ReplyInfo, ReplyStream
 from ...speech.asr import FileASR
 from ...storage.sqlite import History, is_sqlite_lock_error
 from .cli import MAX_PAGE_SIZE, MIN_PAGE_SIZE, CliError, CliStdoutLimit, FeishuCLI
@@ -27,14 +27,30 @@ _MAX_PENDING_REPLIES = 8
 
 
 class FeishuChannel:
-    def __init__(self, cli: FeishuCLI) -> None:
+    def __init__(self, cli: FeishuCLI, *,
+                 select_voice: Callable[[ReplyStream], ReplyDelivery | None] | None = None) -> None:
         self._cli = cli
+        self._select_voice = select_voice
         self._pending: deque[tuple[str, str]] = deque()
         self._sender: asyncio.Task[None] | None = None
         self._closed = False
 
+    def select_delivery(self, reply: ReplyStream) -> ReplyDelivery:
+        if not self._closed and self._select_voice is not None:
+            selected = self._select_voice(reply)
+            if selected is not None:
+                return selected
+        return ReplyDelivery(self.deliver, after_commit=self.enqueue, require_complete_model=True)
+
     async def deliver(self, reply: ReplyStream) -> Receipt:
-        raise RuntimeError("Feishu text replies require background delivery")
+        """回执仅确认全文已收齐；实际发送必须等待历史提交。"""
+        if self._closed:
+            reply.abandon()
+            return Receipt(reply.info.reply_id, DeliveryStatus.ZERO)
+        text = "".join([segment async for segment in reply])
+        if self._closed or reply.abandoned:
+            return Receipt(reply.info.reply_id, DeliveryStatus.ZERO)
+        return Receipt(reply.info.reply_id, DeliveryStatus.FULL, text)
 
     def enqueue(self, info: ReplyInfo, text: str) -> None:
         """将已落库的文字正文交给发送队列，也可用于语音确认正文的副本。"""

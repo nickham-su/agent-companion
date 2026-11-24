@@ -8,11 +8,18 @@ from tempfile import TemporaryDirectory
 import unittest
 from unittest.mock import patch
 
+import httpcore
+import httpx
+
 from agent_companion.app import running_agent
 from agent_companion.config import Settings
-from agent_companion.protocol import DeliveryStatus, Message, ModelError, Receipt, TextDelta, ToolCall, ToolReady
+from agent_companion.models import _http_stream
+from agent_companion.models.deepseek import DeepSeek
+from agent_companion.protocol import (DeliveryStatus, InternalInput, Message, ModelError, Receipt, TextDelta,
+                                      ToolCall, ToolReady)
 from agent_companion.runtime.subtasks import DELEGATE_TOOL_NAME, RESULT_PREFIX
 from agent_companion.runtime.tools import ToolContext
+from agent_companion.session_scheduler import SessionSchedulers
 from agent_companion.storage.sqlite import History
 
 
@@ -112,6 +119,103 @@ class SubtaskTests(unittest.IsolatedAsyncioTestCase):
         call = _call(call_id, prompt, **extra)
         context = ToolContext("main", "parent-run", call_id, has_user_input=True)
         return json.loads(await subtasks.tools.execute(call, context))
+
+    async def test_native_subtask_transport_finishes_or_expires_before_releasing_parent(self):
+        for mode in ("complete", "graceful", "timeout"):
+            with self.subTest(mode=mode):
+                await self._check_native_subtask_close(mode)
+
+    async def _check_native_subtask_close(self, mode):
+        read_waiting, closing_wire, release, closed, cancelled = (asyncio.Event() for _ in range(5))
+        body = b'data: {"choices":[{"index":0,"delta":{"content":"child result"}}]}\n\n'
+        if mode == "complete":
+            body += b'data: {"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}\n\ndata: [DONE]\n\n'
+        response = (b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n"
+                    + f"Content-Length: {len(body) + (0 if mode == 'complete' else 100)}\r\n\r\n".encode() + body)
+
+        class Wire(httpcore.AsyncNetworkStream):
+            sent = False
+
+            async def read(self, max_bytes, timeout=None):
+                if not self.sent:
+                    self.sent = True
+                    return response
+                read_waiting.set()
+                await asyncio.Future()
+
+            async def write(self, buffer, timeout=None):
+                pass
+
+            async def start_tls(self, ssl_context, server_hostname=None, timeout=None):
+                return self
+
+            async def aclose(self):
+                closing_wire.set()
+                try:
+                    if mode != "complete":
+                        await release.wait()
+                except asyncio.CancelledError:
+                    cancelled.set()
+                    raise
+                closed.set()
+
+        class Backend(httpcore.AsyncNetworkBackend):
+            async def connect_tcp(self, host, port, timeout=None, local_address=None, socket_options=None):
+                return Wire()
+
+        pool = httpcore.AsyncConnectionPool
+        with patch.object(httpcore, "AsyncConnectionPool", side_effect=lambda **kw: pool(network_backend=Backend(), **kw)):
+            transport = httpx.AsyncHTTPTransport(trust_env=False)
+
+        schedulers = SessionSchedulers()
+        scheduler = schedulers.get_or_create("main")
+        budget = 0.1
+        loop = asyncio.get_running_loop()
+        with (patch.object(_http_stream, "_RESPONSE_CLOSE_TIMEOUT", budget),
+              patch.object(_http_stream._LOG, "warning", wraps=_http_stream._LOG.warning) as warning):
+            async with httpx.AsyncClient(transport=transport, trust_env=False) as client:
+                model = DeepSeek(client)
+                agent = running_agent(self.settings, self.history, model, self.channel,
+                                      session_id="main", schedulers=schedulers)
+                runtime, subtasks = await agent.__aenter__()
+                stopping = None
+                try:
+                    job = await self._delegate(subtasks, f"native-{mode}", "fixture task")
+                    if mode == "complete":
+                        await _wait(subtasks.wait_idle())
+                        await _wait(runtime.wait_idle())
+                        result = self._run(job)
+                        self.assertEqual((result.status, result.result), ("completed", "child result"))
+                        self.assertIsNotNone(result.enqueued_at)
+                        self.assertTrue(closed.is_set())
+                        return
+
+                    await _wait(read_waiting.wait())
+                    started = loop.time()
+                    stopping = asyncio.create_task(agent.__aexit__(None, None, None))
+                    await _wait(closing_wire.wait())
+                    self.assertFalse(stopping.done())
+                    with self.assertRaisesRegex(RuntimeError, "already bound or owned"):
+                        scheduler.reserve_agent()
+                    if mode == "graceful":
+                        release.set()
+                    await asyncio.wait_for(asyncio.shield(stopping), 1)
+                    self.assertEqual(closed.is_set(), mode == "graceful")
+                    self.assertEqual(cancelled.is_set(), mode == "timeout")
+                    self.assertEqual(warning.called, mode == "timeout")
+                    if mode == "timeout":
+                        self.assertGreaterEqual(loop.time() - started, budget)
+                        self.assertIn("transport_close_timeout", warning.call_args.args[0])
+                    result = self._run(job)
+                    self.assertEqual((result.status, result.error, result.enqueued_at), ("interrupted", "shutdown", None))
+                    scheduler.release_agent(scheduler.reserve_agent())
+                finally:
+                    release.set()
+                    if stopping is None:
+                        await agent.__aexit__(None, None, None)
+                    else:
+                        await stopping
+                    await model.aclose()
 
     async def test_locked_admissions_reserve_capacity_and_cancellation_releases_it(self):
         async def answer(messages, main):
@@ -249,8 +353,11 @@ class SubtaskTests(unittest.IsolatedAsyncioTestCase):
             await _wait(main.wait_idle())
             self.assertEqual(_result_inputs(self._messages("main")), [
                 {"child_session_id": run.child_session_id, "run_id": run.run_id,
-                 "status": "completed", "result": "child-finished-output"},
+                 "status": "completed", "result": "child-finished-output",
+                 "tool_call_id": "delegate-1", "tool_name": DELEGATE_TOOL_NAME},
             ])
+            tool_rows = [message for message in self._messages("main") if message.role == "tool"]
+            self.assertEqual([(row.tool_call_id, json.loads(row.content)) for row in tool_rows], [(run.tool_call_id, accepted)])
             self.assertEqual(_result_inputs(model.requests[-1][0]), _result_inputs(self._messages("main")))
             self.assertEqual(self._messages(run.child_session_id), [
                 Message("user", "child-only-input"), Message("assistant", "child-finished-output"),
@@ -429,6 +536,8 @@ class SubtaskTests(unittest.IsolatedAsyncioTestCase):
             for item in accepted:
                 run = self._run(item)
                 self.assertEqual((run.status, run.error, run.result), ("failed", "model_failed", None))
+                notice = next(notice for notice in inputs if notice["run_id"] == run.run_id)
+                self.assertEqual((notice["tool_call_id"], notice["tool_name"]), (run.tool_call_id, DELEGATE_TOOL_NAME))
                 self.assertEqual(len(self._messages(run.child_session_id)), 1)
             self.assertTrue(all(item["error"] == "model_failed" and "result" not in item for item in inputs))
             self.assertTrue(self.channel.replies)
@@ -496,7 +605,7 @@ class SubtaskTests(unittest.IsolatedAsyncioTestCase):
             async def compete_with_shutdown():
                 late = await self._delegate(subtasks, "late", "must not be accepted")
                 with self.assertRaisesRegex(RuntimeError, "runtime is closed"):
-                    main.submit_subtask_result(Message("user", "late internal result"))
+                    main.submit_inputs((InternalInput(Message("user", "late internal result")),))
                 return late
 
             # 两条路径比异步 close 更早就绪；退出必须先同步封住入口。
@@ -508,6 +617,77 @@ class SubtaskTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(run.enqueued_at)
         self.assertFalse(self._messages("main"))
         self.assertFalse(self.channel.replies)
+
+    async def test_registered_parent_releases_typed_notice_with_real_user_only(self):
+        schedulers = SessionSchedulers()
+
+        async def answer(messages, main):
+            last = messages[-1]
+            if not main:
+                yield TextDelta("completed:" + last.content)
+            elif last.content == "real-user":
+                self.assertEqual(_result_inputs(messages)[-1]["tool_call_id"], "original-call")
+                yield ToolReady(_call("allowed", "second-child"))
+            else:
+                yield TextDelta("done")
+
+        model = _Model(answer)
+        async with running_agent(self.settings, self.history, model, self.channel,
+                                 session_id="other", schedulers=schedulers):
+            async with running_agent(self.settings, self.history, model, self.channel,
+                                     session_id="main", schedulers=schedulers) as (main, subtasks):
+                parent = schedulers.get_or_create("main")
+                parent.session_input(input_active=True)
+                accepted = await self._delegate(subtasks, "original-call", "first-child")
+                await _wait(subtasks.wait_idle())
+                self.assertEqual(self._run(accepted).status, "completed")
+                self.assertFalse(self._messages("main"))
+                self.assertFalse(self._messages("other"))
+                parent.session_input((Message("user", "real-user"),), input_active=False)
+                await _wait(main.wait_idle())
+                await _wait(subtasks.wait_idle())
+                await _wait(main.wait_idle())
+                self.assertFalse(self._messages("other"))
+                rows = self._messages("main")
+                self.assertEqual([notice["tool_call_id"] for notice in _result_inputs(rows)], ["original-call", "allowed"])
+                self.assertEqual(rows[1], Message("user", "real-user"))
+                accepted_row, = (row for row in rows if row.role == "tool")
+                self.assertEqual((accepted_row.tool_call_id, json.loads(accepted_row.content)["status"]),
+                                 ("allowed", "accepted"))
+
+    async def test_parent_without_active_binding_keeps_terminal_without_replaying(self):
+        schedulers = SessionSchedulers()
+        child_started, child_release = asyncio.Event(), asyncio.Event()
+
+        async def answer(messages, main):
+            if not main:
+                child_started.set()
+                await child_release.wait()
+                yield TextDelta("child completed offline")
+            else:
+                self.fail("an offline completion must not reach a model or send channel")
+
+        model = _Model(answer)
+        async with running_agent(self.settings, self.history, model, self.channel,
+                                 session_id="main", schedulers=schedulers) as (main, subtasks):
+            accepted = await self._delegate(subtasks, "offline", "child-task")
+            await _wait(child_started.wait())
+            parent = schedulers.get_or_create("main")
+            revoke = parent.input_revoker()
+            revoke()
+            child_release.set()
+            await _wait(subtasks.wait_idle())
+            await _wait(main.wait_idle())
+            run = self._run(accepted)
+            self.assertEqual((run.status, run.result, run.enqueued_at), ("completed", "child completed offline", None))
+        async with running_agent(self.settings, self.history, model, self.channel,
+                                 session_id="main", schedulers=schedulers) as (main, subtasks):
+            self.assertIs(schedulers.get_or_create("main"), parent)
+            await _wait(main.wait_idle())
+            await _wait(subtasks.wait_idle())
+            self.assertEqual(len(model.requests), 1)
+            self.assertFalse(self._messages("main"))
+            self.assertFalse(self.channel.replies)
 
     async def test_result_only_run_cannot_delegate_even_after_tool_failure(self):
         async def answer(messages, main):
@@ -571,6 +751,115 @@ class SubtaskTests(unittest.IsolatedAsyncioTestCase):
             outcomes = self.history.outcomes("main")
             self.assertEqual({outcome.run_id for outcome in outcomes[:2]}, {run.parent_run_id})
             self.assertEqual(sum(not names for _, names in model.requests), 2)
+
+    async def test_duplicate_open_does_not_interrupt_the_running_child(self):
+        schedulers = SessionSchedulers()
+        child_started, release = asyncio.Event(), asyncio.Event()
+
+        async def answer(messages, main):
+            if not main:
+                child_started.set()
+                await release.wait()
+            yield TextDelta("done")
+
+        model = _Model(answer)
+        with patch.object(self.history, "interrupt_subtasks", wraps=self.history.interrupt_subtasks) as interrupt:
+            async with running_agent(self.settings, self.history, model, self.channel,
+                                     session_id="main", schedulers=schedulers) as (main, subtasks):
+                accepted = await self._delegate(subtasks, "call", "child")
+                await _wait(child_started.wait())
+                with self.assertRaisesRegex(RuntimeError, "already bound or owned"):
+                    async with running_agent(self.settings, self.history, model, self.channel,
+                                             session_id="main", schedulers=schedulers):
+                        self.fail("a duplicate agent entered the active session")
+                interrupt.assert_called_once_with("main", reason="restart")
+                self.assertEqual(self._run(accepted).status, "running")
+                release.set()
+                await _wait(subtasks.wait_idle())
+                await _wait(main.wait_idle())
+                self.assertEqual(self._run(accepted).status, "completed")
+
+    async def test_shutdown_retains_ownership_during_slow_child_close_and_repeated_cancellation(self):
+        schedulers = SessionSchedulers()
+        child_started, child_closing, release_close = asyncio.Event(), asyncio.Event(), asyncio.Event()
+        previous = []
+
+        async def answer(messages, main):
+            if not main and messages[-1].content == "old-child":
+                child_started.set()
+                try:
+                    await asyncio.Future()
+                except asyncio.CancelledError:
+                    child_closing.set()
+                    await release_close.wait()
+                    raise
+            yield TextDelta("done")
+
+        model = _Model(answer)
+
+        async def run_old():
+            async with running_agent(self.settings, self.history, model, self.channel,
+                                     session_id="main", schedulers=schedulers) as (_, subtasks):
+                previous.append(await self._delegate(subtasks, "old-call", "old-child"))
+                await asyncio.Future()
+
+        old_task = asyncio.create_task(run_old())
+        try:
+            await _wait(child_started.wait())
+            parent = schedulers.get_or_create("main")
+            revoke_old = parent.input_revoker()
+            old_task.cancel()
+            await _wait(child_closing.wait())
+            old_task.cancel()  # 不能中断正在执行的 shutdown，也不能提前放开所有权。
+            await asyncio.sleep(0)
+            self.assertFalse(old_task.done())
+            self.assertEqual(self._run(previous[0]).status, "running")
+            with self.assertRaisesRegex(RuntimeError, "not bound"):
+                parent.session_input((Message("user", "late user"),))
+            self.assertFalse(schedulers.submit_internal("main", InternalInput(Message("user", "late result"))))
+            with self.assertRaisesRegex(RuntimeError, "already bound or owned"):
+                async with running_agent(self.settings, self.history, model, self.channel,
+                                         session_id="main", schedulers=schedulers):
+                    self.fail("a successor entered before old shutdown finished")
+            release_close.set()
+            with self.assertRaises(asyncio.CancelledError):
+                await _wait(old_task)
+            run = self._run(previous[0])
+            self.assertEqual((run.status, run.error, run.enqueued_at), ("interrupted", "shutdown", None))
+
+            async with running_agent(self.settings, self.history, model, self.channel,
+                                     session_id="main", schedulers=schedulers) as (main, subtasks):
+                revoke_old()
+                accepted = await self._delegate(subtasks, "new-call", "new-child")
+                await _wait(subtasks.wait_idle())
+                await _wait(main.wait_idle())
+                self.assertEqual(self._run(accepted).status, "completed")
+                self.assertEqual([item["tool_call_id"] for item in _result_inputs(self._messages("main"))], ["new-call"])
+        finally:
+            release_close.set()
+            if not old_task.done():
+                old_task.cancel()
+            await asyncio.gather(old_task, return_exceptions=True)
+
+    async def test_startup_or_shutdown_failure_releases_session_ownership(self):
+        schedulers = SessionSchedulers()
+        model = _Model(None)
+        interrupt = self.history.interrupt_subtasks
+        for failure in ("restart", "shutdown"):
+            with self.subTest(failure=failure):
+                def fail_phase(session_id, *, reason):
+                    if reason == failure:
+                        raise OperationalError("injected lifecycle failure")
+                    return interrupt(session_id, reason=reason)
+
+                with patch.object(self.history, "interrupt_subtasks", side_effect=fail_phase):
+                    with self.assertRaisesRegex(OperationalError, "injected lifecycle failure"):
+                        async with running_agent(self.settings, self.history, model, self.channel,
+                                                 session_id="main", schedulers=schedulers):
+                            self.assertEqual(failure, "shutdown")
+                async with running_agent(self.settings, self.history, model, self.channel,
+                                         session_id="main", schedulers=schedulers):
+                    self.assertIsNotNone(schedulers.get_or_create("main").input_revoker())
 
     async def test_close_persists_interruption_and_restart_does_not_resume_or_replay(self):
         started = asyncio.Event()

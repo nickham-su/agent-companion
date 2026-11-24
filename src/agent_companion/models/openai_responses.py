@@ -1,5 +1,6 @@
 """OpenAI Responses：无状态 SSE、原生 item 及已确认历史的回传。"""
 
+import asyncio
 from collections.abc import AsyncGenerator, AsyncIterator, Sequence
 from contextlib import aclosing
 from dataclasses import asdict
@@ -11,9 +12,10 @@ from typing import Any
 import httpx
 
 from ..config import normalize_openai_base_url
-from ..protocol import (MAX_REPLAY_BYTES, Image, InputUsage, Message, ModelError, ModelEvent, ProviderReplay,
-                        ReplayItem, ReplayReady, ReplayScope, Text, TextDelta,
-                        ToolCall, ToolReady, ToolSpec)
+from ..protocol import (MAX_REPLAY_BYTES, Image, InputUsage, Message, ModelClosing, ModelError, ModelEvent,
+                        ProviderReplay, ReplayItem, ReplayReady, ReplayScope, Text, TextDelta, ToolCall,
+                        ToolReady, ToolSpec)
+from ._http_stream import ResponseStreams
 from ._request import JSON_ENCODER, request_body
 
 
@@ -333,6 +335,7 @@ class OpenAIResponses:
         fingerprint = hmac.digest(api_key.encode("ascii"),
                                   b"agent-companion/openai-responses-replay\0" + replay_salt + target, "sha256")
         self._client = client
+        self._responses = ResponseStreams()
         self._endpoint = base_url + "/responses"
         self._authorization = f"Bearer {api_key}"
         self._model = model
@@ -358,11 +361,12 @@ class OpenAIResponses:
         body = request_body(self._payload(messages, tools))
         terminal: list[ModelEvent] = []
         try:
-            async with self._client.stream("POST", self._endpoint, content=body, follow_redirects=False,
-                                           auth=None, headers={
+            request = self._client.stream("POST", self._endpoint, content=body, follow_redirects=False,
+                                          auth=None, headers={
                 "Authorization": self._authorization,
                 "Accept": "text/event-stream", "Content-Type": "application/json", "Accept-Encoding": "identity",
-            }) as response:
+            })
+            async with self._responses.open(request) as response:
                 if not response.is_success:
                     raise ModelError(f"http_{response.status_code}")
                 if response.headers.get("Content-Encoding", "").strip().lower() not in ("", "identity"):
@@ -375,8 +379,15 @@ class OpenAIResponses:
                             yield event
                         else:
                             terminal.append(event)
+                yield ModelClosing(complete=False)
         except httpx.RequestError:
             raise ModelError("transport_error") from None
         # HTTP 传输完成收尾后才提交工具和私有回放；此前仅允许文本交付。
         for event in terminal:
             yield event
+
+    def stop_stream(self, reader: asyncio.Task[object]) -> bool:
+        return self._responses.stop(reader)
+
+    async def aclose(self) -> None:
+        await self._responses.aclose()

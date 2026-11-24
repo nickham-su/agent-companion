@@ -376,10 +376,10 @@ class OpenAIResponsesTests(unittest.IsolatedAsyncioTestCase):
                     ([_delta("可见前缀"), {"type": "response.output_item.done", "output_index": 1, "item": _reason()}],
                      "truncated_stream"),
                     ([_delta("可见前缀"), _completed(_answer("可见前缀"), _call(), _call(2, arguments='{"value":NaN}'))],
-                     "invalid_tool_arguments"),
+                      "invalid_tool_arguments"),
                     ([_delta("可见前缀"), _completed(_answer("可见前缀"), _call(), {**_call(2), "call_id": "call_1"})],
-                     "duplicate_tool_id"),
-                    (_Wire([_delta("可见前缀"), valid], close_error=True), "transport_error")]
+                      "duplicate_tool_id"),
+                     (_Wire([_delta("可见前缀", output=1), valid], close_error=True), "transport_error")]
         for packet, error in variants:
             with self.subTest(error=error), closing(History(":memory:")) as history:
                 tool = AsyncMock(return_value="must not call")
@@ -389,6 +389,53 @@ class OpenAIResponsesTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(history.outcomes("main")[0].model_error, error)
                 self.assertEqual(history.read_after("main")[1].message.content, "可见前缀")
                 self.assertEqual(history._db.execute("SELECT count(*) FROM model_replays").fetchone()[0], 0)
+
+    async def test_voice_interrupt_while_closing_preserves_transport_but_not_withheld_terminal(self):
+        closing_wire, release_close, closed_wire = (asyncio.Event() for _ in range(3))
+
+        class SlowWire(_Wire):
+            async def aclose(self):
+                closing_wire.set()
+                await release_close.wait()
+                closed_wire.set()
+
+        fixture = _Fixture(self, SlowWire([_delta("confirmed tail", output=1),
+                                           _completed(_reason(), _answer("confirmed tail"), _call())]),
+                           [_completed(_answer("next"))])
+        tool = AsyncMock(return_value="unexpected")
+
+        class Voice:
+            async def deliver(self, reply):
+                reply.select_voice_delivery()
+                first = await anext(reply)
+                if first == "confirmed tail":
+                    await closing_wire.wait()
+                    return Receipt(reply.info.reply_id, DeliveryStatus.PARTIAL, "confirmed")
+                text = first + "".join([part async for part in reply])
+                return Receipt(reply.info.reply_id, DeliveryStatus.FULL, text)
+
+        with closing(History(":memory:")) as history:
+            async with httpx.AsyncClient(transport=fixture.transport) as client:
+                runtime = Runtime("main", history, _model(client), Voice(), tools=Tools([Tool(_SPEC, tool)]))
+                try:
+                    runtime.submit_batch([Message("user", "one")])
+                    runtime.submit_batch([Message("user", "two")])
+                    await asyncio.wait_for(runtime.wait_idle(), 2)
+                    self.assertFalse(closed_wire.is_set())
+                    old, new = history.outcomes("main")
+                    self.assertEqual((old.model_status, old.delivery_status),
+                                     ("model_interrupted", DeliveryStatus.PARTIAL))
+                    self.assertNotEqual(old.run_id, new.run_id)
+                    self.assertEqual(fixture.requests[1]["input"][-3:], [
+                        {"role": "user", "content": "one"}, {"role": "assistant", "content": "confirmed"},
+                        {"role": "user", "content": "two"},
+                    ])
+                    tool.assert_not_awaited()
+                finally:
+                    release_close.set()
+                    await runtime.close()
+                self.assertTrue(closed_wire.is_set())
+                tool.assert_not_awaited()
 
     async def test_historical_replay_survives_changes_to_tools_and_input_prefix(self):
         tool = AsyncMock(return_value="accepted")

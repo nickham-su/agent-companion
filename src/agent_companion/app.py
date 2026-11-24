@@ -14,10 +14,11 @@ from typing import TYPE_CHECKING
 from .channels.feishu.cli import FeishuDiscovery
 from .config import FeishuSettings, Settings
 from .feishu_private import run_private_chats
-from .protocol import Channel, Message, Model, ReplyRoute
+from .protocol import Channel, Model
 from .runtime.compaction import Compactions
 from .runtime.engine import Runtime
 from .runtime.subtasks import Subtasks
+from .session_scheduler import SessionSchedulers
 from .speech.asr import FileASR
 from .speech.tts import StreamingTTS
 from .speech.vad import VoiceSetupError
@@ -28,47 +29,69 @@ if TYPE_CHECKING:
     from .speech.voice import VoiceChannel
 
 
+async def _finish_agent_cleanup(cleanups: list[Awaitable[None]]) -> None:
+    pending = asyncio.gather(*cleanups, return_exceptions=True)
+    cancelled = None
+    while not pending.done():
+        try:
+            await asyncio.shield(pending)
+        except asyncio.CancelledError as exc:
+            # 调用者可被反复取消；必须等 shutdown 写入结束才能放开该会话。
+            cancelled = exc
+    outcomes = pending.result()
+    if cancelled is not None:
+        raise cancelled
+    for outcome in outcomes:
+        if isinstance(outcome, BaseException):
+            raise outcome
+
+
 @asynccontextmanager
 async def running_agent(
     settings: Settings, history: History, model: Model, channel: Channel, *,
-    session_id: str, wait_for_subtask_delivery: bool = True,
+    session_id: str,
     retry_sqlite_locks: bool = False, compactions: Compactions | None = None,
+    schedulers: SessionSchedulers | None = None,
 ) -> AsyncIterator[tuple[Runtime, Subtasks]]:
     """组装一组主、子会话；注入的压缩管理器由应用入口负责关闭。"""
-    def return_result(message: Message) -> None:
-        main.submit_subtask_result(message, wait_for_delivery=wait_for_subtask_delivery)
-
-    def return_routed_result(message: Message, route: ReplyRoute) -> bool:
-        if not route.active():
-            return False
-        main.submit_subtask_result(message, reply_route=route)
-        return True
-
-    llm = settings.llm
-    thinking = llm is not None and llm.adapter == "deepseek" and llm.reasoning_effort != "disabled"
-
+    if schedulers is None:
+        schedulers = SessionSchedulers()
+    scheduler = schedulers.get_or_create(session_id)
+    owner = scheduler.reserve_agent()
+    main = subtasks = revoke_input = None
     owns_compactions = compactions is None
-    if compactions is None:
-        compactions = Compactions(history, model)
-    subtasks = Subtasks(session_id, history, model, return_result,
-                        settings=settings.runtime, thinking=thinking, retry_sqlite_locks=retry_sqlite_locks,
-                        submit_routed_result=return_routed_result, compactions=compactions)
-    main = Runtime(session_id, history, model, channel, tools=subtasks.tools,
-                   settings=settings.runtime, thinking=thinking, retry_sqlite_locks=retry_sqlite_locks,
-                   compactions=compactions)
     try:
+        llm = settings.llm
+        thinking = llm is not None and llm.adapter == "deepseek" and llm.reasoning_effort != "disabled"
+        if compactions is None:
+            compactions = Compactions(history, model)
+        subtasks = Subtasks(session_id, history, model, schedulers=schedulers,
+                            settings=settings.runtime, thinking=thinking, retry_sqlite_locks=retry_sqlite_locks,
+                            compactions=compactions)
+        main = Runtime(session_id, history, model, channel, tools=subtasks.tools,
+                       settings=settings.runtime, thinking=thinking, retry_sqlite_locks=retry_sqlite_locks,
+                       compactions=compactions)
+
+        revoke_input = scheduler.bind(main.submit_inputs, owner=owner)
         yield main, subtasks
     finally:
-        # 在首次让出事件循环之前关停两端入口，再异步收尾，之后才可关闭 SQLite。
-        subtasks.stop_accepting()
-        main.stop_accepting()
-        cleanups = [subtasks.close(), main.close()]
-        if owns_compactions:
-            compactions.stop()
-            cleanups.append(compactions.close())
-        for outcome in await asyncio.gather(*cleanups, return_exceptions=True):
-            if isinstance(outcome, BaseException):
-                raise outcome
+        try:
+            # 在首次让出事件循环之前关停入口；保留所有权直到异步收尾结束。
+            if revoke_input is not None:
+                revoke_input()
+            cleanups = []
+            if subtasks is not None:
+                subtasks.stop_accepting()
+                cleanups.append(subtasks.close())
+            if main is not None:
+                main.stop_accepting()
+                cleanups.append(main.close())
+            if owns_compactions and compactions is not None:
+                compactions.stop()
+                cleanups.append(compactions.close())
+            await _finish_agent_cleanup(cleanups)
+        finally:
+            scheduler.release_agent(owner)
 
 
 def feishu_settings(settings: Settings) -> FeishuSettings:
@@ -119,12 +142,14 @@ async def prepare_private_feishu(
             incoming = IncomingCalls(desktop, discovery, prepare_voice, own_id=feishu.own_open_id,
                                      idle_timeout=settings.voice.idle_timeout, copy_confirmed=feishu.voice_text_copy)
         compactions = Compactions(history, model)
+        schedulers = SessionSchedulers()
         try:
             await run_private_chats(
                 discovery, history, asr, own_id=feishu.own_open_id, started_ms=started_ms, incoming=incoming,
+                schedulers=schedulers,
                 open_agent=lambda session_id, channel: running_agent(
-                    settings, history, model, channel, session_id=session_id, wait_for_subtask_delivery=False,
-                    retry_sqlite_locks=True, compactions=compactions))
+                    settings, history, model, channel, session_id=session_id,
+                    retry_sqlite_locks=True, compactions=compactions, schedulers=schedulers))
         finally:
             await compactions.close()
 

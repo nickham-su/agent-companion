@@ -1,14 +1,15 @@
 import asyncio
-from contextlib import closing
+from contextlib import closing, contextmanager
 import json
 import unittest
+from unittest.mock import patch
 
 import httpx
 
 from agent_companion.config import RuntimeSettings
 from agent_companion.models.deepseek import DeepSeek, build_request, parse_stream
-from agent_companion.protocol import (DeliveryStatus, Image, InputUsage, Message, ModelError, ReasoningDelta, Receipt, Text,
-                                      TextDelta, ToolCall, ToolReady, ToolSpec)
+from agent_companion.protocol import (DeliveryStatus, Image, InputUsage, Message, ModelClosing, ModelError,
+                                      ReasoningDelta, Receipt, Text, TextDelta, ToolCall, ToolReady, ToolSpec)
 from agent_companion.runtime.context import _SUMMARIZE
 from agent_companion.runtime.engine import Runtime
 from agent_companion.runtime.tools import Tool, Tools
@@ -17,6 +18,21 @@ from agent_companion.storage.sqlite import History
 
 SAMPLE_IMAGE = Image("data:image/png;base64,iVBORw0KGgo=")
 SPEC = ToolSpec("test", "模拟工具", {"type": "object", "properties": {"size": {"type": "integer"}}})
+
+
+@contextmanager
+def _record_model_timers():
+    loop = asyncio.get_running_loop()
+    deadlines, call_at = [], loop.call_at
+
+    def tracking_call_at(when, callback, *args, **kwargs):
+        deadline = call_at(when, callback, *args, **kwargs)
+        if getattr(callback, "__module__", None) == "agent_companion.runtime.model_deadline":
+            deadlines.append(deadline)
+        return deadline
+
+    with patch.object(loop, "call_at", new=tracking_call_at):
+        yield deadlines
 
 
 def chunk(delta=None, finish=None):
@@ -61,7 +77,283 @@ class DeepSeekTest(unittest.IsolatedAsyncioTestCase):
 
         async with httpx.AsyncClient(transport=httpx.MockTransport(endpoint)) as client:
             events = [event async for event in DeepSeek(client).stream([message], (), thinking=False)]
-        self.assertEqual(events, [TextDelta("模拟")])
+        self.assertEqual(events, [TextDelta("模拟"), ModelClosing(complete=True)])
+
+    async def test_interrupted_http_response_cleanup_survives_read_deadline_and_shutdown(self):
+        reading, closing_wire, release_close, closed_wire = (asyncio.Event() for _ in range(4))
+        interrupt, close_cancelled = asyncio.Event(), asyncio.Event()
+
+        class SlowWire(httpx.AsyncByteStream):
+            async def __aiter__(self):
+                frame = chunk({"content": "confirmed tail", "reasoning_content": "unvalidated reasoning"})
+                yield f"data: {frame}\n\n".encode()
+                reading.set()
+                await asyncio.Future()
+
+            async def aclose(self):
+                closing_wire.set()
+                try:
+                    await release_close.wait()
+                except asyncio.CancelledError:
+                    close_cancelled.set()
+                    raise
+                closed_wire.set()
+
+        class Voice:
+            async def deliver(self, reply):
+                reply.select_voice_delivery()
+                await anext(reply)
+                await interrupt.wait()
+                return Receipt(reply.info.reply_id, DeliveryStatus.PARTIAL, "confirmed")
+
+        wire = SlowWire()
+        transport = httpx.MockTransport(lambda request: httpx.Response(200, stream=wire))
+        with _record_model_timers() as deadlines, closing(History(":memory:")) as history:
+            async with httpx.AsyncClient(transport=transport) as client:
+                runtime = Runtime("main", history, DeepSeek(client), Voice(), thinking=True,
+                                  settings=RuntimeSettings(model_timeout=.3))
+                shutdown = None
+                try:
+                    runtime.submit_batch([Message("user", "one")])
+                    await asyncio.wait_for(reading.wait(), 2)
+                    deadline, = deadlines
+                    cutoff = deadline.when()
+                    interrupt.set()
+                    await asyncio.wait_for(closing_wire.wait(), 2)
+                    await asyncio.wait_for(runtime.wait_idle(), 2)
+                    self.assertEqual(history.outcomes("main")[0].model_status, "model_interrupted")
+                    self.assertEqual(history.tail("main", 1)[0].message, Message("assistant", "confirmed"))
+                    self.assertTrue(deadline.cancelled())  # 已撤销旧计时 handle，而不是只清引用。
+                    shutdown = asyncio.create_task(runtime.close())
+                    await asyncio.sleep(max(0, cutoff - asyncio.get_running_loop().time()) + .01)
+                    self.assertFalse(close_cancelled.is_set())
+                    self.assertFalse(shutdown.done())
+                finally:
+                    release_close.set()
+                    if shutdown is None:
+                        await runtime.close()
+                    else:
+                        await asyncio.wait_for(shutdown, 2)
+                self.assertTrue(closed_wire.is_set())
+                self.assertFalse(close_cancelled.is_set())
+
+    async def test_done_commits_reasoning_usage_and_native_tool_before_http_close(self):
+        closing_wire, release_close, closed_wire = (asyncio.Event() for _ in range(3))
+        next_reading, release_next = asyncio.Event(), asyncio.Event()
+        requests, ran = [], []
+
+        class SlowWire(Bytes):
+            async def aclose(self):
+                closing_wire.set()
+                await release_close.wait()
+                closed_wire.set()
+
+        class NextWire(Bytes):
+            async def __aiter__(self):
+                async for data in super().__aiter__():
+                    yield data
+                next_reading.set()
+                await release_next.wait()
+                yield b"data: [DONE]\n\n"
+
+        first = [chunk({"content": "confirmed tail", "reasoning_content": "validated reasoning"}),
+                 chunk(call(id="call-a", type="function", function={"name": "test", "arguments": "{}"})),
+                 chunk(finish="tool_calls"), '{"choices":[],"usage":{"prompt_tokens":42}}', "[DONE]"]
+        second = [chunk({"content": "next", "reasoning_content": "next reasoning"}), chunk(finish="stop")]
+
+        def endpoint(request):
+            requests.append(json.loads(request.content))
+            which = len(requests)
+            frames = first if which == 1 else second
+            content = "".join(f"data: {frame}\n\n" for frame in frames).encode()
+            wire = SlowWire(content) if which == 1 else NextWire(content)
+            return httpx.Response(200, stream=wire)
+
+        async def tool(args, context):
+            ran.append(context.call_id)
+            return "tool completed"
+
+        class Voice:
+            async def deliver(self, reply):
+                reply.select_voice_delivery()
+                content = "".join([part async for part in reply])
+                if content == "confirmed tail":
+                    await closing_wire.wait()
+                    return Receipt(reply.info.reply_id, DeliveryStatus.PARTIAL, "confirmed")
+                return Receipt(reply.info.reply_id, DeliveryStatus.FULL, content)
+
+        with _record_model_timers() as deadlines, closing(History(":memory:")) as history:
+            async with httpx.AsyncClient(transport=httpx.MockTransport(endpoint)) as client:
+                runtime = Runtime("main", history, DeepSeek(client), Voice(), thinking=True,
+                                  tools=Tools([Tool(SPEC, tool)]), settings=RuntimeSettings(model_timeout=.25))
+                try:
+                    runtime.submit_batch([Message("user", "one")])
+                    runtime.submit_batch([Message("user", "two")])
+                    await asyncio.wait_for(next_reading.wait(), 2)
+                    self.assertFalse(closed_wire.is_set())
+                    _, next_deadline = deadlines
+                    cutoff = next_deadline.when()
+                    self.assertFalse(next_deadline.cancelled())
+                    release_close.set()
+                    await asyncio.wait_for(closed_wire.wait(), 2)
+                    self.assertEqual(next_deadline.when(), cutoff)
+                    self.assertFalse(next_deadline.cancelled())
+                    release_next.set()
+                    await asyncio.wait_for(runtime.wait_idle(), 2)
+                    self.assertIsNone(runtime.last_failure)
+                    self.assertEqual(ran, ["call-a"])
+                    old, new = history.outcomes("main")
+                    self.assertEqual((old.model_status, old.delivery_status, old.input_tokens),
+                                     ("complete", DeliveryStatus.PARTIAL, 42))
+                    self.assertNotEqual(old.run_id, new.run_id)
+                    assistant, result, user = requests[1]["messages"][-3:]
+                    self.assertEqual((assistant["content"], assistant["reasoning_content"]),
+                                     ("confirmed", "validated reasoning"))
+                    self.assertEqual(assistant["tool_calls"][0]["id"], "call-a")
+                    self.assertEqual((result["tool_call_id"], result["content"]), ("call-a", "tool completed"))
+                    self.assertEqual(user["content"], "two")
+                finally:
+                    release_close.set()
+                    release_next.set()
+                    await runtime.close()
+                self.assertTrue(closed_wire.is_set())
+
+    async def test_two_complete_tool_rounds_finish_after_response_closes_without_new_input(self):
+        requests, tool_ids = [], []
+        sent = asyncio.Queue()
+        closing_wire = [asyncio.Event() for _ in range(3)]
+        release_close = [asyncio.Event() for _ in range(3)]
+        closed = [asyncio.Event() for _ in range(3)]
+
+        class SlowWire(Bytes):
+            def __init__(self, content, index):
+                super().__init__(content)
+                self.index = index
+
+            async def aclose(self):
+                closing_wire[self.index].set()
+                await release_close[self.index].wait()
+                closed[self.index].set()
+
+        def endpoint(request):
+            index = len(requests)
+            if index:
+                self.assertTrue(closed[index - 1].is_set(), "续轮不应把完整响应留在退役队列")
+            requests.append(json.loads(request.content))
+            if index < 2:
+                frames = [chunk({"content": f"step {index}"}),
+                          chunk(call(id=f"call-{index}", type="function",
+                                     function={"name": "test", "arguments": "{}"})),
+                          chunk(finish="tool_calls"), "[DONE]"]
+            else:
+                frames = [chunk({"content": "final answer"}), chunk(finish="stop"), "[DONE]"]
+            data = "".join(f"data: {frame}\n\n" for frame in frames).encode()
+            return httpx.Response(200, stream=SlowWire(data, index))
+
+        async def tool(args, context):
+            tool_ids.append(context.call_id)
+            return "tool result"
+
+        class Voice:
+            async def deliver(self, reply):
+                reply.select_voice_delivery()
+                text = "".join([part async for part in reply])
+                sent.put_nowait((reply.info.run_id, text))
+                return Receipt(reply.info.reply_id, DeliveryStatus.FULL, text)
+
+        with closing(History(":memory:")) as history:
+            async with httpx.AsyncClient(transport=httpx.MockTransport(endpoint)) as client:
+                runtime = Runtime("main", history, DeepSeek(client), Voice(), tools=Tools([Tool(SPEC, tool)]))
+                try:
+                    runtime.submit_batch([Message("user", "one")])
+                    run_ids = set()
+                    for index, expected in enumerate(("step 0", "step 1", "final answer")):
+                        await asyncio.wait_for(closing_wire[index].wait(), 2)
+                        run_id, text = await asyncio.wait_for(sent.get(), 2)
+                        self.assertEqual(text, expected)
+                        run_ids.add(run_id)
+                        self.assertEqual(len(requests), index + 1)
+                        self.assertFalse(runtime._retired_models)
+                        release_close[index].set()
+                    await asyncio.wait_for(runtime.wait_idle(), 2)
+                    self.assertIsNone(runtime.last_failure)
+                    self.assertEqual(len(run_ids), 1)
+                    self.assertEqual(tool_ids, ["call-0", "call-1"])
+                    self.assertEqual(len(history.outcomes("main")), 3)
+                    self.assertTrue(all(event.is_set() for event in closed))
+                    self.assertFalse(runtime._retired_models)
+                finally:
+                    for release in release_close:
+                        release.set()
+                    await runtime.close()
+
+    async def test_response_close_budget_reports_timeout_without_waiting_for_uncooperative_wire(self):
+        cancellation, release_close, closed = (asyncio.Event() for _ in range(3))
+
+        class SlowWire(Bytes):
+            async def aclose(self):
+                try:
+                    await asyncio.Future()
+                except asyncio.CancelledError:
+                    cancellation.set()
+                    await release_close.wait()
+                closed.set()
+
+        frame = f"data: {chunk({'content': 'confirmed'})}\n\n".encode()
+        transport = httpx.MockTransport(lambda _: httpx.Response(200, stream=SlowWire(frame)))
+        with patch("agent_companion.models._http_stream._RESPONSE_CLOSE_TIMEOUT", .02):
+            async with httpx.AsyncClient(transport=transport) as client:
+                model = DeepSeek(client)
+                try:
+                    with self.assertLogs("agent_companion.models._http_stream", level="WARNING") as logs:
+                        with self.assertRaises(ModelError) as error:
+                            _ = [event async for event in model.stream([Message("user", "one")], (), thinking=False)]
+                    self.assertEqual(error.exception.diagnostic, "transport_close_timeout")
+                    self.assertEqual(len(logs.output), 1)
+                    await asyncio.wait_for(cancellation.wait(), 2)
+                    await asyncio.wait_for(model.aclose(), 2)
+                    self.assertFalse(closed.is_set())
+                finally:
+                    release_close.set()
+                await asyncio.wait_for(closed.wait(), 2)
+
+    async def test_response_close_timeout_preserves_the_primary_error_or_cancellation(self):
+        for status in (503, 200):
+            with self.subTest(status=status):
+                reading = asyncio.Event()
+
+                class SlowWire(Bytes):
+                    async def __aiter__(self):
+                        reading.set()
+                        await asyncio.Future()
+                        yield b""
+
+                    async def aclose(self):
+                        await asyncio.Future()
+
+                transport = httpx.MockTransport(lambda _: httpx.Response(status, stream=SlowWire(b"")))
+                with patch("agent_companion.models._http_stream._RESPONSE_CLOSE_TIMEOUT", .02):
+                    async with httpx.AsyncClient(transport=transport) as client:
+                        model = DeepSeek(client)
+
+                        async def read():
+                            return [event async for event in model.stream([Message("user", "one")], (), thinking=False)]
+
+                        with self.assertLogs("agent_companion.models._http_stream", level="WARNING") as logged:
+                            if status == 503:
+                                with self.assertRaises(ModelError) as error:
+                                    await asyncio.wait_for(read(), 2)
+                                self.assertEqual(error.exception.diagnostic, "http_503")
+                            else:
+                                reader = asyncio.create_task(read())
+                                try:
+                                    await asyncio.wait_for(reading.wait(), 2)
+                                finally:
+                                    reader.cancel()
+                                    with self.assertRaises(asyncio.CancelledError):
+                                        await asyncio.wait_for(reader, 2)
+                        self.assertEqual(len(logged.output), 1)
+                        await model.aclose()
 
     async def test_usage_from_final_content_or_empty_choice_chunk(self):
         final = json.loads(chunk(finish="stop"))

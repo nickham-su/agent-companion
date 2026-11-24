@@ -12,6 +12,7 @@ from time import monotonic
 from ..protocol import (Message, Model, ModelError, ProviderReplay, ReasoningDelta,
                         ReplayReady, TextDelta, ToolReady, ToolSpec)
 from ..storage.sqlite import History, Summary
+from .model_deadline import model_deadline_at
 
 
 _LOG = logging.getLogger(__name__)
@@ -53,8 +54,10 @@ class Compactions:
         if not self._closed:
             self._closed = True
             self._remembered.clear()
-            if self._generating is not None:
-                self._generating.cancel()
+            if (reader := self._generating) is not None:
+                stop_stream = getattr(self._model, "stop_stream", None)
+                if stop_stream is None or not stop_stream(reader):
+                    reader.cancel()
 
     async def close(self) -> None:
         self.stop()
@@ -118,7 +121,8 @@ class Compactions:
         try:
             loop = asyncio.get_running_loop()
             expires = loop.time() + timeout
-            async with asyncio.timeout_at(expires) as deadline:
+            stop_stream = getattr(self._model, "stop_stream", None)
+            async with model_deadline_at(expires, stop_stream) as deadline:
                 content = await _summarize(self._model, prompt, tools, thinking)
             if deadline.expired() or loop.time() >= expires:
                 raise TimeoutError

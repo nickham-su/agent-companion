@@ -2,6 +2,7 @@ import asyncio
 from contextlib import closing
 from dataclasses import replace
 import io
+from threading import Event
 import unittest
 from unittest.mock import patch
 import wave
@@ -102,6 +103,13 @@ class _TTS:
     async def synthesize(self, text, *, sample_rate):
         self.calls.append((text, sample_rate))
         yield _A * self.size
+
+
+def _transcripts(submit):
+    def on_input(text, _active):
+        if text:
+            submit(text)
+    return on_input
 
 
 def _reply(id_, *text, close=True):
@@ -215,6 +223,9 @@ class VoiceOutputTest(unittest.IsolatedAsyncioTestCase):
 
                 class TTS:
                     async def synthesize(self, text, *, sample_rate):
+                        if text == "已交付。":
+                            yield _B * 4
+                            return
                         try:
                             yield _A * _RATE
                             first.set()
@@ -227,18 +238,45 @@ class VoiceOutputTest(unittest.IsolatedAsyncioTestCase):
                 output = VoiceOutput(TTS(), replace(_SETTINGS, delivery_timeout=0.15))
                 device = _Device()
                 device.render = output.render
-                task = asyncio.create_task(output.deliver(_reply("fail", "甲乙丙丁戊己庚辛。")))
+                task = asyncio.create_task(output.deliver(_reply("fail", "已交付。甲乙丙丁戊己庚辛。")))
                 try:
                     await first.wait()
-                    self.assertEqual(device.pull(_RATE // 2), _A * (_RATE // 2))
+                    self.assertEqual(device.pull(4 + _RATE // 2), _B * 4 + _A * (_RATE // 2))
                     if failure:
                         release.set()
                     receipt = await task
-                    self.assertEqual((receipt.status, receipt.confirmed), (expected, "甲乙" if failure else ""))
+                    self.assertEqual((receipt.status, receipt.confirmed), (expected, "已交付。"))
                     await _until(closed.is_set)
                     self.assertEqual(device.pull(1), b"\0\0")
                 finally:
                     await output.close()
+
+    async def test_interrupt_only_confirms_complete_segments_taken_by_device(self):
+        for first_segment_delivered in (False, True):
+            with self.subTest(first_segment_delivered=first_segment_delivered):
+                buffered = asyncio.Event()
+
+                class TTS:
+                    async def synthesize(self, text, *, sample_rate):
+                        if text == "已交付。":
+                            yield _A * 4
+                        else:
+                            yield bytes(2) + _B * 3  # 未交完的合成段只取到一个静音采样。
+                            asyncio.get_running_loop().call_soon(buffered.set)
+
+                output = VoiceOutput(TTS(), _SETTINGS)
+                self.addAsyncCleanup(output.close)
+                device = _Device()
+                device.render = output.render
+                prefix = "已交付。" if first_segment_delivered else ""
+                task = asyncio.create_task(output.deliver(_reply("stop", prefix + "尚未交付。")))
+                await asyncio.wait_for(buffered.wait(), 1)
+                self.assertEqual(device.pull(5 if first_segment_delivered else 1),
+                                 (_A * 4 if first_segment_delivered else b"") + bytes(2))
+                output.interrupt()
+                receipt = await asyncio.wait_for(task, 1)
+                self.assertEqual((receipt.status, receipt.confirmed),
+                                 (DeliveryStatus.PARTIAL if first_segment_delivered else DeliveryStatus.ZERO, prefix))
 
 
     async def test_hard_deadline_decides_by_worker_completion_not_observation(self):
@@ -307,17 +345,115 @@ class VoiceOutputTest(unittest.IsolatedAsyncioTestCase):
             receipt = await task
         self.assertEqual((receipt.status, receipt.confirmed), (DeliveryStatus.UNKNOWN, ""))
 
+    async def test_hangup_before_last_pcm_confirms_only_the_prefix(self):
+        for at_cutoff in (False, True):
+            with self.subTest(at_cutoff=at_cutoff):
+                loop = asyncio.get_running_loop()
+                clock = [loop.time()]
+                buffered = asyncio.Event()
+
+                class TTS(_TTS):
+                    async def synthesize(self, text, *, sample_rate):
+                        async for pcm in super().synthesize(text, sample_rate=sample_rate):
+                            yield pcm
+                        if len(self.calls) == 2:
+                            buffered.set()
+
+                output = VoiceOutput(TTS(), replace(_SETTINGS, delivery_timeout=2))
+                self.addAsyncCleanup(output.close)
+                device = _Device()
+                device.render = output.render
+                with (patch.object(loop, "time", new=lambda: clock[0]),
+                      patch.object(loop, "slow_callback_duration", float("inf"))):
+                    task = asyncio.create_task(output.deliver(_reply("stop", "已播句。", "未播句。")))
+                    await buffered.wait()
+                    self.assertEqual(device.pull(4), _A * 4)
+                    clock[0] += 2 if at_cutoff else 0.02
+                    output.interrupt()
+                    self.assertEqual(device.pull(4), bytes(8))
+                    receipt = await task
+                self.assertEqual(receipt.confirmed, "已播句。")
+                self.assertEqual(receipt.status, DeliveryStatus.UNKNOWN if at_cutoff else DeliveryStatus.PARTIAL)
+
+    async def test_abandoned_stream_cannot_complete_playback(self):
+        tts = _TTS()
+        output = VoiceOutput(tts, _SETTINGS)
+        self.addAsyncCleanup(output.close)
+        device = _Device()
+        device.render = output.render
+        reply = _reply("abandoned", "已播句。", close=False)
+        task = asyncio.create_task(output.deliver(reply))
+        await _until(lambda: bool(tts.calls))
+        self.assertEqual(device.pull(4), _A * 4)
+        reply.abandon()
+        receipt = await task
+        self.assertEqual((receipt.status, receipt.confirmed), (DeliveryStatus.FAILED, "已播句。"))
+
 
 class VoiceDeliveryWatchdogTest(unittest.IsolatedAsyncioTestCase):
-    def setup_runtime(self, output, model, settings):
+    def setup_runtime(self, output, model, settings, **kwargs):
         history = History(":memory:")
         self.addCleanup(history.close)
-        runtime = Runtime("main", history, model, output, delivery_idle_timeout=settings.idle_timeout)
+        runtime = Runtime("main", history, model, output, delivery_idle_timeout=settings.idle_timeout, **kwargs)
         self.addAsyncCleanup(output.close)
         self.addAsyncCleanup(runtime.close)
         device = _Device()
         device.render = output.render
         return runtime, history, device
+
+    async def test_completed_playback_before_hangup_and_idle_deadline_keeps_tool_continuation(self):
+        buffered = asyncio.Event()
+        requests = []
+        loop = asyncio.get_running_loop()
+        clock = [loop.time()]
+        ordering = []
+
+        class Model:
+            async def stream(self, messages, tools, *, thinking):
+                requests.append(messages)
+                if len(requests) == 1:
+                    yield ToolReady(ToolCall("one", "lookup", "{}"))
+                    yield TextDelta("已播正文。")
+
+        class TTS:
+            async def synthesize(self, text, *, sample_rate):
+                yield _A * 4
+                buffered.set()
+
+        class Output(VoiceOutput):
+            async def _produce(self, reply, state):
+                await super()._produce(reply, state)
+                ordering.append("production_complete")
+
+                def hangup():
+                    clock[0] += .02  # 确保停播发生在 worker 完成之后、两个截止之前。
+                    self.interrupt()
+                    ordering.append("hangup")
+                    clock[0] += 3  # 投递协程恢复前，同时越过滚动空闲与硬截止。
+
+                loop.call_soon(hangup)  # 先于 worker.done() 唤醒投递协程的回调。
+
+            async def deliver(self, reply):
+                receipt = await super().deliver(reply)
+                ordering.append("receipt")
+                return receipt
+
+        async def lookup(args, context):
+            return "工具结果"
+
+        settings = replace(_SETTINGS, idle_timeout=1, delivery_timeout=2)
+        tools = Tools((Tool(ToolSpec("lookup", "查询", {"type": "object"}), lookup),))
+        runtime, history, device = self.setup_runtime(Output(TTS(), settings), Model(), settings, tools=tools)
+        with (patch.object(loop, "time", new=lambda: clock[0]),
+              patch.object(loop, "slow_callback_duration", float("inf"))):
+            runtime.submit_batch([Message("user", "运行工具")])
+            await buffered.wait()
+            self.assertEqual(device.pull(4), _A * 4)
+            clock[0] += .02
+            await runtime.wait_idle()
+        self.assertEqual(ordering, ["production_complete", "hangup", "receipt"])
+        self.assertEqual(history.outcomes("main")[0].delivery_status, DeliveryStatus.FULL)
+        self.assertEqual([m.content for m in requests[1] if m.role == "tool"], ["工具结果"])
 
     async def test_no_pcm_starts_idle_timer_only_after_model_closes(self):
         model_close, tts_started = asyncio.Event(), asyncio.Event()
@@ -449,7 +585,7 @@ class VoiceInputTest(unittest.IsolatedAsyncioTestCase):
                 setattr(device, f"{name}_format", declared)
                 voice = VoiceChannel(_ASR(), _TTS(), _Vad(), _SETTINGS, asr_timeout=0.1, max_audio_seconds=500)
                 with self.assertRaisesRegex(VoiceSetupError, f"voice_{name}_device_format_mismatch"):
-                    async with voice.connected(device, lambda _: None):
+                    async with voice.connected(device, lambda *_: None):
                         self.fail("invalid format must not start")
                 self.assertFalse(device.started.is_set())
 
@@ -457,7 +593,7 @@ class VoiceInputTest(unittest.IsolatedAsyncioTestCase):
         asr, tts, vad, device = _ASR(), _TTS(), _Vad(), _Device()
         voice = VoiceChannel(asr, tts, vad, _SETTINGS, asr_timeout=0.5, max_audio_seconds=500)
         received = []
-        async with voice.connected(device, received.append):
+        async with voice.connected(device, _transcripts(received.append)):
             device.frame(True, 2)  # 小于连续三帧门槛
             device.frame(False, 2)
             await _processed(vad, 4)
@@ -484,7 +620,7 @@ class VoiceInputTest(unittest.IsolatedAsyncioTestCase):
                 asr, tts, vad, device = _ASR(result, block=True), _TTS(), _Vad(), _Device()
                 voice = VoiceChannel(asr, tts, vad, _SETTINGS, asr_timeout=0.5, max_audio_seconds=500)
                 received = []
-                async with voice.connected(device, received.append):
+                async with voice.connected(device, _transcripts(received.append)):
                     speaking = _reply("speaking", "旧回复。")
                     pending = _reply("pending", "旧回复。")
                     idle_late = _reply("idle_late", "旧回复。")
@@ -515,7 +651,7 @@ class VoiceInputTest(unittest.IsolatedAsyncioTestCase):
         asr, device = _ASR(), _Device()
         voice = VoiceChannel(asr, _TTS(), _Vad(), _SETTINGS, asr_timeout=0.5, max_audio_seconds=500)
         received = []
-        async with voice.connected(device, received.append):
+        async with voice.connected(device, _transcripts(received.append)):
             # 注入可弱引用的 PCM 来检查空闲 worker 的局部变量是否仍持有它。
             recording = ObservablePCM(_HOT)
             recording_ref = ref(recording)
@@ -530,7 +666,7 @@ class VoiceInputTest(unittest.IsolatedAsyncioTestCase):
             with self.subTest(hot=hot):
                 asr, vad, device = _ASR(), _Vad(), _Device()
                 voice = VoiceChannel(asr, _TTS(), vad, _SETTINGS, asr_timeout=0.5, max_audio_seconds=500)
-                async with voice.connected(device, lambda _: None):
+                async with voice.connected(device, lambda *_: None):
                     device.frame(hot, 3)
                     await _processed(vad, 3)
                     self.assertTrue(voice._record if hot else voice._preroll)
@@ -559,14 +695,14 @@ class VoiceInputTest(unittest.IsolatedAsyncioTestCase):
                     finalize.set()
 
         voice = VoiceChannel(asr, SlowTTS(), vad, _SETTINGS, asr_timeout=0.5, max_audio_seconds=500)
-        async with voice.connected(device, lambda _: None):
+        async with voice.connected(device, lambda *_: None):
             old = asyncio.create_task(voice.deliver(_reply("old", "甲乙丙丁戊己庚辛。")))
             try:
                 await first.wait()
                 self.assertEqual(device.pull(_RATE // 2), _A * (_RATE // 2))
                 device.frame(True, 3)
                 receipt = await asyncio.wait_for(old, 0.3)
-                self.assertEqual((receipt.status, receipt.confirmed), (DeliveryStatus.PARTIAL, "甲乙"))
+                self.assertEqual((receipt.status, receipt.confirmed), (DeliveryStatus.ZERO, ""))
                 await cancelled.wait()
                 self.assertFalse(finalize.is_set())
                 self.assertEqual(device.pull(4), bytes(8))
@@ -584,6 +720,80 @@ class VoiceInputTest(unittest.IsolatedAsyncioTestCase):
             finally:
                 late.set()
 
+    async def test_capture_stall_counts_from_enable_and_ignores_invalid_frames(self):
+        asr, vad, device = _ASR(), _Vad(), _Device()
+        voice = VoiceChannel(asr, _TTS(), vad, _SETTINGS, asr_timeout=1, max_audio_seconds=500)
+        clock = [0.0]
+        events = []
+        with (patch("agent_companion.speech.voice.monotonic", new=lambda: clock[0]),
+              patch("agent_companion.speech.voice._CAPTURE_STALL_SECONDS", .25),
+              self.assertLogs("agent_companion.speech.voice", level="ERROR") as log):
+            async with voice.connected(device, lambda *event: events.append(event), capture_enabled=False):
+                clock[0] = 10.0  # 等待接通的时间不计入首帧宽限。
+                device.frame(True, 3)
+                await asyncio.sleep(.025)
+                self.assertFalse(voice.failed)
+                self.assertEqual(vad.count, 0)
+                voice.enable_capture()
+                clock[0] += .125
+                device.frame(False, overflow=True)
+                device.capture(memoryview(b""), False)
+                await _processed(vad, 1)
+                self.assertFalse(voice.failed)
+                clock[0] += .125
+                device.frame(True, 3)  # 截止后到达，不能抢在监听任务前重置宽限。
+                await _until(lambda: device.closed)
+        self.assertEqual(events, [(None, False)])
+        self.assertFalse(asr.called.is_set())
+        self.assertIn("capture PCM stalled", "\n".join(log.output))
+
+    async def test_continuous_real_pcm_renews_capture_deadline_even_in_silence(self):
+        vad, device = _Vad(), _Device()
+        voice = VoiceChannel(_ASR(), _TTS(), vad, _SETTINGS, asr_timeout=1, max_audio_seconds=500)
+        clock = [0.0]
+        with (patch("agent_companion.speech.voice.monotonic", new=lambda: clock[0]),
+              patch("agent_companion.speech.voice._CAPTURE_STALL_SECONDS", .25)):
+            async with voice.connected(device, lambda *_: None):
+                for count in range(1, 7):
+                    clock[0] += .125
+                    device.frame(False)
+                    await _processed(vad, count)
+                device.check_active()
+
+    async def test_slow_vad_does_not_stall_capture_when_valid_pcm_keeps_arriving(self):
+        loop = asyncio.get_running_loop()
+        entered, release = asyncio.Event(), Event()
+
+        class SlowVAD(_Vad):
+            def probability(self, pcm):
+                if not self.count:
+                    loop.call_soon_threadsafe(entered.set)
+                    release.wait()
+                return super().probability(pcm)
+
+        vad, device = SlowVAD(), _Device()
+        voice = VoiceChannel(_ASR(), _TTS(), vad, _SETTINGS, asr_timeout=1, max_audio_seconds=500)
+        clock = [0.0]
+        with (patch("agent_companion.speech.voice.monotonic", new=lambda: clock[0]),
+              patch("agent_companion.speech.voice._CAPTURE_STALL_SECONDS", .0625)):
+            async with voice.connected(device, lambda *_: None):
+                try:
+                    device.frame(False)
+                    await asyncio.wait_for(entered.wait(), 1)
+                    for count in range(6):
+                        clock[0] += .03125
+                        if count == 0:
+                            device.frame(False, 40)  # 先填满队列，覆盖旧帧。
+                        else:
+                            with voice._capture._lock:
+                                device.frame(False)  # 实际到达，但消费者侧无法入队。
+                        await asyncio.sleep(.04)
+                        device.check_active()
+                    self.assertEqual(vad.count, 0)
+                finally:
+                    release.set()
+                await _until(lambda: vad.count > 1)
+
     async def test_device_fault_returns_prefix_and_never_falls_back_to_text(self):
         asr, vad, device = _ASR(), _Vad(), _Device()
         first = asyncio.Event()
@@ -596,13 +806,13 @@ class VoiceInputTest(unittest.IsolatedAsyncioTestCase):
 
         voice = VoiceChannel(asr, TTS(), vad, _SETTINGS, asr_timeout=0.5, max_audio_seconds=500)
         with patch("agent_companion.speech.voice._DEVICE_CHECK_SECONDS", 0.02):
-            async with voice.connected(device, lambda _: None):
+            async with voice.connected(device, lambda *_: None):
                 old = asyncio.create_task(voice.deliver(_reply("fault", "甲乙丙丁戊己庚辛。")))
                 await _until(first.is_set)
                 self.assertEqual(device.pull(_RATE // 2), _A * (_RATE // 2))
                 device.fault = True
                 receipt = await asyncio.wait_for(old, 0.3)
-                self.assertEqual((receipt.status, receipt.confirmed), (DeliveryStatus.FAILED, "甲乙"))
+                self.assertEqual((receipt.status, receipt.confirmed), (DeliveryStatus.FAILED, ""))
                 self.assertEqual(device.pull(1), bytes(2))
                 self.assertEqual((await voice.deliver(_reply("new", "不回退。"))).status, DeliveryStatus.FAILED)
         self.assertTrue(device.closed)
@@ -630,7 +840,7 @@ class VoiceInputTest(unittest.IsolatedAsyncioTestCase):
         voice = VoiceChannel(SlowASR(), _TTS(), vad, _SETTINGS, asr_timeout=1, max_audio_seconds=500)
         submitted = []
         with patch("agent_companion.speech.voice._DEVICE_CHECK_SECONDS", 0.02):
-            async with voice.connected(device, submitted.append):
+            async with voice.connected(device, _transcripts(submitted.append)):
                 try:
                     device.frame(True, 3)
                     device.frame(False, 2)
@@ -662,11 +872,11 @@ class VoiceInputTest(unittest.IsolatedAsyncioTestCase):
                 finally:
                     release.set()
 
-    async def test_audio_limit_submits_prefix_and_allows_playback_until_fresh_speech(self):
+    async def test_audio_limit_reports_transcript_with_idle_only_after_trusted_silence(self):
         asr, tts, vad, device = _ASR(), _TTS(size=10), _Vad(), _Device()
         samples = 6 * INPUT_FRAMES + 37
         voice = VoiceChannel(asr, tts, vad, _SETTINGS, asr_timeout=0.5, max_audio_seconds=samples / _RATE)
-        prompts = []
+        events, prompts = [], []
 
         class Model:
             async def stream(self, messages, tools, *, thinking):
@@ -675,49 +885,59 @@ class VoiceInputTest(unittest.IsolatedAsyncioTestCase):
 
         with closing(History(":memory:")) as history:
             runtime = Runtime("main", history, Model(), voice)
+
+            def on_input(text, active):
+                events.append((text, active))
+                if text:
+                    runtime.submit_batch([Message("user", text)])
+
             try:
-                async with voice.connected(device, lambda text: runtime.submit_batch([Message("user", text)])):
+                async with voice.connected(device, on_input):
                     device.frame(False, 2)  # 预录计入上限
                     device.frame(True, 3)
                     device.frame(False)  # 话轮内短停顿也计入
                     await _processed(vad, 6)
                     self.assertEqual(asr.files, [])
                     device.frame(True)
-                    await _until(lambda: len(tts.calls) == 1)  # 尚未出现静默就已转写、生成回复
-                    self.assertEqual(prompts, [Message("user", "转写结果")])
+                    await asr.finished.wait()
+                    await _until(lambda: voice._pending == 0)
+                    self.assertEqual(events, [(None, True)])
+                    self.assertEqual(prompts, [])
                     with wave.open(io.BytesIO(asr.files[0].data), "rb") as wav:
                         self.assertEqual(wav.getnframes(), samples)
                         self.assertEqual(wav.readframes(samples), _QUIET * 2 + _HOT * 3 + _QUIET + _HOT[:74])
+                    # 即使绕过调度器，语音通道也不能在仍有尾音时播报。
+                    receipt = await voice.deliver(_reply("tail", "不应播放。"))
+                    self.assertEqual(receipt.status, DeliveryStatus.ZERO)
 
                     device.frame(True, 4)
-                    await _processed(vad, 11)
-                    self.assertEqual(device.pull(2), _A * 2)
                     device.frame(False)
                     device.frame(True, 3)
                     await _processed(vad, 15)
-                    self.assertEqual(device.pull(2), _A * 2)
                     device.frame(False)
-                    device.frame(False, overflow=True)  # 缺口两侧的静默不能相加
+                    device.frame(False, overflow=True)  # 缺口两侧静默不能相加
                     device.frame(True, 3)
                     await _processed(vad, 20)
-                    self.assertGreater(vad.resets, 0)
-                    self.assertEqual(device.pull(2), _A * 2)
-                    device.frame(False, overflow=True)  # 带溢出的静默帧本身也不能计数
+                    device.frame(False, overflow=True)  # 溢出的静默帧本身也不算
                     device.frame(False)
                     device.frame(True, 3)
                     await _processed(vad, 25)
-                    self.assertEqual(device.pull(2), _A * 2)
+                    self.assertGreater(vad.resets, 0)
                     self.assertEqual(len(asr.files), 1)
+                    self.assertEqual(events, [(None, True)])
+                    self.assertEqual(tts.calls, [])
+                    self.assertEqual(device.pull(2), bytes(4))
 
                     device.frame(False, 2)
-                    device.frame(True, 2)
-                    await _processed(vad, 29)
-                    self.assertEqual(device.pull(1), _A)
-                    device.frame(True)  # 足够静默后，第三个人声帧恢复打断
-                    await _processed(vad, 30)
-                    self.assertEqual(device.pull(1), bytes(2))
+                    await _until(lambda: len(tts.calls) == 1)
+                    self.assertEqual(events, [(None, True), ("转写结果", False)])
+                    self.assertEqual(prompts, [Message("user", "转写结果")])
+                    self.assertEqual(device.pull(10), _A * 10)
+                    await asyncio.wait_for(runtime.wait_idle(), 1)
+                    device.frame(True, 3)
                     device.frame(False, 2)
                     await _until(lambda: len(tts.calls) == 2)
+                    self.assertEqual(events, [(None, True), ("转写结果", False)] * 2)
                     self.assertEqual(len(asr.files), 2)
                     with wave.open(io.BytesIO(asr.files[1].data), "rb") as wav:
                         self.assertEqual(wav.readframes(wav.getnframes()), _HOT * 3 + _QUIET)
@@ -726,11 +946,39 @@ class VoiceInputTest(unittest.IsolatedAsyncioTestCase):
             finally:
                 await runtime.close()
 
+    async def test_capped_turn_dropped_at_asr_limit_does_not_hold_earlier_transcripts(self):
+        class ASR(_ASR):
+            async def transcribe(self, file):
+                index = len(self.files) + 1
+                return f"{await super().transcribe(file)}{index}"
+
+        asr, vad, device = ASR(block=True), _Vad(), _Device()
+        voice = VoiceChannel(asr, _TTS(), vad, _SETTINGS, asr_timeout=0.5,
+                             max_audio_seconds=5 * INPUT_FRAMES / _RATE)
+        events = []
+        async with voice.connected(device, lambda *event: events.append(event)):
+            device.frame(True, 3)
+            device.frame(False, 2)
+            await asyncio.wait_for(asr.called.wait(), 1)
+            device.frame(True, 3)
+            device.frame(False, 2)
+            await _processed(vad, 10)
+            self.assertEqual(voice._pending, 2)
+            device.frame(True, 5)
+            await _processed(vad, 15)
+            asr.release.set()
+            await _until(lambda: voice._pending == 0)
+            self.assertEqual(events, [(None, True)] * 3 + [("转写结果1", None), ("转写结果2", None)])
+            self.assertEqual(len(asr.files), 2)
+            device.frame(False, 2)
+            await _until(lambda: events[-1] == (None, False))
+            self.assertEqual(len(events), 6)
+
     async def test_quiet_frames_before_cut_count_towards_rearming(self):
         asr, vad, device = _ASR(), _Vad(), _Device()
         seconds = (3 * INPUT_FRAMES + 11) / _RATE
         voice = VoiceChannel(asr, _TTS(), vad, _SETTINGS, asr_timeout=0.5, max_audio_seconds=seconds)
-        async with voice.connected(device, lambda _: None):
+        async with voice.connected(device, lambda *_: None):
             for count in (1, 2):
                 device.frame(True, 3)
                 device.frame(False)  # 上限在第一帧静默期间到达
@@ -744,7 +992,7 @@ class VoiceInputTest(unittest.IsolatedAsyncioTestCase):
                   patch("agent_companion.speech.asr.MAX_AUDIO_BYTES", 44 + 2 * 11 + 1)):
                 asr, vad, device = _ASR(), _Vad(), _Device()
                 voice = VoiceChannel(asr, _TTS(), vad, _SETTINGS, asr_timeout=0.5, max_audio_seconds=seconds)
-                async with voice.connected(device, lambda _: None):
+                async with voice.connected(device, lambda *_: None):
                     device.frame(False, 3)
                     device.frame(True, 3)
                     await _until(lambda: len(asr.files) == 1)
@@ -759,7 +1007,7 @@ class VoiceInputTest(unittest.IsolatedAsyncioTestCase):
         asr, vad, device = _ASR(block=True), _Vad(), _Device()
         voice = VoiceChannel(asr, _TTS(), vad, _SETTINGS, asr_timeout=0.03, max_audio_seconds=500)
         received = []
-        async with voice.connected(device, received.append):
+        async with voice.connected(device, _transcripts(received.append)):
             device.frame(True, 3)
             device.frame(True, 4, overflow=True)
             device.frame(False, 3)
@@ -776,6 +1024,46 @@ class VoiceInputTest(unittest.IsolatedAsyncioTestCase):
             device.frame(False, 2)
             await _until(lambda: received == ["转写结果"])
             self.assertEqual(len(asr.files), 2)
+
+    async def test_gap_frame_does_not_end_active_turn_as_silence(self):
+        asr, vad, device = _ASR(), _Vad(), _Device()
+        settings = replace(_SETTINGS, speech_frames=1, silence_seconds=0.02)
+        voice = VoiceChannel(asr, _TTS(), vad, settings, asr_timeout=0.5, max_audio_seconds=500)
+        events = []
+        async with voice.connected(device, lambda *event: events.append(event)):
+            device.frame(True)
+            await _processed(vad, 1)
+            device.frame(False, overflow=True)
+            await _processed(vad, 2)
+            device.frame(True)
+            await _processed(vad, 3)
+            self.assertEqual(events, [(None, True)])
+            self.assertFalse(asr.called.is_set())
+
+            device.frame(False)
+            await _until(lambda: events == [(None, True), (None, False)])
+            self.assertFalse(asr.called.is_set())  # 不拼接缺口两边的人声。
+
+            device.frame(True)
+            device.frame(False)
+            await _until(lambda: len(events) == 4)
+            self.assertEqual(events[2:], [(None, True), ("转写结果", False)])
+            self.assertEqual(len(asr.files), 1)
+
+    async def test_empty_failed_and_timed_out_asr_report_idle(self):
+        for text, blocked in (("  ", False), (RuntimeError("synthetic"), False), ("迟到结果", True)):
+            with self.subTest(text=text, timeout=blocked):
+                asr, vad, device = _ASR(text, block=blocked), _Vad(), _Device()
+                voice = VoiceChannel(asr, _TTS(), vad, _SETTINGS, asr_timeout=0.03, max_audio_seconds=500)
+                events = []
+                async with voice.connected(device, lambda *event: events.append(event)):
+                    device.frame(True, 3)
+                    await _processed(vad, 3)
+                    self.assertEqual(events, [(None, True)])
+                    device.frame(False, 2)
+                    await asr.called.wait()
+                    await _until(lambda: len(events) == 2)
+                    self.assertEqual(events, [(None, True), (None, False)])
 
     async def test_runtime_tool_continues_and_asr_enters_same_session(self):
         asr, tts, vad, device = _ASR(block=True), _TTS(), _Vad(), _Device()
@@ -802,7 +1090,7 @@ class VoiceInputTest(unittest.IsolatedAsyncioTestCase):
         with closing(History(":memory:")) as history:
             runtime = Runtime("main", history, Model(), voice, tools=tools)
             try:
-                async with voice.connected(device, lambda text: runtime.submit_batch([Message("user", text)])):
+                async with voice.connected(device, _transcripts(lambda text: runtime.submit_batch([Message("user", text)]))):
                     runtime.submit_batch([Message("user", "运行工具")])
                     await tool_started.wait()
                     device.frame(True, 3)
@@ -823,13 +1111,16 @@ class VoiceInputTest(unittest.IsolatedAsyncioTestCase):
             finally:
                 await runtime.close()
 
-    async def test_interrupted_mixed_response_keeps_model_and_tool_alive(self):
+    async def test_interrupted_playback_cancels_model_before_it_starts_new_tool(self):
         asr, device, vad = _ASR(block=True), _Device(), _Vad()
-        release_model, ran_tool, spoke = (asyncio.Event() for _ in range(3))
+        model_cancelled, ran_tool, spoke = (asyncio.Event() for _ in range(3))
         prompts = []
 
         class TTS:
             async def synthesize(self, text, *, sample_rate):
+                if text == "已交付。":
+                    yield _B * 4
+                    return
                 yield _A * _RATE
                 spoke.set()
                 await asyncio.Event().wait()
@@ -838,9 +1129,12 @@ class VoiceInputTest(unittest.IsolatedAsyncioTestCase):
             async def stream(self, messages, tools, *, thinking):
                 prompts.append(messages)
                 if len(prompts) == 1:
-                    yield TextDelta("甲乙丙丁戊己庚辛。")
-                    await release_model.wait()
-                    yield TextDelta("未播的正文。")
+                    yield TextDelta("已交付。甲乙丙丁戊己庚辛。")
+                    try:
+                        await asyncio.Future()
+                    except asyncio.CancelledError:
+                        model_cancelled.set()
+                    # 即使适配器尝试在取消后继续输出，Runtime 也不会执行这条调用。
                     yield ToolReady(ToolCall("a", "wait", "{}"))
                 else:
                     yield TextDelta("仍在说话，不能播报。")
@@ -854,20 +1148,20 @@ class VoiceInputTest(unittest.IsolatedAsyncioTestCase):
         with closing(History(":memory:")) as history:
             runtime = Runtime("main", history, Model(), voice, tools=tools)
             try:
-                async with voice.connected(device, lambda _: None):
+                async with voice.connected(device, lambda *_: None):
                     runtime.submit_batch([Message("user", "测试请求")])
                     await _until(spoke.is_set)
-                    self.assertEqual(device.pull(_RATE // 2), _A * (_RATE // 2))
+                    self.assertEqual(device.pull(4 + _RATE // 2), _B * 4 + _A * (_RATE // 2))
                     device.frame(True, 3)
                     await _processed(vad, 3)
                     self.assertEqual(device.pull(4), bytes(8))
-                    self.assertFalse(ran_tool.is_set())
-                    release_model.set()
                     await asyncio.wait_for(runtime.wait_idle(), 1)
-                    self.assertTrue(ran_tool.is_set())
+                    await asyncio.wait_for(model_cancelled.wait(), 1)
+                    self.assertFalse(ran_tool.is_set())
+                    self.assertEqual(len(prompts), 1)
                     self.assertEqual([msg.message.content for msg in history.read_after("main")],
-                                     ["测试请求", "甲乙", "工具结果", ""])
+                                     ["测试请求", "已交付。"])
                     self.assertEqual([r.delivery_status for r in history.outcomes("main")],
-                                     [DeliveryStatus.PARTIAL, DeliveryStatus.ZERO])
+                                     [DeliveryStatus.PARTIAL])
             finally:
                 await runtime.close()

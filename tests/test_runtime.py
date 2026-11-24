@@ -4,7 +4,8 @@ from unittest.mock import patch
 
 from agent_companion.config import RuntimeSettings
 from agent_companion.models.deepseek import build_request
-from agent_companion.protocol import (DeliveryStatus, Message, ModelError, ReasoningDelta, Receipt, TextDelta, ToolCall,
+from agent_companion.protocol import (DeliveryStatus, Message, ModelError, ProviderReplay, ReasoningDelta, Receipt,
+                                      ReplayItem, ReplayReady, ReplayScope, ReplyDelivery, TextDelta, ToolCall,
                                       ToolReady, ToolSpec)
 from agent_companion.runtime.engine import Runtime
 from agent_companion.runtime.tools import Tool, Tools
@@ -118,7 +119,7 @@ class RuntimeTest(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(channel.replies[0][0].run_id, channel.replies[1][0].run_id)
                 self.assertNotEqual(channel.replies[0][0].reply_id, channel.replies[1][0].reply_id)
 
-    async def test_model_stream_completion_is_a_separate_gate(self):
+    async def test_full_voice_receipt_does_not_stop_active_model(self):
         stop, receipt_done, tool_done = (asyncio.Event() for _ in range(3))
 
         async def mixed():
@@ -132,6 +133,7 @@ class RuntimeTest(unittest.IsolatedAsyncioTestCase):
 
         class EarlyChannel(Channel):
             async def deliver(self, reply):
+                reply.select_voice_delivery()
                 text = await anext(reply)
                 receipt_done.set()
                 return Receipt(reply.info.reply_id, DeliveryStatus.FULL, text)
@@ -146,6 +148,353 @@ class RuntimeTest(unittest.IsolatedAsyncioTestCase):
         stop.set()
         await self.idle(runtime)
         self.assertEqual(len(model.requests), 2)
+
+    async def test_voice_receipt_stops_blocked_model_but_settles_started_tool_and_next_run(self):
+        for status, confirmed in ((DeliveryStatus.PARTIAL, "first"), (DeliveryStatus.ZERO, "")):
+            with self.subTest(status=status):
+                receipt_ready, model_cancelled, model_closed, release_model = (asyncio.Event() for _ in range(4))
+                tool_started, release_tool = asyncio.Event(), asyncio.Event()
+                requests, ran_calls = [], []
+                late_call = ToolCall("late", SPEC.name, "{}")
+
+                class Model:
+                    async def stream(self, messages, tools, *, thinking):
+                        requests.append(list(messages))
+                        if len(requests) > 1:
+                            yield TextDelta("next")
+                            return
+                        try:
+                            yield TextDelta("first unconfirmed")
+                            yield ToolReady(CALL)
+                            try:
+                                await asyncio.Future()
+                            except asyncio.CancelledError:
+                                model_cancelled.set()
+                                await release_model.wait()
+                                yield ToolReady(late_call)
+                        finally:
+                            model_closed.set()
+
+                class Voice(Channel):
+                    async def deliver(self, reply):
+                        reply.select_voice_delivery()
+                        if self.replies:
+                            return await super().deliver(reply)
+                        self.replies.append((reply.info, await anext(reply)))
+                        await receipt_ready.wait()
+                        return Receipt(reply.info.reply_id, status, confirmed)
+
+                async def tool(args, context):
+                    ran_calls.append(context.call_id)
+                    tool_started.set()
+                    await release_tool.wait()
+                    return "tool result"
+
+                voice = Voice()
+                runtime, history = self.setup_runtime(Model(), voice, tools=Tools([Tool(SPEC, tool)]))
+                try:
+                    runtime.submit_batch([Message("user", "one")])
+                    await asyncio.wait_for(tool_started.wait(), 2)
+                    runtime.submit_batch([Message("user", "two")])
+                    receipt_ready.set()
+                    await asyncio.wait_for(model_cancelled.wait(), 2)
+                    self.assertEqual(history.outcomes("main"), [])
+                    self.assertEqual(len(requests), 1)
+                    release_tool.set()
+                    await self.idle(runtime)
+                    self.assertFalse(model_closed.is_set())
+                    self.assertEqual(requests[1], [Message("user", "one"), Message("assistant", confirmed, (CALL,)),
+                                                  Message("tool", "tool result", tool_call_id=CALL.id),
+                                                  Message("user", "two")])
+                    first, second = history.outcomes("main")
+                    self.assertEqual((first.model_status, first.delivery_status), ("model_interrupted", status))
+                    self.assertNotEqual(first.run_id, second.run_id)
+                    release_model.set()
+                    await asyncio.wait_for(model_closed.wait(), 2)
+                    self.assertEqual(ran_calls, [CALL.id])
+                finally:
+                    release_model.set()
+
+    async def test_cancelled_model_child_leaves_voice_settlement_and_queue_running(self):
+        for order in ("simultaneous", "model first", "ordinary full"):
+            with self.subTest(order=order):
+                release_model, model_exiting, release_receipt = (asyncio.Event() for _ in range(3))
+                tool_started, release_tool = asyncio.Event(), asyncio.Event()
+                recorded = []
+
+                async def script():
+                    yield TextDelta("confirmed tail")
+                    yield ToolReady(CALL)
+                    await release_model.wait()
+                    model_exiting.set()
+                    raise asyncio.CancelledError
+
+                class ChannelForTest(Channel):
+                    async def deliver(self, reply):
+                        if self.replies:
+                            return await super().deliver(reply)
+                        if order != "ordinary full":
+                            reply.select_voice_delivery()
+                        text = await anext(reply)
+                        self.replies.append((reply.info, text))
+                        await release_receipt.wait()
+                        if order == "simultaneous":
+                            release_model.set()  # 子任务先于等待者醒来，与有效回执一同就绪。
+                        if order == "ordinary full":
+                            return Receipt(reply.info.reply_id, DeliveryStatus.FULL, text)
+                        return Receipt(reply.info.reply_id, DeliveryStatus.PARTIAL, "confirmed")
+
+                async def tool(args, context):
+                    tool_started.set()
+                    await release_tool.wait()
+                    recorded.append(context.call_id)
+                    return "result"
+
+                model = ScriptModel(script, events(TextDelta("next")))
+                runtime, history = self.setup_runtime(model, ChannelForTest(), tools=Tools([Tool(SPEC, tool)]))
+                runtime.submit_batch([Message("user", "one")])
+                await asyncio.wait_for(tool_started.wait(), 2)
+                runtime.submit_batch([Message("user", "two")])
+                if order != "simultaneous":
+                    release_model.set()
+                    await asyncio.wait_for(model_exiting.wait(), 2)
+                release_receipt.set()
+                await asyncio.wait_for(model_exiting.wait(), 2)
+                self.assertEqual(history.outcomes("main"), [])
+                release_tool.set()
+                await self.idle(runtime)
+                first, second = history.outcomes("main")
+                self.assertNotEqual(first.run_id, second.run_id)
+                self.assertEqual(recorded, [CALL.id])
+                if order == "ordinary full":
+                    self.assertEqual((first.model_status, first.delivery_status),
+                                     ("model_cancelled", DeliveryStatus.FULL))
+                    prefix = "confirmed tail"
+                else:
+                    self.assertEqual((first.model_status, first.delivery_status),
+                                     ("model_interrupted", DeliveryStatus.PARTIAL))
+                    prefix = "confirmed"
+                self.assertEqual(model.requests[1][0], [Message("user", "one"), Message("assistant", prefix, (CALL,)),
+                                                      Message("tool", "result", tool_call_id=CALL.id),
+                                                      Message("user", "two")])
+
+    async def test_stuck_model_cleanup_pauses_at_limit_and_shutdown_does_not_cancel_again(self):
+        releases = [asyncio.Event(), asyncio.Event()]
+        cleaned = [asyncio.Event(), asyncio.Event()]
+        cancellations = [0, 0]
+
+        def stuck(index):
+            async def script():
+                yield TextDelta("interrupted")
+                try:
+                    await asyncio.Future()
+                except asyncio.CancelledError:
+                    cancellations[index] += 1
+                    try:
+                        await releases[index].wait()
+                    except asyncio.CancelledError:
+                        cancellations[index] += 1
+                        raise
+                finally:
+                    cleaned[index].set()
+            return script
+
+        class Voice(Channel):
+            async def deliver(self, reply):
+                reply.select_voice_delivery()
+                if len(self.replies) == 2:
+                    return await super().deliver(reply)
+                self.replies.append((reply.info, await anext(reply)))
+                return Receipt(reply.info.reply_id, DeliveryStatus.ZERO)
+
+        model = ScriptModel(stuck(0), stuck(1), events(TextDelta("last response")))
+        runtime, history = self.setup_runtime(model, Voice())
+        try:
+            with self.assertLogs("agent_companion.runtime.engine", level="WARNING") as reached:
+                for text in ("one", "two", "three"):
+                    runtime.submit_batch([Message("user", text)])
+                await asyncio.wait_for(runtime.wait_idle(), 2)
+            self.assertEqual(len(model.requests), 2)
+            self.assertEqual(runtime.last_failure, "model_cleanup_blocked")
+            self.assertTrue(any("capacity reached; pending=2" in row for row in reached.output))
+            self.assertEqual([r.message.content for r in history.read_after("main")], ["one", "two"])
+
+            releases[0].set()
+            async with asyncio.timeout(2):
+                while len(history.outcomes("main")) != 3:
+                    await asyncio.sleep(0)
+            await self.idle(runtime)
+            self.assertEqual([r.message.content for r in history.read_after("main")],
+                             ["one", "two", "three", "last response"])
+            with patch("agent_companion.runtime.engine._MODEL_CLOSE_GRACE", .01):
+                with self.assertLogs("agent_companion.runtime.engine", level="WARNING") as closing:
+                    await asyncio.wait_for(runtime.close(), 2)
+            self.assertTrue(any("still running after shutdown grace; pending=1" in row for row in closing.output))
+            self.assertFalse(cleaned[1].is_set())
+            self.assertEqual(cancellations, [1, 1])
+        finally:
+            for release in releases:
+                release.set()
+        await asyncio.wait_for(asyncio.gather(*(event.wait() for event in cleaned)), 2)
+
+    async def test_tool_continuation_waits_for_capacity_without_restarting_the_run(self):
+        for shutdown in (False, True):
+            with self.subTest(shutdown=shutdown):
+                await self._check_tool_continuation_at_capacity(shutdown=shutdown)
+
+    async def _check_tool_continuation_at_capacity(self, *, shutdown):
+        cleanup_started, release_cleanup, cleanup_finished = (asyncio.Event() for _ in range(3))
+        tool_started, release_tool = asyncio.Event(), asyncio.Event()
+        cancellations = []
+        calls = []
+
+        async def interrupted():
+            yield TextDelta("old")
+            try:
+                await asyncio.Future()
+            except asyncio.CancelledError:
+                cancellations.append("reader")
+                cleanup_started.set()
+                try:
+                    await release_cleanup.wait()
+                except asyncio.CancelledError:
+                    cancellations.append("cleanup")
+                    raise
+                finally:
+                    cleanup_finished.set()
+
+        async def tool(args, context):
+            calls.append(context.call_id)
+            tool_started.set()
+            await release_tool.wait()
+            return "result"
+
+        class Voice(Channel):
+            async def deliver(self, reply):
+                reply.select_voice_delivery()
+                if self.replies:
+                    return await super().deliver(reply)
+                self.replies.append((reply.info, await anext(reply)))
+                return Receipt(reply.info.reply_id, DeliveryStatus.ZERO)
+
+        model = ScriptModel(interrupted, events(TextDelta("tool round"), ToolReady(CALL)),
+                            events(TextDelta("final answer")))
+        voice = Voice()
+        runtime, history = self.setup_runtime(model, voice, tools=Tools([Tool(SPEC, tool)]))
+        try:
+            runtime.submit_batch([Message("user", "one")])
+            runtime.submit_batch([Message("user", "two")])
+            await asyncio.wait_for(asyncio.gather(tool_started.wait(), cleanup_started.wait()), 2)
+            # 模拟执行中的工具链遇到容量紧缩；正常完成的应答本身不占退役名额。
+            with patch("agent_companion.runtime.engine._MAX_RETIRED_MODELS", 1):
+                with self.assertLogs("agent_companion.runtime.engine", level="WARNING") as blocked:
+                    release_tool.set()
+                    async with asyncio.timeout(2):
+                        while runtime.last_failure != "model_cleanup_blocked":
+                            await asyncio.sleep(0)
+                self.assertTrue(any("capacity reached; pending=1" in row for row in blocked.output))
+                self.assertEqual(len(model.requests), 2)
+                rows = [row.message for row in history.read_after("main")]
+                self.assertEqual(rows[-1], Message("tool", "result", tool_call_id=CALL.id))
+                if shutdown:
+                    worker = runtime._worker
+                    with (patch("agent_companion.runtime.engine._MODEL_CLOSE_GRACE", .01),
+                          self.assertLogs("agent_companion.runtime.engine", level="WARNING") as closing):
+                        await asyncio.wait_for(runtime.close(), 2)
+                    self.assertTrue(worker.cancelled())
+                    self.assertTrue(any("still running after shutdown grace" in row for row in closing.output))
+                    self.assertFalse(cleanup_finished.is_set())
+                release_cleanup.set()
+                await asyncio.wait_for(cleanup_finished.wait(), 2)
+                if not shutdown:
+                    await self.idle(runtime)
+            self.assertEqual(cancellations, ["reader"])
+            self.assertEqual(calls, [CALL.id])
+            outcomes = history.outcomes("main")
+            if shutdown:
+                self.assertEqual(len(model.requests), 2)
+                self.assertEqual(len(outcomes), 2)
+                self.assertEqual([row.message for row in history.read_after("main")], rows)
+            else:
+                old, tool_round, final = outcomes
+                self.assertNotEqual(old.run_id, tool_round.run_id)
+                self.assertEqual(tool_round.run_id, final.run_id)
+                self.assertEqual(voice.replies[-1][1], "final answer")
+        finally:
+            release_tool.set()
+            release_cleanup.set()
+
+    async def test_voice_receipt_wins_over_simultaneous_tool_frame(self):
+        ready = asyncio.Event()
+
+        async def script():
+            yield TextDelta("not played")
+            await ready.wait()
+            yield ToolReady(CALL)
+
+        class Voice:
+            async def deliver(self, reply):
+                reply.select_voice_delivery()
+                await anext(reply)
+                # 模型帧会先于等待投递任务的 Runtime 唤醒，但此时回执已返回。
+                ready.set()
+                return Receipt(reply.info.reply_id, DeliveryStatus.ZERO)
+
+        ran_tool = asyncio.Event()
+
+        async def tool(args, context):
+            ran_tool.set()
+            return "unexpected"
+
+        model = ScriptModel(script)
+        runtime, history = self.setup_runtime(model, Voice(), tools=Tools([Tool(SPEC, tool)]))
+        runtime.submit_batch([Message("user", "one")])
+        await self.idle(runtime)
+        self.assertFalse(ran_tool.is_set())
+        self.assertEqual([entry.message for entry in history.read_after("main")], [Message("user", "one")])
+        self.assertEqual(len(model.requests), 1)
+        outcome, = history.outcomes("main")
+        self.assertEqual((outcome.model_status, outcome.delivery_status, outcome.assistant_message_id),
+                         ("model_interrupted", DeliveryStatus.ZERO, None))
+
+    async def test_voice_receipt_after_model_completion_still_blocks_tool_continuation(self):
+        model_finished, release_receipt = asyncio.Event(), asyncio.Event()
+        replay = ProviderReplay(ReplayScope("test", bytes(32), ""),
+                                (ReplayItem("function_call", "item", call_id=CALL.id),))
+
+        async def script():
+            yield TextDelta("first unconfirmed")
+            yield ToolReady(CALL)
+            yield ReplayReady(replay)
+            model_finished.set()
+
+        class Voice(Channel):
+            async def deliver(self, reply):
+                reply.select_voice_delivery()
+                text = "".join([part async for part in reply])
+                self.replies.append((reply.info, text))
+                if len(self.replies) == 1:
+                    await release_receipt.wait()
+                    return Receipt(reply.info.reply_id, DeliveryStatus.PARTIAL, "first")
+                return Receipt(reply.info.reply_id, DeliveryStatus.FULL, text)
+
+        async def tool(args, context):
+            return "tool result"
+
+        model = ScriptModel(script, events(TextDelta("next")))
+        model.replay_scope = replay.scope
+        runtime, history = self.setup_runtime(model, Voice(), tools=Tools([Tool(SPEC, tool)]))
+        runtime.submit_batch([Message("user", "one")])
+        await asyncio.wait_for(model_finished.wait(), 2)
+        runtime.submit_batch([Message("user", "two")])
+        release_receipt.set()
+        await self.idle(runtime)
+        first, second = history.outcomes("main")
+        self.assertEqual((first.model_status, first.delivery_status), ("complete", DeliveryStatus.PARTIAL))
+        self.assertNotEqual(first.run_id, second.run_id)
+        self.assertEqual(model.requests[1][0], [Message("user", "one"), Message("assistant", "first", (CALL,), replay=replay),
+                                               Message("tool", "tool result", tool_call_id=CALL.id),
+                                               Message("user", "two")])
 
     async def test_pure_tool_does_not_call_channel_and_records_failure(self):
         async def tool(args, context):
@@ -175,7 +524,8 @@ class RuntimeTest(unittest.IsolatedAsyncioTestCase):
                 runtime.submit_batch([Message("user", "two")])
                 await self.idle(runtime)
                 prefix = "" if confirmed == "bad prefix" else confirmed
-                self.assertEqual(history.read_after("main")[1].message, Message("assistant", prefix))
+                saved = [row.message for row in history.read_after("main") if row.message.role == "assistant"]
+                self.assertEqual(saved, [] if status == DeliveryStatus.ZERO else [Message("assistant", prefix)])
                 self.assertEqual(history.outcomes("main")[0].delivery_status,
                                  DeliveryStatus.UNKNOWN if confirmed == "bad prefix" else status)
                 self.assertEqual([m.content for m in model.requests[1][0]],
@@ -333,6 +683,13 @@ class RuntimeTest(unittest.IsolatedAsyncioTestCase):
             return "ok"
 
         class Background(Channel):
+            def select_delivery(self, reply):
+                return ReplyDelivery(self.deliver, after_commit=self.enqueue, require_complete_model=True)
+
+            async def deliver(self, reply):
+                text = "".join([part async for part in reply])
+                return Receipt(reply.info.reply_id, DeliveryStatus.FULL, text)
+
             def enqueue(self, info, text):
                 self.replies.append((info, text, history.read_after("main")))
 
@@ -344,21 +701,22 @@ class RuntimeTest(unittest.IsolatedAsyncioTestCase):
                             events(TextDelta("not committed")))
         channel = Background()
         runtime, history = self.setup_runtime(model, channel, tools=Tools([Tool(SPEC, tool)]))
-        runtime.submit_batch([Message("user", "one")], wait_for_delivery=False)
+        runtime.submit_batch([Message("user", "one")])
         await asyncio.wait_for(tool_started.wait(), 1)
         self.assertEqual(channel.replies, [])
         tool_released.set()
         await self.idle(runtime)
         self.assertEqual([item[1] for item in channel.replies], ["start", "end"])
         self.assertEqual([row.message.role for row in channel.replies[0][2]], ["user", "assistant", "tool"])
-        self.assertEqual([item.delivery_status for item in history.outcomes("main")], [None, None])
+        self.assertEqual([item.delivery_status for item in history.outcomes("main")],
+                         [DeliveryStatus.FULL, DeliveryStatus.FULL])
 
-        runtime.submit_batch([Message("user", "two")], wait_for_delivery=False)
+        runtime.submit_batch([Message("user", "two")])
         await asyncio.wait_for(runtime.wait_idle(), 2)
         self.assertEqual(runtime.last_failure, "model_failed")
         self.assertNotIn("unfinished", [row.message.content for row in history.read_after("main")])
         with patch.object(history, "finalize_reply", side_effect=ValueError("simulated write failure")):
-            runtime.submit_batch([Message("user", "three")], wait_for_delivery=False)
+            runtime.submit_batch([Message("user", "three")])
             await asyncio.wait_for(runtime.wait_idle(), 2)
             self.assertEqual(runtime.last_failure, "runtime_failed")
         self.assertEqual([item[1] for item in channel.replies], ["start", "end"])
@@ -368,6 +726,7 @@ class RuntimeTest(unittest.IsolatedAsyncioTestCase):
 
         class HangingChannel:
             async def deliver(self, reply):
+                reply.select_voice_delivery()
                 delivery_started.set()
                 try:
                     await asyncio.Event().wait()
@@ -381,13 +740,33 @@ class RuntimeTest(unittest.IsolatedAsyncioTestCase):
             finally:
                 tool_cancelled.set()
 
-        model = ScriptModel(events(TextDelta("waiting"), ToolReady(CALL)))
-        runtime, history = self.setup_runtime(model, HangingChannel(), tools=Tools([Tool(SPEC, tool)]))
+        model_closed = asyncio.Event()
+        late_calls = []
+
+        class Model:
+            async def stream(self, messages, tools, *, thinking):
+                yield TextDelta("waiting")
+                yield ToolReady(CALL)
+                try:
+                    await asyncio.Future()
+                except asyncio.CancelledError:
+                    yield ToolReady(ToolCall("late", SPEC.name, "{}"))
+                finally:
+                    model_closed.set()
+
+        async def check_tool(args, context):
+            if context.call_id == CALL.id:
+                return await tool(args, context)
+            late_calls.append(context.call_id)
+            return "unexpected"
+
+        runtime, history = self.setup_runtime(Model(), HangingChannel(), tools=Tools([Tool(SPEC, check_tool)]))
         runtime.submit_batch([Message("user", "started")])
         await asyncio.wait_for(asyncio.gather(delivery_started.wait(), tool_started.wait()), 2)
         runtime.submit_batch([Message("user", "discarded on close")])
         await asyncio.wait_for(runtime.close(), 2)
-        await asyncio.wait_for(asyncio.gather(delivery_cancelled.wait(), tool_cancelled.wait()), 2)
+        await asyncio.wait_for(asyncio.gather(delivery_cancelled.wait(), tool_cancelled.wait(), model_closed.wait()), 2)
+        self.assertEqual(late_calls, [])
         self.assertEqual(history.outcomes("main"), [])
         self.assertEqual([row.message.content for row in history.read_after("main")], ["started"])
 
@@ -418,7 +797,7 @@ class RuntimeTest(unittest.IsolatedAsyncioTestCase):
         self.assertLessEqual(seen[0].started_at, model_times[0])
         self.assertLess(seen[0].started_at, newer_input_started)
         self.assertEqual(history.outcomes("main")[0].delivery_status, DeliveryStatus.ZERO)
-        self.assertEqual(history.read_after("main")[1].message, Message("assistant", ""))
+        self.assertEqual([row.message for row in history.read_after("main")], [Message("user", "one")])
 
     async def test_timeout_and_model_failure_set_terminal_states_and_keep_confirmed(self):
         for timeout in (False, True):

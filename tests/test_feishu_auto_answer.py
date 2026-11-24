@@ -4,6 +4,7 @@ from dataclasses import replace
 from hashlib import sha256
 import json
 from pathlib import Path
+from threading import Event
 import unittest
 from unittest.mock import Mock, patch
 
@@ -11,9 +12,11 @@ from agent_companion.app import run_feishu, running_agent
 from agent_companion.channels.feishu.cli import CliError, CommandResult, FeishuDiscovery
 from agent_companion.channels.feishu.macos_calls import DesktopCallError, MacCallDesktop, RingingWindow, WindowIdentity
 from agent_companion.config import ASRSettings, FeishuSettings, MiniMaxConnection, Settings
-from agent_companion.protocol import TextDelta, ToolCall, ToolReady
-from agent_companion.runtime.engine import Runtime
+from agent_companion.feishu_calls import IncomingCalls
+from agent_companion.feishu_private import _Route
+from agent_companion.protocol import DeliveryStatus, InternalInput, Message, TextDelta, ToolCall, ToolReady
 from agent_companion.runtime.subtasks import DELEGATE_TOOL_NAME, RESULT_PREFIX
+from agent_companion.speech.vad import INPUT_FRAMES, INPUT_RATE
 from agent_companion.speech.voice import VoiceChannel
 from agent_companion.storage.sqlite import History
 
@@ -294,19 +297,20 @@ class IncomingCallTests(unittest.IsolatedAsyncioTestCase):
 
     @asynccontextmanager
     async def _serve(self, model, *, make_asr=lambda i: _ASR(f"测试语音{i}"), make_device=_Device,
-                     tts=None, copy=True):
+                     tts=None, copy=True, max_audio_seconds=30, asr_timeout=2):
         tts = _TTS() if tts is None else tts
         settings = Settings(feishu=FeishuSettings(_OWN, mode="voice", voice_text_copy=copy),
                             voice=replace(_SETTINGS, input_device="mock-in", output_device="mock-out",
                                           vad_model=Path("synthetic.onnx")),
-                            asr=ASRSettings(MiniMaxConnection("synthetic"), max_audio_seconds=30))
+                             asr=ASRSettings(MiniMaxConnection("synthetic"), max_audio_seconds=max_audio_seconds))
 
         def build(_, asr, tts):
             device, vad = make_device(), _Vad()
             self.devices.append(device)
             self.vads.append(vad)
             self.asrs.append(make_asr(len(self.devices)))
-            return VoiceChannel(self.asrs[-1], tts, vad, settings.voice, asr_timeout=2, max_audio_seconds=30), device
+            return VoiceChannel(self.asrs[-1], tts, vad, settings.voice, asr_timeout=asr_timeout,
+                                max_audio_seconds=max_audio_seconds), device
 
         with (closing(History(":memory:")) as history,
               patch("agent_companion.channels.feishu.macos_calls.MacCallDesktop", return_value=self.desktop),
@@ -327,6 +331,19 @@ class IncomingCallTests(unittest.IsolatedAsyncioTestCase):
                 with suppress(asyncio.CancelledError):
                     await task
 
+    @asynccontextmanager
+    async def _pause_follow(self):
+        bindings, resume = asyncio.Queue(), asyncio.Event()
+        original_follow = IncomingCalls._follow
+
+        async def follow(calls, binding):
+            bindings.put_nowait(binding)
+            await resume.wait()
+            await original_follow(calls, binding)
+
+        with patch.object(IncomingCalls, "_follow", follow):
+            yield bindings, resume
+
     async def _ring_connect(self, sender, number, count):
         self.desktop.ring(sender, number)
         await _eventually(lambda: len(self.desktop.clicks) == count)
@@ -336,7 +353,8 @@ class IncomingCallTests(unittest.IsolatedAsyncioTestCase):
         await asyncio.sleep(0.025)
 
     def _text(self, index, content):
-        self.runner.messages[_CHATS[index]].append(_message(str(index), _CHATS[index], _SENDERS[index], content))
+        messages = self.runner.messages[_CHATS[index]]
+        messages.append(_message(str(len(messages)), _CHATS[index], _SENDERS[index], content))
         self.clock = 102.0
 
     async def test_first_call_looks_up_once_after_audio_opens_and_shares_text_history(self):
@@ -366,9 +384,11 @@ class IncomingCallTests(unittest.IsolatedAsyncioTestCase):
             await _eventually(lambda: any(device.pull(32)))
             await _eventually(lambda: self.runner.sent[_CHATS[0]] == ["测试语音1。"])
             self._text(0, "通话中发文字")
+            await _eventually(lambda: len(tts.calls) == 2)
+            await _eventually(lambda: any(device.pull(32)))
             await _eventually(lambda: len(self.runner.sent[_CHATS[0]]) == 2)
             self.assertEqual(self.runner.sent[_CHATS[0]][1], "通话中发文字。")
-            self.assertEqual(len(tts.calls), 1)
+            self.assertEqual(tts.calls[-1], ("通话中发文字。", 16000))
             self.assertEqual(agents.call_count, 1)
             self.assertEqual(self.runner.lookups, 1)
             self.assertEqual([row.message.content for row in history.tail(_session(sender), 10)],
@@ -707,8 +727,8 @@ class IncomingCallTests(unittest.IsolatedAsyncioTestCase):
                     except asyncio.CancelledError:
                         # 模拟忽略首次取消的模型适配器：仍不得向下一通输出。
                         await model_release.wait()
-                    yield TextDelta("旧模型尾句。")
                     model_late.set()
+                    yield TextDelta("旧模型尾句。")
                 else:
                     async for event in super().stream(messages, tools, thinking=thinking):
                         yield event
@@ -819,7 +839,7 @@ class IncomingCallTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual([row.message.content for row in history.tail(_session(sender), 10)],
                              ["测试语音1", "已播放的旧句。", "测试语音2", "测试语音2。"])
 
-    async def test_ending_call_does_not_stop_blocked_text_model(self):
+    async def test_hangup_before_first_handoff_keeps_running_model_and_delivers_full_text(self):
         started, resume, finished = asyncio.Event(), asyncio.Event(), asyncio.Event()
 
         class Model(_Echo):
@@ -833,7 +853,7 @@ class IncomingCallTests(unittest.IsolatedAsyncioTestCase):
 
         async with self._serve(Model()):
             await self._ring_connect(_SENDERS[0], 1, 1)
-            self._text(0, "通话期间开始的文字轮")
+            _talk(self.devices[0])
             await asyncio.wait_for(started.wait(), 2)
             self.desktop.main = ()
             await _eventually(lambda: self.devices[0].closed)
@@ -841,16 +861,16 @@ class IncomingCallTests(unittest.IsolatedAsyncioTestCase):
             resume.set()
             await _eventually(lambda: self.runner.sent[_CHATS[0]] == ["文字仍可回复。"])
 
-    async def test_queued_voice_tool_continuation_and_delayed_child_keep_their_original_route(self):
+    async def test_queued_voice_and_delayed_child_survive_ordinary_hangup(self):
         parent_wait, parent_release = asyncio.Event(), asyncio.Event()
         child_wait, child_release = asyncio.Event(), asyncio.Event()
-        continuation = []
-        voice_submitted = []
-        submit = Runtime.submit_batch
+        queued, notices = asyncio.Event(), []
+        call_input = _Route.call_input
 
-        def track_submit(runtime, messages, **kwargs):
-            voice_submitted.extend(m.content for m in messages)
-            submit(runtime, messages, **kwargs)
+        def track_voice(route, stop, text, input_active):
+            call_input(route, stop, text, input_active)
+            if text == "挂断前排队转写":
+                queued.set()
 
         class Model(_Echo):
             async def stream(self, messages, tools, *, thinking):
@@ -858,52 +878,406 @@ class IncomingCallTests(unittest.IsolatedAsyncioTestCase):
                 if not tools:
                     child_wait.set()
                     await child_release.wait()
-                    yield TextDelta("旧子任务结果。")
+                    yield TextDelta("子任务结果。")
                 elif last.content == "开始委派":
-                    yield ToolReady(ToolCall("voice-child", DELEGATE_TOOL_NAME, '{"prompt":"旧后台任务"}'))
+                    yield ToolReady(ToolCall("voice-child", DELEGATE_TOOL_NAME, '{"prompt":"后台任务"}'))
                     parent_wait.set()
                     await parent_release.wait()
-                elif last.role == "tool":
-                    continuation.append(tuple(m.content for m in messages if m.role == "user"))
-                    yield TextDelta("旧通话工具续轮。")
+                elif isinstance(last.content, str) and last.content.startswith(RESULT_PREFIX):
+                    notices.append(json.loads(last.content.removeprefix(RESULT_PREFIX)))
+                    yield TextDelta("收到任务结果。")
                 else:
                     async for event in super().stream(messages, tools, thinking=thinking):
                         yield event
 
         sender = _SENDERS[0]
-        first = _ASR("开始委派")
-        tts = _TTS()
-        with patch.object(Runtime, "submit_batch", track_submit):
-            async with self._serve(Model(), tts=tts, copy=False,
-                                   make_asr=lambda i: first if i == 1 else _ASR("重拨语音")) as (history, agents):
+        asr, tts = _ASR("开始委派"), _TTS()
+        with patch.object(_Route, "call_input", track_voice):
+            async with self._serve(Model(), tts=tts, copy=False, make_asr=lambda _: asr) as (history, agents):
                 await self._ring_connect(sender, 1, 1)
                 _talk(self.devices[0])
                 await asyncio.wait_for(parent_wait.wait(), 2)
                 await asyncio.wait_for(child_wait.wait(), 2)
-                first.text = "挂断前排队转写"
+                asr.text = "挂断前排队转写"
                 _talk(self.devices[0])
-                await _eventually(lambda: "挂断前排队转写" in voice_submitted)
-                self._text(0, "排队的文字")
+                await asyncio.wait_for(queued.wait(), 2)
                 self.desktop.main = ()
-                await self._ring_connect(sender, 2, 2)
-                _talk(self.devices[1])
-                await _eventually(lambda: "重拨语音" in voice_submitted)
+                await _eventually(lambda: self.devices[0].closed)
                 parent_release.set()
+                await _eventually(lambda: self.runner.sent[_CHATS[0]] == ["挂断前排队转写。"])
                 child_release.set()
-                await _eventually(lambda: self.runner.sent[_CHATS[0]] == ["排队的文字。"])
-                await _eventually(lambda: bool(tts.calls))
-                await _eventually(lambda: any(self.devices[1].pull(32)))
-                self.assertEqual(continuation, [])
-                self.assertEqual(tts.calls, [("重拨语音。", 16000)])
+                await _eventually(lambda: self.runner.sent[_CHATS[0]] == ["挂断前排队转写。", "收到任务结果。"])
+                self.assertEqual(tts.calls, [])
                 self.assertEqual(agents.call_count, 1)
                 rows = history.tail(_session(sender), 20)
                 accepted, = (json.loads(row.message.content) for row in rows if row.message.role == "tool")
+                child = history.subtask_run(accepted["child_session_id"], accepted["run_id"])
+                self.assertEqual(child.status, "completed")
+                self.assertIsNotNone(child.enqueued_at)
+                notice, = notices
+                self.assertEqual(notice["tool_call_id"], "voice-child")
+                self.assertEqual(notice["result"], "子任务结果。")
+                self.assertIn("挂断前排队转写", [row.message.content for row in rows])
 
-                def child():
-                    return history.subtask_run(accepted["child_session_id"], accepted["run_id"])
+    async def _assert_voice_intercept(self, *, after_idle):
+        started, release_model, idle_reported = (asyncio.Event() for _ in range(3))
+        call_input = _Route.call_input
 
-                await _eventually(lambda: child().status == "completed")
-                self.assertIsNone(child().enqueued_at)
-                texts = [row.message.content for row in rows]
-                self.assertNotIn("挂断前排队转写", texts)
-                self.assertFalse(any(text.startswith(RESULT_PREFIX) for text in texts if isinstance(text, str)))
+        def track_idle(route, stop, text, input_active):
+            call_input(route, stop, text, input_active)
+            if text and input_active is False:
+                idle_reported.set()
+
+        class Model(_Echo):
+            async def stream(self, messages, tools, *, thinking):
+                if messages[-1].content == "先开始的文字请求":
+                    started.set()
+                    await release_model.wait()
+                    yield TextDelta("过期回复。")
+                    yield ToolReady(ToolCall("obsolete", DELEGATE_TOOL_NAME, '{"prompt":"不应启动"}'))
+                    await asyncio.Future()
+                else:
+                    async for event in super().stream(messages, tools, thinking=thinking):
+                        yield event
+
+        asr, tts, model = _ASR("新话轮", block=True), _TTS(), Model()
+        sender = _SENDERS[0]
+        session = _session(sender)
+        with patch.object(_Route, "call_input", track_idle):
+            async with self._serve(model, tts=tts, make_asr=lambda _: asr) as (history, _):
+                await self._ring_connect(sender, 1, 1)
+                self._text(0, "先开始的文字请求")
+                await asyncio.wait_for(started.wait(), 2)
+                _talk(self.devices[0])
+                await asyncio.wait_for(asr.called.wait(), 2)
+                if after_idle:
+                    asr.release.set()
+                    await asyncio.wait_for(idle_reported.wait(), 2)
+                release_model.set()
+                await _eventually(lambda: bool(history.outcomes(session)))
+                self.assertEqual(history.outcomes(session)[0].delivery_status, DeliveryStatus.ZERO)
+                if not after_idle:
+                    self.assertEqual(tts.calls, [])
+                    asr.release.set()
+                await _eventually(lambda: any(self.devices[0].pull(32)))
+                await _eventually(lambda: self.runner.sent[_CHATS[0]] == ["新话轮。"])
+                self.assertEqual(tts.calls, [("新话轮。", 16000)])
+                self.assertEqual([row.message.role for row in history.tail(session, 10)],
+                                 ["user", "user", "assistant"])
+                first, second = history.outcomes(session)
+                self.assertNotEqual(first.run_id, second.run_id)
+
+    async def test_voice_intercepts_first_handoff_while_user_input_is_pending(self):
+        await self._assert_voice_intercept(after_idle=False)
+
+    async def test_voice_intercepts_obsolete_first_handoff_even_after_transcription_finished(self):
+        await self._assert_voice_intercept(after_idle=True)
+
+    async def test_feishu_and_internal_input_wait_for_last_transcript_in_fifo_order(self):
+        sender = _SENDERS[0]
+        session = _session(sender)
+        asr, tts, model = _ASR("最后转写", block=True), _TTS(), _Echo()
+        async with self._serve(model, tts=tts, make_asr=lambda _: asr) as (history, agents):
+            await self._ring_connect(sender, 1, 1)
+            _talk(self.devices[0])
+            await asyncio.wait_for(asr.called.wait(), 2)
+            self._text(0, "飞书补充")
+            await _eventually(lambda: bool(history.pending_inbound(session, "feishu-private")))
+            schedulers = agents.call_args.kwargs["schedulers"]
+            self.assertTrue(schedulers.submit_internal(session, InternalInput(Message("user", "内部结果"))))
+            self.assertEqual(model.calls, [])
+            self.assertEqual(history.tail(session, 10), [])
+            asr.release.set()
+            await _eventually(lambda: len(tts.calls) == 1)
+            await _eventually(lambda: any(self.devices[0].pull(32)))
+            await _eventually(lambda: self.runner.sent[_CHATS[0]] == ["最后转写。"])
+            self.assertEqual(model.calls, [("飞书补充", "内部结果", "最后转写")])
+            self.assertFalse(history.pending_inbound(session, "feishu-private"))
+
+    async def test_hangup_releases_buffered_text_and_discards_old_call_events_after_redial(self):
+        sender = _SENDERS[0]
+        session = _session(sender)
+        old, new = _ASR("过期转写", block=True), _ASR("新通转写", block=True)
+        model, old_binding = _Echo(), []
+        start_call = _Route.call_started
+
+        def track_first_call(route, stop, *args, **kwargs):
+            started = start_call(route, stop, *args, **kwargs)
+            if started and not old_binding:
+                old_binding.extend((route, stop))
+            return started
+
+        with patch.object(_Route, "call_started", track_first_call):
+            async with self._serve(model, make_asr=lambda i: old if i == 1 else new) as (history, _):
+                await self._ring_connect(sender, 1, 1)
+                _talk(self.devices[0])
+                await asyncio.wait_for(old.called.wait(), 2)
+                self._text(0, "挂断前补充")
+                await _eventually(lambda: bool(history.pending_inbound(session, "feishu-private")))
+                self.assertEqual(model.calls, [])
+                self.desktop.main = ()
+                await _eventually(lambda: self.runner.sent[_CHATS[0]] == ["挂断前补充。"])
+                await self._ring_connect(sender, 2, 2)
+                _talk(self.devices[1])
+                await asyncio.wait_for(new.called.wait(), 2)
+                self._text(0, "新通补充")
+                await _eventually(lambda: bool(history.pending_inbound(session, "feishu-private")))
+                route, old_stop = old_binding
+                route.call_input(old_stop, "过期转写", False)
+                route.call_ended(old_stop)
+                old_stop()
+                await asyncio.sleep(0)
+                self.assertEqual(model.calls, [("挂断前补充",)])
+                new.release.set()
+                await _eventually(lambda: any(self.devices[1].pull(32)))
+                await _eventually(lambda: self.runner.sent[_CHATS[0]] == ["挂断前补充。", "新通转写。"])
+                self.assertEqual(model.calls[-1], ("挂断前补充", "新通补充", "新通转写"))
+
+    async def test_voice_selected_at_first_handoff_cannot_fall_back_before_player_runs(self):
+        model, tts = _Echo(), _TTS()
+        select_voice = _Route._select_voice
+
+        def select_then_hang_up(route, reply):
+            selected = select_voice(route, reply)
+            self.assertIsNotNone(selected)
+            route._stop_call()
+            self.desktop.main = ()
+            return selected
+
+        sender = _SENDERS[0]
+        with patch.object(_Route, "_select_voice", select_then_hang_up):
+            async with self._serve(model, tts=tts) as (history, _):
+                await self._ring_connect(sender, 1, 1)
+                _talk(self.devices[0])
+                session = _session(sender)
+                await _eventually(lambda: bool(history.outcomes(session)))
+                self.assertEqual([outcome.delivery_status for outcome in history.outcomes(session)],
+                                 [DeliveryStatus.ZERO])
+                self.assertEqual([row.message.content for row in history.tail(session, 10)], ["测试语音1"])
+                self.assertEqual(tts.calls, [])
+                self.assertEqual(self.runner.sent[_CHATS[0]], [])
+
+    async def _assert_first_handoff_rechecks_window(self, *, desktop_error):
+        started, release_model = asyncio.Event(), asyncio.Event()
+
+        class Model(_Echo):
+            async def stream(self, messages, tools, *, thinking):
+                if messages[-1].content == "文字请求":
+                    started.set()
+                    await release_model.wait()
+                async for event in super().stream(messages, tools, thinking=thinking):
+                    yield event
+
+        model, tts, sender = Model(), _TTS(), _SENDERS[0]
+        async with self._pause_follow() as (bindings, resume), self._serve(model, tts=tts, copy=False) as (history, _):
+            await self._ring_connect(sender, 1, 1)
+            old = await asyncio.wait_for(bindings.get(), 2)
+            self._text(0, "文字请求")
+            await asyncio.wait_for(started.wait(), 2)
+            if desktop_error:
+                self.desktop.error = True
+            else:
+                self.desktop.main = ()
+            release_model.set()
+            await _eventually(lambda: self.runner.sent[_CHATS[0]] == ["文字请求。"])
+            self.assertTrue(old.closed)
+            self.assertFalse(resume.is_set())
+            self.assertEqual(tts.calls, [])
+            session = _session(sender)
+            self.assertEqual(history.outcomes(session)[0].delivery_status, DeliveryStatus.FULL)
+
+            self.desktop.main = ()
+            self.desktop.error = False
+            resume.set()
+            await _eventually(lambda: self.devices[0].closed)
+            await self._ring_connect(sender, 2, 2)
+            current = await asyncio.wait_for(bindings.get(), 2)
+            self.assertFalse(old.check_window())
+            old.input("旧通转写", False)
+            old.stop()
+            self.assertTrue(current.active())
+            _talk(self.devices[1])
+            await _eventually(lambda: len(tts.calls) == 1)
+            await _eventually(lambda: any(self.devices[1].pull(32)))
+            await _eventually(lambda: len(history.outcomes(session)) == 2)
+            self.assertEqual(tts.calls, [("测试语音2。", 16000)])
+            self.assertEqual(model.calls, [("文字请求",), ("文字请求", "测试语音2")])
+            self.assertEqual(self.runner.sent[_CHATS[0]], ["文字请求。"])
+
+    async def test_first_handoff_rechecks_window_before_follow_poll(self):
+        await self._assert_first_handoff_rechecks_window(desktop_error=False)
+
+    async def test_first_handoff_desktop_error_detaches_only_the_current_call(self):
+        with self.assertLogs("agent_companion.feishu_calls", level="WARNING"):
+            await self._assert_first_handoff_rechecks_window(desktop_error=True)
+
+    async def test_asr_after_window_loss_detaches_and_never_enters_scheduler(self):
+        asr, model, sender = _ASR("挂断后的转写", block=True), _Echo(), _SENDERS[0]
+        async with (self._pause_follow() as (bindings, resume),
+                    self._serve(model, make_asr=lambda _: asr) as (history, _)):
+            await self._ring_connect(sender, 1, 1)
+            binding = await asyncio.wait_for(bindings.get(), 2)
+            _talk(self.devices[0])
+            await asyncio.wait_for(asr.called.wait(), 2)
+            self._text(0, "挂断前补充")
+            await _eventually(lambda: bool(history.pending_inbound(_session(sender), "feishu-private")))
+            self.assertEqual(model.calls, [])
+            self.desktop.main = ()
+            asr.release.set()
+            await _eventually(lambda: self.runner.sent[_CHATS[0]] == ["挂断前补充。"])
+            self.assertTrue(binding.closed)
+            self.assertFalse(resume.is_set())
+            self.assertEqual(model.calls, [("挂断前补充",)])
+
+    async def test_capped_turn_holds_feishu_and_internal_input_until_silence(self):
+        await self._assert_capped_turn_holds_inputs("silence")
+
+    async def test_capped_turn_asr_timeout_still_holds_inputs_until_silence(self):
+        await self._assert_capped_turn_holds_inputs("timeout")
+
+    async def test_capped_turn_hangup_drops_unfinished_turn_and_releases_inputs(self):
+        await self._assert_capped_turn_holds_inputs("hangup")
+
+    async def test_capped_turn_device_stop_releases_inputs_without_waiting_for_frames(self):
+        with patch("agent_companion.speech.voice._DEVICE_CHECK_SECONDS", .015):
+            await self._assert_capped_turn_holds_inputs("device_stop")
+
+    async def test_capture_stall_releases_ordinary_turn_with_window_and_device_active(self):
+        await self._assert_capture_stall_releases_inputs(capped=False)
+
+    async def test_capture_stall_releases_capped_turn_after_asr_with_window_and_device_active(self):
+        await self._assert_capture_stall_releases_inputs(capped=True)
+
+    async def _assert_capture_stall_releases_inputs(self, *, capped):
+        sender = _SENDERS[0]
+        session = _session(sender)
+        asr, model, tts = _ASR("未结束的转写"), _Echo(), _TTS()
+        max_audio_seconds = 3 * INPUT_FRAMES / INPUT_RATE if capped else 30
+        clock = [0.0]
+        with (patch("agent_companion.speech.voice.monotonic", new=lambda: clock[0]),
+              patch("agent_companion.speech.voice._CAPTURE_STALL_SECONDS", .25)):
+            async with self._serve(model, make_asr=lambda _: asr, tts=tts, copy=False,
+                                   max_audio_seconds=max_audio_seconds) as (history, agents):
+                await self._ring_connect(sender, 1, 1)
+                window, = self.desktop.main
+                device = self.devices[0]
+                schedulers = agents.call_args.kwargs["schedulers"]
+                scheduler = schedulers.get_or_create(session)
+                clock[0] += .125
+                device.frame(True, 4)
+                await _eventually(lambda: scheduler._input_active)
+                if capped:
+                    await asyncio.wait_for(asr.finished.wait(), 2)
+                self._text(0, "飞书补充")
+                await _eventually(lambda: bool(history.pending_inbound(session, "feishu-private")))
+                self.assertTrue(schedulers.submit_internal(session, InternalInput(Message("user", "内部结果"))))
+                self.assertTrue(scheduler._input_active)
+                self.assertEqual(model.calls, [])
+                device.check_active()
+                self.assertTrue(self.desktop.window_exists(window))
+
+                with self.assertLogs("agent_companion.speech.voice", level="ERROR") as log:
+                    clock[0] += .25  # 不再提供 PCM，桌面和设备状态均未改变。
+                    await _eventually(lambda: self.runner.sent[_CHATS[0]] == ["内部结果。"])
+                self.assertIn("capture PCM stalled", "\n".join(log.output))
+                self.assertTrue(device.closed)
+                self.assertTrue(self.desktop.window_exists(window))
+                self.assertFalse(scheduler._input_active)
+                self.assertFalse(history.pending_inbound(session, "feishu-private"))
+                self.assertEqual(model.calls, [("飞书补充", "内部结果")])
+                self.assertEqual(len(asr.files), int(capped))
+                self.assertEqual(tts.calls, [])
+                self._text(0, "故障后的文字")
+                await _eventually(lambda: self.runner.sent[_CHATS[0]] == ["内部结果。", "故障后的文字。"])
+                self.assertEqual(agents.call_count, 1)
+
+    async def test_capture_watchdog_releases_inputs_and_allows_redial_while_vad_is_blocked(self):
+        loop = asyncio.get_running_loop()
+        entered, finished, release = asyncio.Event(), asyncio.Event(), Event()
+
+        class BlockedVAD(_Vad):
+            def probability(self, pcm):
+                if self.count == 3:
+                    loop.call_soon_threadsafe(entered.set)
+                    release.wait()
+                result = super().probability(pcm)
+                if self.count == 5:
+                    loop.call_soon_threadsafe(finished.set)
+                return result
+
+        sender, model, tts = _SENDERS[0], _Echo(), _TTS()
+        session = _session(sender)
+        clock = [0.0]
+        with (patch(f"{__name__}._Vad", side_effect=[BlockedVAD(), _Vad()]),
+              patch("agent_companion.speech.voice.monotonic", new=lambda: clock[0]),
+              patch("agent_companion.speech.voice._CAPTURE_STALL_SECONDS", .125)):
+            async with self._serve(model, tts=tts) as (history, agents):
+                try:
+                    await self._ring_connect(sender, 1, 1)
+                    old = self.devices[0]
+                    window, = self.desktop.main
+                    schedulers = agents.call_args.kwargs["schedulers"]
+                    scheduler = schedulers.get_or_create(session)
+                    old.frame(True, 3)
+                    await _eventually(lambda: scheduler._input_active)
+                    old.frame(False, 2)  # 旧 VAD 停在会结束话轮的这批数据上。
+                    await asyncio.wait_for(entered.wait(), 1)
+                    self._text(0, "飞书补充")
+                    await _eventually(lambda: bool(history.pending_inbound(session, "feishu-private")))
+                    self.assertTrue(schedulers.submit_internal(session, InternalInput(Message("user", "内部结果"))))
+                    self.assertEqual(model.calls, [])
+                    old.check_active()
+
+                    with self.assertLogs("agent_companion.speech.voice", level="ERROR") as log:
+                        clock[0] += .125
+                        await _eventually(lambda: self.runner.sent[_CHATS[0]] == ["内部结果。"])
+                    self.assertIn("capture PCM stalled", "\n".join(log.output))
+                    self.assertTrue(old.closed)
+                    self.assertTrue(self.desktop.window_exists(window))
+                    self.assertFalse(scheduler._input_active)
+                    self.assertFalse(finished.is_set())
+                    self.assertEqual(model.calls, [("飞书补充", "内部结果")])
+
+                    self.desktop.main = ()
+                    await self._ring_connect(sender, 2, 2)
+                    self.assertFalse(finished.is_set())
+                    old.frame(True, 4)
+                    release.set()
+                    await asyncio.wait_for(finished.wait(), 1)
+                    _talk(self.devices[1])
+                    await _eventually(lambda: any(self.devices[1].pull(32)))
+                    await _eventually(lambda: self.runner.sent[_CHATS[0]] == ["内部结果。", "测试语音2。"])
+                    self.assertEqual(self.asrs[0].files, [])
+                    self.assertEqual(model.calls[-1], ("飞书补充", "内部结果", "测试语音2"))
+                    self.assertEqual(agents.call_count, 1)
+                finally:
+                    release.set()
+
+    async def _assert_capped_turn_holds_inputs(self, end):
+        sender, session = _SENDERS[0], _session(_SENDERS[0])
+        asr, model, tts = _ASR("封顶转写", block=end == "timeout"), _Echo(), _TTS()
+        async with self._serve(model, make_asr=lambda _: asr, tts=tts, asr_timeout=.05,
+                               max_audio_seconds=3 * INPUT_FRAMES / INPUT_RATE) as (history, agents):
+            await self._ring_connect(sender, 1, 1)
+            device = self.devices[0]
+            device.frame(True, 4)  # 转写已完成/超时，但没有后续帧，也就没有可信静默。
+            await asyncio.wait_for(asr.finished.wait(), 2)
+            self._text(0, "飞书补充")
+            await _eventually(lambda: bool(history.pending_inbound(session, "feishu-private")))
+            schedulers = agents.call_args.kwargs["schedulers"]
+            self.assertTrue(schedulers.submit_internal(session, InternalInput(Message("user", "内部结果"))))
+            self.assertTrue(schedulers.get_or_create(session)._input_active)
+            self.assertEqual(model.calls, [])
+            self.assertEqual(tts.calls, [])
+            self.assertEqual(history.tail(session, 10), [])
+            if end == "device_stop":
+                device.fault = True
+            elif end == "hangup":
+                self.desktop.main = ()
+            else:
+                device.frame(False, 2)
+                await _eventually(lambda: any(device.pull(32)))
+            expected = ("飞书补充", "内部结果") + (("封顶转写",) if end == "silence" else ())
+            await _eventually(lambda: self.runner.sent[_CHATS[0]] == [expected[-1] + "。"])
+            self.assertEqual(model.calls, [expected])
+            self.assertFalse(history.pending_inbound(session, "feishu-private"))

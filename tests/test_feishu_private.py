@@ -123,6 +123,29 @@ class _Model:
             yield TextDelta("reply: " + last.content)
 
 
+class _SlowRetiringChild(_Model):
+    def __init__(self):
+        super().__init__()
+        self.started = asyncio.Event()
+        self.retiring = asyncio.Event()
+        self.release_retirement = asyncio.Event()
+
+    async def stream(self, messages, tools, *, thinking):
+        last = messages[-1]
+        if tools and last.content == "delegate slow A":
+            yield ToolReady(ToolCall("slow-child-a", DELEGATE_TOOL_NAME, '{"prompt":"slow child A"}'))
+        elif not tools and last.content == "slow child A":
+            self.started.set()
+            try:
+                await asyncio.Future()
+            finally:
+                self.retiring.set()
+                await self.release_retirement.wait()
+        else:
+            async for event in super().stream(messages, tools, thinking=thinking):
+                yield event
+
+
 @asynccontextmanager
 async def _serve_private(settings, history, model, runner, clock):
     with (patch("agent_companion.app.time", side_effect=lambda: clock[0]),
@@ -304,6 +327,87 @@ class FeishuPrivateTests(unittest.IsolatedAsyncioTestCase):
                 clock[0] = 102.0
                 await _eventually(lambda: set(runner.sent) == {a, b})
             self.assertEqual(runner.closed_sends, {a, b})
+
+    async def test_slow_retirement_does_not_delay_other_chat_activation_or_revocation(self):
+        a, b, _ = _CHATS
+        sa, sb, _ = _SENDERS
+        runner, model, clock = self.runner, _SlowRetiringChild(), [100.25]
+        runner.pages = {None: ([_chat(a, sa)], None)}
+        runner.messages[a] = [_message("delegate_a", a, sa, "delegate slow A")]
+        runner.hold_destinations.add(b)
+        session_a = "feishu-private:" + sha256(sa.encode()).hexdigest()
+        close = Subtasks.close
+
+        async def close_with_fault(subtasks):
+            await close(subtasks)
+            if subtasks._parent == session_a:
+                raise RuntimeError("synthetic exception body not for logs")
+
+        with (closing(History(":memory:")) as history, patch.object(Subtasks, "close", close_with_fault)):
+            async with _serve_private(self.settings, history, model, runner, clock):
+                try:
+                    await _eventually(lambda: runner.queries)
+                    clock[0] = 101.0
+                    await asyncio.wait_for(model.started.wait(), 3)
+                    runner.messages[b] = [_message("independent_b", b, sb, "independent B", stamp=101_100)]
+                    clock[0] = 102.0
+                    runner.pages = {None: ([_chat(b, sb)], None)}
+                    await asyncio.wait_for(model.retiring.wait(), 3)
+                    await _eventually(lambda: runner.sent[b] == ["reply: independent B"])
+                    runner.pages = {None: ([], None)}
+                    await _eventually(lambda: b in runner.closed_sends)
+                    with self.assertLogs("agent_companion.feishu_private", level="WARNING") as logs:
+                        model.release_retirement.set()
+                        await _eventually(lambda: any("retirement failed" in line for line in logs.output))
+                    self.assertEqual(len(logs.records), 1)
+                    self.assertTrue(logs.records[0].getMessage().endswith("error_type=RuntimeError"))
+                    self.assertNotIn("synthetic exception body", logs.records[0].getMessage())
+                    self.assertIsNone(logs.records[0].exc_info)
+                    count = len(runner.queries)
+                    await _eventually(lambda: len(runner.queries) > count)
+                finally:
+                    model.release_retirement.set()
+
+    async def test_retiring_session_requires_a_new_verified_snapshot_after_old_exit(self):
+        a, sa = _CHATS[0], _SENDERS[0]
+        runner, model, clock = self.runner, _SlowRetiringChild(), [100.25]
+        verified = {None: ([_chat(a, sa)], None)}
+        runner.pages = verified
+        runner.messages[a] = [_message("delegate_a", a, sa, "delegate slow A")]
+        with closing(History(":memory:")) as history:
+            with patch.object(history, "bind_feishu_private_route", wraps=history.bind_feishu_private_route) as bind:
+                async with _serve_private(self.settings, history, model, runner, clock) as agents:
+                    try:
+                        await _eventually(lambda: runner.queries)
+                        clock[0] = 101.0
+                        await asyncio.wait_for(model.started.wait(), 3)
+                        session = agents.call_args.kwargs["session_id"]
+                        await _eventually(lambda: any(e.message.role == "tool" for e in history.read_after(session)))
+                        accepted = next(json.loads(e.message.content) for e in history.read_after(session)
+                                        if e.message.role == "tool")
+                        runner.pages = {None: ([], None)}
+                        await asyncio.wait_for(model.retiring.wait(), 3)
+
+                        runner.messages[a].append(_message("after_a", a, sa, "fresh A", stamp=101_100))
+                        clock[0] = 102.0
+                        runner.pages = verified
+                        count = len(runner.queries)
+                        await _eventually(lambda: len(runner.queries) >= count + 2)
+                        self.assertEqual((bind.call_count, agents.call_count), (1, 1))
+
+                        runner.pages = {None: ([], None)}
+                        model.release_retirement.set()
+                        await _eventually(lambda: history.subtask_run(
+                            accepted["child_session_id"], accepted["run_id"]).status == "interrupted")
+                        count = len(runner.queries)
+                        await _eventually(lambda: len(runner.queries) >= count + 2)
+                        self.assertEqual((bind.call_count, agents.call_count), (1, 1))
+
+                        runner.pages = verified
+                        await _eventually(lambda: "reply: fresh A" in runner.sent[a])
+                        self.assertEqual((bind.call_count, agents.call_count), (2, 2))
+                    finally:
+                        model.release_retirement.set()
 
     async def test_revoked_route_cancels_queued_and_inflight_work_then_restores_only_pending_input(self):
         class PausedModel(_Model):
@@ -821,9 +925,10 @@ class FeishuPrivateTests(unittest.IsolatedAsyncioTestCase):
                         self.assertEqual([outcome.run_id for outcome in history.outcomes(child)], [run_id])
                         payloads = [json.loads(e.message.content.removeprefix(RESULT_PREFIX))
                                     for e in history.read_after(session) if e.message.content.startswith(RESULT_PREFIX)]
-                        self.assertEqual(payloads, [{"child_session_id": child, "run_id": run_id,
-                                                     "status": "completed", "result": "reply: child B"}])
                         run = history.subtask_run(child, run_id)
+                        self.assertEqual(payloads, [{"child_session_id": child, "run_id": run_id,
+                                                     "status": "completed", "result": "reply: child B",
+                                                     "tool_call_id": run.tool_call_id, "tool_name": DELEGATE_TOOL_NAME}])
                         self.assertEqual(run.status, "completed")
                         self.assertIsNotNone(run.enqueued_at)
 

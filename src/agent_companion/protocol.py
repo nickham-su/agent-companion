@@ -1,9 +1,10 @@
 """通道、运行时与模型共享的值和最薄接口。"""
 
 import asyncio
-from collections.abc import AsyncGenerator, AsyncIterator, Callable, Sequence
+from collections.abc import AsyncGenerator, AsyncIterator, Awaitable, Callable, Sequence
 from dataclasses import dataclass, field
 from enum import StrEnum
+import json
 import re
 from typing import Any, Literal, Protocol, runtime_checkable
 
@@ -73,6 +74,77 @@ class Message:
 
 
 @dataclass(frozen=True, slots=True)
+class PersistedInput:
+    """已持久化的用户输入，交给 Runtime 在执行边界消费。"""
+
+    batch_id: int
+
+
+ASYNC_TOOL_RESULT_PREFIX = "[内部子任务结果]\n"
+
+
+@dataclass(frozen=True, slots=True)
+class AsyncToolResult:
+    """已结束的异步工具任务；不是原调用的第二条 tool 消息。"""
+
+    tool_call_id: str
+    result: str | None = field(default=None, repr=False)
+    error: str | None = None
+    tool_name: str | None = None
+    child_session_id: str | None = None
+    run_id: str | None = None
+
+    def __post_init__(self) -> None:
+        if not self.tool_call_id or (self.result is None) == (self.error is None):
+            raise ValueError("async tool result requires a call ID and exactly one result or error")
+
+    def to_model_message(self) -> Message:
+        fields = {
+            "tool_call_id": self.tool_call_id,
+            "tool_name": self.tool_name,
+            "child_session_id": self.child_session_id,
+            "run_id": self.run_id,
+        }
+        payload = {key: value for key, value in fields.items() if value is not None}
+        if self.error is not None:
+            payload.update(status="failed", error=self.error)
+        else:
+            assert self.result is not None
+            payload.update(status="completed", result=self.result)
+        return Message("user", ASYNC_TOOL_RESULT_PREFIX + json.dumps(payload, ensure_ascii=False))
+
+
+@dataclass(frozen=True, slots=True)
+class InternalInput:
+    """可进入模型上下文，但不授予用户输入权限。"""
+
+    content: Message | AsyncToolResult = field(repr=False)
+
+    def to_model_message(self) -> Message:
+        return self.content.to_model_message() if isinstance(self.content, AsyncToolResult) else self.content
+
+
+# 未包装的 Message 表示真实用户输入。
+InputItem = Message | PersistedInput | InternalInput
+
+
+def validate_input_items(items: Sequence[InputItem]) -> None:
+    """在调度器或 Runtime 修改队列前校验同一批输入。"""
+    for item in items:
+        if isinstance(item, PersistedInput):
+            if type(item.batch_id) is not int:
+                raise ValueError("persisted input requires an integer batch ID")
+            continue
+        message = item.content if isinstance(item, InternalInput) else item
+        if isinstance(item, InternalInput) and isinstance(message, AsyncToolResult):
+            continue
+        if (not isinstance(message, Message) or message.role != "user" or message.tool_calls
+                or message.tool_call_id is not None or message.reasoning is not None
+                or message.replay is not None):
+            raise ValueError("runtime inputs must be plain user messages")
+
+
+@dataclass(frozen=True, slots=True)
 class ToolSpec:
     name: str
     description: str
@@ -103,7 +175,15 @@ class InputUsage:
     input_tokens: int
 
 
-ModelEvent = TextDelta | ReasoningDelta | ToolReady | ReplayReady | InputUsage
+@dataclass(frozen=True, slots=True)
+class ModelClosing:
+    """适配器接下来由当前读流任务关闭连接，不再读取模型帧。"""
+
+    # False 表示关闭成功后仍有尚未交付的终态事件；True 表示已全部验证并交付。
+    complete: bool
+
+
+ModelEvent = TextDelta | ReasoningDelta | ToolReady | ReplayReady | InputUsage | ModelClosing
 
 
 class ModelError(Exception):
@@ -120,7 +200,8 @@ class ModelError(Exception):
 _MODEL_DIAGNOSTICS = frozenset({
     "abnormal_stream_finish", "duplicate_tool_id", "empty_summary", "incomplete_tool_call",
     "internal_tool_call", "invalid_sse_event", "invalid_stream_finish", "invalid_tool_arguments",
-    "invalid_tool_delta", "invalid_tool_id", "missing_reasoning", "transport_error", "truncated_stream",
+    "invalid_tool_delta", "invalid_tool_id", "missing_reasoning", "transport_error", "transport_close_timeout",
+    "truncated_stream",
     "unsupported_tool_type", "responses_output_limit", "responses_event_limit",
     "responses_unsupported_encoding", "responses_unsupported_output", "responses_unexpected_response",
     "summary_tool_call", "summary_private_echo", "agents_md_invalid_file",
@@ -169,7 +250,7 @@ class ReplyStream(AsyncIterator[str]):
         self._delivery_deadline = 0.0
         self._idle_timeout: float | None = None
         self._arm_idle: Callable[[float, float | None], float] | None = None
-        self._read_playback: Callable[[], tuple[float, float, str]] | None = None
+        self._read_playback: Callable[[], tuple[float, float, str, float | None]] | None = None
         self.delivery_finished_at: float | None = None
         self._closed = False
         self._exhausted = False
@@ -177,6 +258,7 @@ class ReplyStream(AsyncIterator[str]):
         self._published_chars = 0
         self._text_limit: int | None = None
         self._overflowed = False
+        self._voice_delivery = False
 
     @property
     def abandoned(self) -> bool:
@@ -187,13 +269,21 @@ class ReplyStream(AsyncIterator[str]):
         return self._overflowed
 
     @property
+    def voice_delivery(self) -> bool:
+        return self._voice_delivery
+
+    def select_voice_delivery(self) -> None:
+        """选定语音投递时（包括交给语音层前拦截），须在返回回执前调用。"""
+        self._voice_delivery = True
+
+    @property
     def progress(self) -> tuple[int, str]:
         """本条回复最新的设备消费字节数及已确认正文前缀。"""
         return self._progress
 
     def bind_playback(self, arm_idle: Callable[[float, float | None], float],
-                      snapshot: Callable[[], tuple[float, float, str]]) -> None:
-        """绑定本回复的同步设备证据；快照含同一锁下的时刻、截止和截止前缀。"""
+                      snapshot: Callable[[], tuple[float, float, str, float | None]]) -> None:
+        """快照含观察时点、空闲截止、截止时的前缀和已发生的播放终态时点。"""
         self._arm_idle, self._read_playback = arm_idle, snapshot
         if self._idle_timeout is not None:
             arm_idle(self._idle_timeout, self._delivery_deadline)
@@ -206,11 +296,11 @@ class ReplyStream(AsyncIterator[str]):
             timeout = fallback if idle_timeout is None else idle_timeout
             self._delivery_deadline = asyncio.get_running_loop().time() + timeout
 
-    def delivery_snapshot(self) -> tuple[float, float, str]:
+    def delivery_snapshot(self) -> tuple[float, float, str, float | None]:
         if self._idle_timeout is not None and self._read_playback is not None:
             return self._read_playback()
         confirmed = self._progress[1] if self._idle_timeout is not None else ""
-        return asyncio.get_running_loop().time(), self._delivery_deadline, confirmed
+        return asyncio.get_running_loop().time(), self._delivery_deadline, confirmed, None
 
     def report_progress(self, reply_id: str, played_bytes: int, confirmed: str) -> None:
         """仅在事件循环线程上报；迟到、回退或重复的进展不能覆盖快照。"""
@@ -276,25 +366,27 @@ class Channel(Protocol):
     async def deliver(self, reply: ReplyStream) -> Receipt:
         """消费一个回复并给出唯一终态，允许在模型流结束前返回。
 
-        Runtime 从模型流关闭起等待回执，不接纳放弃后的进展和回执。
+        Runtime 并行观察回执；只有选定语音投递的非完整回执可截断模型流。
+        回执等待的空闲计时从模型流关闭开始。
         通道取消后只做清理，不再开始外部发送；若捕获取消，可查看
         ``reply.abandoned``。通道可另设不可续期的总时限。
         """
         ...
 
 
+@dataclass(frozen=True, slots=True)
+class ReplyDelivery:
+    """一条回复在首次交接时选定的投递方式，之后不再查询连接。"""
+
+    deliver: Callable[[ReplyStream], Awaitable[Receipt]]
+    idle_timeout: float | None = None
+    after_commit: Callable[[ReplyInfo, str], None] | None = None
+    # 全文交接仅确认完整模型文字；实际发送由 after_commit 调度。
+    require_complete_model: bool = False
+
+
 @runtime_checkable
-class BackgroundChannel(Protocol):
-    def enqueue(self, info: ReplyInfo, text: str) -> None:
-        """落库后尽力交给通道后台发送；不得阻塞或产生投递回执。"""
+class SelectableChannel(Protocol):
+    def select_delivery(self, reply: ReplyStream) -> ReplyDelivery:
+        """同步为首段正文锁定交接方式，不等待 I/O。"""
         ...
-
-
-@dataclass(frozen=True, eq=False, slots=True)
-class ReplyRoute:
-    """一个短期投递目标；对象身份贯穿输入队列、工具续轮和子任务。"""
-
-    channel: Channel
-    active: Callable[[], bool]
-    idle_timeout: float
-    on_confirmed: Callable[[ReplyInfo, str], None] | None = None

@@ -1,5 +1,6 @@
 """DeepSeek Chat Completions 的请求投影与 SSE 解析。"""
 
+import asyncio
 from collections.abc import AsyncGenerator, AsyncIterator, Sequence
 from contextlib import aclosing
 from dataclasses import dataclass, field
@@ -8,8 +9,9 @@ from typing import Any
 
 import httpx
 
-from ..protocol import (Image, InputUsage, Message, ModelError, ModelEvent, ReasoningDelta, Text,
+from ..protocol import (Image, InputUsage, Message, ModelClosing, ModelError, ModelEvent, ReasoningDelta, Text,
                         TextDelta, ToolCall, ToolReady, ToolSpec)
+from ._http_stream import ResponseStreams
 from ._request import request_body
 
 
@@ -168,6 +170,7 @@ class DeepSeek:
     def __init__(self, client: httpx.AsyncClient, *, model: str = MODEL_NAME,
                  reasoning_effort: str | None = None) -> None:
         self._client = client
+        self._responses = ResponseStreams()
         self._model = model
         self._effort = reasoning_effort
 
@@ -179,13 +182,21 @@ class DeepSeek:
                      thinking: bool) -> AsyncGenerator[ModelEvent, None]:
         body = request_body(self._payload(messages, tools, thinking))
         try:
-            async with self._client.stream("POST", CHAT_COMPLETIONS, content=body,
-                                           headers={"Accept": "text/event-stream",
-                                                    "Content-Type": "application/json"}) as response:
+            request = self._client.stream("POST", CHAT_COMPLETIONS, content=body,
+                                          headers={"Accept": "text/event-stream", "Content-Type": "application/json"})
+            async with self._responses.open(request) as response:
                 if not response.is_success:
                     raise ModelError(f"http_{response.status_code}")
                 async with aclosing(parse_stream(response.aiter_lines())) as events:
                     async for event in events:
                         yield event
+                # 解析器只在完整的 [DONE] 后正常结束；此时数据和连接收尾是两个边界。
+                yield ModelClosing(complete=True)
         except httpx.RequestError:
             raise ModelError("transport_error") from None
+
+    def stop_stream(self, reader: asyncio.Task[object]) -> bool:
+        return self._responses.stop(reader)
+
+    async def aclose(self) -> None:
+        await self._responses.aclose()

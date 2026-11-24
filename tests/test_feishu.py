@@ -18,7 +18,7 @@ from agent_companion.app import run_feishu, running_agent
 from agent_companion.channels.feishu.channel import FeishuChannel, FeishuPoller
 from agent_companion.channels.feishu.cli import CliError, CliStdoutLimit, CommandResult, FeishuCLI, run_command
 from agent_companion.config import FeishuSettings, Settings, load_settings
-from agent_companion.protocol import (OMITTED_INPUT_IMAGE, DeliveryStatus, Image, Message, Receipt, ReplyInfo, ReplyRoute,
+from agent_companion.protocol import (OMITTED_INPUT_IMAGE, DeliveryStatus, Image, Message, Receipt, ReplyDelivery, ReplyInfo,
                                       Text, TextDelta)
 from agent_companion.speech.asr import AsrError
 from agent_companion.storage.sqlite import History
@@ -260,43 +260,46 @@ print(json.dumps({"ok": True, "identity": "user", "data": {"size_bytes": peak}})
 class FeishuBackgroundDeliveryTests(unittest.IsolatedAsyncioTestCase):
     async def test_slow_cli_does_not_block_runtime_fifo_or_later_sends_after_failures(self):
         first_started, release_first, finished = (asyncio.Event() for _ in range(3))
-        sent = []
+        sent, committed_before_send = [], []
 
-        class CLI:
-            async def send_text(self, text):
-                sent.append(text)
-                if text == "回复 0":
-                    first_started.set()
-                    await release_first.wait()
-                if text == "回复 1":
-                    return DeliveryStatus.UNKNOWN
-                if text == "回复 2":
-                    raise RuntimeError("synthetic raw diagnostic")
-                if text == "回复 8":
-                    finished.set()
-                return DeliveryStatus.FULL
+        async def runner(argv, data, timeout):
+            text = json.loads(json.loads(data)["content"])["text"]
+            sent.append(text)
+            committed_before_send.append(text in [row.message.content for row in history.read_after("main")])
+            if text == "回复 0":
+                first_started.set()
+                await release_first.wait()
+            if text == "回复 1":
+                raise CliError("cli_timeout")
+            if text == "回复 2":
+                raise RuntimeError("synthetic raw diagnostic")
+            if text == "回复 8":
+                finished.set()
+            return _success({"message_id": "om_reply"})
 
         class Echo:
             async def stream(self, messages, tools, *, thinking):
                 yield TextDelta(f"回复 {messages[-1].content}")
 
-        channel = FeishuChannel(CLI())
+        channel = FeishuChannel(FeishuCLI("lark-cli", _CHAT, timeout=2, runner=runner))
         self.addAsyncCleanup(channel.close)
         with closing(History(":memory:")) as history:
             async with running_agent(Settings(), history, Echo(), channel, session_id="main") as (main, _):
-                main.submit_batch([Message("user", "0")], wait_for_delivery=False)
+                main.submit_batch([Message("user", "0")])
                 await asyncio.wait_for(first_started.wait(), 1)
                 with self.assertLogs("agent_companion.channels.feishu.channel", level="WARNING") as logs:
                     for i in range(1, 10):
-                        main.submit_batch([Message("user", str(i))], wait_for_delivery=False)
+                        main.submit_batch([Message("user", str(i))])
                     await asyncio.wait_for(main.wait_idle(), 1)
                     self.assertEqual(sent, ["回复 0"])
                     self.assertEqual([row.message.content for row in history.read_after("main") if
                                       row.message.role == "assistant"], [f"回复 {i}" for i in range(10)])
-                    self.assertEqual([outcome.delivery_status for outcome in history.outcomes("main")], [None] * 10)
+                    self.assertEqual([outcome.delivery_status for outcome in history.outcomes("main")],
+                                     [DeliveryStatus.FULL] * 10)
                     release_first.set()
                     await asyncio.wait_for(finished.wait(), 1)
                 self.assertEqual(sent, [f"回复 {i}" for i in range(9)])
+                self.assertEqual(committed_before_send, [True] * 9)
                 self.assertEqual(len(logs.output), 3)
                 self.assertIn("queue_full", logs.output[0])
                 self.assertNotIn("回复", "".join(logs.output))
@@ -359,6 +362,7 @@ class FeishuBackgroundDeliveryTests(unittest.IsolatedAsyncioTestCase):
 
                 class Voice:
                     async def deliver(self, reply):
+                        reply.select_voice_delivery()
                         async for _ in reply:
                             pass
                         if case == "idle timeout":
@@ -387,14 +391,18 @@ class FeishuBackgroundDeliveryTests(unittest.IsolatedAsyncioTestCase):
 
                 expected_to_send = bool(saved) and case not in ("disabled", "commit failed")
 
-                channel = FeishuChannel(cli)
-                route = ReplyRoute(Voice(), lambda: True, 0.05,
-                                   channel.enqueue if case != "disabled" else None)
+                voice = Voice()
+
+                def select_voice(reply):
+                    reply.select_voice_delivery()
+                    return ReplyDelivery(voice.deliver, 0.05, channel.enqueue if case != "disabled" else None)
+
+                channel = FeishuChannel(cli, select_voice=select_voice)
                 try:
                     with patch.object(history, "finalize_reply", finalize):
                         async with running_agent(Settings(), history, Model(), channel,
                                                  session_id="main") as (main, _):
-                            main.submit_batch([Message("user", "测试输入")], reply_route=route)
+                            main.submit_batch([Message("user", "测试输入")])
                             await asyncio.wait_for(main.wait_idle(), 1)
                             if expected_to_send:
                                 await asyncio.wait_for(sent.wait(), 1)
@@ -405,7 +413,7 @@ class FeishuBackgroundDeliveryTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(outbound, [(_CHAT, saved, Message("assistant", saved))] if expected_to_send else [])
                 assistant = [entry.message for entry in history.read_after("main") if entry.message.role == "assistant"]
                 outcomes = history.outcomes("main")
-                self.assertEqual(assistant, [] if case == "commit failed" else [Message("assistant", saved)])
+                self.assertEqual(assistant, [] if case in ("commit failed", "zero") else [Message("assistant", saved)])
                 expected_status = DeliveryStatus.UNKNOWN if case == "invalid receipt" else status
                 self.assertEqual([outcome.delivery_status for outcome in outcomes],
                                  [] if case == "commit failed" else [expected_status])
@@ -562,7 +570,7 @@ class FeishuPollingTests(unittest.IsolatedAsyncioTestCase):
             channel = FeishuChannel(cli)
             self.addAsyncCleanup(channel.close)
             async with running_agent(Settings(), history, model, channel, session_id="main") as (main, _):
-                submit = partial(main.submit_persisted_batch, wait_for_delivery=False)
+                submit = main.submit_persisted_batch
                 poller = _poller(history, submit, cli, asr, clock)
                 await poller.poll_once()
                 clock[0] = 110
@@ -851,10 +859,10 @@ print(json.dumps({"ok": True, "identity": "user", "data": page}))
             channel = FeishuChannel(cli)
             self.addAsyncCleanup(channel.close)
             async with running_agent(Settings(), history, model, channel, session_id="main") as (main, _):
-                submit = partial(main.submit_persisted_batch, wait_for_delivery=False)
+                submit = main.submit_persisted_batch
                 poller = _poller(history, submit, cli, asr, clock)
                 await poller.poll_once()
-                main.submit_batch([Message("user", "先处理")], wait_for_delivery=False)
+                main.submit_batch([Message("user", "先处理")])
                 await asyncio.wait_for(started.wait(), 1)
                 clock[0] = 110
                 await poller.poll_once()
@@ -888,7 +896,7 @@ print(json.dumps({"ok": True, "identity": "user", "data": page}))
                     channel = FeishuChannel(cli)
                     self.addAsyncCleanup(channel.close)
                     async with running_agent(Settings(), history, model, channel, session_id="main") as (main, _):
-                        submit = partial(main.submit_persisted_batch, wait_for_delivery=False)
+                        submit = main.submit_persisted_batch
                         await _poller(history, submit, cli, asr, clock).poll_once()
                         await main.wait_idle()
                         self.assertEqual(len(model.calls), expected_calls)
@@ -907,7 +915,7 @@ print(json.dumps({"ok": True, "identity": "user", "data": page}))
             channel = FeishuChannel(cli)
             self.addAsyncCleanup(channel.close)
             async with running_agent(Settings(), history, model, channel, session_id="main") as (main, _):
-                submit = partial(main.submit_persisted_batch, wait_for_delivery=False)
+                submit = main.submit_persisted_batch
                 poller = FeishuPoller(cli, asr, channel, chat_id=_CHAT, sender_id=_PEER, own_id=_SELF,
                                       session_id="main", history=history, submit=submit,
                                       private_started_ms=100_000, clock=lambda: clock[0], batch_budget=470)

@@ -2,36 +2,40 @@
 
 import asyncio
 from collections import deque
-from collections.abc import AsyncIterator, Sequence
-from contextlib import aclosing, asynccontextmanager
+from collections.abc import Sequence
+from contextlib import aclosing
 from dataclasses import dataclass
 import logging
 from pathlib import Path
 from uuid import uuid4
 
 from ..config import RuntimeSettings
-from ..protocol import (BackgroundChannel, Channel, DeliveryStatus, InputUsage, Message, Model, ModelError,
-                        ReasoningDelta, Receipt, ReplayReady, ReplayScope, ReplyInfo,
-                        ReplyRoute, ReplyStream, TextDelta, ToolCall, ToolReady)
-from ..storage.sqlite import History, ReplyOutcome
+from ..protocol import (Channel, DeliveryStatus, InputItem, InputUsage, InternalInput, Message, Model, ModelClosing,
+                         ModelError, PersistedInput, ReasoningDelta, Receipt, ReplayReady, ReplayScope, ReplyDelivery,
+                         ReplyInfo, ReplyStream, SelectableChannel, TextDelta, ToolCall, ToolReady, validate_input_items)
+from ..storage.sqlite import History, ReplyOutcome, RetryableInputWrite
 from .compaction import Compactions
 from .context import Context
 from .instructions import InstructionsError
+from .model_deadline import ModelDeadline, model_deadline_at
 from .sqlite_access import SQLiteAccess
 from .tools import ToolContext, Tools
 
 
 _LOG = logging.getLogger(__name__)
 _DELIVERY_TIMEOUT = 120  # 无播放进展语义的回执通道（例如离线控制台）
+_MAX_RETIRED_MODELS = 2
+_MODEL_CLOSE_GRACE = 1.0  # 关停只等待已退役的模型任务自行完成，不再次取消。
 
 
 @dataclass(frozen=True, slots=True)
 class _InputBatch:
-    messages: tuple[Message, ...]
-    has_user_input: bool
-    wait_for_delivery: bool
-    persisted_id: int | None = None
-    reply_route: ReplyRoute | None = None
+    items: tuple[InputItem, ...]
+    persisted_ids: frozenset[int] = frozenset()
+
+
+class _InputWriteFailed(Exception):
+    """输入未确认落库，与已落库后的执行或回复失败区分。"""
 
 
 class Runtime:
@@ -56,10 +60,10 @@ class Runtime:
         self._replay_scope = replay_scope if isinstance(replay_scope, ReplayScope) else None
         self._pending: deque[_InputBatch] = deque()
         self._queued_inbound: set[int] = set()
+        self._input_blocked = False
         self._worker: asyncio.Task[None] | None = None
         self._retired_deliveries: set[asyncio.Task[Receipt]] = set()
-        self._active_reply_route: ReplyRoute | None = None
-        self._active_model_deadline: asyncio.Timeout | None = None
+        self._retired_models: set[asyncio.Task[bool]] = set()
         self._closed = False
         self._sqlite = SQLiteAccess(retry_locks=retry_sqlite_locks, stopped=lambda: self._closed)
         self._owns_compactions = compactions is None
@@ -71,68 +75,71 @@ class Runtime:
         self._idle.set()
         self.last_failure: str | None = None
 
-    def submit_batch(self, messages: Sequence[Message], *, wait_for_delivery: bool = True,
-                     reply_route: ReplyRoute | None = None) -> None:
+    def submit_batch(self, messages: Sequence[Message]) -> None:
         """在事件循环内整批追加用户输入；不阻塞当前响应。"""
-        self._submit(messages, has_user_input=True, wait_for_delivery=wait_for_delivery, reply_route=reply_route)
+        self.submit_inputs(messages)
 
-    def submit_subtask_result(self, message: Message, *, wait_for_delivery: bool = True,
-                              reply_route: ReplyRoute | None = None) -> None:
-        """后台回投也走同一个队列，但不会被当成新用户输入授权委派。"""
-        self._submit((message,), has_user_input=False, wait_for_delivery=wait_for_delivery, reply_route=reply_route)
+    def submit_persisted_batch(self, batch_id: int) -> None:
+        """由持久化入口移交批次；不在安全边界之前改变模型可读历史。"""
+        self.submit_inputs((PersistedInput(batch_id),))
 
-    def stop_reply_route(self, route: ReplyRoute) -> None:
-        """缩短本通的模型流截止；不取消投递回执、工具和整个 Runtime。"""
-        deadline = self._active_model_deadline
-        if self._active_reply_route is route and deadline is not None and not deadline.expired():
-            deadline.reschedule(asyncio.get_running_loop().time())
-
-    def _check_user_channel(self, wait_for_delivery: bool) -> None:
+    def submit_inputs(self, items: Sequence[InputItem]) -> None:
+        """在同一个事件循环同步接收有序混合批次；不立即写入历史。"""
         if self._closed:
             raise RuntimeError("runtime is closed")
         if self._channel is None:
             raise RuntimeError("internal runs must be scheduled by the subtask dispatcher")
-        if not wait_for_delivery and not isinstance(self._channel, BackgroundChannel):
-            raise ValueError("channel does not support background delivery")
-
-    def _submit(self, messages: Sequence[Message], *, has_user_input: bool, wait_for_delivery: bool,
-                reply_route: ReplyRoute | None = None) -> None:
-        self._check_user_channel(wait_for_delivery)
-        if reply_route is not None and not wait_for_delivery:
-            raise ValueError("reply route requires foreground delivery")
-        batch = tuple(messages)
-        if not batch:
+        items = tuple(items)
+        validate_input_items(items)
+        inputs: list[InputItem] = []
+        persisted_ids: set[int] = set()
+        for item in items:
+            if isinstance(item, PersistedInput):
+                if item.batch_id in self._queued_inbound or item.batch_id in persisted_ids:
+                    continue
+                persisted_ids.add(item.batch_id)
+            inputs.append(item)
+        if not inputs:
             return
-        if any(item.role != "user" or item.tool_calls or item.tool_call_id or item.reasoning is not None
-               or item.replay is not None
-               for item in batch):
-            raise ValueError("runtime inputs must be plain user messages")
-        self._enqueue(_InputBatch(batch, has_user_input, wait_for_delivery, reply_route=reply_route))
-
-    def submit_persisted_batch(self, batch_id: int, *, wait_for_delivery: bool = True) -> None:
-        """由持久化入口移交批次；不在安全边界之前改变模型可读历史。"""
-        self._check_user_channel(wait_for_delivery)
-        if batch_id not in self._queued_inbound:
-            self._enqueue(_InputBatch((), True, wait_for_delivery, batch_id))
-            self._queued_inbound.add(batch_id)
-
-    def _enqueue(self, batch: _InputBatch) -> None:
         loop = asyncio.get_running_loop()
-        self._pending.append(batch)
-        _LOG.debug("runtime input queued; batch=%s messages=%d user_input=%s pending=%d",
-                   batch.persisted_id, len(batch.messages), batch.has_user_input, len(self._pending))
-        self._idle.clear()
-        if self._worker is None:
+        self._pending.append(_InputBatch(tuple(inputs), frozenset(persisted_ids)))
+        self._queued_inbound.update(persisted_ids)
+        _LOG.debug("runtime input queued; items=%d persisted=%d pending=%d",
+                   len(inputs), len(persisted_ids), len(self._pending))
+        self._start_worker(loop)
+
+    def _start_worker(self, loop: asyncio.AbstractEventLoop) -> None:
+        if (self._worker is None and self._pending and not self._closed and not self._input_blocked
+                and self._has_model_slot()):
+            self._idle.clear()
             self._worker = loop.create_task(self._drain())
 
+    def _has_model_slot(self) -> bool:
+        pending = sum(not task.done() for task in self._retired_models)
+        if pending < _MAX_RETIRED_MODELS:
+            return True
+        if self.last_failure != "model_cleanup_blocked":
+            _LOG.warning("model cleanup capacity reached; pending=%d", pending)
+            self.last_failure = "model_cleanup_blocked"
+        return False
+
+    async def _wait_for_model_slot(self) -> None:
+        while not self._closed and not self._has_model_slot():
+            # 保持同一工具链和已提交的调用结果；关闭仅取消等待者，不动旧收尾任务。
+            pending = tuple(task for task in self._retired_models if not task.done())
+            await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
+        if self.last_failure == "model_cleanup_blocked" and not self._closed:
+            self.last_failure = None
+
     async def wait_idle(self) -> None:
+        """等待队列停转；输入故障或模型清理达到上限时也会返回，原因见 last_failure。"""
         await self._idle.wait()
 
     async def run_internal(self, run_id: str, prompt: str) -> str | None:
         """运行独立的子会话话轮，返回失败代码；由调用方保证同会话串行。"""
         if self._closed or self._channel is not None or self._tools.specs:
             raise RuntimeError("internal runs require a runtime without a user channel or tools")
-        await self._process(_InputBatch((Message("user", prompt),), has_user_input=False, wait_for_delivery=False), run_id)
+        await self._process(Message("user", prompt), run_id)
         return self.last_failure
 
     def stop_accepting(self) -> None:
@@ -147,6 +154,10 @@ class Runtime:
         if task is not None:
             task.cancel()
             await asyncio.gather(task, return_exceptions=True)
+        if self._retired_models:
+            _, pending = await asyncio.wait(tuple(self._retired_models), timeout=_MODEL_CLOSE_GRACE)
+            if pending:
+                _LOG.warning("model cleanup still running after shutdown grace; pending=%d", len(pending))
         if self._owns_compactions:
             await self._compactions.close()
         self._pending.clear()
@@ -156,43 +167,71 @@ class Runtime:
 
     async def _drain(self) -> None:
         try:
-            while self._pending and not self._closed:
-                await self._process(self._pending.popleft(), uuid4().hex)
+            while self._pending and not self._closed and not self._input_blocked and self._has_model_slot():
+                await self._process(self._pending[0], uuid4().hex)
         finally:
             self._worker = None
             self._idle.set()
 
-    async def _record_input(self, batch: _InputBatch, run_id: str) -> list[int]:
-        if batch.persisted_id is None:
-            def append() -> list[int]:
-                # 每次重试写入前重新核对，不能在等待 SQLite 解锁时跨过通话边界。
-                if batch.reply_route is not None and not batch.reply_route.active():
-                    return []
-                return self.history.append(self.session_id, batch.messages)
+    async def _record_head(self, run_id: str) -> tuple[list[int], bool]:
+        batch = self._pending[0]
+        recorded = await self._record_input(batch, run_id)
+        # 确认写入、空批次或旧路由作废后才能交还队首；失败时保留输入和去重。
+        self._pending.popleft()
+        self._queued_inbound.difference_update(batch.persisted_ids)
+        return recorded
 
-            ids = await self._sqlite(append)
-        else:
-            try:
-                ids = await self._sqlite(self.history.consume_inbound, self.session_id, batch.persisted_id)
-            finally:
-                self._queued_inbound.discard(batch.persisted_id)
-        _LOG.debug("runtime input recorded; run=%s batch=%s messages=%d user_input=%s wait_for_delivery=%s",
-                   run_id, batch.persisted_id, len(ids), batch.has_user_input, batch.wait_for_delivery)
-        return ids
+    async def _record_input(self, batch: _InputBatch, run_id: str) -> tuple[list[int], bool]:
+        rows: list[Message | int] = []
+        has_memory_user = False
+        for item in batch.items:
+            if isinstance(item, PersistedInput):
+                rows.append(item.batch_id)
+            elif isinstance(item, InternalInput):
+                rows.append(item.to_model_message())
+            else:
+                rows.append(item)
+                has_memory_user = True
 
-    async def _process(self, batch: _InputBatch, run_id: str) -> None:
+        def append() -> tuple[list[int], bool]:
+            if not batch.persisted_ids:
+                messages = tuple(row for row in rows if isinstance(row, Message))
+                return self.history.append(self.session_id, messages, retryable_io=True), has_memory_user
+            if len(rows) == 1 and isinstance(rows[0], int):
+                ids = self.history.consume_inbound(self.session_id, rows[0])
+                return ids, bool(ids)
+            ids, consumed_user = self.history.append_with_inbound(self.session_id, rows)
+            return ids, has_memory_user or consumed_user
+
+        try:
+            ids, has_user_input = await self._sqlite.write_input(append)
+        except Exception as exc:
+            raise _InputWriteFailed from exc
+        _LOG.debug("runtime input recorded; run=%s persisted=%d messages=%d user_input=%s",
+                   run_id, len(batch.persisted_ids), len(ids), has_user_input)
+        return ids, has_user_input
+
+    async def _process(self, entry: _InputBatch | Message, run_id: str) -> None:
         self.last_failure = None
         clock = asyncio.get_running_loop().time
         started = clock()
         try:
-            message_ids = await self._record_input(batch, run_id)
+            if isinstance(entry, _InputBatch):
+                message_ids, has_user_input = await self._record_head(run_id)
+            else:
+                # 独立子任务由 dispatcher 管理，不走队首的有界重试或重新投放。
+                message_ids = await self._sqlite(self.history.append, self.session_id, (entry,))
+                has_user_input = False
             if message_ids:
-                self._active_reply_route = batch.reply_route
-                try:
-                    await self._run(run_id, message_ids[0], has_user_input=batch.has_user_input,
-                                    wait_for_delivery=batch.wait_for_delivery, reply_route=batch.reply_route)
-                finally:
-                    self._active_reply_route = None
+                await self._run(run_id, message_ids[0], has_user_input=has_user_input)
+        except _InputWriteFailed as exc:
+            self.last_failure = "input_write_failed"
+            self._input_blocked = True
+            cause = exc.__cause__
+            if isinstance(cause, RetryableInputWrite):
+                cause = cause.__cause__
+            _LOG.error("runtime input write failed; queue blocked; run=%s error_type=%s sqlite_code=%s",
+                       run_id, type(cause).__name__, getattr(cause, "sqlite_errorcode", None))
         except asyncio.CancelledError:
             _LOG.debug("runtime run cancelled; run=%s", run_id)
             raise
@@ -210,10 +249,9 @@ class Runtime:
         _LOG.debug("runtime run finished; run=%s status=%s elapsed_ms=%.0f",
                    run_id, self.last_failure or "complete", (clock() - started) * 1000)
 
-    async def _run(self, run_id: str, protected_from: int, *, has_user_input: bool,
-                   wait_for_delivery: bool, reply_route: ReplyRoute | None) -> None:
+    async def _run(self, run_id: str, protected_from: int, *, has_user_input: bool) -> None:
         def can_send() -> bool:
-            return not self._closed and (reply_route is None or reply_route.active())
+            return not self._closed
 
         for index in range(self._settings.max_tool_rounds):
             if not can_send():
@@ -225,40 +263,28 @@ class Runtime:
                                                     last_input_tokens=last_input_tokens)
             if messages is None:
                 return
-            model_status, has_calls = await self._reply(run_id, messages, has_user_input=has_user_input,
-                                                       wait_for_delivery=wait_for_delivery, reply_route=reply_route)
+            model_status, continue_tools = await self._reply(
+                run_id, messages, has_user_input=has_user_input)
             if model_status != "complete":
-                self.last_failure = model_status
+                if model_status != "model_interrupted":
+                    self.last_failure = model_status
                 return
-            if not has_calls:
+            if not continue_tools:
                 return
             if index + 1 == self._settings.max_tool_rounds:
                 self.last_failure = "tool_round_limit"
                 return
-            if self._closed or (reply_route is not None and not reply_route.active()):
+            if not can_send():
                 return
-            # 不跨通话或文字通道吸收输入；剩余批次保持原队列顺序。
-            while (self._pending and self._pending[0].reply_route is reply_route
-                   and self._pending[0].wait_for_delivery == wait_for_delivery):
-                batch = self._pending.popleft()
-                if await self._record_input(batch, run_id):
-                    has_user_input = has_user_input or batch.has_user_input
-
-    @asynccontextmanager
-    async def _model_deadline(self) -> AsyncIterator[None]:
-        async with asyncio.timeout(self._settings.model_timeout) as deadline:
-            route = self._active_reply_route
-            if route is not None and not route.active():
-                raise TimeoutError
-            self._active_model_deadline = deadline
-            try:
-                yield
-            finally:
-                self._active_model_deadline = None
+            await self._wait_for_model_slot()
+            if not can_send():
+                return
+            while self._pending:
+                _, recorded_user_input = await self._record_head(run_id)
+                has_user_input = has_user_input or recorded_user_input
 
     async def _reply(self, run_id: str, messages: Sequence[Message], *,
-                     has_user_input: bool, wait_for_delivery: bool,
-                     reply_route: ReplyRoute | None) -> tuple[str, bool]:
+                     has_user_input: bool) -> tuple[str, bool]:
         loop = asyncio.get_running_loop()
         info = ReplyInfo(uuid4().hex, self.session_id, run_id, loop.time())
         text: list[str] = []
@@ -277,65 +303,152 @@ class Runtime:
                     return True
             return False
 
-        idle_timeout = self._delivery_idle_timeout if reply_route is None else reply_route.idle_timeout
-        validate_progress = is_generated_prefix if wait_for_delivery and idle_timeout is not None else None
-        reply = ReplyStream(info, validate_progress=validate_progress)
-        channel = self._channel if reply_route is None else reply_route.channel
+        idle_timeout = self._delivery_idle_timeout
+        reply = ReplyStream(info, validate_progress=is_generated_prefix if self._channel is not None else None)
+        channel = self._channel
+        selected: ReplyDelivery | None = None
+        delivery_started: asyncio.Future[None] = loop.create_future()
 
-        async def deliver() -> Receipt:
-            assert channel is not None
+        async def deliver(target: ReplyDelivery) -> Receipt:
             try:
-                if reply_route is not None and not reply_route.active():
-                    reply.abandon()
-                    return Receipt(info.reply_id, DeliveryStatus.ZERO)
-                return await channel.deliver(reply)
+                if not delivery_started.done():
+                    delivery_started.set_result(None)
+                return await target.deliver(reply)
             finally:
                 reply.delivery_finished_at = loop.time()
 
         delivery: asyncio.Task[Receipt] | None = None
+        queued_run = self._channel is not None
+        model_complete = False
+        reply_closed = False
+        input_tokens: int | None = None
+        accept_model_events = True
+        reader_closing = False
+        read_deadline: ModelDeadline | None = None
+        stop_stream = getattr(self._model, "stop_stream", None)
+
+        def finish_reply_stream() -> None:
+            nonlocal reply_closed
+            if not reply_closed:
+                reply_closed = True
+                if delivery is not None:
+                    reply.start_delivery_wait(idle_timeout, _DELIVERY_TIMEOUT)
+                reply.close()
+
+        def voice_interrupted() -> bool:
+            if not reply.voice_delivery or delivery is None or not delivery.done():
+                return False
+            receipt = self._read_receipt(reply, delivery)
+            return (receipt is not None and receipt.status != DeliveryStatus.FULL
+                    and is_generated_prefix(receipt.confirmed))
+
+        async def read_model() -> bool:
+            nonlocal delivery, input_tokens, replay, read_deadline, reader_closing, model_complete
+            nonlocal selected, idle_timeout
+            async with model_deadline_at(loop.time() + self._settings.model_timeout, stop_stream) as deadline:
+                read_deadline = deadline
+                async with aclosing(self._model.stream(messages, self._tools.specs, thinking=self._thinking)) as events:
+                    async for event in events:
+                        # 即使回执与这一帧同时就绪，也不能发布它或启动新的工具。
+                        # 适配器在收到取消后吐出的迟到帧也一律丢弃。
+                        if not accept_model_events or voice_interrupted():
+                            reader_closing = True
+                            deadline.disarm()
+                            return False
+                        if stop_stream is not None and deadline.expired():
+                            # 已在传输收尾的适配器仍可能吐出缓存的终态；超时后不启动工具。
+                            raise TimeoutError
+                        if isinstance(event, ModelClosing):
+                            reader_closing = True
+                            if event.complete and queued_run:
+                                deadline.disarm()
+                                model_complete = True
+                                finish_reply_stream()  # 回执可先于连接关闭结算；完整投递仍等连接收尾。
+                                return True
+                        elif isinstance(event, TextDelta) and event.text:
+                            if not text:
+                                _LOG.debug("model first text; reply=%s elapsed_ms=%.0f", info.reply_id,
+                                           (loop.time() - info.started_at) * 1000)
+                            text.append(event.text)
+                            if channel is not None:
+                                first_handoff = delivery is None
+                                if delivery is None:
+                                    # 首段交接同步选路；随后挂断或重拨不能改变已选通道。
+                                    if isinstance(channel, SelectableChannel):
+                                        selected = channel.select_delivery(reply)
+                                    else:
+                                        selected = ReplyDelivery(channel.deliver, idle_timeout)
+                                    idle_timeout = selected.idle_timeout
+                                    delivery = loop.create_task(deliver(selected))
+                                if not delivery.done():
+                                    reply.publish(event.text)
+                                if first_handoff and reply.voice_delivery:
+                                    # 先让语音投递进入同一回执接口，以便拒收先于相邻工具帧。
+                                    await delivery_started
+                        elif isinstance(event, ReasoningDelta) and self._thinking:
+                            reasoning.append(event.text)
+                        elif isinstance(event, InputUsage):
+                            input_tokens = event.input_tokens
+                        elif isinstance(event, ReplayReady):
+                            if replay is not None or event.replay.scope != self._replay_scope:
+                                raise ModelError("invalid_sse_event")
+                            replay = event.replay
+                        elif isinstance(event, ToolReady):
+                            if self._channel is None:
+                                raise ModelError("internal_tool_call")
+                            call = event.call
+                            if call.id in scheduled:
+                                raise ModelError("duplicate_tool_id")
+                            context = ToolContext(self.session_id, run_id, call.id, has_user_input)
+                            scheduled[call.id] = (call, loop.create_task(self._tools.execute(call, context)))
+            return True
+
+        model_task: asyncio.Task[bool] | None = None
+
+        def retire_reader(task: asyncio.Task[bool]) -> None:
+            nonlocal accept_model_events
+            accept_model_events = False
+            if read_deadline is not None:
+                read_deadline.disarm()
+            self._retired_models.add(task)
+            task.add_done_callback(self._model_cleanup_finished)
+            if not reader_closing or not queued_run:
+                if (stop_stream is None or not stop_stream(task)) and not task.cancelling():
+                    task.cancel()
+
+        async def complete_model() -> str:
+            nonlocal model_task
+            if not queued_run and stop_stream is None:
+                return "complete" if await read_model() else "model_interrupted"
+            model_task = loop.create_task(read_model())
+            while not model_task.done():
+                if voice_interrupted():
+                    retire_reader(model_task)
+                    return "complete" if model_complete else "model_interrupted"
+                signal = delivery if delivery is not None else delivery_started
+                # wait 不会把分派 worker 的取消直接传给原生读流；由 retire_reader 启动关闭预算。
+                waiting = (model_task,) if not queued_run or signal.done() else (model_task, signal)
+                await asyncio.wait(waiting, return_when=asyncio.FIRST_COMPLETED)
+            if model_complete:
+                self._report_model_cleanup(model_task)
+                return "complete"
+            if queued_run and model_task.cancelled():
+                # 只观察子任务的取消；真正的外层取消由 asyncio.wait 继续抛出。
+                return "model_cancelled"
+            return "complete" if model_task.result() else "model_interrupted"
+
         model_status = "complete"
         model_error = None
-        input_tokens: int | None = None
         _LOG.debug("model request started; run=%s reply=%s messages=%d tools=%d thinking=%s",
                    run_id, info.reply_id, len(messages), len(self._tools.specs), self._thinking)
         try:
             try:
-                async with self._model_deadline():
-                    async with aclosing(self._model.stream(messages, self._tools.specs,
-                                                           thinking=self._thinking)) as events:
-                        async for event in events:
-                            if isinstance(event, TextDelta) and event.text:
-                                if not text:
-                                    _LOG.debug("model first text; reply=%s elapsed_ms=%.0f", info.reply_id,
-                                               (loop.time() - info.started_at) * 1000)
-                                text.append(event.text)
-                                if self._channel is not None and wait_for_delivery:
-                                    if delivery is None:
-                                        delivery = loop.create_task(deliver())
-                                    if not delivery.done():
-                                        reply.publish(event.text)
-                            elif isinstance(event, ReasoningDelta) and self._thinking:
-                                reasoning.append(event.text)
-                            elif isinstance(event, InputUsage):
-                                input_tokens = event.input_tokens
-                            elif isinstance(event, ReplayReady):
-                                if replay is not None or event.replay.scope != self._replay_scope:
-                                    raise ModelError("invalid_sse_event")
-                                replay = event.replay
-                            elif isinstance(event, ToolReady):
-                                if self._channel is None:
-                                    raise ModelError("internal_tool_call")
-                                call = event.call
-                                if call.id in scheduled:
-                                    raise ModelError("duplicate_tool_id")
-                                context = ToolContext(self.session_id, run_id, call.id, has_user_input, reply_route)
-                                scheduled[call.id] = (call, loop.create_task(self._tools.execute(call, context)))
+                model_status = await complete_model()
+                if model_status == "model_interrupted":
+                    reply.abandon()
             except TimeoutError:
                 model_status = "model_timeout"
-                if reply_route is not None and not reply_route.active():
-                    _LOG.debug("model stream stopped after call ended; reply=%s", info.reply_id)
-                else:
-                    _LOG.warning("model request timed out; reply=%s", info.reply_id)
+                _LOG.warning("model request timed out; reply=%s", info.reply_id)
             except ModelError as exc:
                 model_status = "model_failed"
                 model_error = exc.diagnostic
@@ -344,9 +457,9 @@ class Runtime:
                 model_status = "model_failed"
                 _LOG.error("model adapter failed")
             finally:
-                if delivery is not None:
-                    reply.start_delivery_wait(idle_timeout, _DELIVERY_TIMEOUT)
-                reply.close()
+                if selected is not None and selected.require_complete_model and model_status != "complete":
+                    reply.abandon()
+                finish_reply_stream()
 
             generated = "".join(text)
             _LOG.debug("model request finished; reply=%s status=%s input_tokens=%s output_chars=%d tools=%d elapsed_ms=%.0f",
@@ -354,21 +467,32 @@ class Runtime:
                        (loop.time() - info.started_at) * 1000)
             # 工具和投递一直独立运行；这个汇合点只提交成套的终态数据。
             receipt = await self._delivery_result(reply, delivery, generated, idle_timeout=idle_timeout)
-            # 内部会话与后台发送都只保存成功生成的全文，不制造回执。
-            generated_text = generated if not wait_for_delivery and model_status == "complete" else ""
+            if selected is not None and selected.require_complete_model and model_status != "complete":
+                # 不把收齐了一段不完整模型输出记成用户已收到的正文。
+                receipt = None
+            voice_incomplete = (reply.voice_delivery and receipt is not None
+                                and receipt.status != DeliveryStatus.FULL)
+            if model_status == "model_cancelled" and voice_interrupted():
+                model_status = "model_interrupted"
+            # 内部会话不经过用户投递，只保留完整模型正文。
+            generated_text = generated if not queued_run and model_status == "complete" else ""
             confirmed_text = receipt.confirmed if receipt else ""
             calls = tuple(call for call, _ in scheduled.values())
             if scheduled:
                 await asyncio.wait([task for _, task in scheduled.values()])
             results = [Message("tool", '{"error":"tool_cancelled"}' if task.cancelled() else task.result(),
                                  tool_call_id=call.id) for call, task in scheduled.values()]
+            # 完整模型流的协议回放元数据可保留成套工具调用；适配器仍仅从确认正文回放文本。
             if model_status != "complete":
                 replay = None
+            # 零投递的纯文本只留投递结果，不创建模型可见的助理消息。
+            keep_reply = (receipt.status != DeliveryStatus.ZERO if receipt is not None else
+                          bool(generated_text or replay is not None))
             rows = ([Message("assistant", confirmed_text if receipt else generated_text, calls,
                               reasoning="".join(reasoning) if model_status == "complete" and reasoning else None,
                               replay=replay),
                        *results]
-                      if receipt is not None or calls or generated_text or replay is not None else [])
+                      if keep_reply or calls else [])
             outcome = ReplyOutcome(info.reply_id, info.session_id, run_id, model_status,
                                    receipt.status if receipt else None, model_error=model_error,
                                    input_tokens=input_tokens if model_status == "complete" else None)
@@ -378,16 +502,23 @@ class Runtime:
                        (loop.time() - info.started_at) * 1000)
             # 外部副本与主投递状态无关，只在历史事务成功后尽力入队。
             try:
-                on_confirmed = reply_route.on_confirmed if reply_route is not None else None
-                if confirmed_text and on_confirmed is not None:
-                    on_confirmed(info, confirmed_text)
-                elif generated_text and isinstance(self._channel, BackgroundChannel):
-                    self._channel.enqueue(info, generated_text)
+                if (confirmed_text and receipt is not None and selected is not None and selected.after_commit is not None
+                        and (not selected.require_complete_model or receipt.status == DeliveryStatus.FULL)):
+                    selected.after_commit(info, confirmed_text)
             except Exception:
                 _LOG.warning("background reply could not be queued; reply=%s", info.reply_id)
-            return model_status, bool(calls)
+            return model_status, bool(calls) and not voice_incomplete
         finally:
+            delivery_started.cancel()
             unfinished = [task for _, task in scheduled.values() if not task.done()]
+            if accept_model_events and model_task is not None:
+                if not model_task.done():
+                    retire_reader(model_task)
+                    if not queued_run:
+                        # 子任务仍持有串行执行权，原生传输收尾或耗尽预算后才能退出。
+                        await asyncio.wait((model_task,))
+                elif not model_task.cancelled():
+                    model_task.exception()
             if delivery is not None:
                 if not delivery.done():
                     self._abandon_delivery(reply, delivery)
@@ -397,6 +528,21 @@ class Runtime:
                 task.cancel()
             if unfinished:
                 await asyncio.gather(*unfinished, return_exceptions=True)
+
+    def _model_cleanup_finished(self, task: asyncio.Task[bool]) -> None:
+        self._retired_models.discard(task)
+        self._report_model_cleanup(task)
+        if self.last_failure == "model_cleanup_blocked":
+            # 只在碰到清理上限后恢复保留的队首；正常路径不等待退役任务。
+            self._start_worker(task.get_loop())
+
+    @staticmethod
+    def _report_model_cleanup(task: asyncio.Task[bool]) -> None:
+        if not task.cancelled():
+            error = task.exception()
+            if error is not None:
+                detail = error.diagnostic if isinstance(error, ModelError) else type(error).__name__
+                _LOG.warning("model cleanup failed (%s)", detail)
 
     def _abandon_delivery(self, reply: ReplyStream, task: asyncio.Task[Receipt]) -> None:
         reply.abandon()
@@ -414,7 +560,12 @@ class Runtime:
         """返回超时时的确认前缀；正常结束返回 None。"""
         clock = asyncio.get_running_loop().time
         while True:
-            now, deadline, confirmed = reply.delivery_snapshot()
+            now, deadline, confirmed, playback_terminal = reply.delivery_snapshot()
+            if playback_terminal is not None and playback_terminal < deadline:
+                # 播放已终止且早于空闲截止，回执只待当前投递协程恢复，无需等待网络清理。
+                if not delivery.done():
+                    await asyncio.wait((delivery,))
+                return None
             finished = reply.delivery_finished_at
             if delivery.done() and (now if finished is None else finished) < deadline:
                 return None
@@ -435,17 +586,20 @@ class Runtime:
             if idle_timeout is not None:
                 _LOG.warning("reply delivery idle deadline reached; reply=%s", info.reply_id)
             return Receipt(info.reply_id, DeliveryStatus.UNKNOWN, timeout_prefix if generated.startswith(timeout_prefix) else "")
-        if delivery.cancelled():
+        receipt = self._read_receipt(reply, delivery)
+        if (receipt is None or not generated.startswith(receipt.confirmed)
+                or (receipt.status == DeliveryStatus.FULL and generated != receipt.confirmed)):
             return failed
-        try:
-            receipt = delivery.result()
-        except Exception:
-            return failed
-        if (not isinstance(receipt, Receipt) or receipt.reply_id != info.reply_id
+        return receipt
+
+    @staticmethod
+    def _read_receipt(reply: ReplyStream, delivery: asyncio.Task[Receipt]) -> Receipt | None:
+        if delivery.cancelled() or delivery.exception() is not None:
+            return None
+        receipt = delivery.result()
+        if (not isinstance(receipt, Receipt) or receipt.reply_id != reply.info.reply_id
                 or not isinstance(receipt.status, DeliveryStatus) or not isinstance(receipt.confirmed, str)
-                or not generated.startswith(receipt.confirmed)
-                or (receipt.status == DeliveryStatus.FULL and generated != receipt.confirmed)
                 or (receipt.status == DeliveryStatus.ZERO and receipt.confirmed)
                 or (receipt.status == DeliveryStatus.PARTIAL and not receipt.confirmed)):
-            return failed
+            return None
         return receipt

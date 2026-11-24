@@ -1,3 +1,4 @@
+import asyncio
 from io import BytesIO, StringIO
 import json
 from pathlib import Path
@@ -7,14 +8,15 @@ import unittest
 from unittest.mock import AsyncMock, patch
 import wave
 
+import httpcore
 import httpx
 from feishu_test_support import private_discovery
 
 from agent_companion.__main__ import _serve, main
-from agent_companion.app import prepare_private_feishu
+from agent_companion.app import prepare_private_feishu, running_agent
 from agent_companion.config import ConfigError, VoiceSettings, load_settings
 from agent_companion.models.deepseek import CHAT_COMPLETIONS
-from agent_companion.protocol import Message
+from agent_companion.protocol import DeliveryStatus, Message, Receipt
 from agent_companion.speech.asr import AudioFile
 from agent_companion.speech.minimax_tts import MiniMaxTTS
 
@@ -47,6 +49,13 @@ max_audio_seconds = 500
 model = "synthetic-tts-model"
 voice_id = "synthetic-shared-voice"
 '''
+
+
+def _native_config(adapter):
+    if adapter == "deepseek":
+        return _CONFIG
+    return _CONFIG.replace('adapter = "deepseek"', 'adapter = "openai_responses"').replace(
+        'reasoning_effort = "disabled"', 'model = "fixture-model"\nreasoning_effort = "low"')
 
 
 class ProviderConfigTests(unittest.TestCase):
@@ -378,6 +387,228 @@ timeout = false
 
 
 class ProviderCompositionTests(unittest.IsolatedAsyncioTestCase):
+    async def test_native_transport_internal_close_outlives_runtime_grace(self):
+        for adapter in ("deepseek", "openai_responses"):
+            for eof_first in (True, False):
+                with self.subTest(adapter=adapter, eof_first=eof_first):
+                    await self._check_native_transport_close(adapter, eof_first=eof_first)
+
+    async def test_native_transport_internal_close_budget_expires_at_shutdown(self):
+        await self._check_native_transport_close("deepseek", eof_first=False, close_mode="timeout")
+
+    async def test_native_transport_internal_close_failure_is_reported(self):
+        await self._check_native_transport_close("openai_responses", eof_first=True, close_mode="failure")
+
+    async def _check_native_transport_close(self, adapter, *, eof_first, close_mode="success"):
+        trace = []
+        read_waiting, wire_closing, release_close, runtime_stopped = (asyncio.Event() for _ in range(4))
+        if adapter == "deepseek":
+            frame = {"choices": [{"index": 0, "delta": {"content": "fixture text"}}]}
+        else:
+            frame = {"type": "response.output_text.delta", "output_index": 0, "content_index": 0,
+                     "delta": "fixture text"}
+        chunk = f"data: {json.dumps(frame)}\n\n".encode()
+        packet = (b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\n\r\n"
+                  + f"{len(chunk):x}\r\n".encode() + chunk + b"\r\n")  # 故意缺少终止块。
+        loop = asyncio.get_running_loop()
+        stop_at = None
+
+        class Wire(httpcore.AsyncNetworkStream):
+            sent = False
+
+            async def read(self, max_bytes, timeout=None):
+                if not self.sent:
+                    self.sent = True
+                    return packet
+                if eof_first:
+                    trace.append("body-eof")
+                    return b""
+                read_waiting.set()
+                try:
+                    await asyncio.Future()
+                except asyncio.CancelledError:
+                    trace.append("body-read-cancelled")
+                    raise
+
+            async def write(self, buffer, timeout=None):
+                pass
+
+            async def start_tls(self, ssl_context, server_hostname=None, timeout=None):
+                return self
+
+            async def aclose(self):
+                trace.append("wire-close-start")
+                wire_closing.set()
+                try:
+                    await release_close.wait()
+                except asyncio.CancelledError:
+                    trace.append("wire-close-cancelled")
+                    raise
+                if close_mode == "failure":
+                    trace.append("wire-close-failed")
+                    raise httpcore.ReadError("fixture close failure")
+                trace.append("wire-closed")
+
+        class Backend(httpcore.AsyncNetworkBackend):
+            async def connect_tcp(self, host, port, timeout=None, local_address=None, socket_options=None):
+                return Wire()
+
+        class Transport(httpx.AsyncHTTPTransport):
+            async def __aexit__(self, *args):
+                await super().__aexit__(*args)
+                trace.append("client-closed")
+
+        class Voice:
+            async def deliver(self, reply):
+                nonlocal stop_at
+                reply.select_voice_delivery()
+                await anext(reply)
+                await (wire_closing if eof_first else read_waiting).wait()
+                trace.append("voice-zero")
+                stop_at = loop.time()
+                return Receipt(reply.info.reply_id, DeliveryStatus.ZERO)
+
+        pool = httpcore.AsyncConnectionPool
+        with patch.object(httpcore, "AsyncConnectionPool", side_effect=lambda **kw: pool(network_backend=Backend(), **kw)):
+            transport = Transport(trust_env=False)
+        actual_client = httpx.AsyncClient
+        clients = []
+
+        def client(**kwargs):
+            owned = transport if not clients else httpx.MockTransport(lambda _: httpx.Response(500))
+            result = actual_client(transport=owned, **kwargs)
+            clients.append(result)
+            return result
+
+        async def prepare(settings, history, *, discovery):
+            async def run(model, asr, tts):
+                async with running_agent(settings, history, model, Voice(), session_id="transport") as (runtime, _):
+                    runtime.submit_batch([Message("user", "fixture input")])
+                    await asyncio.wait_for(runtime.wait_idle(), 2)
+                    outcome, = history.outcomes("transport")
+                    self.assertEqual((outcome.model_status, outcome.delivery_status),
+                                     ("model_interrupted", DeliveryStatus.ZERO))
+                    self.assertNotIn("wire-closed", trace)
+                trace.append("runtime-stopped")
+                runtime_stopped.set()
+            return run
+
+        with TemporaryDirectory(dir=Path.cwd()) as folder:
+            config = Path(folder) / "native.toml"
+            config.write_text('database = "fixture.sqlite"\n' + _native_config(adapter), encoding="utf-8")
+            settings = load_settings(config, for_run=True)
+            with (patch("agent_companion.__main__.httpx.AsyncClient", side_effect=client),
+                  patch("agent_companion.__main__.prepare_private_feishu", side_effect=prepare),
+                  self.assertLogs("agent_companion", level="WARNING") as logged):
+                serving = asyncio.create_task(_serve(settings))
+                initial = (["body-eof", "wire-close-start", "voice-zero"] if eof_first else
+                           ["voice-zero", "body-read-cancelled", "wire-close-start"])
+                try:
+                    await asyncio.wait_for(runtime_stopped.wait(), 4)
+                    self.assertFalse(serving.done())
+                    self.assertEqual(trace, [*initial, "runtime-stopped"])
+                    if close_mode == "timeout":
+                        await asyncio.wait_for(asyncio.shield(serving), 6)
+                        self.assertGreaterEqual(loop.time() - stop_at, 4.9)
+                    else:
+                        release_close.set()
+                finally:
+                    release_close.set()
+                    await asyncio.wait_for(serving, 4)
+            self.assertTrue(any("still running after shutdown grace" in row for row in logged.output))
+            if close_mode == "timeout":
+                self.assertTrue(any("transport_close_timeout" in row for row in logged.output))
+                terminal = "wire-close-cancelled"
+            elif close_mode == "failure":
+                self.assertTrue(any("model cleanup failed (transport_error)" in row for row in logged.output))
+                terminal = "wire-close-failed"
+            else:
+                terminal = "wire-closed"
+            self.assertEqual(trace, [*initial, "runtime-stopped", terminal, "client-closed"])
+            self.assertTrue(all(owned.is_closed for owned in clients))
+
+    async def test_native_eof_close_outlives_runtime_grace_and_precedes_client_close(self):
+        actual_client = httpx.AsyncClient
+        for adapter in ("deepseek", "openai_responses"):
+            with self.subTest(adapter=adapter), TemporaryDirectory(dir=Path.cwd()) as folder:
+                trace = []
+                wire_closing, release_close, runtime_stopped = (asyncio.Event() for _ in range(3))
+                if adapter == "deepseek":
+                    frame = {"choices": [{"index": 0, "delta": {"content": "confirmed tail"}}]}
+                else:
+                    frame = {"type": "response.output_text.delta", "output_index": 0, "content_index": 0,
+                             "delta": "confirmed tail"}
+
+                class Wire(httpx.AsyncByteStream):
+                    async def __aiter__(self):
+                        # 正文后直接 EOF：没有 [DONE] 或 response.completed。
+                        yield f"data: {json.dumps(frame)}\n\n".encode()
+
+                    async def aclose(self):
+                        trace.append("response-close-start")
+                        wire_closing.set()
+                        try:
+                            await release_close.wait()
+                        except asyncio.CancelledError:
+                            trace.append("response-close-cancelled")
+                            raise
+                        trace.append("response-closed")
+
+                class Transport(httpx.AsyncBaseTransport):
+                    async def handle_async_request(self, request):
+                        return httpx.Response(200, headers={"Content-Type": "text/event-stream"}, stream=Wire())
+
+                    async def aclose(self):
+                        trace.append("model-client-closed")
+
+                class Voice:
+                    async def deliver(self, reply):
+                        reply.select_voice_delivery()
+                        await anext(reply)
+                        # 等到 HTTPX 已在 EOF 内置关闭中，才触发语音打断。
+                        await wire_closing.wait()
+                        return Receipt(reply.info.reply_id, DeliveryStatus.PARTIAL, "confirmed")
+
+                clients = []
+
+                def client(**kwargs):
+                    transport = Transport() if not clients else httpx.MockTransport(lambda _: httpx.Response(500))
+                    result = actual_client(transport=transport, **kwargs)
+                    clients.append(result)
+                    return result
+
+                async def prepare(settings, history, *, discovery):
+                    async def run(model, asr, tts):
+                        async with running_agent(settings, history, model, Voice(), session_id="eof") as (runtime, _):
+                            runtime.submit_batch([Message("user", "prompt")])
+                            await asyncio.wait_for(runtime.wait_idle(), 2)
+                            outcome, = history.outcomes("eof")
+                            self.assertEqual((outcome.model_status, outcome.delivery_status),
+                                             ("model_interrupted", DeliveryStatus.PARTIAL))
+                        trace.append("runtime-stopped")
+                        runtime_stopped.set()
+                    return run
+
+                config = Path(folder) / "native.toml"
+                config.write_text('database = "fixture.sqlite"\n' + _native_config(adapter), encoding="utf-8")
+                settings = load_settings(config, for_run=True)
+                with (patch("agent_companion.__main__.httpx.AsyncClient", side_effect=client),
+                      patch("agent_companion.__main__.prepare_private_feishu", side_effect=prepare),
+                      self.assertLogs("agent_companion.runtime.engine", level="WARNING") as logged):
+                    serving = asyncio.create_task(_serve(settings))
+                    try:
+                        # 真实的旧 1 秒 Runtime 宽限已耗尽，原生关闭和客户端必须还活着。
+                        await asyncio.wait_for(runtime_stopped.wait(), 4)
+                        self.assertFalse(serving.done())
+                        self.assertEqual(trace, ["response-close-start", "runtime-stopped"])
+                    finally:
+                        release_close.set()
+                        await asyncio.wait_for(serving, 4)
+                self.assertTrue(any("still running after shutdown grace" in row for row in logged.output))
+                self.assertEqual(trace, ["response-close-start", "runtime-stopped", "response-closed",
+                                         "model-client-closed"])
+                self.assertTrue(all(owned.is_closed for owned in clients))
+
     async def test_authentication_region_model_and_sampling_in_text_and_voice(self):
         buf = BytesIO()
         with wave.open(buf, "wb") as wav:
