@@ -116,15 +116,12 @@ class LLMSettings:
 
 @dataclass(frozen=True, slots=True)
 class FeishuSettings:
-    own_open_id: str = field(repr=False)
     mode: str = "text"
     cli: str = "lark-cli"
     cli_timeout: float = 20
     voice_text_copy: bool = True
 
     def __post_init__(self) -> None:
-        if not isinstance(self.own_open_id, str) or not re.fullmatch(r"ou_[\w-]{1,160}", self.own_open_id, flags=re.ASCII):
-            raise ConfigError("feishu.own_open_id 必须是以 ou_ 开头的有效飞书 ID")
         if self.mode not in ("text", "voice"):
             raise ConfigError("feishu.mode 必须是 text 或 voice")
         if type(self.voice_text_copy) is not bool:

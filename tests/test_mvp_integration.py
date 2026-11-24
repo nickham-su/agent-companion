@@ -301,7 +301,7 @@ class MVPIntegrationTest(unittest.IsolatedAsyncioTestCase):
     async def _scenario(self, database):
         settings = Settings(
             database=database,
-            feishu=FeishuSettings(own_open_id=_OWN, cli_timeout=1),
+            feishu=FeishuSettings(cli_timeout=1),
             runtime=RuntimeSettings(model_timeout=3),
             asr=ASRSettings(MiniMaxConnection("synthetic"), max_audio_seconds=500),
             voice=VoiceSettings(input_device="mock-in", output_device="mock-out", vad_model=Path("synthetic.onnx"),

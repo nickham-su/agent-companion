@@ -268,12 +268,11 @@ class BackgroundCompactionTest(unittest.IsolatedAsyncioTestCase):
             yield InputUsage(240)
 
         model = _GatedModel(reply)
-        feishu = FeishuSettings(own_open_id="ou_fixture")
-        settings = Settings(runtime=_SETTINGS, feishu=feishu)
+        settings = Settings(runtime=_SETTINGS, feishu=FeishuSettings())
 
         class Discovery:
             async def account_open_id(self):
-                return feishu.own_open_id
+                return "ou_fixture"
 
         async def run_groups(_discovery, shared_history, _asr, *, open_agent, **kwargs):
             self.assertIs(shared_history, history)
@@ -308,8 +307,8 @@ class BackgroundCompactionTest(unittest.IsolatedAsyncioTestCase):
 
         with closing(History(":memory:")) as history:
             with patch("agent_companion.app.run_private_chats", side_effect=run_groups):
-                run_private = await prepare_private_feishu(settings, history, discovery=Discovery(), roles=demo_roles())
-                await run_private(model, object(), None)
+                async with prepare_private_feishu(settings, history, discovery=Discovery(), roles=demo_roles()) as (_, run_private):
+                    await run_private(model, object(), None)
             self.assertTrue(model.cancelled.is_set())
             self.assertIsNone(history.summary("main-b"))
 

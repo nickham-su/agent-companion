@@ -299,7 +299,7 @@ class IncomingCallTests(unittest.IsolatedAsyncioTestCase):
     async def _serve(self, model, *, make_asr=lambda i: _ASR(f"测试语音{i}"), make_device=_Device,
                      tts=None, copy=True, max_audio_seconds=30, asr_timeout=2):
         tts = _TTS() if tts is None else tts
-        settings = Settings(feishu=FeishuSettings(_OWN, mode="voice", voice_text_copy=copy),
+        settings = Settings(feishu=FeishuSettings(mode="voice", voice_text_copy=copy),
                             voice=replace(_SETTINGS, input_device="mock-in", output_device="mock-out",
                                           vad_model=Path("synthetic.onnx")),
                              asr=ASRSettings(MiniMaxConnection("synthetic"), max_audio_seconds=max_audio_seconds))

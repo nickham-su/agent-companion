@@ -71,7 +71,7 @@ class RoleFileTests(_RoleFiles, unittest.TestCase):
                 self.assertIs(roles.default, Parameter.empty)
 
     def test_missing_main_stops_startup_before_database_and_network_at_critical_log_level(self):
-        settings = Settings(feishu=FeishuSettings(own_open_id="ou_role_fixture"), log_level="CRITICAL")
+        settings = Settings(feishu=FeishuSettings(), log_level="CRITICAL")
         (self.agents / "main.example.md").write_bytes(b"template is not a configuration")
         # 上级目录即使有 main.md 也不搜索。
         other_agents = self.workdir.parent / "agents"
@@ -86,8 +86,8 @@ class RoleFileTests(_RoleFiles, unittest.TestCase):
                       patch("sys.stderr", new_callable=StringIO) as stderr,
                       patch("agent_companion.__main__.load_settings", return_value=settings),
                       patch("agent_companion.__main__.Path.cwd", return_value=self.workdir),
-                      patch("agent_companion.__main__.History") as history,
-                      patch("agent_companion.__main__.prepare_private_feishu") as network):
+                      patch("agent_companion.app.History") as history,
+                      patch("agent_companion.app.FeishuDiscovery") as network):
                     self.assertEqual(main(), 1)
                 history.assert_not_called()
                 network.assert_not_called()

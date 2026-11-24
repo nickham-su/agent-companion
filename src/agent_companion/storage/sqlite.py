@@ -304,7 +304,7 @@ class History:
                             self._db.execute(statement)
                     self._db.execute(f"PRAGMA user_version = {_SCHEMA_VERSION}")
                 if feishu_private_owner is not None:
-                    # 只预检已有归属；空库须等实际 CLI 账号核验后绑定。
+                    # 打开时只预检已有归属；空库由绑定事务认领。
                     self.check_feishu_private(feishu_private_owner)
         except BaseException:
             self.close()
@@ -364,7 +364,7 @@ class History:
         row = self._db.execute("SELECT owner_fingerprint, started_ms FROM feishu_private_account").fetchone()
         if row is not None:
             if row["owner_fingerprint"] != owner_fingerprint:
-                raise FeishuBindingError("飞书服务账号与数据库绑定不一致；请恢复原配置或使用新的数据库路径。")
+                raise FeishuBindingError("飞书服务账号与数据库绑定不一致；请切回原 CLI 登录账号和应用，或使用新的数据库路径。")
             return row["started_ms"]
         if self._has_history():
             raise FeishuBindingError("现有数据库有历史但没有飞书账号绑定；请保留旧数据库并配置新的数据库路径。")

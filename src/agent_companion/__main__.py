@@ -11,7 +11,7 @@ import sys
 
 import httpx
 
-from .app import feishu_settings, prepare_private_feishu, private_feishu_identity, running_agent
+from .app import feishu_settings, prepare_private_feishu, running_agent
 from .channels.feishu.cli import CliError, FeishuDiscovery
 from .config import ConfigError, Settings, load_settings
 from .logging_setup import stdout_logging
@@ -95,8 +95,7 @@ async def _serve(settings: Settings, *, discovery: FeishuDiscovery | None = None
     tts_settings = settings.tts if feishu.mode == "voice" else None
     if llm is None or asr_settings is None or (feishu.mode == "voice" and tts_settings is None):
         raise ConfigError("正式启动缺少已选中的 Provider 配置")
-    with closing(History(settings.database, feishu_private_owner=private_feishu_identity(feishu))) as history:
-        run_private = await prepare_private_feishu(settings, history, discovery=discovery, roles=roles)
+    async with prepare_private_feishu(settings, discovery=discovery, roles=roles) as (history, run_private):
         # 独立客户端，避免任一平台收到另一平台的凭据。不接受网络重定向。
         async with AsyncExitStack() as stack:
             async def client(key: str | None) -> httpx.AsyncClient:

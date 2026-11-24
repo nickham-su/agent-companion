@@ -1,5 +1,5 @@
 import asyncio
-from contextlib import closing
+from contextlib import asynccontextmanager, closing
 import json
 import logging
 from pathlib import Path
@@ -862,7 +862,6 @@ asr_provider = "speech"
 [timeouts]
 llm = 0.75
 [feishu]
-own_open_id = "ou_self"
 [providers.speech]
 adapter = "minimax"
 api_key = "synthetic-speech-test"
@@ -883,13 +882,13 @@ max_audio_seconds = 500
                 await asyncio.wait_for(runtime.wait_idle(), 2)
                 self.assertIsNone(runtime.last_failure)
 
-        async def prepare(settings, history, *, discovery, roles):
-            await prepare_private_feishu(settings, history, discovery=discovery, roles=roles)
+        @asynccontextmanager
+        async def prepare(settings, *, discovery, roles):
+            async with prepare_private_feishu(settings, discovery=discovery, roles=roles) as (history, _):
+                async def run(model, asr, tts):
+                    await exercise(settings, history, model, asr, tts, roles)
 
-            async def run(model, asr, tts):
-                await exercise(settings, history, model, asr, tts, roles)
-
-            return run
+                yield history, run
 
         actual_client = httpx.AsyncClient
         with TemporaryDirectory(dir=Path.cwd()) as folder:

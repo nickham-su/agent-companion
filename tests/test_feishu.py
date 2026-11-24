@@ -580,7 +580,7 @@ class FeishuBackgroundDeliveryTests(unittest.IsolatedAsyncioTestCase):
                 poll_cleaning.set()
                 await release_poll.wait()
 
-        settings = Settings(feishu=FeishuSettings(own_open_id=_SELF))
+        settings = Settings(feishu=FeishuSettings())
         discovery = private_discovery(_CHAT, _PEER, _SELF, cli=CLI("lark-cli", _CHAT, timeout=2))
         with (closing(History(":memory:")) as history, patch.object(FeishuPoller, "run", poll),
               self.assertLogs("agent_companion.channels.feishu.channel", level="WARNING")):
@@ -654,7 +654,7 @@ class FeishuBackgroundDeliveryTests(unittest.IsolatedAsyncioTestCase):
             await runner.notice_entered.wait()
             raise RuntimeError("synthetic poll failure")
 
-        settings = Settings(feishu=FeishuSettings(own_open_id=_SELF))
+        settings = Settings(feishu=FeishuSettings())
         discovery = private_discovery(_CHAT, _PEER, _SELF, cli=cli)
         with (closing(History(":memory:")) as history, patch.object(FeishuPoller, "poll_once", poll_once),
               patch("agent_companion.app.time", return_value=clock[0]),
@@ -1080,14 +1080,12 @@ print(json.dumps({"ok": True, "identity": "user", "data": page}))
             self.assertEqual((before, omitted, after), (Text("前"), OMITTED_INPUT_IMAGE, Text("后")))
             self.assertIsInstance(image, Image)
 
-    def test_sample_config_offline_and_id_validation(self):
+    def test_sample_config_offline(self):
         settings = load_settings(Path("config.example.toml"))
         self.assertIsNone(settings.feishu)
         self.assertIsNone(settings.llm)
         self.assertIsNone(settings.asr)
         self.assertIsNone(settings.tts)
-        with self.assertRaises(ValueError):
-            FeishuSettings(own_open_id="invalid")
 
 if __name__ == "__main__":
     unittest.main()

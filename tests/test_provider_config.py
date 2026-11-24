@@ -1,4 +1,5 @@
 import asyncio
+from contextlib import asynccontextmanager
 from io import BytesIO, StringIO
 import json
 from pathlib import Path
@@ -25,7 +26,6 @@ from agent_companion.speech.minimax_tts import MiniMaxTTS
 _KEY = "synthetic-private-config-value"
 _FEISHU = '''
 [feishu]
-own_open_id = "ou_self"
 mode = "text"
 '''
 _CONFIG = '''llm_provider = "chat"
@@ -189,11 +189,9 @@ api_key = 123
 
     def test_known_common_config_errors_name_safe_fields(self):
         for config, diagnostic in (
-            (_CONFIG.replace('own_open_id = "ou_self"', f'own_open_id = "{_KEY}"'),
-             'feishu.own_open_id 必须是以 ou_ 开头的有效飞书 ID'),
+            (_CONFIG.replace('[feishu]', f'[feishu]\nown_open_id = "{_KEY}"'), 'feishu 配置字段无效'),
             (_CONFIG.replace('[feishu]', '[feishu]\nchat_id = "oc_fixture"'), 'feishu 配置字段无效'),
             (_CONFIG.replace('[feishu]', '[feishu]\nsender_open_id = "ou_peer"'), 'feishu 配置字段无效'),
-            (_CONFIG.replace('own_open_id = "ou_self"', ''), 'feishu.own_open_id'),
             (_CONFIG.replace('mode = "text"', f'mode = "{_KEY}"'), 'feishu.mode 必须是 text 或 voice'),
             (_CONFIG.replace('mode = "text"', 'mode = "text"\ncli_timeout = false'), 'feishu.cli_timeout 必须是有限正数'),
             (_CONFIG + '\n[runtime]\ndelivery_timeout = 120\n', 'runtime 配置字段无效'),
@@ -481,18 +479,22 @@ class ProviderCompositionTests(unittest.IsolatedAsyncioTestCase):
             clients.append(result)
             return result
 
-        async def prepare(settings, history, *, discovery, roles):
-            async def run(model, asr, tts):
-                async with running_agent(settings, history, model, Voice(), session_id="transport", roles=roles) as (runtime, _):
-                    runtime.submit_batch([Message("user", "fixture input")])
-                    await asyncio.wait_for(runtime.wait_idle(), 2)
-                    outcome, = history.outcomes("transport")
-                    self.assertEqual((outcome.model_status, outcome.delivery_status),
-                                     ("model_interrupted", DeliveryStatus.ZERO))
-                    self.assertNotIn("wire-closed", trace)
-                trace.append("runtime-stopped")
-                runtime_stopped.set()
-            return run
+        @asynccontextmanager
+        async def prepare(settings, *, discovery, roles):
+            async with prepare_private_feishu(settings, discovery=discovery, roles=roles) as (history, _):
+                async def run(model, asr, tts):
+                    async with running_agent(settings, history, model, Voice(), session_id="transport",
+                                             roles=roles) as (runtime, _):
+                        runtime.submit_batch([Message("user", "fixture input")])
+                        await asyncio.wait_for(runtime.wait_idle(), 2)
+                        outcome, = history.outcomes("transport")
+                        self.assertEqual((outcome.model_status, outcome.delivery_status),
+                                         ("model_interrupted", DeliveryStatus.ZERO))
+                        self.assertNotIn("wire-closed", trace)
+                    trace.append("runtime-stopped")
+                    runtime_stopped.set()
+
+                yield history, run
 
         with TemporaryDirectory(dir=Path.cwd()) as folder:
             config = Path(folder) / "native.toml"
@@ -501,7 +503,8 @@ class ProviderCompositionTests(unittest.IsolatedAsyncioTestCase):
             with (patch("agent_companion.__main__.httpx.AsyncClient", side_effect=client),
                   patch("agent_companion.__main__.prepare_private_feishu", side_effect=prepare),
                   self.assertLogs("agent_companion", level="WARNING") as logged):
-                serving = asyncio.create_task(_serve(settings, roles=demo_roles()))
+                discovery = private_discovery("oc_fixture", "ou_peer", "ou_self")
+                serving = asyncio.create_task(_serve(settings, discovery=discovery, roles=demo_roles()))
                 initial = (["body-eof", "wire-close-start", "voice-zero"] if eof_first else
                            ["voice-zero", "body-read-cancelled", "wire-close-start"])
                 try:
@@ -578,17 +581,21 @@ class ProviderCompositionTests(unittest.IsolatedAsyncioTestCase):
                     clients.append(result)
                     return result
 
-                async def prepare(settings, history, *, discovery, roles):
-                    async def run(model, asr, tts):
-                        async with running_agent(settings, history, model, Voice(), session_id="eof", roles=roles) as (runtime, _):
-                            runtime.submit_batch([Message("user", "prompt")])
-                            await asyncio.wait_for(runtime.wait_idle(), 2)
-                            outcome, = history.outcomes("eof")
-                            self.assertEqual((outcome.model_status, outcome.delivery_status),
-                                             ("model_interrupted", DeliveryStatus.PARTIAL))
-                        trace.append("runtime-stopped")
-                        runtime_stopped.set()
-                    return run
+                @asynccontextmanager
+                async def prepare(settings, *, discovery, roles):
+                    async with prepare_private_feishu(settings, discovery=discovery, roles=roles) as (history, _):
+                        async def run(model, asr, tts):
+                            async with running_agent(settings, history, model, Voice(), session_id="eof",
+                                                     roles=roles) as (runtime, _):
+                                runtime.submit_batch([Message("user", "prompt")])
+                                await asyncio.wait_for(runtime.wait_idle(), 2)
+                                outcome, = history.outcomes("eof")
+                                self.assertEqual((outcome.model_status, outcome.delivery_status),
+                                                 ("model_interrupted", DeliveryStatus.PARTIAL))
+                            trace.append("runtime-stopped")
+                            runtime_stopped.set()
+
+                        yield history, run
 
                 config = Path(folder) / "native.toml"
                 config.write_text('database = "fixture.sqlite"\n' + _native_config(adapter), encoding="utf-8")
@@ -596,7 +603,8 @@ class ProviderCompositionTests(unittest.IsolatedAsyncioTestCase):
                 with (patch("agent_companion.__main__.httpx.AsyncClient", side_effect=client),
                       patch("agent_companion.__main__.prepare_private_feishu", side_effect=prepare),
                       self.assertLogs("agent_companion.runtime.engine", level="WARNING") as logged):
-                    serving = asyncio.create_task(_serve(settings, roles=demo_roles()))
+                    discovery = private_discovery("oc_fixture", "ou_peer", "ou_self")
+                    serving = asyncio.create_task(_serve(settings, discovery=discovery, roles=demo_roles()))
                     try:
                         # 真实的旧 1 秒 Runtime 宽限已耗尽，原生关闭和客户端必须还活着。
                         await asyncio.wait_for(runtime_stopped.wait(), 4)
@@ -675,14 +683,14 @@ voice_id = "synthetic-other-voice"
                         chunks = tts.synthesize("合成输出", sample_rate=settings.voice.output_sample_rate)
                         self.assertEqual([chunk async for chunk in chunks], [b"\x01\x00"])
 
-                async def prepare(settings, history, *, discovery, roles):
-                    run = await prepare_private_feishu(settings, history, discovery=discovery, roles=roles)
+                @asynccontextmanager
+                async def prepare(settings, *, discovery, roles):
+                    async with prepare_private_feishu(settings, discovery=discovery, roles=roles) as (history, run):
+                        async def exercise(model, asr, tts):
+                            await drive(model, asr, tts)
+                            await run(model, asr, tts)
 
-                    async def exercise(model, asr, tts):
-                        await drive(model, asr, tts)
-                        await run(model, asr, tts)
-
-                    return exercise
+                        yield history, exercise
 
                 with (patch("agent_companion.__main__.httpx.AsyncClient", side_effect=client),
                       patch("agent_companion.speech.minimax_tts.MiniMaxTTS", wraps=MiniMaxTTS) as open_tts,

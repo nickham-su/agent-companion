@@ -13,7 +13,7 @@ from unittest.mock import patch
 from agent_companion.__main__ import _serve
 from agent_companion.app import private_feishu_identity, run_feishu, running_agent
 from agent_companion.channels.feishu.cli import CliError, CommandResult, FeishuDiscovery
-from agent_companion.config import (ASRSettings, ConfigError, FeishuSettings, LLMSettings, MiniMaxConnection, Settings,
+from agent_companion.config import (ASRSettings, FeishuSettings, LLMSettings, MiniMaxConnection, Settings,
                                     load_settings)
 from agent_companion.protocol import AGENT_REPLY_PREFIX, Message, TextDelta, ToolCall, ToolReady
 from agent_companion.runtime.subtasks import AgentTree, DELEGATE_TOOL_NAME, demo_roles
@@ -21,6 +21,7 @@ from agent_companion.storage.sqlite import AgentReplyInput, DelegatedInput, Feis
 
 
 _OWN = "ou_private_service"
+_ACCOUNT_QUERY = ("api", "GET", "/open-apis/authen/v1/user_info")
 _CHATS = ("oc_private_a", "oc_private_b", "oc_private_c")
 _SENDERS = ("ou_private_a", "ou_private_b", "ou_private_c")
 
@@ -60,7 +61,7 @@ class _Runner:
         self.commands.append(argv[1:4])
         assert argv[-4:] == ("--as", "user", "--format", "json")
         op = argv[1:4]
-        if op == ("api", "GET", "/open-apis/authen/v1/user_info"):
+        if op == _ACCOUNT_QUERY:
             self.checking_account.set()
             await self.release_account.wait()
             if self.account_failed:
@@ -182,33 +183,28 @@ async def _eventually(predicate):
 class FeishuPrivateTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
         self.runner = _Runner()
-        self.settings = Settings(feishu=FeishuSettings(own_open_id=_OWN))
+        self.settings = Settings(feishu=FeishuSettings())
 
     async def test_configuration_and_database_ownership(self):
         with TemporaryDirectory() as tmp:
             config = Path(tmp) / "synthetic.toml"
-            config.write_text(f'[feishu]\nown_open_id = "{_OWN}"\n', encoding="utf-8")
+            config.write_text('[feishu]\n', encoding="utf-8")
             self.assertEqual(load_settings(config).feishu, self.settings.feishu)
             self.assertEqual(self.settings.feishu.mode, "text")
-            config.write_text(f'[feishu]\nown_open_id = "{_OWN}"\nmode = "text"\n', encoding="utf-8")
-            self.assertEqual(load_settings(config).feishu, self.settings.feishu)
-            config.write_text(f'[feishu]\nown_open_id = "{_OWN}"\nmode = "voice"\n', encoding="utf-8")
-            self.assertEqual(load_settings(config).feishu, FeishuSettings(own_open_id=_OWN, mode="voice"))
-            with self.assertRaisesRegex(ConfigError, "own_open_id"):
-                FeishuSettings(own_open_id="invalid")
+            config.write_text('[feishu]\nmode = "voice"\n', encoding="utf-8")
+            self.assertEqual(load_settings(config).feishu, FeishuSettings(mode="voice"))
 
-            owner = private_feishu_identity(self.settings.feishu)
+            # 已有库的账号指纹不随配置项移除而改变。
+            owner = sha256(f'["private","{_OWN}"]'.encode()).hexdigest()
+            self.assertEqual(private_feishu_identity(_OWN), owner)
             with closing(History(Path(tmp) / "private.db", feishu_private_owner=owner)) as history:
                 history.bind_feishu_private(owner, started_ms=99_000)
-                other = Settings(feishu=FeishuSettings(own_open_id="ou_another_account"))
-                with self.assertRaisesRegex(FeishuBindingError, "服务账号与数据库绑定不一致"):
-                    await run_feishu(other, history, _Model(), object(), discovery=self.runner.discovery(),
-                                     roles=demo_roles())
-                self.assertEqual(self.runner.commands, [])
                 self.runner.account = "ou_unexpected_account"
-                with self.assertRaisesRegex(FeishuBindingError, "CLI 当前登录账号"):
+                with self.assertRaisesRegex(FeishuBindingError, "服务账号与数据库绑定不一致"):
                     await run_feishu(self.settings, history, _Model(), object(), discovery=self.runner.discovery(),
                                      roles=demo_roles())
+                self.assertEqual(self.runner.commands, [_ACCOUNT_QUERY])
+                self.assertEqual(history.check_feishu_private(owner), 99_000)
                 self.assertEqual(self.runner.queries, [])
                 self.assertEqual(self.runner.sent, {})
             unbound = Path(tmp) / "unbound.db"
@@ -550,13 +546,14 @@ class FeishuPrivateTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_failed_account_verification_leaves_new_database_available_and_keeps_startup_message(self):
         runner, model, clock = self.runner, _Model(), [100.25]
-        wrong = replace(self.settings, feishu=FeishuSettings(own_open_id="ou_wrong_account"))
-        owner = private_feishu_identity(self.settings.feishu)
+        owner = private_feishu_identity(_OWN)
         with TemporaryDirectory() as tmp:
             path = Path(tmp) / "new.db"
             with closing(History(path)) as history:
-                with self.assertRaisesRegex(FeishuBindingError, "CLI 当前登录账号"):
-                    await run_feishu(wrong, history, model, object(), discovery=runner.discovery(), roles=demo_roles())
+                runner.account = "invalid"
+                with self.assertRaisesRegex(CliError, "cli_invalid_account"):
+                    await run_feishu(self.settings, history, model, object(), discovery=runner.discovery(),
+                                     roles=demo_roles())
                 self.assertIsNone(history.check_feishu_private(owner))
                 runner.account_failed = True
                 with self.assertRaisesRegex(CliError, "cli_result_unknown"):
@@ -566,11 +563,14 @@ class FeishuPrivateTests(unittest.IsolatedAsyncioTestCase):
                 self.assertFalse(runner.queries)
             with closing(History(path, feishu_private_owner=owner)) as history:
                 a, sa = _CHATS[0], _SENDERS[0]
+                runner.account = _OWN
                 runner.account_failed = False
                 runner.checking_account.clear()
                 runner.release_account.clear()
-                runner.pages = {None: ([_chat(a, sa)], None)}
+                self_chat = _CHATS[1]
+                runner.pages = {None: ([_chat(a, sa), _chat(self_chat, _OWN)], None)}
                 runner.messages[a] = [_message("too_early", a, sa, "old A", stamp=100_249),
+                                      _message("from_self", a, _OWN, "ignore self", stamp=100_251),
                                       _message("during_auth", a, sa, "during verification", stamp=100_251)]
                 async with _serve_private(self.settings, history, model, runner, clock):
                     await asyncio.wait_for(runner.checking_account.wait(), 3)
@@ -579,11 +579,12 @@ class FeishuPrivateTests(unittest.IsolatedAsyncioTestCase):
                     clock[0] = 102.0
                     runner.release_account.set()
                     await _eventually(lambda: runner.sent[a] == ["reply: during verification"])
+                    self.assertNotIn(self_chat, runner.windows)
                     self.assertEqual(history.check_feishu_private(owner), 100_250)
 
     async def test_production_checks_owner_and_uses_single_cli_verification_before_providers(self):
         runner = self.runner
-        owner = private_feishu_identity(self.settings.feishu)
+        owner = private_feishu_identity(_OWN)
         with TemporaryDirectory(dir=Path.cwd()) as tmp:
             workdir = Path(tmp)
             agents = workdir / "agents"
@@ -592,38 +593,44 @@ class FeishuPrivateTests(unittest.IsolatedAsyncioTestCase):
             settings = replace(self.settings, database=workdir / "production.db",
                                llm=LLMSettings("openai_responses", "disabled", model="synthetic", api_key="synthetic"),
                                asr=ASRSettings(MiniMaxConnection("synthetic"), max_audio_seconds=120))
-            wrong = replace(settings, feishu=FeishuSettings(own_open_id="ou_wrong_service"))
             with (patch("agent_companion.__main__.Path.cwd", return_value=workdir),
                   patch("agent_companion.app.FeishuDiscovery", return_value=runner.discovery()) as discover,
                   patch("agent_companion.app.run_private_chats") as run_chats,
                   patch("agent_companion.__main__.httpx.AsyncClient") as client,
                   patch.object(History, "replay_salt", autospec=True) as get_salt):
-                with self.assertRaisesRegex(FeishuBindingError, "CLI 当前登录账号"):
-                    await _serve(wrong)
+                runner.account_failed = True
+                with self.assertRaisesRegex(CliError, "cli_result_unknown"):
+                    await _serve(settings)
                 client.assert_not_called()
                 get_salt.assert_not_called()
                 run_chats.assert_not_awaited()
-                with closing(History(settings.database)) as history:
-                    self.assertIsNone(history.check_feishu_private(owner))
+                self.assertFalse(settings.database.exists())
 
                 def check_before_salt(history):
                     self.assertIsNotNone(history.check_feishu_private(owner))
-                    self.assertEqual(len(runner.commands), 1)
+                    self.assertEqual(runner.commands, [_ACCOUNT_QUERY])
                     return bytes(32)
 
+                runner.account_failed = False
                 runner.commands.clear()
                 get_salt.side_effect = check_before_salt
                 await _serve(settings)
-                self.assertEqual(len(runner.commands), 1)
+                self.assertEqual(runner.commands, [_ACCOUNT_QUERY])
                 run_chats.assert_awaited_once()
+                self.assertEqual(run_chats.await_args.kwargs["own_id"], _OWN)
+                original = settings.database.read_bytes()
                 client.reset_mock()
                 get_salt.reset_mock()
                 discover.reset_mock()
+                run_chats.reset_mock()
                 runner.commands.clear()
+                runner.account = "ou_wrong_service"
                 with self.assertRaisesRegex(FeishuBindingError, "服务账号与数据库绑定不一致"):
-                    await _serve(wrong)
-                self.assertFalse(runner.commands)
-                discover.assert_not_called()
+                    await _serve(settings)
+                self.assertEqual(runner.commands, [_ACCOUNT_QUERY])
+                self.assertEqual(settings.database.read_bytes(), original)
+                discover.assert_called_once()
+                run_chats.assert_not_awaited()
                 client.assert_not_called()
                 get_salt.assert_not_called()
 

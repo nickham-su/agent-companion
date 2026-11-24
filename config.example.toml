@@ -53,9 +53,8 @@ max_audio_seconds = 500  # 必填；按所选模型的单文件时长上限填�
 model = "speech-2.8-turbo"
 voice_id = "male-qn-qingse"
 
-# 默认文字模式自动发现真人私聊，每人独立会话；own_open_id 与 CLI 登录账号一致。
+# 默认文字模式自动发现真人私聊，每人独立会话；服务账号由启动时的 CLI 登录身份决定。
 # [feishu]
-# own_open_id = "ou_self_example"
 # mode = "text"  # 默认 text；voice 保留文字，并自动接听符合条件的飞书来电
 # voice_text_copy = true  # 仅 voice：已确认并入库的正文另发到原对端私聊
 # cli = "lark-cli"

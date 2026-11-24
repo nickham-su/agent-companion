@@ -136,6 +136,6 @@ class SileroVADTest(unittest.TestCase):
                             await task
 
             for mode in ({}, {"mode": "text"}):
-                asyncio.run(run(Settings(feishu=FeishuSettings(own_open_id="ou_self", **mode))))
+                asyncio.run(run(Settings(feishu=FeishuSettings(**mode))))
         ''')
         subprocess.run([sys.executable, "-c", code], check=True, timeout=5, capture_output=True)

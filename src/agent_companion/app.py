@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, closing, nullcontext
 from hashlib import sha256
 import json
 from math import ceil
@@ -23,7 +23,7 @@ from .session_scheduler import SessionSchedulers
 from .speech.asr import FileASR
 from .speech.tts import StreamingTTS
 from .speech.vad import VoiceSetupError
-from .storage.sqlite import Agent, FeishuBindingError, History
+from .storage.sqlite import Agent, History
 
 if TYPE_CHECKING:
     from .speech.audio import AudioDevice
@@ -98,69 +98,67 @@ def feishu_settings(settings: Settings) -> FeishuSettings:
     return feishu
 
 
-def private_feishu_identity(feishu: FeishuSettings) -> str:
-    encoded = json.dumps(("private", feishu.own_open_id), separators=(",", ":")).encode()
+def private_feishu_identity(own_id: str) -> str:
+    encoded = json.dumps(("private", own_id), separators=(",", ":")).encode()
     return sha256(encoded).hexdigest()
 
 
-async def _verified_discovery(feishu: FeishuSettings, discovery: FeishuDiscovery | None) -> FeishuDiscovery:
-    discovery = discovery if discovery is not None else FeishuDiscovery(feishu.cli, timeout=feishu.cli_timeout)
-    if await discovery.account_open_id() != feishu.own_open_id:
-        raise FeishuBindingError("飞书 CLI 当前登录账号与 feishu.own_open_id 不匹配。")
-    return discovery
-
-
+@asynccontextmanager
 async def prepare_private_feishu(
-    settings: Settings, history: History, *, roles: Mapping[str, AgentRole],
+    settings: Settings, history: History | None = None, *, roles: Mapping[str, AgentRole],
     discovery: FeishuDiscovery | None = None,
-) -> Callable[[Model, FileASR, StreamingTTS | None], Awaitable[None]]:
-    """接收已校验的角色，确认库的归属和实际登录账号后提交首次启用基准。"""
+) -> AsyncIterator[tuple[History, Callable[[Model, FileASR, StreamingTTS | None], Awaitable[None]]]]:
+    """查一次 CLI 登录账号后绑定数据库；仅负责关闭本函数打开的库。"""
     feishu = feishu_settings(settings)
-    identity = private_feishu_identity(feishu)
-    history.check_feishu_private(identity)
+    if discovery is None:
+        discovery = FeishuDiscovery(feishu.cli, timeout=feishu.cli_timeout)
+    # 账号查询期间到达的新消息也纳入首次扫描。
     candidate_ms = ceil(time() * 1000)
-    discovery = await _verified_discovery(feishu, discovery)
-    started_ms = history.bind_feishu_private(identity, started_ms=candidate_ms)
+    own_id = await discovery.account_open_id()
+    identity = private_feishu_identity(own_id)
+    with (closing(History(settings.database, feishu_private_owner=identity))
+          if history is None else nullcontext(history)) as db:
+        started_ms = db.bind_feishu_private(identity, started_ms=candidate_ms)
 
-    async def run(model: Model, asr: FileASR, tts: StreamingTTS | None) -> None:
-        sqlite = SQLiteAccess(retry_locks=True, stopped=lambda: False)
-        await sqlite.write_input(lambda: history.interrupt_agent_work(reason="restart"))
-        incoming = None
-        if feishu.mode == "voice":
-            if tts is None:
-                raise VoiceSetupError("voice_tts_settings_required")
-            _check_voice_settings(settings)
-            from .channels.feishu.macos_calls import MacCallDesktop
-            from .feishu_calls import IncomingCalls
+        async def run(model: Model, asr: FileASR, tts: StreamingTTS | None) -> None:
+            sqlite = SQLiteAccess(retry_locks=True, stopped=lambda: False)
+            await sqlite.write_input(lambda: db.interrupt_agent_work(reason="restart"))
+            incoming = None
+            if feishu.mode == "voice":
+                if tts is None:
+                    raise VoiceSetupError("voice_tts_settings_required")
+                _check_voice_settings(settings)
+                from .channels.feishu.macos_calls import MacCallDesktop
+                from .feishu_calls import IncomingCalls
 
-            desktop = MacCallDesktop()
+                desktop = MacCallDesktop()
 
-            async def prepare_voice() -> tuple[VoiceChannel, AudioDevice]:
-                # VAD 的音频状态只属于本通，即使上一通的推理线程仍在退出。
-                return await asyncio.to_thread(_make_voice, settings, asr, tts)
+                async def prepare_voice() -> tuple[VoiceChannel, AudioDevice]:
+                    # VAD 的音频状态只属于本通，即使上一通的推理线程仍在退出。
+                    return await asyncio.to_thread(_make_voice, settings, asr, tts)
 
-            incoming = IncomingCalls(desktop, discovery, prepare_voice, own_id=feishu.own_open_id,
-                                     idle_timeout=settings.voice.idle_timeout, copy_confirmed=feishu.voice_text_copy)
-        compactions = Compactions(history, model)
-        schedulers = SessionSchedulers()
-        try:
-            await run_private_chats(
-                discovery, history, asr, own_id=feishu.own_open_id, started_ms=started_ms, incoming=incoming,
-                schedulers=schedulers,
-                open_agent=lambda agent, channel: running_agent(
-                    settings, history, model, channel, session_id=agent.session_id, agent=agent, roles=roles,
-                    retry_sqlite_locks=True, compactions=compactions, schedulers=schedulers))
-        finally:
-            await compactions.close()
+                incoming = IncomingCalls(desktop, discovery, prepare_voice, own_id=own_id,
+                                         idle_timeout=settings.voice.idle_timeout, copy_confirmed=feishu.voice_text_copy)
+            compactions = Compactions(db, model)
+            schedulers = SessionSchedulers()
+            try:
+                await run_private_chats(
+                    discovery, db, asr, own_id=own_id, started_ms=started_ms, incoming=incoming,
+                    schedulers=schedulers,
+                    open_agent=lambda agent, channel: running_agent(
+                        settings, db, model, channel, session_id=agent.session_id, agent=agent, roles=roles,
+                        retry_sqlite_locks=True, compactions=compactions, schedulers=schedulers))
+            finally:
+                await compactions.close()
 
-    return run
+        yield db, run
 
 
 async def run_feishu(settings: Settings, history: History, model: Model, asr: FileASR, *,
                      roles: Mapping[str, AgentRole], tts: StreamingTTS | None = None,
                      discovery: FeishuDiscovery | None = None) -> None:
-    run_private = await prepare_private_feishu(settings, history, discovery=discovery, roles=roles)
-    await run_private(model, asr, tts)
+    async with prepare_private_feishu(settings, history, discovery=discovery, roles=roles) as (_, run_private):
+        await run_private(model, asr, tts)
 
 
 def _check_voice_settings(settings: Settings) -> None:
