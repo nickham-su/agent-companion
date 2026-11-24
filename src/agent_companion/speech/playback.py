@@ -14,21 +14,34 @@ from ..protocol import DeliveryStatus, Receipt, ReplyStream
 from .tts import StreamingTTS, TtsError
 
 _LOG = logging.getLogger(__name__)
-_MAX_SEGMENT = 72
+_MAX_SEGMENT = 200
+_MIN_SEGMENT_BODY = 30
 _MAX_REPLY_TEXT = 16_000
 _MAX_PCM_CHUNK = 512 * 1024
 _TICK = 0.008
-_BOUNDARIES = frozenset("。！？；，!?;\n")
+_BOUNDARIES = frozenset("。！？.!?\n")
+
+
+def _is_body_char(char: str) -> bool:
+    return not char.isspace() and not category(char).startswith("P")
 
 
 async def _segments(reply: ReplyStream) -> AsyncGenerator[str, None]:
     pending = []
+    body_chars = 0
+    first = True
     async for delta in reply:
         for char in delta:
             pending.append(char)
-            if char in _BOUNDARIES or len(pending) >= _MAX_SEGMENT:
+            body_chars += _is_body_char(char)
+            # 纯标点和空行保留在原文中，但不占用首段，也不单独请求合成。
+            ready = first or body_chars == 0 or body_chars >= _MIN_SEGMENT_BODY
+            if len(pending) >= _MAX_SEGMENT or (char in _BOUNDARIES and ready):
                 yield "".join(pending)
+                if body_chars:
+                    first = False
                 pending.clear()
+                body_chars = 0
     if pending:
         yield "".join(pending)
 
@@ -280,7 +293,7 @@ class VoiceOutput:
             state.segments.append(part)
             spoken = text.strip()
             # 一串连续句末标点或空行不单独触发一条无法合成的请求。
-            if not spoken or all(char.isspace() or category(char).startswith("P") for char in spoken):
+            if not any(_is_body_char(char) for char in spoken):
                 state.complete(part)
                 continue
             while self._pcm.size(state) >= self._prefetch:

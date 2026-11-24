@@ -1,5 +1,5 @@
 import asyncio
-from contextlib import closing
+from contextlib import aclosing, closing
 from dataclasses import replace
 import io
 from threading import Event
@@ -15,7 +15,7 @@ from agent_companion.runtime.engine import Runtime
 from agent_companion.runtime.tools import Tool, Tools
 from agent_companion.speech.audio import AudioFormat
 from agent_companion.speech.asr import AsrError
-from agent_companion.speech.playback import VoiceOutput
+from agent_companion.speech.playback import VoiceOutput, _segments
 from agent_companion.speech.tts import TtsError
 from agent_companion.speech.vad import INPUT_FRAMES, VoiceSetupError
 from agent_companion.speech.voice import VoiceChannel
@@ -131,6 +131,32 @@ async def _processed(vad, count):
     await _until(lambda: vad.count >= count)
     # 让执行线程的决策回到事件循环。
     await asyncio.sleep(0.012)
+
+
+class SpeechSegmentationTest(unittest.IsolatedAsyncioTestCase):
+    async def test_short_first_sentence_is_emitted_while_reply_is_still_open(self):
+        for end in "。！？.!?\n":
+            with self.subTest(end=end):
+                first = "好，行;稍等；我看看,马上"
+                reply = _reply("segments", "。\n好，行;", "稍等；我看看,马上", end, close=False)
+                async with aclosing(_segments(reply)) as segments:
+                    self.assertEqual(await asyncio.wait_for(anext(segments), 1), "。")
+                    self.assertEqual(await asyncio.wait_for(anext(segments), 1), "\n")
+                    self.assertEqual(await asyncio.wait_for(anext(segments), 1), first + end)
+
+    async def test_followups_wait_for_a_sentence_end_after_at_least_thirty_body_chars(self):
+        short = "甲" * 13 + "， " + "乙" * 16 + "。"  # 29 个正文字符
+        sentence = "丙丁？"  # 攒到「丙」恰好 30 个，仍需等到句尾。
+        exact = "字" * 30 + "!"
+        reply = _reply("segments", "好。", short, sentence, exact, "末尾")
+        self.assertEqual([part async for part in _segments(reply)], ["好。", short + sentence, exact, "末尾"])
+
+    async def test_hard_cap_counts_all_characters_and_applies_to_every_segment(self):
+        first = "甲" * 198 + "， "
+        second = "乙" * 200
+        tail = "剩下。下一句！"
+        reply = _reply("segments", first + second + tail)
+        self.assertEqual([part async for part in _segments(reply)], [first, second, tail])
 
 
 class VoiceOutputTest(unittest.IsolatedAsyncioTestCase):
@@ -507,10 +533,11 @@ class VoiceDeliveryWatchdogTest(unittest.IsolatedAsyncioTestCase):
 
     async def test_device_keeps_pre_cutoff_chain_without_event_loop_sampling(self):
         buffered = asyncio.Event()
+        second = "甲乙丙丁戊己庚辛壬癸" * 3 + "。"
 
         class Model:
             async def stream(self, messages, tools, *, thinking):
-                yield TextDelta("第一句。第二句。迟到句。")
+                yield TextDelta(f"第一句。{second}迟到句。")
 
         class TTS:
             async def synthesize(self, text, *, sample_rate):
@@ -536,7 +563,7 @@ class VoiceDeliveryWatchdogTest(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(device.pull(4), bytes(8))
             await runtime.wait_idle()
         self.assertEqual(history.outcomes("main")[0].delivery_status, DeliveryStatus.UNKNOWN)
-        self.assertEqual(history.tail("main", 1)[0].message.content, "第一句。第二句。")
+        self.assertEqual(history.tail("main", 1)[0].message.content, "第一句。" + second)
 
     async def test_real_progress_renews_idle_but_never_the_hard_deadline(self):
         for continuous in (False, True):
@@ -1129,7 +1156,7 @@ class VoiceInputTest(unittest.IsolatedAsyncioTestCase):
             async def stream(self, messages, tools, *, thinking):
                 prompts.append(messages)
                 if len(prompts) == 1:
-                    yield TextDelta("已交付。甲乙丙丁戊己庚辛。")
+                    yield TextDelta("已交付。" + "甲乙丙丁戊己庚辛壬癸" * 3 + "。")
                     try:
                         await asyncio.Future()
                     except asyncio.CancelledError:
