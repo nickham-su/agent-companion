@@ -6,6 +6,7 @@ import json
 from typing import Any
 
 from ..protocol import ToolCall, ToolSpec
+from ..workspace import Workspace
 
 
 @dataclass(frozen=True, slots=True)
@@ -16,6 +17,7 @@ class ToolContext:
     has_user_input: bool
     agent_id: str | None = None
     has_agent_input: bool = False
+    workspace: Workspace | None = None
 
 
 @dataclass(frozen=True, slots=True)

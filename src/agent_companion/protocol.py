@@ -399,6 +399,13 @@ class ReplyStream(AsyncIterator[str]):
         raise StopAsyncIteration
 
 
+@dataclass(frozen=True, slots=True)
+class ChannelUser:
+    """已由通道适配器核验的用户，以该适配器提供的稳定键标识。"""
+
+    key: str = field(repr=False)
+
+
 class Channel(Protocol):
     async def deliver(self, reply: ReplyStream) -> Receipt:
         """消费一个回复并给出唯一终态，允许在模型流结束前返回。

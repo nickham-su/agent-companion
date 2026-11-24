@@ -38,6 +38,9 @@ def checked_path(relative: Path) -> Path:
 def python_sources(relative: Path) -> Iterator[Path]:
     directory = checked_path(relative)
     for entry in directory.iterdir():
+        # 即使自定义工作区根放在源码树里，也不把用户指纹目录打入交付包。
+        if len(entry.name) == 64 and all(char in "0123456789abcdef" for char in entry.name):
+            continue
         path = relative / entry.name
         if entry.name.isidentifier() and entry.name != "__pycache__":
             if checked_path(path).is_dir() and checked_path(path / "__init__.py").is_file():

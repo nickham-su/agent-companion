@@ -14,7 +14,7 @@ from typing import TYPE_CHECKING
 from .channels.feishu.cli import FeishuDiscovery
 from .config import FeishuSettings, Settings
 from .feishu_private import run_private_chats
-from .protocol import Channel, Model
+from .protocol import Channel, ChannelUser, Model
 from .runtime.compaction import Compactions
 from .runtime.engine import Runtime
 from .runtime.sqlite_access import SQLiteAccess
@@ -24,6 +24,7 @@ from .speech.asr import FileASR
 from .speech.tts import StreamingTTS
 from .speech.vad import VoiceSetupError
 from .storage.sqlite import Agent, History
+from .workspace import Workspace
 
 if TYPE_CHECKING:
     from .speech.audio import AudioDevice
@@ -51,6 +52,7 @@ async def _finish_agent_cleanup(cleanups: list[Awaitable[None]]) -> None:
 async def running_agent(
     settings: Settings, history: History, model: Model, channel: Channel, *,
     session_id: str, roles: Mapping[str, AgentRole], agent: Agent | None = None,
+    user: ChannelUser | None = None,
     retry_sqlite_locks: bool = False, compactions: Compactions | None = None,
     schedulers: SessionSchedulers | None = None,
 ) -> AsyncIterator[tuple[Runtime, AgentTree]]:
@@ -72,9 +74,13 @@ async def running_agent(
         await sqlite.write_input(lambda: history.interrupt_agent_tree(agent.agent_id, reason="restart"))
         if compactions is None:
             compactions = Compactions(history, model)
+        workspace = None
+        if user is not None:
+            directory_name = sha256(user.key.encode("utf-8")).hexdigest()
+            workspace = Workspace(settings.workspace_root.absolute() / directory_name)
         tree = AgentTree(agent, history, model, roles=roles,
                          schedulers=schedulers, settings=settings.runtime, thinking=thinking,
-                         retry_sqlite_locks=retry_sqlite_locks, compactions=compactions)
+                         retry_sqlite_locks=retry_sqlite_locks, compactions=compactions, workspace=workspace)
         yield tree.bind_root(channel, owner), tree
     finally:
         try:
@@ -98,8 +104,9 @@ def feishu_settings(settings: Settings) -> FeishuSettings:
     return feishu
 
 
-def private_feishu_identity(own_id: str) -> str:
-    encoded = json.dumps(("private", own_id), separators=(",", ":")).encode()
+def private_feishu_identity(account: ChannelUser) -> str:
+    # 保持已经绑定数据库的账号指纹不变。
+    encoded = json.dumps(("private", account.key), separators=(",", ":")).encode()
     return sha256(encoded).hexdigest()
 
 
@@ -114,8 +121,8 @@ async def prepare_private_feishu(
         discovery = FeishuDiscovery(feishu.cli, timeout=feishu.cli_timeout)
     # 账号查询期间到达的新消息也纳入首次扫描。
     candidate_ms = ceil(time() * 1000)
-    own_id = await discovery.account_open_id()
-    identity = private_feishu_identity(own_id)
+    account = await discovery.account_user()
+    identity = private_feishu_identity(account)
     with (closing(History(settings.database, feishu_private_owner=identity))
           if history is None else nullcontext(history)) as db:
         started_ms = db.bind_feishu_private(identity, started_ms=candidate_ms)
@@ -137,16 +144,16 @@ async def prepare_private_feishu(
                     # VAD 的音频状态只属于本通，即使上一通的推理线程仍在退出。
                     return await asyncio.to_thread(_make_voice, settings, asr, tts)
 
-                incoming = IncomingCalls(desktop, discovery, prepare_voice, own_id=own_id,
+                incoming = IncomingCalls(desktop, discovery, prepare_voice, account=account,
                                          idle_timeout=settings.voice.idle_timeout, copy_confirmed=feishu.voice_text_copy)
             compactions = Compactions(db, model)
             schedulers = SessionSchedulers()
             try:
                 await run_private_chats(
-                    discovery, db, asr, own_id=own_id, started_ms=started_ms, incoming=incoming,
+                    discovery, db, asr, account=account, started_ms=started_ms, incoming=incoming,
                     schedulers=schedulers,
-                    open_agent=lambda agent, channel: running_agent(
-                        settings, db, model, channel, session_id=agent.session_id, agent=agent, roles=roles,
+                    open_agent=lambda agent, channel, user: running_agent(
+                        settings, db, model, channel, session_id=agent.session_id, agent=agent, roles=roles, user=user,
                         retry_sqlite_locks=True, compactions=compactions, schedulers=schedulers))
             finally:
                 await compactions.close()

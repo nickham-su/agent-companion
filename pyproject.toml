@@ -25,3 +25,5 @@ agent-companion = "agent_companion.__main__:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
+include = ["agent_companion", "agent_companion.*"]
+namespaces = false

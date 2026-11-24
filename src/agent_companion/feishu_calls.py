@@ -8,6 +8,7 @@ from typing import Protocol
 
 from .channels.feishu.cli import CliError, FeishuDiscovery
 from .channels.feishu.macos_calls import DesktopCallError, RingingWindow, WindowIdentity
+from .protocol import ChannelUser
 from .speech.audio import AudioDevice
 from .speech.vad import VoiceSetupError
 from .speech.voice import VoiceChannel
@@ -103,12 +104,12 @@ class _CallBinding:
 
 class IncomingCalls:
     def __init__(self, desktop: CallDesktop, discovery: FeishuDiscovery, voice_factory: VoiceFactory, *,
-                 own_id: str, idle_timeout: float, copy_confirmed: bool) -> None:
+                 account: ChannelUser, idle_timeout: float, copy_confirmed: bool) -> None:
         self._desktop, self._discovery, self._voice_factory = desktop, discovery, voice_factory
-        self._own_id = own_id
+        self._account = account
         self._idle_timeout, self._copy_confirmed = idle_timeout, copy_confirmed
 
-    async def run(self, resolve: Callable[[str], CallPeer | None]) -> None:
+    async def run(self, resolve: Callable[[ChannelUser], CallPeer | None]) -> None:
         desktop_error: str | None = None
         while True:
             try:
@@ -122,7 +123,7 @@ class IncomingCalls:
                     _LOG.warning("Feishu auto-answer desktop unavailable (%s)", desktop_error)
             await asyncio.sleep(_POLL_SECONDS)
 
-    async def _handle(self, ring: RingingWindow, resolve: Callable[[str], CallPeer | None]) -> None:
+    async def _handle(self, ring: RingingWindow, resolve: Callable[[ChannelUser], CallPeer | None]) -> None:
         loop = asyncio.get_running_loop()
         started_at = loop.time()
 
@@ -152,7 +153,7 @@ class IncomingCalls:
                     _LOG.debug("Feishu auto-answer caller lookup started (audio_prepare=%.3fs, audio_open=%.3fs)",
                                audio_open_started_at - started_at, lookup_started_at - audio_open_started_at)
                     try:
-                        caller = await self._discovery.ringing_caller(self._own_id)
+                        caller = await self._discovery.ringing_caller(self._account)
                     finally:
                         lookup_finished_at = loop.time()
                         _LOG.debug("Feishu auto-answer caller lookup finished (elapsed=%.3fs)",
@@ -173,7 +174,7 @@ class IncomingCalls:
                     if not before_deadline():
                         _LOG.debug("Feishu auto-answer skipped: caller lookup result expired")
                         return
-                    peer = resolve(caller.sender_open_id)
+                    peer = resolve(caller.user)
                     if peer is None:
                         _LOG.debug("Feishu auto-answer skipped: private route not ready")
                         return
@@ -195,7 +196,7 @@ class IncomingCalls:
                                            copy_confirmed=self._copy_confirmed)
                     if not peer.watch_call(binding.stop):
                         return
-                    if (binding.closed or resolve(caller.sender_open_id) is not peer or self._desktop.main_windows()):
+                    if (binding.closed or resolve(caller.user) is not peer or self._desktop.main_windows()):
                         _LOG.debug("Feishu auto-answer skipped: private route or desktop changed before click")
                         return
                     _require_audio(voice, device)

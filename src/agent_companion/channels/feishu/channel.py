@@ -8,7 +8,7 @@ import logging
 from sqlite3 import OperationalError
 from time import time
 
-from ...protocol import DeliveryStatus, Message, Receipt, ReplyDelivery, ReplyInfo, ReplyStream
+from ...protocol import ChannelUser, DeliveryStatus, Message, Receipt, ReplyDelivery, ReplyInfo, ReplyStream
 from ...speech.asr import FileASR
 from ...storage.sqlite import History, is_sqlite_lock_error
 from .cli import MAX_PAGE_SIZE, MIN_PAGE_SIZE, CliError, CliStdoutLimit, FeishuCLI
@@ -168,7 +168,7 @@ class _ScanWindow:
 
 class FeishuPoller:
     def __init__(self, cli: FeishuCLI, asr: FileASR, channel: FeishuChannel, *,
-                 chat_id: str, sender_id: str, own_id: str, session_id: str, history: History,
+                 chat_id: str, user: ChannelUser, account: ChannelUser, session_id: str, history: History,
                  submit: Callable[[int], Awaitable[None] | None], private_started_ms: int,
                  clock: Callable[[], float] = time,
                  batch_budget: int = MAX_BATCH_BYTES, before_close: Callable[[], None] | None = None) -> None:
@@ -177,8 +177,8 @@ class FeishuPoller:
         self._batch_budget = batch_budget
         self._channel = channel
         self._chat_id = chat_id
-        self._sender_id = sender_id
-        self._own_id = own_id
+        self._user = user
+        self._account = account
         self._session_id = session_id
         self._private_started_ms = private_started_ms
         self._source = "feishu-private"
@@ -228,7 +228,7 @@ class FeishuPoller:
                 self._window = window.restart()
                 raise CliError("cli_page_cycle")
             for item in items:
-                message = incoming(item, chat_id=self._chat_id, sender_id=self._sender_id, own_id=self._own_id)
+                message = incoming(item, chat_id=self._chat_id, user=self._user, account=self._account)
                 if (message is not None and window.start * 1000 <= message.created_ms < window.end * 1000
                         and message.created_ms >= self._private_started_ms
                         and message.message_id not in window.messages

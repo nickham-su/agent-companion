@@ -11,6 +11,8 @@ from ..config import RuntimeSettings
 from ..protocol import AgentReply, Channel, DelegationTask, InternalInput, Model, ToolSpec
 from ..session_scheduler import SessionScheduler, SessionSchedulers
 from ..storage.sqlite import Agent, History
+from ..workspace import Workspace
+from .bash import BASH_TOOL_NAME, Bash
 from .compaction import Compactions
 from .engine import Runtime
 from .sqlite_access import SQLiteAccess
@@ -20,7 +22,7 @@ from .tools import Tool, ToolContext, Tools
 
 _LOG = logging.getLogger(__name__)
 DELEGATE_TOOL_NAME = "delegate_subtask"
-AGENT_TOOL_NAMES = frozenset({DELEGATE_TOOL_NAME, SET_TIMER_TOOL_NAME, CANCEL_TIMER_TOOL_NAME})
+AGENT_TOOL_NAMES = frozenset({DELEGATE_TOOL_NAME, SET_TIMER_TOOL_NAME, CANCEL_TIMER_TOOL_NAME, BASH_TOOL_NAME})
 
 
 @dataclass(frozen=True, slots=True)
@@ -51,7 +53,7 @@ class AgentTree:
 
     def __init__(self, root: Agent, history: History, model: Model, *, roles: Mapping[str, AgentRole],
                  schedulers: SessionSchedulers, settings: RuntimeSettings, thinking: bool,
-                 retry_sqlite_locks: bool, compactions: Compactions) -> None:
+                 retry_sqlite_locks: bool, compactions: Compactions, workspace: Workspace | None = None) -> None:
         self._root = root
         self._history = history
         self._model = model
@@ -63,6 +65,8 @@ class AgentTree:
         self._compactions = compactions
         self._bindings: dict[str, _Binding] = {}
         self._closed = False
+        self._workspace = workspace
+        self._bash = Bash()  # 每棵树仅一把锁，主 Agent 与所有子 Agent 共用。
         self._sqlite = SQLiteAccess(retry_locks=retry_sqlite_locks, stopped=lambda: self._closed)
         descriptions = {name: role.description for name, role in sorted(self._roles.items()) if name != "main"}
         # 没有可选角色时不展示工具，但仍为白名单内的显式复用返回准确错误。
@@ -99,7 +103,7 @@ class AgentTree:
         try:
             role = self._roles[agent.role_id]
             timers = None
-            available = {DELEGATE_TOOL_NAME: self._delegate_tool}
+            available = {DELEGATE_TOOL_NAME: self._delegate_tool, BASH_TOOL_NAME: self._bash.tool}
             if SET_TIMER_TOOL_NAME in role.tools or CANCEL_TIMER_TOOL_NAME in role.tools:
                 timers = Timers(agent.session_id, scheduler.submit_internal)
                 available.update((tool.spec.name, tool) for tool in timers.tools)
@@ -120,7 +124,8 @@ class AgentTree:
             runtime = Runtime(agent.session_id, self._history, self._model, channel, tools=tools,
                               settings=self._settings, thinking=self._thinking, instructions=role.instructions,
                               retry_sqlite_locks=self._retry_sqlite_locks, compactions=self._compactions,
-                              agent=agent, reply_to_parent=reply_to_parent if parent_id is not None else None)
+                              workspace=self._workspace, agent=agent,
+                              reply_to_parent=reply_to_parent if parent_id is not None else None)
             revoke = scheduler.bind(runtime.submit_inputs, owner=owner,
                                     on_revoke=timers.close if timers is not None else None)
             binding = self._bindings[agent.agent_id] = _Binding(runtime, scheduler, owner, revoke)
@@ -201,6 +206,7 @@ class AgentTree:
 
     def stop_accepting(self) -> None:
         self._closed = True
+        self._bash.stop_accepting()
         for binding in self._bindings.values():
             binding.runtime.stop_accepting()
             # 保留所有权，直到异步关停与状态收尾完成。

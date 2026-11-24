@@ -17,6 +17,7 @@ MINIMAX_ASR_MODEL = "asr-1.0"
 DEFAULT_ASR_TIMEOUT = 30
 DEFAULT_MODEL_TIMEOUT = 60
 DEFAULT_TTS_TIMEOUT = 25
+_DEFAULT_WORKSPACE_ROOT = "workspaces"
 _DEFAULT_LOG_LEVEL = "WARNING"
 _LOG_LEVELS = ("DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL")
 _LEGACY_CONFIG_ERROR = "旧配置格式不再支持，请按 config.example.toml 迁移到命名 Provider"
@@ -224,6 +225,7 @@ class Settings:
     asr_timeout: float = DEFAULT_ASR_TIMEOUT
     tts_timeout: float = DEFAULT_TTS_TIMEOUT
     log_level: str = _DEFAULT_LOG_LEVEL
+    workspace_root: Path = Path(_DEFAULT_WORKSPACE_ROOT)
 
     def __post_init__(self) -> None:
         if not isinstance(self.log_level, str) or self.log_level not in _LOG_LEVELS:
@@ -341,7 +343,7 @@ def _parse_settings(data: dict[str, Any], path: Path, *, for_run: bool) -> Setti
             or isinstance(runtime_data, dict) and "model_timeout" in runtime_data):
         raise ConfigError(_LEGACY_CONFIG_ERROR)
     _table(data, {"database", "log_level", "runtime", "feishu", "voice", "providers", "timeouts",
-                  "llm_provider", "asr_provider", "tts_provider"}, "顶层")
+                  "llm_provider", "asr_provider", "tts_provider", "workspace_root"}, "顶层")
     database = data.get("database", "db.sqlite3")
     if not isinstance(database, str) or not database.strip() or "\x00" in database:
         raise ConfigError("database 必须是非空且不含 NUL 字符的路径")
@@ -349,6 +351,9 @@ def _parse_settings(data: dict[str, Any], path: Path, *, for_run: bool) -> Setti
         raise ConfigError("正式启动的 database 必须是持久化 SQLite 文件路径")
     if database != ":memory:":
         database = str(path.parent / database)
+    workspace_root = data.get("workspace_root", _DEFAULT_WORKSPACE_ROOT)
+    if not isinstance(workspace_root, str) or not workspace_root.strip() or "\x00" in workspace_root:
+        raise ConfigError("workspace_root 必须是非空且不含 NUL 字符的路径")
     timeouts = _table(data.get("timeouts", {}), {"llm", "asr", "tts"}, "timeouts")
     runtime = RuntimeSettings(model_timeout=timeouts.get("llm", DEFAULT_MODEL_TIMEOUT),
                               **_section(runtime_data, RuntimeSettings, "runtime", exclude=("model_timeout",)))
@@ -373,4 +378,5 @@ def _parse_settings(data: dict[str, Any], path: Path, *, for_run: bool) -> Setti
         asr_timeout=timeouts.get("asr", DEFAULT_ASR_TIMEOUT),
         tts_timeout=timeouts.get("tts", DEFAULT_TTS_TIMEOUT) if for_run and use_voice else DEFAULT_TTS_TIMEOUT,
         log_level=data.get("log_level", _DEFAULT_LOG_LEVEL),
+        workspace_root=path.parent / workspace_root,
     )

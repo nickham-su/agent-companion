@@ -2,6 +2,8 @@
 # 角色文件另从启动工作目录的 agents/ 读取；正式启动前从 agents/main.example.md 复制并配置 main.md。
 # 如需委派，从 agents/sub.example.md 创建实际子角色；角色正文会发给模型，不要填写敏感信息。
 database = "db.sqlite3"
+# 用户工作区的共同根目录；子目录按用户分配、按需创建，不是沙箱。
+workspace_root = "workspaces"
 # 日志只写标准输出，部署默认 WARNING；排查时改为 DEBUG，修改后重启。
 log_level = "WARNING"
 # 切换时只改对应引用，再重启；真实 Key 请只填写在本机私有配置中。

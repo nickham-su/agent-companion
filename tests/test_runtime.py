@@ -59,6 +59,70 @@ class RuntimeTest(unittest.IsolatedAsyncioTestCase):
         await asyncio.wait_for(runtime.wait_idle(), 2)
         self.assertIsNone(runtime.last_failure)
 
+    async def test_close_cancels_active_and_queued_tools_before_waiting_for_child_model(self):
+        model_closing, model_release, model_stopped = (asyncio.Event() for _ in range(3))
+        tool_active, tool_closing, tool_release = asyncio.Event(), asyncio.Event(), asyncio.Event()
+        queued_started, queued_closing = asyncio.Event(), asyncio.Event()
+        lock = asyncio.Lock()
+
+        class Model:
+            async def stream(self, messages, tools, *, thinking):
+                try:
+                    yield ToolReady(CALL)
+                    yield ToolReady(ToolCall("queued", SPEC.name, "{}"))
+                    await asyncio.Future()
+                finally:
+                    model_closing.set()
+                    await model_release.wait()
+                    model_stopped.set()
+
+        async def tool(args, context):
+            if context.call_id == "queued":
+                queued_started.set()
+                try:
+                    async with lock:
+                        self.fail("queued tool executed after shutdown")
+                finally:
+                    queued_closing.set()
+            async with lock:
+                tool_active.set()
+                try:
+                    await asyncio.Future()
+                finally:
+                    tool_closing.set()
+                    await tool_release.wait()
+
+        runtime, _ = self.setup_runtime(Model(), None, tools=Tools([Tool(SPEC, tool)]))
+        runtime.submit_batch((Message("user", "synthetic"),))
+        await asyncio.wait_for(tool_active.wait(), 2)
+        await asyncio.wait_for(queued_started.wait(), 2)
+        first = asyncio.create_task(runtime.close())
+        second = None
+        try:
+            await asyncio.wait_for(model_closing.wait(), 2)
+            await asyncio.wait_for(tool_closing.wait(), 2)
+            await asyncio.wait_for(queued_closing.wait(), 2)
+            second = asyncio.create_task(runtime.close())
+            first.cancel()
+            await asyncio.sleep(0)
+            first.cancel()
+            self.assertFalse(runtime.idle)
+            model_release.set()
+            await asyncio.wait_for(model_stopped.wait(), 2)
+            await asyncio.sleep(0)
+            self.assertFalse(runtime.idle)
+            self.assertFalse(first.done())
+            self.assertFalse(second.done())
+            tool_release.set()
+            with self.assertRaises(asyncio.CancelledError):
+                await asyncio.wait_for(first, 2)
+            await asyncio.wait_for(second, 2)
+            self.assertTrue(runtime.idle)
+        finally:
+            tool_release.set()
+            model_release.set()
+            await asyncio.gather(*(task for task in (first, second) if task is not None), return_exceptions=True)
+
     async def test_mixed_receipt_and_tool_complete_in_both_orders(self):
         for first in ("tool", "receipt"):
             with self.subTest(first=first):

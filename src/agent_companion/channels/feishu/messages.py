@@ -6,9 +6,9 @@ import json
 import re
 from typing import Any
 
-from ...protocol import OMITTED_INPUT_IMAGE, Image, Message, Part, Text
+from ...protocol import OMITTED_INPUT_IMAGE, ChannelUser, Image, Message, Part, Text
 from ...speech.asr import AsrError, AudioFile, FileASR, MAX_AUDIO_BYTES
-from .cli import CliError, FeishuCLI
+from .cli import CliError, FeishuCLI, parse_open_id
 
 
 SUPPORTED_TYPES = {"audio", "image", "post", "text"}
@@ -29,12 +29,15 @@ class IncomingMessage:
     content: str = field(repr=False)
 
 
-def incoming(raw: Any, *, chat_id: str, sender_id: str, own_id: str) -> IncomingMessage | None:
+def incoming(raw: Any, *, chat_id: str, user: ChannelUser, account: ChannelUser) -> IncomingMessage | None:
     if not isinstance(raw, dict) or raw.get("chat_id") != chat_id or raw.get("deleted") is True:
         return None
     sender = raw.get("sender")
     if (not isinstance(sender, dict) or sender.get("sender_type") != "user"
-            or sender.get("id_type") != "open_id" or sender.get("id") == own_id or sender.get("id") != sender_id):
+            or sender.get("id_type") != "open_id"):
+        return None
+    author = parse_open_id(sender.get("id"))
+    if author is None or author == account or author != user:
         return None
     kind, message_id, created = raw.get("msg_type"), raw.get("message_id"), raw.get("create_time")
     if (not isinstance(kind, str) or kind not in SUPPORTED_TYPES or not isinstance(message_id, str)

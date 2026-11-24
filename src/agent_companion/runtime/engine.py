@@ -17,6 +17,7 @@ from ..protocol import (AgentReply, Channel, DelegationTask, DeliveryStatus, Inp
                          ToolReady, validate_input_items)
 from ..storage.sqlite import (Agent, AgentReplyInput, DelegatedInput, History, ReplyOutcome, RetryableInputWrite,
                               is_sqlite_lock_error)
+from ..workspace import Workspace
 from .compaction import Compactions
 from .context import Context
 from .model_deadline import ModelDeadline, model_deadline_at
@@ -47,7 +48,8 @@ class Runtime:
                  tools: Tools | None = None, settings: RuntimeSettings | None = None,
                  thinking: bool = False, instructions: str | None = None, delivery_idle_timeout: float | None = None,
                  retry_sqlite_locks: bool = False, compactions: Compactions | None = None,
-                 agent: Agent | None = None, reply_to_parent: Callable[[AgentReply], bool] | None = None) -> None:
+                 workspace: Workspace | None = None, agent: Agent | None = None,
+                 reply_to_parent: Callable[[AgentReply], bool] | None = None) -> None:
         if not session_id:
             raise ValueError("session_id must be non-empty")
         if agent is not None and agent.session_id != session_id:
@@ -63,6 +65,7 @@ class Runtime:
         self._model = model
         self._channel = channel
         self._delivery_idle_timeout = delivery_idle_timeout
+        self._workspace = workspace
         self._tools = tools if tools is not None else Tools()
         self._settings = settings if settings is not None else RuntimeSettings()
         self._thinking = thinking
@@ -74,6 +77,7 @@ class Runtime:
         self._input_blocked: Literal["retryable", "unsafe"] | None = None
         self._input_retry_requested = False
         self._worker: asyncio.Task[None] | None = None
+        self._close_task: asyncio.Task[None] | None = None
         self._retired_deliveries: set[asyncio.Task[Receipt]] = set()
         self._retired_models: set[asyncio.Task[bool]] = set()
         self._closed = False
@@ -167,11 +171,27 @@ class Runtime:
             self._compactions.stop()
 
     async def close(self) -> None:
-        self.stop_accepting()
-        task = self._worker
-        if task is not None:
-            task.cancel()
-            await asyncio.gather(task, return_exceptions=True)
+        if self._close_task is None:
+            self.stop_accepting()
+            worker = self._worker
+            if worker is not None:
+                worker.cancel()
+            self._close_task = asyncio.create_task(self._finish_close(worker))
+        closing = self._close_task
+        interrupted = None
+        while not closing.done():
+            try:
+                await asyncio.shield(closing)
+            except asyncio.CancelledError as exc:
+                # 并发或反复取消关闭调用方，均不再次取消 worker 或提前交还会话。
+                interrupted = exc
+        closing.result()
+        if interrupted is not None:
+            raise interrupted
+
+    async def _finish_close(self, worker: asyncio.Task[None] | None) -> None:
+        if worker is not None:
+            await asyncio.gather(worker, return_exceptions=True)
         if self._retired_models:
             _, pending = await asyncio.wait(tuple(self._retired_models), timeout=_MODEL_CLOSE_GRACE)
             if pending:
@@ -472,7 +492,7 @@ class Runtime:
                                 raise ModelError("duplicate_tool_id")
                             context = ToolContext(self.session_id, run_id, call.id, has_user_input,
                                                   self.agent.agent_id if self.agent is not None else None,
-                                                  has_agent_input)
+                                                  has_agent_input, workspace=self._workspace)
                             scheduled[call.id] = (call, loop.create_task(self._tools.execute(call, context)))
             return True
 
@@ -580,25 +600,30 @@ class Runtime:
                 _LOG.warning("background reply could not be queued; reply=%s", info.reply_id)
             return model_status, bool(calls) and not voice_incomplete, generated_text or confirmed_text or None
         finally:
-            delivery_started.cancel()
             unfinished = [task for _, task in scheduled.values() if not task.done()]
-            if accept_model_events and model_task is not None:
-                if not model_task.done():
-                    retire_reader(model_task)
-                    if not has_user_channel:
-                        # 子任务仍持有串行执行权，原生传输收尾或耗尽预算后才能退出。
-                        await asyncio.wait((model_task,))
-                elif not model_task.cancelled():
-                    model_task.exception()
-            if delivery is not None:
-                if not delivery.done():
-                    self._abandon_delivery(reply, delivery)
-                elif not delivery.cancelled():
-                    delivery.exception()
+            # 异常退出时先撤销工具（含还在等锁的调用），再等待可能延迟的模型收尾。
             for task in unfinished:
                 task.cancel()
-            if unfinished:
-                await asyncio.gather(*unfinished, return_exceptions=True)
+            delivery_started.cancel()
+            wait_for_child_model = False
+            try:
+                if accept_model_events and model_task is not None:
+                    if not model_task.done():
+                        retire_reader(model_task)
+                        wait_for_child_model = not has_user_channel
+                    elif not model_task.cancelled():
+                        model_task.exception()
+                if delivery is not None:
+                    if not delivery.done():
+                        self._abandon_delivery(reply, delivery)
+                    elif not delivery.cancelled():
+                        delivery.exception()
+                if wait_for_child_model:
+                    # 子任务仍持有串行执行权，原生传输收尾或耗尽预算后才能退出。
+                    await asyncio.wait((model_task,))
+            finally:
+                if unfinished:
+                    await asyncio.gather(*unfinished, return_exceptions=True)
 
     def _model_cleanup_finished(self, task: asyncio.Task[bool]) -> None:
         self._retired_models.discard(task)

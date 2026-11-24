@@ -13,7 +13,7 @@ import sys
 from tempfile import TemporaryDirectory
 from typing import Any
 
-from ...protocol import DeliveryStatus
+from ...protocol import ChannelUser, DeliveryStatus
 
 
 _LOG = logging.getLogger(__name__)
@@ -176,20 +176,25 @@ class _UserCLI:
 @dataclass(frozen=True, slots=True)
 class PrivateChat:
     chat_id: str = field(repr=False)
-    sender_id: str = field(repr=False)
+    user: ChannelUser
 
 
 @dataclass(frozen=True, slots=True, repr=False)
 class RingingCaller:
     meeting_id: str
-    sender_open_id: str
+    user: ChannelUser
 
 
 def _valid_id(value: Any, prefix: str) -> bool:
     return isinstance(value, str) and re.fullmatch(rf"{prefix}_[\w-]{{1,160}}", value, flags=re.ASCII) is not None
 
 
-def _classify_chat(row: Any, own_open_id: str) -> tuple[str, str | None]:
+def parse_open_id(value: Any) -> ChannelUser | None:
+    """在飞书协议边界将合法的 open_id 转为通道用户。"""
+    return ChannelUser(value) if _valid_id(value, "ou") else None
+
+
+def _classify_chat(row: Any, account: ChannelUser) -> tuple[str, ChannelUser | None]:
     """返回可信私聊 ID 与对端；明确不允许的路由没有对端，无法分类则拒绝快照。"""
     if not isinstance(row, dict) or not _valid_id(chat_id := row.get("chat_id"), "oc"):
         raise CliError("cli_invalid_chat_page")
@@ -200,21 +205,20 @@ def _classify_chat(row: Any, own_open_id: str) -> tuple[str, str | None]:
         target = row.get("p2p_target_type")
         if target == "bot":
             return chat_id, None
-        peer = row.get("p2p_target_id")
-        if target == "user" and _valid_id(peer, "ou"):
-            return chat_id, peer if peer != own_open_id else None
+        if target == "user" and (user := parse_open_id(row.get("p2p_target_id"))) is not None:
+            return chat_id, user if user != account else None
     raise CliError("cli_invalid_chat_page")
 
 
 class FeishuDiscovery(_UserCLI):
-    async def account_open_id(self) -> str:
+    async def account_user(self) -> ChannelUser:
         data = _success_data(await self._run(("api", "GET", "/open-apis/authen/v1/user_info")))
-        open_id = data.get("open_id")
-        if not _valid_id(open_id, "ou"):
+        user = parse_open_id(data.get("open_id"))
+        if user is None:
             raise CliError("cli_invalid_account")
-        return open_id
+        return user
 
-    async def private_chats(self, own_open_id: str) -> set[PrivateChat]:
+    async def private_chats(self, account: ChannelUser) -> set[PrivateChat]:
         """只有完整分页扫描才用于绑定；不会用未读完的列表判断是否有冲突。"""
         chats: set[PrivateChat] = set()
         unverified_chats: set[str] = set()
@@ -233,11 +237,11 @@ class FeishuDiscovery(_UserCLI):
             )):
                 raise CliError("cli_invalid_chat_page")
             for row in rows:
-                chat_id, sender_id = _classify_chat(row, own_open_id)
-                if sender_id is None:
+                chat_id, user = _classify_chat(row, account)
+                if user is None:
                     unverified_chats.add(chat_id)
                 else:
-                    chats.add(PrivateChat(chat_id, sender_id))
+                    chats.add(PrivateChat(chat_id, user))
             if not more:
                 return {chat for chat in chats if chat.chat_id not in unverified_chats}
             if token in tokens:
@@ -261,7 +265,7 @@ class FeishuDiscovery(_UserCLI):
             _LOG.debug("Feishu ringing CLI query (step=%s, outcome=%s, elapsed=%.3fs)",
                        step, outcome, loop.time() - started_at)
 
-    async def ringing_caller(self, own_open_id: str) -> RingingCaller | None:
+    async def ringing_caller(self, account: ChannelUser) -> RingingCaller | None:
         """只接受当前实测的一对一响铃形态，不将其当作会议来源的证明。"""
         data = await self._ringing_query("list_active", ("vc", "+meeting-list-active"))
         meetings = data.get("meetings")
@@ -283,10 +287,10 @@ class FeishuDiscovery(_UserCLI):
         status, host, participants = meeting.get("status"), meeting.get("host_user"), meeting.get("participants")
         if type(status) is not int or status != 1 or not isinstance(participants, list) or len(participants) != 1:
             return None
-        caller = host.get("id") if isinstance(host, dict) else None
+        caller = parse_open_id(host.get("id")) if isinstance(host, dict) else None
         participant = participants[0]
-        if (not _valid_id(caller, "ou") or caller == own_open_id
-                or not isinstance(participant, dict) or participant.get("id") != caller):
+        if (caller is None or caller == account
+                or not isinstance(participant, dict) or parse_open_id(participant.get("id")) != caller):
             return None
         return RingingCaller(meeting_id, caller)
 

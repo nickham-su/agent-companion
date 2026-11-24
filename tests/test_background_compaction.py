@@ -16,7 +16,7 @@ from agent_companion.app import prepare_private_feishu, running_agent
 from agent_companion.config import FeishuSettings, RuntimeSettings, Settings
 from agent_companion.models import _http_stream
 from agent_companion.models.deepseek import DeepSeek
-from agent_companion.protocol import (InputUsage, Message, ProviderReplay, ReplayItem, ReplayScope,
+from agent_companion.protocol import (ChannelUser, InputUsage, Message, ProviderReplay, ReplayItem, ReplayScope,
                                       TextDelta, ToolCall, ToolReady)
 from agent_companion.runtime.subtasks import demo_roles
 from agent_companion.runtime.compaction import Compactions, Prefix
@@ -271,8 +271,8 @@ class BackgroundCompactionTest(unittest.IsolatedAsyncioTestCase):
         settings = Settings(runtime=_SETTINGS, feishu=FeishuSettings())
 
         class Discovery:
-            async def account_open_id(self):
-                return "ou_fixture"
+            async def account_user(self):
+                return ChannelUser("ou_fixture")
 
         async def run_groups(_discovery, shared_history, _asr, *, open_agent, **kwargs):
             self.assertIs(shared_history, history)
@@ -280,8 +280,8 @@ class BackgroundCompactionTest(unittest.IsolatedAsyncioTestCase):
                 history.append(session_id, [_OLD])
                 _report_high_usage(history, session_id)
 
-            async with open_agent(history.ensure_main_agent("main-b"), Sink()) as (second, _):
-                async with open_agent(history.ensure_main_agent("main-a"), Sink()) as (first, _):
+            async with open_agent(history.ensure_main_agent("main-b"), Sink(), ChannelUser("ou_b")) as (second, _):
+                async with open_agent(history.ensure_main_agent("main-a"), Sink(), ChannelUser("ou_a")) as (first, _):
                     first_task = await self._begin(first, model, "first group input")
                     await _idle(first)
                     second.submit_batch([Message("user", "second group while occupied")])

@@ -14,7 +14,8 @@ from agent_companion.channels.feishu.macos_calls import DesktopCallError, MacCal
 from agent_companion.config import ASRSettings, FeishuSettings, MiniMaxConnection, Settings
 from agent_companion.feishu_calls import IncomingCalls
 from agent_companion.feishu_private import _Route
-from agent_companion.protocol import AGENT_REPLY_PREFIX, DeliveryStatus, InternalInput, Message, TextDelta, ToolCall, ToolReady
+from agent_companion.protocol import (AGENT_REPLY_PREFIX, ChannelUser, DeliveryStatus, InternalInput, Message,
+                                      TextDelta, ToolCall, ToolReady)
 from agent_companion.runtime.subtasks import DELEGATE_TOOL_NAME, demo_roles
 from agent_companion.speech.vad import INPUT_FRAMES, INPUT_RATE
 from agent_companion.speech.voice import VoiceChannel
@@ -72,10 +73,10 @@ class CallCLITests(unittest.IsolatedAsyncioTestCase):
             with self.subTest(listing=listing, detail=detail):
                 if expected is CliError:
                     with self.assertRaises(CliError):
-                        await discovery.ringing_caller(_OWN)
+                        await discovery.ringing_caller(ChannelUser(_OWN))
                 else:
-                    caller = await discovery.ringing_caller(_OWN)
-                    self.assertEqual(caller.sender_open_id if caller else None, expected)
+                    caller = await discovery.ringing_caller(ChannelUser(_OWN))
+                    self.assertEqual(caller.user if caller else None, ChannelUser(expected) if expected else None)
                     if caller is not None:
                         self.assertEqual(caller.meeting_id, "12345")
                 self.assertEqual(len(commands), 1 if detail is no_detail else 2)

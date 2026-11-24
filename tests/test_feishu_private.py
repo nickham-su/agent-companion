@@ -15,7 +15,7 @@ from agent_companion.app import private_feishu_identity, run_feishu, running_age
 from agent_companion.channels.feishu.cli import CliError, CommandResult, FeishuDiscovery
 from agent_companion.config import (ASRSettings, FeishuSettings, LLMSettings, MiniMaxConnection, Settings,
                                     load_settings)
-from agent_companion.protocol import AGENT_REPLY_PREFIX, Message, TextDelta, ToolCall, ToolReady
+from agent_companion.protocol import AGENT_REPLY_PREFIX, ChannelUser, Message, TextDelta, ToolCall, ToolReady
 from agent_companion.runtime.subtasks import AgentTree, DELEGATE_TOOL_NAME, demo_roles
 from agent_companion.storage.sqlite import AgentReplyInput, DelegatedInput, FeishuBindingError, History, is_sqlite_lock_error
 
@@ -196,7 +196,7 @@ class FeishuPrivateTests(unittest.IsolatedAsyncioTestCase):
 
             # 已有库的账号指纹不随配置项移除而改变。
             owner = sha256(f'["private","{_OWN}"]'.encode()).hexdigest()
-            self.assertEqual(private_feishu_identity(_OWN), owner)
+            self.assertEqual(private_feishu_identity(ChannelUser(_OWN)), owner)
             with closing(History(Path(tmp) / "private.db", feishu_private_owner=owner)) as history:
                 history.bind_feishu_private(owner, started_ms=99_000)
                 self.runner.account = "ou_unexpected_account"
@@ -214,6 +214,30 @@ class FeishuPrivateTests(unittest.IsolatedAsyncioTestCase):
             with self.assertRaisesRegex(FeishuBindingError, "现有数据库有历史"):
                 History(unbound, feishu_private_owner=owner)
             self.assertEqual(unbound.read_bytes(), original)
+
+    async def test_verified_user_reuses_legacy_account_and_route_on_restart(self):
+        chat_id, open_id = _CHATS[0], _SENDERS[0]
+        owner = sha256(f'["private","{_OWN}"]'.encode("ascii")).hexdigest()
+        session_id = "feishu-private:" + sha256(open_id.encode("ascii")).hexdigest()
+        chat_fingerprint = sha256(chat_id.encode("ascii")).hexdigest()
+        self.runner.pages = {None: ([_chat(chat_id, open_id)], None)}
+        self.runner.messages[chat_id] = [_message("next", chat_id, open_id, "new input")]
+        with TemporaryDirectory() as tmp:
+            database = Path(tmp) / "legacy.db"
+            with closing(History(database)) as history:
+                history.bind_feishu_private(owner, started_ms=99_000)
+                legacy_agent = history.bind_feishu_private_agent(session_id, chat_fingerprint)
+                self.assertIsNotNone(legacy_agent)
+                history.append(session_id, [Message("user", "existing history")])
+
+            model = _Model()
+            with closing(History(database)) as history:
+                async with _serve_private(self.settings, history, model, self.runner, [101.0]) as agents:
+                    await _eventually(lambda: self.runner.sent[chat_id] == ["reply: new input"])
+                    agents.assert_called_once()
+                    self.assertEqual(agents.call_args.kwargs["agent"], legacy_agent)
+                    self.assertEqual(model.calls, [(True, ("existing history", "new input"))])
+                    self.assertEqual(history.check_feishu_private(owner), 99_000)
 
     async def test_lazy_sessions_parallel_delivery_and_restart(self):
         a, b, c = _CHATS
@@ -314,9 +338,9 @@ class FeishuPrivateTests(unittest.IsolatedAsyncioTestCase):
             with self.subTest(rows=rows, cursor=cursor):
                 self.runner.pages = {None: (rows, cursor)}
                 with self.assertRaisesRegex(CliError, "cli_invalid_chat_page"):
-                    await self.runner.discovery().private_chats(_OWN)
+                    await self.runner.discovery().private_chats(ChannelUser(_OWN))
         self.runner.pages = {None: (None, None)}
-        self.assertEqual(await self.runner.discovery().private_chats(_OWN), set())
+        self.assertEqual(await self.runner.discovery().private_chats(ChannelUser(_OWN)), set())
 
     async def test_shutdown_awaits_outbound_closure_in_every_route(self):
         a, b, _ = _CHATS
@@ -546,7 +570,7 @@ class FeishuPrivateTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_failed_account_verification_leaves_new_database_available_and_keeps_startup_message(self):
         runner, model, clock = self.runner, _Model(), [100.25]
-        owner = private_feishu_identity(_OWN)
+        owner = private_feishu_identity(ChannelUser(_OWN))
         with TemporaryDirectory() as tmp:
             path = Path(tmp) / "new.db"
             with closing(History(path)) as history:
@@ -584,7 +608,7 @@ class FeishuPrivateTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_production_checks_owner_and_uses_single_cli_verification_before_providers(self):
         runner = self.runner
-        owner = private_feishu_identity(_OWN)
+        owner = private_feishu_identity(ChannelUser(_OWN))
         with TemporaryDirectory(dir=Path.cwd()) as tmp:
             workdir = Path(tmp)
             agents = workdir / "agents"
@@ -617,7 +641,7 @@ class FeishuPrivateTests(unittest.IsolatedAsyncioTestCase):
                 await _serve(settings)
                 self.assertEqual(runner.commands, [_ACCOUNT_QUERY])
                 run_chats.assert_awaited_once()
-                self.assertEqual(run_chats.await_args.kwargs["own_id"], _OWN)
+                self.assertEqual(run_chats.await_args.kwargs["account"], ChannelUser(_OWN))
                 original = settings.database.read_bytes()
                 client.reset_mock()
                 get_salt.reset_mock()

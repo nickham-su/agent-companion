@@ -18,8 +18,8 @@ from agent_companion.app import run_feishu, running_agent
 from agent_companion.channels.feishu.channel import FeishuChannel, FeishuPoller
 from agent_companion.channels.feishu.cli import CliError, CliStdoutLimit, CommandResult, FeishuCLI, run_command
 from agent_companion.config import FeishuSettings, Settings, load_settings
-from agent_companion.protocol import (OMITTED_INPUT_IMAGE, DeliveryStatus, Image, Message, Receipt, ReplyDelivery, ReplyInfo,
-                                      Text, TextDelta)
+from agent_companion.protocol import (OMITTED_INPUT_IMAGE, ChannelUser, DeliveryStatus, Image, Message, Receipt,
+                                      ReplyDelivery, ReplyInfo, Text, TextDelta)
 from agent_companion.runtime.subtasks import demo_roles
 from agent_companion.speech.asr import AsrError
 from agent_companion.storage.sqlite import History
@@ -124,7 +124,8 @@ class _Model:
 
 
 def _poller(history, main, cli, asr, clock):
-    return FeishuPoller(cli, asr, FeishuChannel(cli), chat_id=_CHAT, sender_id=_PEER, own_id=_SELF,
+    return FeishuPoller(cli, asr, FeishuChannel(cli), chat_id=_CHAT, user=ChannelUser(_PEER),
+                        account=ChannelUser(_SELF),
                         session_id="main", history=history, submit=main, private_started_ms=clock[0] * 1000,
                         clock=lambda: clock[0])
 
@@ -1066,7 +1067,8 @@ print(json.dumps({"ok": True, "identity": "user", "data": page}))
             async with running_agent(Settings(), history, model, channel, session_id="main",
                                      roles=demo_roles()) as (main, _):
                 submit = main.submit_persisted_batch
-                poller = FeishuPoller(cli, asr, channel, chat_id=_CHAT, sender_id=_PEER, own_id=_SELF,
+                poller = FeishuPoller(cli, asr, channel, chat_id=_CHAT, user=ChannelUser(_PEER),
+                                      account=ChannelUser(_SELF),
                                       session_id="main", history=history, submit=submit,
                                       private_started_ms=100_000, clock=lambda: clock[0], batch_budget=470)
                 await poller.poll_once()
