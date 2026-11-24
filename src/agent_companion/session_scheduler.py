@@ -3,11 +3,13 @@
 import asyncio
 from collections.abc import Awaitable, Callable, Iterator, Sequence
 from contextlib import contextmanager
+import logging
 
 from .protocol import (DeliveryStatus, InputItem, InternalInput, PersistedInput, Receipt, ReplyDelivery, ReplyStream,
                        validate_input_items)
 
 
+_LOG = logging.getLogger(__name__)
 _Submit = Callable[[tuple[InputItem, ...]], None]
 _RunChild = Callable[[str, str], Awaitable[str | None]]
 
@@ -45,7 +47,8 @@ class SessionScheduler:
                 self._revoke_input()
             self._agent_owner = None
 
-    def bind(self, submit: _Submit, *, owner: object | None = None) -> Callable[[], None]:
+    def bind(self, submit: _Submit, *, owner: object | None = None,
+             on_revoke: Callable[[], None] | None = None) -> Callable[[], None]:
         self._ensure_unbound(owner)
         self._submit = submit
 
@@ -59,6 +62,8 @@ class SessionScheduler:
                 self._obsolete_until = -float("inf")
                 self._pending.clear()
                 self._pending_inbound.clear()
+                if on_revoke is not None:
+                    on_revoke()
 
         self._revoke_input = revoke
         return revoke
@@ -109,21 +114,34 @@ class SessionScheduler:
         validate_input_items(items)
         if input_active is not None and not isinstance(input_active, bool):
             raise ValueError("input state must be a bool or None")
+        self._append_inputs(items)
+        if input_active is not None:
+            if input_active or self._input_active:
+                self._obsolete_until = asyncio.get_running_loop().time()
+            self._input_active = input_active
+        self._flush_pending(submit)
+
+    def _append_inputs(self, items: tuple[InputItem, ...]) -> None:
         for item in items:
             if isinstance(item, PersistedInput):
                 if item.batch_id in self._pending_inbound:
                     continue
                 self._pending_inbound.add(item.batch_id)
             self._pending.append(item)
-        if input_active is not None:
-            if input_active or self._input_active:
-                self._obsolete_until = asyncio.get_running_loop().time()
-            self._input_active = input_active
-        if not self._input_active and self._pending:
-            # Runtime 接手跨队列的批次去重。
-            submit(tuple(self._pending))
-            self._pending.clear()
-            self._pending_inbound.clear()
+
+    def _flush_pending(self, submit: _Submit, *, internal: bool = False) -> None:
+        if self._input_active or not self._pending:
+            return
+        batch = tuple(self._pending)
+        try:
+            submit(batch)
+        except Exception as exc:
+            if not internal:
+                raise
+            _LOG.warning("runtime input handoff failed; batch retained; error_type=%s", type(exc).__name__)
+            return
+        self._pending.clear()
+        self._pending_inbound.clear()
 
     def select_voice(self, reply: ReplyStream, target: ReplyDelivery) -> ReplyDelivery:
         """语音选路后同步决定是否拦截，不在转写结束后恢复过期回复。"""
@@ -133,10 +151,14 @@ class SessionScheduler:
         return target
 
     def submit_internal(self, item: InternalInput) -> bool:
-        """不为没有可信 Runtime 入口的会话启动运行或安排补投。"""
-        if self._submit is None:
+        """绑定有效且消息已加入调度器即视为接纳，不等待 Runtime 接手。"""
+        submit = self._submit
+        if submit is None:
             return False
-        self.session_input((item,))
+        items = (item,)
+        validate_input_items(items)
+        self._append_inputs(items)
+        self._flush_pending(submit, internal=True)
         return True
 
 

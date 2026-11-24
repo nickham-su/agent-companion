@@ -19,6 +19,7 @@ from agent_companion.config import (ASRSettings, FeishuSettings, MiniMaxConnecti
                                     VoiceSettings)
 from agent_companion.protocol import DeliveryStatus, TextDelta, ToolCall, ToolReady
 from agent_companion.runtime.subtasks import DELEGATE_TOOL_NAME, RESULT_PREFIX
+from agent_companion.runtime.timers import CANCEL_TIMER_TOOL_NAME, SET_TIMER_TOOL_NAME
 from agent_companion.speech.audio import AudioFormat
 from agent_companion.speech.vad import INPUT_FRAMES, INPUT_RATE
 from agent_companion.speech.voice import VoiceChannel
@@ -121,7 +122,7 @@ class _ScriptedModel:
         elif last.role == "tool":
             yield TextDelta(_ACCEPTED)
         elif last.content == _USER:
-            assert {tool.name for tool in tools} == {DELEGATE_TOOL_NAME}
+            assert {tool.name for tool in tools} == {DELEGATE_TOOL_NAME, SET_TIMER_TOOL_NAME, CANCEL_TIMER_TOOL_NAME}
             yield ToolReady(ToolCall("synthetic-call", DELEGATE_TOOL_NAME, json.dumps({"prompt": _PROMPT})))
         elif last.content.startswith(RESULT_PREFIX):
             yield TextDelta(_RETURNED)

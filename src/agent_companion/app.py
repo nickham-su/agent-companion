@@ -18,6 +18,7 @@ from .protocol import Channel, Model
 from .runtime.compaction import Compactions
 from .runtime.engine import Runtime
 from .runtime.subtasks import Subtasks
+from .runtime.timers import Timers
 from .session_scheduler import SessionSchedulers
 from .speech.asr import FileASR
 from .speech.tts import StreamingTTS
@@ -68,11 +69,13 @@ async def running_agent(
         subtasks = Subtasks(session_id, history, model, schedulers=schedulers,
                             settings=settings.runtime, thinking=thinking, retry_sqlite_locks=retry_sqlite_locks,
                             compactions=compactions)
-        main = Runtime(session_id, history, model, channel, tools=subtasks.tools,
+        timers = Timers(session_id, scheduler.submit_internal)
+        main = Runtime(session_id, history, model, channel, tools=subtasks.tools.with_tools(timers.tools),
                        settings=settings.runtime, thinking=thinking, retry_sqlite_locks=retry_sqlite_locks,
                        compactions=compactions)
 
-        revoke_input = scheduler.bind(main.submit_inputs, owner=owner)
+        # 路由也可以提前撤销绑定；在重新绑定前同步取消旧会话的定时回调。
+        revoke_input = scheduler.bind(main.submit_inputs, owner=owner, on_revoke=timers.close)
         yield main, subtasks
     finally:
         try:

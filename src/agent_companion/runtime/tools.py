@@ -31,6 +31,9 @@ class Tools:
             self._tools[tool.spec.name] = tool
         self.specs = tuple(tool.spec for tool in self._tools.values())
 
+    def with_tools(self, tools: Iterable[Tool]) -> "Tools":
+        return Tools((*self._tools.values(), *tools))
+
     async def execute(self, call: ToolCall, context: ToolContext) -> str:
         tool = self._tools.get(call.name)
         if tool is None:

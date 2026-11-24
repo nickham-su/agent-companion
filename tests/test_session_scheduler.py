@@ -197,6 +197,23 @@ class SessionSchedulerTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([row.message.content for row in history.read_after("main")],
                          ["initial", "valid transcript", "later", "done"])
 
+    async def test_external_handoff_and_internal_validation_errors_still_propagate(self):
+        scheduler = SessionSchedulers().get_or_create("main")
+        submit = Mock(side_effect=[RuntimeError("synthetic handoff failure"), None])
+        scheduler.bind(submit)
+        first = Message("user", "synthetic first")
+        second = Message("user", "synthetic second")
+        with self.assertRaises(RuntimeError):
+            scheduler.session_input((first,))
+        with self.assertRaises(ValueError):
+            scheduler.submit_internal(InternalInput(Message("assistant", "invalid input")))
+        submit.assert_called_once_with((first,))
+
+        scheduler.session_input((second,))
+        submit.assert_called_with((first, second))
+        scheduler.session_input()
+        self.assertEqual(submit.call_count, 2)
+
     async def test_statement_ioerr_preserves_entire_batch_and_fifo_on_initial_input_and_continuation(self):
         for continuation in (False, True):
             with self.subTest(continuation=continuation):

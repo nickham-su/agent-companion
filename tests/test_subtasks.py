@@ -18,6 +18,7 @@ from agent_companion.models.deepseek import DeepSeek
 from agent_companion.protocol import (DeliveryStatus, InternalInput, Message, ModelError, Receipt, TextDelta,
                                       ToolCall, ToolReady)
 from agent_companion.runtime.subtasks import DELEGATE_TOOL_NAME, RESULT_PREFIX
+from agent_companion.runtime.timers import CANCEL_TIMER_TOOL_NAME, SET_TIMER_TOOL_NAME
 from agent_companion.runtime.tools import ToolContext
 from agent_companion.session_scheduler import SessionSchedulers
 from agent_companion.storage.sqlite import History
@@ -369,7 +370,8 @@ class SubtaskTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual({row[0] for row in self.channel.replies}, {"main"})
             self.assertEqual(self.channel.replies[-1][2], "main-used-result")
             self.assertNotEqual(self.channel.replies[-1][1], self.channel.replies[0][1])
-            self.assertTrue(all(names == (DELEGATE_TOOL_NAME,) for _, names in model.requests if names))
+            main_tools = (DELEGATE_TOOL_NAME, SET_TIMER_TOOL_NAME, CANCEL_TIMER_TOOL_NAME)
+            self.assertTrue(all(names == main_tools for _, names in model.requests if names))
             self.assertEqual(sum(not names for _, names in model.requests), 1)
 
     async def test_busy_main_waits_for_delivery_before_admitting_result(self):

@@ -114,14 +114,47 @@ class AsyncToolResult:
         return Message("user", ASYNC_TOOL_RESULT_PREFIX + json.dumps(payload, ensure_ascii=False))
 
 
+TIMER_EVENT_PREFIX = "[内部定时器事件]\n"
+
+
+@dataclass(frozen=True, slots=True)
+class TimerFired:
+    timer_id: str
+    fire_count: int
+    max_fires: int
+    repeat: bool
+    message: str | None = field(default=None, repr=False)
+
+    def to_model_message(self) -> Message:
+        completed = self.fire_count == self.max_fires
+        if not self.repeat:
+            description = "单次定时器已到期并完成，不再触发。"
+        else:
+            progress = f"定时器已触发（第 {self.fire_count}/{self.max_fires} 次），"
+            description = progress + ("已达到最大次数，不再触发。" if completed else "还会继续触发。")
+        payload = {
+            "event": "timer_fired",
+            "timer_id": self.timer_id,
+            "fire_count": self.fire_count,
+            "max_fires": self.max_fires,
+            "status": "completed" if completed else "active",
+            "description": description,
+        }
+        if self.message is not None:
+            payload["message"] = self.message
+        # JSON 可包含孤立代理项；让它保持转义，避免传输或 SQLite 拒绝整条输入。
+        content = json.dumps(payload, ensure_ascii=False).encode("utf-8", "backslashreplace").decode("utf-8")
+        return Message("user", TIMER_EVENT_PREFIX + content)
+
+
 @dataclass(frozen=True, slots=True)
 class InternalInput:
     """可进入模型上下文，但不授予用户输入权限。"""
 
-    content: Message | AsyncToolResult = field(repr=False)
+    content: Message | AsyncToolResult | TimerFired = field(repr=False)
 
     def to_model_message(self) -> Message:
-        return self.content.to_model_message() if isinstance(self.content, AsyncToolResult) else self.content
+        return self.content if isinstance(self.content, Message) else self.content.to_model_message()
 
 
 # 未包装的 Message 表示真实用户输入。
@@ -136,7 +169,7 @@ def validate_input_items(items: Sequence[InputItem]) -> None:
                 raise ValueError("persisted input requires an integer batch ID")
             continue
         message = item.content if isinstance(item, InternalInput) else item
-        if isinstance(item, InternalInput) and isinstance(message, AsyncToolResult):
+        if isinstance(item, InternalInput) and isinstance(message, (AsyncToolResult, TimerFired)):
             continue
         if (not isinstance(message, Message) or message.role != "user" or message.tool_calls
                 or message.tool_call_id is not None or message.reasoning is not None
