@@ -761,8 +761,7 @@ class VoiceInputTest(unittest.IsolatedAsyncioTestCase):
             # 注入可弱引用的 PCM 来检查空闲 worker 的局部变量是否仍持有它。
             recording = ObservablePCM(_HOT)
             recording_ref = ref(recording)
-            voice._turns.put_nowait(recording)
-            voice._pending += 1
+            voice._enqueue_turn(recording)
             del recording
             await _until(lambda: received == ["转写结果"])
             self.assertIsNone(recording_ref())
@@ -953,7 +952,7 @@ class VoiceInputTest(unittest.IsolatedAsyncioTestCase):
                     await _until(started.is_set)
                     device.frame(True, 3)
                     device.frame(False, 2)
-                    await _until(lambda: voice._turns.qsize() == 1)
+                    await _until(lambda: len(voice._turns) == 1)
                     self.assertEqual(len(requests), 1)
                     in_flight = voice._asr_task
                     self.assertIsNotNone(in_flight)
@@ -962,7 +961,7 @@ class VoiceInputTest(unittest.IsolatedAsyncioTestCase):
                     await _until(lambda: device.closed and cancelled.is_set())
                     self.assertFalse(finished.is_set())
                     self.assertIs(voice._asr_task, in_flight)
-                    self.assertTrue(voice._turns.empty())
+                    self.assertFalse(voice._turns)
                     self.assertEqual((await voice.deliver(_reply("disabled", "停用。"))).status,
                                      DeliveryStatus.FAILED)
 

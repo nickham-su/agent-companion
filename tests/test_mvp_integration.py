@@ -261,10 +261,10 @@ async def _service(settings, history, model, transport, asr, *, desktop=None, tt
         assert desktop is not None, "text must not initialize the desktop"
         return desktop
 
-    def make_voice(settings, asr, tts):
+    def make_voice(settings, asr, tts, *, streaming=None):
         assert device is not None, "text must not prepare audio"
         return VoiceChannel(asr, tts, _VAD(), settings.voice, asr_timeout=settings.asr_timeout,
-                            max_audio_seconds=settings.asr.max_audio_seconds), device
+                            max_audio_seconds=settings.asr.max_audio_seconds, streaming=streaming), device
 
     with (patch("agent_companion.app.time", side_effect=lambda: transport.now),
           patch("agent_companion.feishu_private.time", side_effect=transport.clock),

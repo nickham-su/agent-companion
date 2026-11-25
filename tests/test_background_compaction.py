@@ -7,7 +7,7 @@ import sqlite3
 import tempfile
 from time import monotonic
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import httpcore
 import httpx
@@ -23,6 +23,7 @@ from agent_companion.runtime.compaction import Compactions, Prefix
 from agent_companion.runtime.context import _SUMMARIZE
 from agent_companion.runtime.engine import Runtime
 from agent_companion.runtime.tools import Tool, ToolContext, Tools
+from agent_companion.speech.asr import ASRCapabilities, FileASR
 from agent_companion.storage.sqlite import History, ReplyOutcome, Summary
 from test_history_context import Sink, SPEC
 
@@ -308,7 +309,7 @@ class BackgroundCompactionTest(unittest.IsolatedAsyncioTestCase):
         with closing(History(":memory:")) as history:
             with patch("agent_companion.app.run_private_chats", side_effect=run_groups):
                 async with prepare_private_feishu(settings, history, discovery=Discovery(), roles=demo_roles()) as (_, run_private):
-                    await run_private(model, object(), None)
+                    await run_private(model, ASRCapabilities(file=Mock(spec=FileASR)), None)
             self.assertTrue(model.cancelled.is_set())
             self.assertIsNone(history.summary("main-b"))
 

@@ -11,11 +11,14 @@ from urllib.parse import urlsplit
 
 import httpx
 
+from .speech.bailian_ws import ASR_MODEL as BAILIAN_ASR_MODEL, TTS_MODELS as BAILIAN_TTS_MODELS, BailianConnection
 from .speech.vad import silence_frames
 
 
 OPENAI_BASE_URL = "https://api.openai.com/v1"
 MINIMAX_ASR_MODEL = "asr-1.0"
+BAILIAN_TTS_MODEL = "qwen-audio-3.1-tts-flash"
+BAILIAN_TTS_VOICE = "longanhuan_v3.1"
 DEFAULT_ASR_TIMEOUT = 30
 DEFAULT_MODEL_TIMEOUT = 60
 DEFAULT_TTS_TIMEOUT = 25
@@ -144,6 +147,9 @@ class MiniMaxConnection:
             raise ConfigError("MiniMax Provider 的 region 必须是 cn 或 global")
 
 
+SpeechConnection = MiniMaxConnection | BailianConnection
+
+
 def require_asr_audio_seconds(value: float) -> None:
     # 整数不必转成 float：很大的有限整数同样是合法配置。
     if not ((type(value) is int and value > 0) or (type(value) is float and 0 < value < math.inf)):
@@ -152,7 +158,7 @@ def require_asr_audio_seconds(value: float) -> None:
 
 @dataclass(frozen=True, slots=True)
 class ASRSettings:
-    connection: MiniMaxConnection
+    connection: SpeechConnection
     max_audio_seconds: float
     model: str = MINIMAX_ASR_MODEL
 
@@ -160,11 +166,13 @@ class ASRSettings:
         require_asr_audio_seconds(self.max_audio_seconds)
         if not isinstance(self.model, str) or not self.model.strip():
             raise ConfigError("asr.model 必须是非空字符串")
+        if isinstance(self.connection, BailianConnection) and self.model != BAILIAN_ASR_MODEL:
+            raise ConfigError("百炼 asr.model 尚未适配文件及实时转写，请参考 config.example.toml")
 
 
 @dataclass(frozen=True, slots=True)
 class TTSSettings:
-    connection: MiniMaxConnection
+    connection: SpeechConnection
     model: str = "speech-2.8-turbo"
     voice_id: str = "male-qn-qingse"
 
@@ -174,6 +182,13 @@ class TTSSettings:
         if not (isinstance(self.voice_id, str) and 0 < len(self.voice_id) <= 128
                 and self.voice_id.strip() == self.voice_id and self.voice_id.isprintable()):
             raise ConfigError("tts.voice_id 格式无效")
+        if isinstance(self.connection, BailianConnection):
+            if self.model not in BAILIAN_TTS_MODELS:
+                raise ConfigError("百炼 tts.model 尚未适配流式合成，请参考 config.example.toml")
+            # 两个已知的示例音色不能混用；其他音色是否有权限、是否匹配由百炼校验。
+            example_model = {BAILIAN_TTS_VOICE: BAILIAN_TTS_MODEL, "longanyang": "cosyvoice-v3-flash"}.get(self.voice_id)
+            if example_model is not None and self.model != example_model:
+                raise ConfigError("百炼 tts.voice_id 与 tts.model 不匹配")
 
 
 @dataclass(frozen=True, slots=True)
@@ -242,6 +257,10 @@ class Settings:
             raise ConfigError("log_level 必须是 DEBUG、INFO、WARNING、ERROR 或 CRITICAL")
         _config_seconds(self.asr_timeout, "timeouts.asr")
         _config_seconds(self.tts_timeout, "timeouts.tts")
+        # 32000 Hz 是本机支持但两种已适配百炼语音模型都不支持的采样率。
+        if (self.tts is not None and isinstance(self.tts.connection, BailianConnection)
+                and self.voice.output_sample_rate == 32_000):
+            raise ConfigError("百炼 TTS 的 voice.output_sample_rate 须为 16000、24000 或 44100")
 
 
 def _table(data: Any, keys: set[str], name: str) -> dict[str, Any]:
@@ -269,7 +288,10 @@ def _selected_provider(data: dict[str, Any], providers: dict[str, Any], ability:
         raise ConfigError(f"必须显式设置 {selector}，请参考 config.example.toml")
     if name not in providers:
         raise ConfigError(f"{selector} 引用的 Provider 不存在")
-    provider = _table(providers[name], {"adapter", "api_key", "base_url", "region", "llm", "asr", "tts"}, selector)
+    provider = _table(providers[name], {"adapter", "api_key", "base_url", "region", "workspace_id",
+                                        "llm", "asr", "tts"}, selector)
+    if "workspace_id" in provider and provider.get("adapter") != "bailian":
+        raise ConfigError("workspace_id 仅适用于百炼 Provider")
     if provider.get("adapter") not in adapters:
         raise ConfigError(f"{selector} 需要显式设置支持 {ability} 的 adapter（{' 或 '.join(adapters)}）")
     options = provider.get(ability)
@@ -289,10 +311,17 @@ def _api_key(provider: dict[str, Any], selector: str) -> str:
     return key
 
 
-def _minimax_connection(provider: dict[str, Any], selector: str) -> MiniMaxConnection:
+def _speech_connection(provider: dict[str, Any], selector: str) -> SpeechConnection:
     if "base_url" in provider:
-        raise ConfigError("base_url 仅适用于 openai_responses；MiniMax 请设置 region")
-    return MiniMaxConnection(api_key=_api_key(provider, selector), region=provider.get("region", "cn"))
+        raise ConfigError("base_url 仅适用于 openai_responses；语音 Provider 请设置 region")
+    key = _api_key(provider, selector)
+    if provider["adapter"] == "minimax":
+        return MiniMaxConnection(api_key=key, region=provider.get("region", "cn"))
+    try:
+        return BailianConnection(api_key=key, workspace_id=provider.get("workspace_id"),
+                                 region=provider.get("region", "cn-beijing"))
+    except ValueError:
+        raise ConfigError("百炼 Provider 须设置有效的 workspace_id，region 为 cn-beijing 或 ap-southeast-1") from None
 
 
 def _load_providers(data: dict[str, Any], *, voice: bool) -> tuple[LLMSettings, ASRSettings, TTSSettings | None]:
@@ -301,19 +330,29 @@ def _load_providers(data: dict[str, Any], *, voice: bool) -> tuple[LLMSettings, 
         raise ConfigError("providers 必须是命名 Provider 配置表")
     _, provider, llm_data = _selected_provider(data, providers, "llm", ("deepseek", "openai_responses"))
     if "region" in provider:
-        raise ConfigError("region 仅适用于 MiniMax Provider")
+        raise ConfigError("region 仅适用于语音 Provider")
     llm_options = _section(llm_data, LLMSettings, "llm", exclude=("adapter", "base_url", "api_key"))
     llm = LLMSettings(adapter=provider["adapter"], base_url=provider.get("base_url"),
                       api_key=_api_key(provider, "llm_provider"), **llm_options)
 
-    asr_name, provider, asr_data = _selected_provider(data, providers, "asr", ("minimax",))
-    connection = _minimax_connection(provider, "asr_provider")
-    asr = ASRSettings(connection, **_section(asr_data, ASRSettings, "asr", exclude=("connection",)))
+    asr_name, provider, asr_data = _selected_provider(data, providers, "asr", ("minimax", "bailian"))
+    connection = _speech_connection(provider, "asr_provider")
+    asr_options = _section(asr_data, ASRSettings, "asr", exclude=("connection",)).copy()
+    if isinstance(connection, BailianConnection):
+        asr_options.setdefault("model", BAILIAN_ASR_MODEL)
+    asr = ASRSettings(connection, **asr_options)
     tts = None
     if voice:
-        tts_name, provider, tts_data = _selected_provider(data, providers, "tts", ("minimax",))
-        tts_connection = connection if tts_name == asr_name else _minimax_connection(provider, "tts_provider")
-        tts = TTSSettings(tts_connection, **_section(tts_data, TTSSettings, "tts", exclude=("connection",)))
+        tts_name, provider, tts_data = _selected_provider(data, providers, "tts", ("minimax", "bailian"))
+        tts_connection = connection if tts_name == asr_name else _speech_connection(provider, "tts_provider")
+        tts_options = _section(tts_data, TTSSettings, "tts", exclude=("connection",)).copy()
+        if isinstance(tts_connection, BailianConnection):
+            tts_model = tts_options.setdefault("model", BAILIAN_TTS_MODEL)
+            if tts_model == BAILIAN_TTS_MODEL:
+                tts_options.setdefault("voice_id", BAILIAN_TTS_VOICE)
+            elif "voice_id" not in tts_options:
+                raise ConfigError("切换百炼 tts.model 时必须同时设置匹配的 tts.voice_id")
+        tts = TTSSettings(tts_connection, **tts_options)
     return llm, asr, tts
 
 

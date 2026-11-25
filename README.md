@@ -14,7 +14,7 @@
 | `storage/sqlite.py`、`models/` | SQLite 历史存储、DeepSeek 和 OpenAI Responses LLM 适配 | 离线模拟通过，真实调用待验 |
 | `runtime/subtasks.py` | 异步委派与结果回投 | 已实现 |
 | `channels/feishu/` | CLI、轮询、消息解析与通道路由 | 两种模式保留飞书输入，待实机验收 |
-| `speech/` | 与 IM 无关的文件 ASR、VAD、TTS 和实时语音调度 | 离线模拟通过，待实机验收 |
+| `speech/` | 与 IM 无关的文件/流式 ASR、VAD、TTS 和实时语音调度 | 离线模拟通过，待实机验收 |
 | `channels/audio/` | macOS CoreAudio 双路音频设备 | 离线替身验证，待实机验收 |
 
 模型与通道实现由启动入口按 `protocol.py` 中的契约注入；Runtime 不导入具体模型、飞书或语音实现。SQLite 存储使用共同消息类型，不反向依赖 Runtime。
@@ -51,13 +51,18 @@ Bash 排查时看 `bash call finished`：记录结果类别、退出码和耗时
 
 旧的 `[llm]`、`[deepseek]`、`[minimax]` 及旧语音模型字段不再兼容，请按 [config.example.toml](config.example.toml) 迁移。`adapter` 必须显式指定，`.llm.reasoning_effort` 必填。
 
-请求时限统一配置在 `[timeouts]`，单位秒：`llm` 是单次模型请求总时限（默认 60），`asr` 是单次转写总时限（默认 30），`tts` 是单次网络读写及等待响应的时限（默认 25，仅 `voice` 启用）。切换 Provider 不改变这些值。旧的 `runtime.model_timeout` 和 Provider 能力表里的 `timeout` 不再兼容；语音投递与飞书 CLI 的时限独立配置。升级时删除 `[runtime]` 中旧的 `delivery_timeout`。
+请求时限统一配置在 `[timeouts]`，单位秒：`llm` 是单次模型请求总时限（默认 60），`asr` 是单次文件转写总时限（默认 30，包含请求握手、文件上传和等待结果）；实时流式转写的启动、停口后的等待分别使用该时限，录音时长不计入其中，`tts` 是单次网络读写及等待响应的时限（默认 25，仅 `voice` 启用）。切换 Provider 不改变这些值。旧的 `runtime.model_timeout` 和 Provider 能力表里的 `timeout` 不再兼容；语音投递与飞书 CLI 的时限独立配置。升级时删除 `[runtime]` 中旧的 `delivery_timeout`。
 
 | `adapter` | 配置 |
 | --- | --- |
 | `deepseek` | `.llm.model` 可省略，默认 `deepseek-flash`。`reasoning_effort = "disabled"` 显式关闭思考；其他值由所选模型解释。历史切到思考开启时，如有不兼容旧记录，用摘要承接，原文仍可查。 |
 | `openai_responses` | `.llm.model` 必填。可选 Provider 层 `base_url`，默认 `https://api.openai.com/v1`，请求时在其后追加 `/responses`。`reasoning_effort` 原样传给 Responses，例如 `low`，或选用明确支持 `none` 的模型来关闭推理。 |
 | `minimax` | Provider 层 `region` 选 `cn`（默认）或 `global`。`.asr.model` 默认 `asr-1.0`，也可填写其他兼容同一文件转写接口的模型名；`.asr.max_audio_seconds` 必填，无默认值。`.tts` 配置模型和音色。ASR、TTS 可以共用一套 Provider，也可以分别使用不同区域和 Key。 |
+| `bailian` | Provider 层填 `workspace_id` 及同地域的 Key，`region` 为 `cn-beijing`（默认）或 `ap-southeast-1`，连接百炼业务空间域名。ASR 支持 `qwen-audio-3.1-asr-flash-message`（文件和流式），`.asr.max_audio_seconds` 必填。TTS 默认 `qwen-audio-3.1-tts-flash` / `longanhuan_v3.1`；也支持 `cosyvoice-v3-flash`，须同时配置与模型和地域匹配的 `voice_id`，如 `longanyang`。 |
+
+默认示例继续使用 MiniMax。`asr_provider` 在语音条和实时通话间共用；`tts_provider` 可独立选择，例如 ASR 用百炼、播报仍用 MiniMax。程序启动时按配置构造适配器，飞书语音条只使用文件能力，实时通话优先使用流式能力，不支持时才选择同一适配器的文件能力。失败时任何路径都不自动切换供应商；百炼流式 ASR 失败不会降级为文件转写或重发，MiniMax 提前分段失败仍按下文的规则补交。
+
+百炼示例的 `max_audio_seconds = 120` 是应用侧通话录音和 WAV 文件的时长上限，不是文件转写保证。120 秒的 16 kHz 单声道 16-bit PCM WAV 按当前 128 kB/s 的发送策略，仅上传就约需 30 秒；默认 `timeouts.asr = 30` 不保证文件能转写到此上限。实时通话边录边发，停口后仍使用默认 30 秒的等待时限。
 
 升级旧配置时，删除 `[voice]` 的 `max_turn_seconds`，在 `asr_provider` 选中的 `[providers.<名称>.asr]` 中明确设置 `max_audio_seconds`（有限正数，单位为秒）。正式的 `text` 和 `voice` 模式都要填写；示例中的 `500` 是 `asr-1.0` 的参考值，使用其他模型时请按其接口限制填写。
 
@@ -86,7 +91,7 @@ python scripts/build_source_zip.py
 
 1. 用专用飞书账号在本机完成 CLI **用户身份**登录。需要支持 [`im +chat-list --types p2p`](https://github.com/larksuite/cli/blob/main/skills/lark-im/references/lark-im-chat-list.md) 的 CLI 版本和 `im:chat:read` 权限，并确认已授权查询当前登录用户信息（`GET /open-apis/authen/v1/user_info`）、[读取私聊历史](https://open.feishu.cn/document/server-docs/im-v1/message/list)、下载媒体和发送消息。程序不会发起登录或直接读取凭据文件。运行中不要切换 CLI 登录账号或应用配置。
 2. 复制 `config.example.toml` 为 `config.local.toml`，启用 `[feishu]`，使用默认的 `mode = "text"`。如果旧配置有 `own_open_id`，请删除这一行。`database` 可指向尚不存在的新文件，首次启动会创建它并绑定当前 CLI 登录账号，请先确认登录的是专用账号。文字模式不加载音频设备或 TTS，也不监听来电、不查询会议；`cli_timeout` 限制单次飞书 CLI 调用（默认 20 秒）。
-3. 按[选择 Provider](#选择-provider)填好所选 LLM 和 MiniMax ASR 的 `api_key`；只在本机私有配置填写真实 Key，不要分享或提交该文件。MiniMax 区域按账号选择 `cn`（[国内 API](https://platform.minimax.cn/docs/api-reference/speech-to-text)）或 `global`（[国际 API](https://platform.minimax.io/docs/api-reference/speech-to-text)）。工作目录需要允许建立用于资源下载的短期目录。
+3. 按[选择 Provider](#选择-provider)填好所选 LLM 和 ASR 的 `api_key`；只在本机私有配置填写真实 Key，不要分享或提交该文件。MiniMax 区域按账号选择 `cn`（[国内 API](https://platform.minimax.cn/docs/api-reference/speech-to-text)）或 `global`（[国际 API](https://platform.minimax.io/docs/api-reference/speech-to-text)）。百炼另需配置同地域的 `workspace_id`。工作目录需要允许建立用于资源下载的短期目录。
 4. 在启动工作目录下复制 `agents/main.example.md` 为 `agents/main.md`，并按 [Agent 角色配置](#agent-角色配置)编辑。需要委派时，再从 `agents/sub.example.md` 创建实际子角色。
 
 ```sh
@@ -105,7 +110,7 @@ python scripts/build_source_zip.py
 
 每个新窗口默认每页 50 条。列表 CLI 标准输出超过 4 MiB 时，将页大小减半（最低 1 条），丢弃该窗口未提交的消息及游标，下次轮询从同一时间窗口的第一页重读。每页仅 1 条仍超限时报告 `cli_single_result_output_limit`，不提交部分结果、不推进水位，也不跳过消息。
 
-图片按文件头识别（JPEG、PNG、GIF、WebP；单张本机上限 8 MiB）；语音条下载后验证容器和 50 MB 文件上限，提交一次完整文件，不做截断。WAV 超过 `max_audio_seconds` 时在本机拒绝；非 WAV 时长仍由服务端检查。飞书入口按原处理顺序执行现有单图和同批媒体限额，受限图片用文字占位，不挤掉同批可用文本；不会为了找更新的图片突破下载限额。macOS/Linux 的 CLI 下载子进程在写文件前已设置相应文件大小硬上限。富文本链接保留为普通文字，不发起下载。语音条失败或超时不重试，原对话尝试发送一次「语音接收失败，请重新发送。」，通知不走模型、不阻塞同批成功输入，崩溃后不补发。
+图片按文件头识别（JPEG、PNG、GIF、WebP；单张本机上限 8 MiB）；语音条下载后验证容器和 50 MB 文件上限，提交一次完整文件，不做截断。WAV 超过 `max_audio_seconds` 时在本机拒绝；非 WAV 时长仍由服务端检查。百炼文件 ASR 暂使用实时 WebSocket 分块上传，目前接受 16 kHz 单声道 16-bit PCM WAV 和单声道 Ogg/Opus；离线测试只覆盖协议与文件样本，真实飞书语音条格式兼容性、当前 128 kB/s 发包速度及实际延迟仍待实测。飞书入口按原处理顺序执行现有单图和同批媒体限额，受限图片用文字占位，不挤掉同批可用文本；不会为了找更新的图片突破下载限额。macOS/Linux 的 CLI 下载子进程在写文件前已设置相应文件大小硬上限。富文本链接保留为普通文字，不发起下载。语音条失败或超时不重试，原对话尝试发送一次「语音接收失败，请重新发送。」，通知不走模型、不阻塞同批成功输入，崩溃后不补发。
 
 飞书语音条和实时通话的有效转写会另发到原私聊，仅将原文加粗。用户可以用普通文字或语音补充纠正；模型不等待回显或确认，既有回复和 `voice_text_copy` 不变。回显不额外写入会话历史，使用独立的有界后台队列，与回复的先后顺序不保证；超限、发送失败或关闭时不重试，重启不补发。
 
@@ -127,16 +132,18 @@ python scripts/build_source_zip.py
    ```
 
 3. 从 [Silero VAD 官方源码](https://github.com/snakers4/silero-vad/blob/master/src/silero_vad/data/silero_vad.onnx)单独取得 `silero_vad.onnx`（使用带 `input/state/sr` 接口的 v6 系列模型，不选只支持其他输入形状的变体），放在本机配置指定路径。程序只加载已有文件，不下载模型，不需要 PyTorch；相对路径以 TOML 文件所在目录为准。音频和 ONNX 依赖不在 `text` 或模拟模式下加载。
-4. 沿用[文字模式](#本机启动飞书文字模式)的 CLI 登录和私聊权限，另给同一 CLI 用户授权 `vc:meeting.meetingevent:read`（获取会议信息）；飞书桌面客户端与 CLI 必须登录同一用户，运行中不要切换。检查 `tts_provider` 选中的 MiniMax 配置含 `.tts` 配置表和 `api_key`，并按示例填写 `[voice]` 的设备与 VAD 模型路径。
+4. 沿用[文字模式](#本机启动飞书文字模式)的 CLI 登录和私聊权限，另给同一 CLI 用户授权 `vc:meeting.meetingevent:read`（获取会议信息）；飞书桌面客户端与 CLI 必须登录同一用户，运行中不要切换。检查 `tts_provider` 选中的 Provider 含 `.tts` 配置表和 `api_key`，并按示例填写 `[voice]` 的设备与 VAD 模型路径。
 5. 在目标 Mac 的图形桌面中设置 `[feishu].mode = "voice"`，以同一 `--run --config config.local.toml` 命令启动。可沿用同一账号的库，也可以直接用新库，不需要先运行 `text`。为运行程序的终端或应用授予发送鼠标事件和收音的权限；如系统不提供通话窗口标题，也需授予屏幕录制权限并重启应用。自动接听会移动鼠标，测试时不要同时参加其他通话。
 
-程序为本次来电准备设备时检查两路是否支持所需流格式。输入为 16 kHz 单声道有符号 16-bit PCM（512 样本一帧），直接供 Silero 和 WAV 文件转写使用。输出为 MiniMax 相同采样率的单声道 16-bit PCM，默认 44.1 kHz，可配 16/24/32/44.1 kHz。CoreAudio 在需要且支持时转换设备格式，程序不更改设备全局采样率、不再做第二次重采样。若报 `voice_input_pcm_16khz_mono_not_supported` 或 `voice_output_pcm_rate_or_channels_not_supported`，在「音频 MIDI 设置」和 `sounddevice` 列表核对两条线路；输出可选一个双方支持的采样率，输入需选择能提供 16 kHz 单声道流的设备或系统转换。若通话对端无声，核对虚拟设备首个单声道的路由、飞书麦克风/扬声器选项和设备权限。
+程序为本次来电准备设备时检查两路是否支持所需流格式。输入为 16 kHz 单声道有符号 16-bit PCM（512 样本一帧），直接供 Silero 及流式/文件转写使用。输出为与 TTS 相同采样率的单声道 16-bit PCM，默认 44.1 kHz；MiniMax 可用 16/24/32/44.1 kHz，百炼可用 16/24/44.1 kHz。CoreAudio 在需要且支持时转换设备格式，程序不更改设备全局采样率、不再做第二次重采样。若报 `voice_input_pcm_16khz_mono_not_supported` 或 `voice_output_pcm_rate_or_channels_not_supported`，在「音频 MIDI 设置」和 `sounddevice` 列表核对两条线路；输出可选一个双方支持的采样率，输入需选择能提供 16 kHz 单声道流的设备或系统转换。若通话对端无声，核对虚拟设备首个单声道的路由、飞书麦克风/扬声器选项和设备权限。
 
 输出采样率由 `[voice]` 中的 `output_sample_rate` 设置，单位为 Hz。升级旧配置时，把 `playback_rate` 改为 `output_sample_rate`，数值不变。
 
-VAD 默认连续 3 个 32 ms 人声窗口触发打断，默认静默 1 秒结束话轮。实时录音按实际样本数计时（含预录和已录停顿），以 `max_audio_seconds` 和含 WAV 文件头的 50 MB 字节保护中先到的上限为准。达到上限时立即将保留的前段送入转写队列，不等用户停下。后续声音不再录音，只用于检测静默；达到 `silence_seconds` 前仍算「输入中」，不放行暂存输入，也不开始播报。ASR 仍串行处理，队列满时仍丢弃新录音；空转写、识别失败或超时不会提交转写文本，也不发送飞书语音条式失败通知。话轮和转写均已结束时，即使没有有效文本也会放行暂存输入。
+VAD 默认连续 3 个 32 ms 人声窗口触发打断，默认静默 1 秒结束话轮。实时录音按实际样本数计时（含预录和已录停顿），以 `max_audio_seconds` 和含 WAV 文件头的 50 MB 字节保护中先到的上限为准。达到上限后，后续声音不再录音，只用于检测静默；达到 `silence_seconds` 前仍算「输入中」，不放行暂存输入，也不开始播报。ASR 仍串行处理，队列满时仍丢弃新录音；空转写、识别失败或超时不会提交转写文本，也不发送飞书语音条式失败通知。话轮和转写均已结束时，即使没有有效文本也会放行暂存输入。
 
-**可选：实时语音提前分段转写。** 在 `[voice]` 中设置 `segment_pause_seconds = 0.4`，`silence_seconds` 可继续用 `1`。两个阈值均向上取整为 32 毫秒帧，短停顿必须比话轮结束早至少一帧。不填写 `segment_pause_seconds` 就走上面的整段逻辑；需要回退时，注释掉该配置并重启。飞书语音条的转写不受影响。
+**通话流式 ASR（百炼）。** 确认开口后先发送开头缓存，再边采集边发送 PCM；本地确认停口才结束音频输入，整轮最终文本只交付一次。达到录音上限先冻结录音，等可信长静默才交付。ASR 串行，最多两个在途或排队话轮；单轮待发 PCM 上限为 2 秒，排队或网络慢导致缓冲满时丢弃整轮。采集缺帧、挂断、超时或服务端失败不交付残缺或迟到文本，也不改走文件转写。
+
+**通话文件 ASR（MiniMax）：可选提前分段。** 在 `[voice]` 中设置 `segment_pause_seconds = 0.4`，`silence_seconds` 可继续用 `1`。两个阈值均向上取整为 32 毫秒帧，短停顿必须比话轮结束早至少一帧。不填写 `segment_pause_seconds` 就整轮录完再转写（封顶时立即提交、仍等本地停口才交付）；需要回退时，注释掉该配置并重启。流式 ASR 不做文件分段，飞书语音条的转写也不受此开关影响。
 
 - 已录到当前未转写段满 10 秒，且遇到短停顿时，如果 ASR 空闲，就提前转写这一段。没有停顿不强切；忙时续录，同一次停顿只尝试一次。切段不重置静默计时或本轮累计录音长度。
 - 提前转写成功的音频不重传；失败则保留音频，下次短停顿（无需再满 10 秒）或最终停口时与后续未识别音频一起补交。ASR 仍串行；停口时如前段仍在途，等其结果再决定尾段要发哪些音频。没有新语音且前段成功时，不单独提交静音尾段。
@@ -145,11 +152,11 @@ VAD 默认连续 3 个 32 ms 人声窗口触发打断，默认静默 1 秒结束
 
 若 `max_audio_seconds` 短到放不下一个 16 kHz 采样点，本次无法准备实时语音，并报告 `voice_asr_max_audio_seconds_below_one_sample`。
 
-启用分段时，在 `DEBUG` 日志里按相同的 `turn` 查找 `voice turn endpoint detected`（确认停口）和 `voice turn transcript ready`（完整转写就绪）。两行的 `at_mono_ms` 是本进程的单调时钟毫秒值，不是日期时间；第二行的 `endpoint_to_transcript_ms` 直接给出时间差，不包含确认停口前的静默和已经完成的提前转写。中间片段不单独记录成功日志，出错时会保留警告；不记录转写正文。
+使用流式 ASR 或启用文件分段时，在 `DEBUG` 日志里按相同的 `turn` 查找 `voice turn endpoint detected`（确认停口）和 `voice turn transcript ready`（完整转写就绪）。两行的 `at_mono_ms` 是本进程的单调时钟毫秒值，不是日期时间；第二行的 `endpoint_to_transcript_ms` 直接给出时间差，不包含确认停口前的静默和已经完成的提前转写。中间片段不单独记录成功日志，出错时会保留警告；不记录转写正文。
 
 语音回复按中英文句号、问号、感叹号或换行切段，逗号和分号不切。每条回复首句不设最短长度；后续累计至少 30 个非空白、非标点字符才在句尾切段。单段达到 200 字符（含空白和标点）时强制切段；首段强切后也按后续规则处理。回复结束时发送剩余正文。空白或纯标点不单独请求合成，也不占用首句。
 
-MiniMax TTS 用 [`/v1/t2a_v2` HTTP SSE](https://platform.minimax.cn/docs/api-reference/speech-t2a-http)逐段发送，首块到达即可播放；每段流结束且待播放低于 `prefetch_seconds` 时才提交下一段。从语音通道开始处理起，`voice.delivery_timeout`（默认 600 秒）是不可续期的总上限。模型输出结束后，Runtime 启动 `voice.idle_timeout`（默认 30 秒）；只有设备实际取走本条回复的 PCM 才续期，补静音或只在合成不算。任一时限到期，投递记为 `UNKNOWN`，历史只保留已确认的连续完整段落，不估算半句。空闲超时由 Runtime 取消投递任务，不等清理或迟到回执。已确认的正文仍进入后续会话历史，不代表对端一定听到了。
+MiniMax TTS 用 [`/v1/t2a_v2` HTTP SSE](https://platform.minimax.cn/docs/api-reference/speech-t2a-http)，百炼用 [WebSocket](https://help.aliyun.com/zh/model-studio/qwen-audio-tts-websocket-api)。两者都逐段发送，首块到达即可播放；每段流结束且待播放低于 `prefetch_seconds` 时才提交下一段。从语音通道开始处理起，`voice.delivery_timeout`（默认 600 秒）是不可续期的总上限。模型输出结束后，Runtime 启动 `voice.idle_timeout`（默认 30 秒）；只有设备实际取走本条回复的 PCM 才续期，补静音或只在合成不算。任一时限到期，投递记为 `UNKNOWN`，历史只保留已确认的连续完整段落，不估算半句。空闲超时由 Runtime 取消投递任务，不等清理或迟到回执。已确认的正文仍进入后续会话历史，不代表对端一定听到了。
 
 排查首声延迟时，开启 `log_level = "DEBUG"`，按相同的 `reply` 查找 `voice first audio latency`。语音投递结束时会汇总四项毫秒值：模型首字到提交首段 TTS（`first_text_to_tts_ms`）、提交到收到首块有效音频（`tts_to_first_pcm_ms`）、首块音频到首次填进本机设备回调（`first_pcm_to_output_ms`）、模型首字到本机输出（`first_text_to_output_ms`）。未到达的阶段记为 `-`。这里不测音频开头可能自带的静音、飞书传输或对端播放，不能视为用户听到声音的时间。
 

@@ -13,12 +13,13 @@ import wave
 
 from ..config import VoiceSettings, require_asr_audio_seconds
 from ..protocol import DeliveryStatus, Receipt, ReplyStream
-from .asr import MAX_AUDIO_BYTES, AudioFile, FileASR
+from .asr import MAX_AUDIO_BYTES, AudioFile, FileASR, StreamingASR
 from .audio import AudioDevice, AudioFormat
 from .playback import VoiceOutput
 from .tts import StreamingTTS
 from .vad import INPUT_BYTES, INPUT_RATE, SAMPLE_BYTES, VoiceDetector, VoiceSetupError, silence_frames
 from .voice_segments import SegmentJob, SegmentedTurn
+from .voice_stream import StreamingTurn
 
 _LOG = logging.getLogger(__name__)
 _WAV_HEADER_BYTES = 44  # wave 为本通道的单声道 16-bit PCM 写出的固定头长
@@ -114,7 +115,7 @@ class VoiceChannel:
     """只对当前语音生命周期投递；不因为打断取消主 Runtime。"""
 
     def __init__(self, asr: FileASR, tts: StreamingTTS, vad: VoiceDetector, settings: VoiceSettings, *,
-                 asr_timeout: float, max_audio_seconds: float) -> None:
+                 asr_timeout: float, max_audio_seconds: float, streaming: StreamingASR | None = None) -> None:
         require_asr_audio_seconds(max_audio_seconds)
         file_samples = (MAX_AUDIO_BYTES - _WAV_HEADER_BYTES) // SAMPLE_BYTES
         if max_audio_seconds >= file_samples / INPUT_RATE:
@@ -127,12 +128,14 @@ class VoiceChannel:
         if max_samples < 1:
             raise VoiceSetupError("voice_asr_max_audio_seconds_below_one_sample")
         self._max_recording_bytes = max_samples * SAMPLE_BYTES
-        self._asr, self._vad = asr, vad
+        self._asr, self._streaming, self._vad = asr, streaming, vad
         self._settings = settings
         self._asr_timeout = asr_timeout
         self._output = VoiceOutput(tts, settings)
         self._capture = _CaptureQueue()
-        self._turns: asyncio.Queue[bytes | SegmentJob] = asyncio.Queue(maxsize=_MAX_ASR_TURNS)
+        # 事件循环内的 FIFO，可摘除未被 worker 取得的流式话轮。
+        self._turns: deque[bytes | SegmentJob | StreamingTurn] = deque()
+        self._turns_ready = asyncio.Event()
         self._pending = 0
         self._asr_request: _AsrRequest | None = None
         self._asr_worker: asyncio.Task[None] | None = None
@@ -144,12 +147,15 @@ class VoiceChannel:
         self._obsolete_until = -float("inf")
         self._record: bytearray | None = None
         self._segment_turn: SegmentedTurn | None = None
+        self._stream_turn: StreamingTurn | None = None
+        self._stream_in_flight: StreamingTurn | None = None
         self._hot_frames = self._quiet_frames = 0
         self._discard_gap = False
         self._preroll: deque[bytes] = deque(maxlen=settings.speech_frames + 3)
         pause = settings.segment_pause_seconds
         self._end_frames = silence_frames(settings.silence_seconds, strict=pause is not None)
-        self._segment_frames = None if pause is None else silence_frames(pause, strict=True)
+        self._segment_frames = (silence_frames(pause, strict=True)
+                                if pause is not None and streaming is None else None)
         self._last_sequence = 0
         self._opened = self._closed = False
         self._failed = self._io_stopped = False
@@ -200,7 +206,7 @@ class VoiceChannel:
         self._speaking = True
         self._quiet_frames = 0
         self._obsolete_until = asyncio.get_running_loop().time()
-        if self._segment_frames is None:
+        if self._streaming is None and self._segment_frames is None:
             _LOG.debug("voice turn started")
         self._output.interrupt()
         if self._on_input is not None:
@@ -213,7 +219,13 @@ class VoiceChannel:
             # 上限太短时先放入已确认的人声，不让开口前的静默占满。
             first_speech = len(preroll) - speech_bytes
             lead_in = min(first_speech, max(0, self._max_recording_bytes - speech_bytes))
-            if self._segment_frames is None:
+            if self._streaming is not None:
+                if self._pending < _MAX_ASR_TURNS:
+                    turn = self._stream_turn = StreamingTurn(monotonic())
+                    self._enqueue_turn(turn)
+                else:
+                    _LOG.warning("voice turn dropped (asr backlog)")
+            elif self._segment_frames is None:
                 self._record = bytearray()
             else:
                 self._segment_turn = SegmentedTurn()
@@ -221,6 +233,16 @@ class VoiceChannel:
         self._preroll.clear()
 
     def _record_audio(self, pcm: bytes, *, hot: bool) -> None:
+        if self._streaming is not None:
+            live = self._stream_turn
+            if live is not None and not live.aborted.done():
+                remaining = self._max_recording_bytes - live.recorded_bytes
+                if not live.offer(pcm[:remaining]):
+                    _LOG.warning("voice turn dropped (streaming ASR buffer full); turn=%s", live.id)
+                    self._abort_stream_turn()
+                elif live.recorded_bytes == self._max_recording_bytes:
+                    self._finish_turn(ignore_tail=True)
+            return
         turn = self._segment_turn
         if turn is not None:
             if turn.record(pcm, hot=hot, limit=self._max_recording_bytes):
@@ -233,10 +255,15 @@ class VoiceChannel:
         if len(self._record) == self._max_recording_bytes:
             self._finish_turn(ignore_tail=True)
 
+    def _enqueue_turn(self, turn: bytes | SegmentJob | StreamingTurn) -> None:
+        assert self._pending < _MAX_ASR_TURNS
+        self._pending += 1
+        self._turns.append(turn)
+        self._turns_ready.set()
+
     def _queue_segment(self, turn: SegmentedTurn, *, early_bytes: int = 0) -> None:
         turn.queued = True
-        self._pending += 1
-        self._turns.put_nowait(SegmentJob(turn, early_bytes))
+        self._enqueue_turn(SegmentJob(turn, early_bytes))
 
     def _offer_segment(self) -> None:
         turn = self._segment_turn
@@ -245,6 +272,23 @@ class VoiceChannel:
             return  # 提交是可选的；忙时保留录音，不能占用另一轮的最终提交位置。
         if turn.retry or len(turn.pcm) >= _MIN_SEGMENT_BYTES:
             self._queue_segment(turn, early_bytes=len(turn.pcm))
+
+    def _abort_stream_turn(self) -> None:
+        live, self._stream_turn = self._stream_turn, None
+        if live is not None:
+            live.abort()
+            if live in self._turns:
+                # worker 取得话轮后只由其 finally 释放；旧请求清理由 _asr_request 跟踪。
+                self._turns.remove(live)
+                self._pending -= 1
+
+    def _close_stream_turn(self) -> None:
+        live, self._stream_turn = self._stream_turn, None
+        if live is not None and not live.aborted.done():
+            endpoint = monotonic()
+            live.finish(endpoint)
+            _LOG.debug("voice turn endpoint detected; turn=%s at_mono_ms=%.0f", live.id, endpoint * 1000)
+        self._report_input()
 
     def _close_segment_turn(self) -> None:
         turn, self._segment_turn = self._segment_turn, None
@@ -284,6 +328,10 @@ class VoiceChannel:
         self._hot_frames = 0
         if not ignore_tail:
             self._quiet_frames = 0
+        if self._streaming is not None:
+            if not ignore_tail:
+                self._close_stream_turn()
+            return
         if self._segment_frames is not None:
             if not ignore_tail:
                 self._close_segment_turn()
@@ -293,8 +341,7 @@ class VoiceChannel:
             pcm = bytes(recording)
             if ignore_tail:
                 self._tail_recording = pcm
-            self._pending += 1
-            self._turns.put_nowait(pcm)
+            self._enqueue_turn(pcm)
             _LOG.debug("voice turn queued for transcription; pcm_bytes=%d duration_limited=%s pending=%d",
                        len(recording), ignore_tail, self._pending)
         elif recording:
@@ -316,12 +363,18 @@ class VoiceChannel:
             # 不再记录尾音，但它仍属于原话轮；缺帧不视为静默。
             if missed:
                 # 溢出丢样可能发生在本帧内部，这一帧不算可信静默。
+                if self._stream_turn is not None:
+                    _LOG.warning("voice capture gap; dropping incomplete turn")
+                    self._abort_stream_turn()
                 self._quiet_frames = 0
                 return
             self._quiet_frames = 0 if hot else self._quiet_frames + 1
             if self._quiet_frames >= self._end_frames:
                 self._ignoring_tail = False
                 self._quiet_frames = 0
+                if self._streaming is not None:
+                    self._close_stream_turn()
+                    return
                 if self._segment_frames is not None:
                     self._close_segment_turn()
                     return
@@ -337,6 +390,7 @@ class VoiceChannel:
                 _LOG.warning("voice capture gap; dropping incomplete turn")
             self._discard_gap = True
             self._record = None
+            self._abort_stream_turn()
             turn, self._segment_turn = self._segment_turn, None
             if turn is not None:
                 turn.discard()
@@ -426,10 +480,15 @@ class VoiceChannel:
             _LOG.warning("voice device could not be closed")
 
     def _stop_transcription(self) -> None:
+        self._abort_stream_turn()
+        if self._stream_in_flight is not None:
+            self._stream_in_flight.abort()
         if self._asr_worker is not None and not self._asr_worker.done() and not self._asr_worker.cancelling():
             self._asr_worker.cancel()
-        while not self._turns.empty():
-            self._turns.get_nowait()
+        while self._turns:
+            waiting = self._turns.popleft()
+            if isinstance(waiting, StreamingTurn):
+                waiting.abort()
             self._pending -= 1  # 已开始处理的话轮由转写协程的 finally 扣除
         if self._asr_task is not None and not self._asr_task.done() and not self._asr_task.cancelling():
             self._asr_task.cancel()  # 不等待在途请求的取消清理
@@ -540,10 +599,96 @@ class VoiceChannel:
         # 缺帧时话轮可能先被摘除、长静默又先到；最后一项任务退出仍需检查是否已空闲。
         self._report_input(transcript)
 
+    async def _recognize_stream(self, turn: StreamingTurn) -> tuple[str, float] | None:
+        streaming = self._streaming
+        assert streaming is not None
+        start_deadline = turn.opened_at + self._asr_timeout
+        previous = self._asr_task
+        if previous is not None and not previous.done():
+            # 已取消的适配器还没退出：在本轮启动时限内等，不并发另开请求。
+            await asyncio.wait((previous, turn.aborted), timeout=max(0, start_deadline - monotonic()),
+                                return_when=asyncio.FIRST_COMPLETED)
+        if turn.aborted.done():
+            return None
+        if monotonic() >= start_deadline or (previous is not None and not previous.done()):
+            raise TimeoutError
+
+        request = _AsrRequest(owner=turn.id)
+
+        async def recognize() -> str:
+            try:
+                text = await streaming.transcribe_stream(turn.frames(monotonic))
+                # 适配器返回即验证；后台消费事后补到的停口或 EOF 不能使结果生效。
+                if turn.endpoint_at is None or not turn.exhausted:
+                    raise RuntimeError("streaming ASR returned before endpoint or EOF")
+                return text
+            finally:
+                request.finished_at = monotonic()
+
+        task = asyncio.create_task(recognize())
+        self._register_asr(request, task)
+        # 只限制首帧被适配器读取的时刻，不把录音时长当作请求时限。
+        await asyncio.wait((task, turn.started, turn.aborted), timeout=max(0, start_deadline - monotonic()),
+                           return_when=asyncio.FIRST_COMPLETED)
+        if turn.aborted.done():
+            return None
+        if (not turn.started.done() or turn.started.result() >= start_deadline) and not task.done():
+            raise TimeoutError
+        await asyncio.wait((task, turn.ended), return_when=asyncio.FIRST_COMPLETED)
+        if turn.aborted.done():
+            return None
+        endpoint = turn.endpoint_at
+        if endpoint is not None:
+            deadline = endpoint + self._asr_timeout
+            if not task.done():
+                await asyncio.wait((task,), timeout=max(0, deadline - monotonic()))
+            if not task.done() or (request.finished_at is not None and request.finished_at >= deadline):
+                raise TimeoutError
+        if task.cancelled():
+            raise RuntimeError("streaming ASR cancelled by adapter")
+        text = task.result().strip()
+        if not turn.started.done() or turn.started.result() >= start_deadline:
+            raise TimeoutError
+        assert request.finished_at is not None
+        return text, request.finished_at
+
+    async def _transcribe_stream(self, turn: StreamingTurn) -> None:
+        self._stream_in_flight = turn
+        text = ""
+        ready_at = None
+        try:
+            result = await self._recognize_stream(turn)
+            if result is not None:
+                text, ready_at = result
+        except TimeoutError:
+            _LOG.warning("voice streaming transcription deadline reached; turn=%s", turn.id)
+        except Exception:
+            _LOG.warning("voice streaming transcription failed; turn=%s", turn.id)
+        finally:
+            self._stream_in_flight = None
+            if not text:
+                turn.abort()
+            request = self._asr_request
+            if (request is not None and request.owner is turn.id and not request.task.done()
+                    and not request.task.cancelling()):
+                request.task.cancel()
+            self._pending -= 1
+        if text and ready_at is not None and turn.endpoint_at is not None and not self._failed and not self._io_stopped:
+            _LOG.debug("voice turn transcript ready; turn=%s at_mono_ms=%.0f endpoint_to_transcript_ms=%.0f",
+                       turn.id, ready_at * 1000, (ready_at - turn.endpoint_at) * 1000)
+        self._report_input(text or None)
+
     async def _transcribe(self) -> None:
         clock = asyncio.get_running_loop().time
         while not self._failed and not self._io_stopped:
-            recording = await self._turns.get()
+            while not self._turns:
+                self._turns_ready.clear()
+                await self._turns_ready.wait()
+            recording = self._turns.popleft()
+            if isinstance(recording, StreamingTurn):
+                await self._transcribe_stream(recording)
+                del recording
+                continue
             if isinstance(recording, SegmentJob):
                 await self._transcribe_segment(recording)
                 del recording

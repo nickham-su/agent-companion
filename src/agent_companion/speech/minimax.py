@@ -6,7 +6,7 @@ import json
 import httpx
 
 from ..config import MINIMAX_ASR_MODEL, require_asr_audio_seconds, require_seconds
-from .asr import AsrError, AudioFile
+from .asr import ASRCapabilities, AsrError, AudioFile
 
 
 _ENDPOINTS = {
@@ -30,6 +30,9 @@ class MiniMaxASR:
         self._endpoint = _ENDPOINTS[region]
         self._timeout = timeout
         self._max_audio_seconds = max_audio_seconds
+
+    def capabilities(self) -> ASRCapabilities:
+        return ASRCapabilities(file=self)
 
     async def transcribe(self, file: AudioFile) -> str:
         if file.duration_seconds is not None and file.duration_seconds > self._max_audio_seconds:

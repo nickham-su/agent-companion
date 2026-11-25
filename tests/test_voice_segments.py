@@ -713,7 +713,7 @@ class SegmentedVoiceTest(unittest.IsolatedAsyncioTestCase):
                 self.assertIn("skipped (ASR busy); phase=final", log.output[0])
                 self.assertFalse(old_task.done())
                 self.assertEqual(voice._pending, 1)
-                self.assertTrue(voice._turns.empty())
+                self.assertFalse(voice._turns)
                 self.assertEqual(events, [(None, True), (None, True)])
                 third_pcm = frames.push(True, 3)
                 release.set()

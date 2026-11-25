@@ -305,13 +305,13 @@ class IncomingCallTests(unittest.IsolatedAsyncioTestCase):
                                           vad_model=Path("synthetic.onnx")),
                              asr=ASRSettings(MiniMaxConnection("synthetic"), max_audio_seconds=max_audio_seconds))
 
-        def build(_, asr, tts):
+        def build(_, asr, tts, *, streaming=None):
             device, vad = make_device(), _Vad()
             self.devices.append(device)
             self.vads.append(vad)
             self.asrs.append(make_asr(len(self.devices)))
             return VoiceChannel(self.asrs[-1], tts, vad, settings.voice, asr_timeout=asr_timeout,
-                                max_audio_seconds=max_audio_seconds), device
+                                max_audio_seconds=max_audio_seconds, streaming=streaming), device
 
         with (closing(History(":memory:")) as history,
               patch("agent_companion.channels.feishu.macos_calls.MacCallDesktop", return_value=self.desktop),

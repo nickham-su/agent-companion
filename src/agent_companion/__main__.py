@@ -21,6 +21,7 @@ from .protocol import (AGENT_REPLY_PREFIX, DeliveryStatus, Message, ModelEvent, 
                        TextDelta, ToolCall, ToolReady, ToolSpec)
 from .runtime.instructions import load_roles
 from .runtime.subtasks import AgentRole, DELEGATE_TOOL_NAME, demo_roles
+from .speech.bailian_ws import BailianConnection
 from .speech.minimax import MiniMaxASR
 from .speech.vad import VoiceSetupError
 from .storage.sqlite import DatabaseFormatError, FeishuBindingError, History
@@ -105,17 +106,31 @@ async def _serve(settings: Settings, *, discovery: FeishuDiscovery | None = None
 
             model_client = await client(llm.api_key if llm.adapter == "deepseek" else None)
             speech = asr_settings.connection
-            asr_client = await client(speech.api_key)
-            asr = MiniMaxASR(asr_client, region=speech.region, model=asr_settings.model, timeout=settings.asr_timeout,
-                             max_audio_seconds=asr_settings.max_audio_seconds)
+            asr_client = None
+            if isinstance(speech, BailianConnection):
+                from .speech.bailian_asr import BailianASR
+
+                asr = BailianASR(speech, model=asr_settings.model, timeout=settings.asr_timeout,
+                                 max_audio_seconds=asr_settings.max_audio_seconds)
+            else:
+                asr_client = await client(speech.api_key)
+                asr = MiniMaxASR(asr_client, region=speech.region, model=asr_settings.model,
+                                 timeout=settings.asr_timeout, max_audio_seconds=asr_settings.max_audio_seconds)
             tts = None
             if tts_settings is not None:
-                from .speech.minimax_tts import MiniMaxTTS
-
                 speech_out = tts_settings.connection
-                tts_client = asr_client if speech_out is speech else await client(speech_out.api_key)
-                tts = MiniMaxTTS(tts_client, region=speech_out.region, model=tts_settings.model,
-                                 voice_id=tts_settings.voice_id, timeout=settings.tts_timeout)
+                if isinstance(speech_out, BailianConnection):
+                    from .speech.bailian_tts import BailianTTS
+
+                    tts = BailianTTS(speech_out, model=tts_settings.model, voice_id=tts_settings.voice_id,
+                                     timeout=settings.tts_timeout)
+                else:
+                    from .speech.minimax_tts import MiniMaxTTS
+
+                    tts_client = asr_client if speech_out is speech and asr_client is not None else await client(
+                        speech_out.api_key)
+                    tts = MiniMaxTTS(tts_client, region=speech_out.region, model=tts_settings.model,
+                                     voice_id=tts_settings.voice_id, timeout=settings.tts_timeout)
             if llm.adapter == "deepseek":
                 model = DeepSeek(model_client, model=llm.model or MODEL_NAME,
                                   reasoning_effort=llm.reasoning_effort)

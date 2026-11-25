@@ -1,5 +1,6 @@
-"""完整音频文件转写契约；同时供语音条和本地话轮使用。"""
+"""文件和实时话轮转写契约。"""
 
+from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
 import io
 import struct
@@ -72,3 +73,26 @@ def _audio_format(data: bytes) -> tuple[str, str, float | None]:
 
 class FileASR(Protocol):
     async def transcribe(self, file: AudioFile) -> str: ...
+
+
+class StreamingASR(Protocol):
+    async def transcribe_stream(self, frames: AsyncIterator[bytes]) -> str:
+        """持续读取非空、对齐的 16 kHz 单声道 s16le PCM，输入结束后只返回最终文本。
+
+        输入由调用方拥有；`__anext__` 必须可取消并及时退出，不能吞掉取消后继续生产。
+        只有完整话轮才应正常结束迭代，缺帧或挂断应取消调用。若取消后输入源未退出，
+        适配器可拒绝新的实时话轮；调用方应保证该输入源最终退出。
+        """
+        ...
+
+
+@dataclass(frozen=True, slots=True)
+class ASRCapabilities:
+    file: FileASR | None = None
+    streaming: StreamingASR | None = None
+
+
+class ASRAdapter(Protocol):
+    def capabilities(self) -> ASRCapabilities:
+        """返回当前配置可用的调用接口，不连接网络。"""
+        ...

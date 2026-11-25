@@ -20,7 +20,7 @@ from .runtime.engine import Runtime
 from .runtime.sqlite_access import SQLiteAccess
 from .runtime.subtasks import AgentRole, AgentTree
 from .session_scheduler import SessionSchedulers
-from .speech.asr import FileASR
+from .speech.asr import ASRAdapter, ASRCapabilities, FileASR, StreamingASR
 from .speech.tts import StreamingTTS
 from .speech.vad import VoiceSetupError
 from .storage.sqlite import Agent, History
@@ -114,7 +114,8 @@ def private_feishu_identity(account: ChannelUser) -> str:
 async def prepare_private_feishu(
     settings: Settings, history: History | None = None, *, roles: Mapping[str, AgentRole],
     discovery: FeishuDiscovery | None = None,
-) -> AsyncIterator[tuple[History, Callable[[Model, FileASR, StreamingTTS | None], Awaitable[None]]]]:
+) -> AsyncIterator[tuple[History, Callable[[Model, ASRAdapter | ASRCapabilities, StreamingTTS | None],
+                                           Awaitable[None]]]]:
     """查一次 CLI 登录账号后绑定数据库；仅负责关闭本函数打开的库。"""
     feishu = feishu_settings(settings)
     if discovery is None:
@@ -127,7 +128,11 @@ async def prepare_private_feishu(
           if history is None else nullcontext(history)) as db:
         started_ms = db.bind_feishu_private(identity, started_ms=candidate_ms)
 
-        async def run(model: Model, asr: FileASR, tts: StreamingTTS | None) -> None:
+        async def run(model: Model, asr: ASRAdapter | ASRCapabilities, tts: StreamingTTS | None) -> None:
+            capabilities = asr if isinstance(asr, ASRCapabilities) else asr.capabilities()
+            file_asr = capabilities.file
+            if file_asr is None:
+                raise VoiceSetupError("feishu_file_asr_required")
             sqlite = SQLiteAccess(retry_locks=True, stopped=lambda: False)
             await sqlite.write_input(lambda: db.interrupt_agent_work(reason="restart"))
             incoming = None
@@ -142,7 +147,8 @@ async def prepare_private_feishu(
 
                 async def prepare_voice() -> tuple[VoiceChannel, AudioDevice]:
                     # VAD 的音频状态只属于本通，即使上一通的推理线程仍在退出。
-                    return await asyncio.to_thread(_make_voice, settings, asr, tts)
+                    return await asyncio.to_thread(_make_voice, settings, file_asr, tts,
+                                                   streaming=capabilities.streaming)
 
                 incoming = IncomingCalls(desktop, discovery, prepare_voice, account=account,
                                          idle_timeout=settings.voice.idle_timeout, copy_confirmed=feishu.voice_text_copy)
@@ -150,7 +156,7 @@ async def prepare_private_feishu(
             schedulers = SessionSchedulers()
             try:
                 await run_private_chats(
-                    discovery, db, asr, account=account, started_ms=started_ms, incoming=incoming,
+                    discovery, db, file_asr, account=account, started_ms=started_ms, incoming=incoming,
                     schedulers=schedulers,
                     open_agent=lambda agent, channel, user: running_agent(
                         settings, db, model, channel, session_id=agent.session_id, agent=agent, roles=roles, user=user,
@@ -161,11 +167,14 @@ async def prepare_private_feishu(
         yield db, run
 
 
-async def run_feishu(settings: Settings, history: History, model: Model, asr: FileASR, *,
+async def run_feishu(settings: Settings, history: History, model: Model, asr: ASRAdapter | FileASR, *,
                      roles: Mapping[str, AgentRole], tts: StreamingTTS | None = None,
                      discovery: FeishuDiscovery | None = None) -> None:
+    # 保留直接注入旧文件适配器的入口；提供能力查询时走和正式启动相同的选择。
+    discover = getattr(asr, "capabilities", None)
+    capabilities = discover() if discover is not None else ASRCapabilities(file=asr)
     async with prepare_private_feishu(settings, history, discovery=discovery, roles=roles) as (_, run_private):
-        await run_private(model, asr, tts)
+        await run_private(model, capabilities, tts)
 
 
 def _check_voice_settings(settings: Settings) -> None:
@@ -178,7 +187,8 @@ def _check_voice_settings(settings: Settings) -> None:
         raise VoiceSetupError("voice_vad_model_required")
 
 
-def _make_voice(settings: Settings, asr: FileASR, tts: StreamingTTS) -> tuple[VoiceChannel, AudioDevice]:
+def _make_voice(settings: Settings, asr: FileASR, tts: StreamingTTS, *,
+                streaming: StreamingASR | None = None) -> tuple[VoiceChannel, AudioDevice]:
     from .channels.audio.macos import MacAudioDevice
     from .speech.vad import SileroVAD
     from .speech.voice import VoiceChannel
@@ -189,4 +199,4 @@ def _make_voice(settings: Settings, asr: FileASR, tts: StreamingTTS) -> tuple[Vo
     audio = MacAudioDevice(voice.input_device, voice.output_device, voice.output_sample_rate)
     vad = SileroVAD(voice.vad_model)
     return VoiceChannel(asr, tts, vad, voice, asr_timeout=settings.asr_timeout,
-                        max_audio_seconds=settings.asr.max_audio_seconds), audio
+                        max_audio_seconds=settings.asr.max_audio_seconds, streaming=streaming), audio

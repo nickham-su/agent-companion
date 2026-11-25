@@ -8,13 +8,13 @@ workspace_root = "workspaces"
 log_level = "WARNING"
 # 切换时只改对应引用，再重启；真实 Key 请只填写在本机私有配置中。
 llm_provider = "deepseek_default"  # 或 "openai_default"
-asr_provider = "minimax_cn"       # 文字模式也用它转写飞书语音条
-tts_provider = "minimax_cn"       # 仅 voice 模式使用；可指向另一套 MiniMax 配置
+asr_provider = "minimax_cn"       # 或 "bailian_beijing"；语音条和实时通话共用
+tts_provider = "minimax_cn"       # 或 "bailian_beijing"；仅 voice 使用，可与 ASR 独立选择
 
 # 各能力共用同一时限，切换 Provider 不变。单位为秒。
 [timeouts]
 llm = 60  # 单次模型请求总时限
-asr = 30  # 单次转写总时限
+asr = 30  # 文件转写总时限，含握手、上传和等结果；流式 ASR 的启动和停口后等待分别计时
 tts = 25  # 单次网络读写、等待响应的时限
 
 [runtime]
@@ -55,6 +55,23 @@ max_audio_seconds = 500  # 必填；按所选模型的单文件时长上限填�
 model = "speech-2.8-turbo"
 voice_id = "male-qn-qingse"
 
+# 百炼是可选 Provider。启用时更换相应顶层引用，并在本机填写同地域的 API Key 与业务空间 ID。
+[providers.bailian_beijing]
+adapter = "bailian"
+api_key = "your-bailian-api-key"
+region = "cn-beijing"  # 也可用 ap-southeast-1；Key、业务空间、模型和音色须在所选地域可用
+workspace_id = "your-workspace-id"
+
+[providers.bailian_beijing.asr]
+model = "qwen-audio-3.1-asr-flash-message"  # 语音条用文件接口；实时通话用流式接口
+# 120 秒的 16 kHz 单声道 16-bit PCM WAV 按当前 128 kB/s 策略仅上传就约需 30 秒；
+# 默认 timeouts.asr 不保证文件能转写到此上限。通话流式路径边录边发，停口后的等待仍默认为 30 秒。
+max_audio_seconds = 120  # 必填，应用侧单轮录音/WAV 上限（秒），不是服务商配额
+
+[providers.bailian_beijing.tts]
+model = "qwen-audio-3.1-tts-flash"
+voice_id = "longanhuan_v3.1"  # 示例配对；也可将两项同时改为 cosyvoice-v3-flash / longanyang
+
 # 默认文字模式自动发现真人私聊，每人独立会话；服务账号由启动时的 CLI 登录身份决定。
 # [feishu]
 # mode = "text"  # 默认 text；voice 保留文字，并自动接听符合条件的飞书来电
@@ -70,8 +87,8 @@ voice_id = "male-qn-qingse"
 # vad_threshold = 0.5  # 判定人声的概率门槛，须大于 0 且小于 1
 # speech_frames = 3  # 连续多少个 32 毫秒的人声帧才确认开口
 # silence_seconds = 1  # 连续静默多久后结束本轮录音（秒）
-# segment_pause_seconds = 0.4  # 取消注释开启长语音分段转写；连续静默多久后可切段（秒）
-# output_sample_rate = 44100  # TTS 合成与本机播放共用的采样率（Hz）；录音固定 16000 Hz
+# segment_pause_seconds = 0.4  # 只在通话走文件 ASR 时生效；连续静默多久可切段（秒）
+# output_sample_rate = 44100  # TTS 和播放共用（Hz）；百炼不支持 32000，录音固定 16000
 # prefetch_seconds = 0.4  # 待播音频少于此时长才合成下一段（秒）
 # buffer_seconds = 2  # 待播音频缓存上限（秒），须大于 prefetch_seconds
 # idle_timeout = 30  # 模型输出结束后，允许多久没有实际播放进展（秒）
