@@ -1,12 +1,14 @@
 """可选分段转写的话轮缓冲，只保留尚未识别的音频。"""
 
 from dataclasses import dataclass, field
+from uuid import UUID, uuid4
 
 
 @dataclass(slots=True, eq=False)
 class SegmentedTurn:
     pcm: bytearray = field(default_factory=bytearray)
-    asr_owner: object = field(default_factory=object, init=False, repr=False)
+    asr_owner: UUID = field(default_factory=uuid4, init=False, repr=False)
+    endpoint_at: float | None = None  # 长静默确认时间，仅用于日志计时。
     recorded_bytes: int = 0  # 累计收录的样本；成功识别、分段和补交都不重置。
     speech_end: int = 0  # 当前缓冲里最后一帧人声的末尾；用以排除纯静音尾段。
     parts: list[str] = field(default_factory=list)

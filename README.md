@@ -141,9 +141,13 @@ VAD 默认连续 3 个 32 ms 人声窗口触发打断，默认静默 1 秒结束
 
 若 `max_audio_seconds` 短到放不下一个 16 kHz 采样点，本次无法准备实时语音，并报告 `voice_asr_max_audio_seconds_below_one_sample`。
 
+启用分段时，在 `DEBUG` 日志里按相同的 `turn` 查找 `voice turn endpoint detected`（确认停口）和 `voice turn transcript ready`（完整转写就绪）。两行的 `at_mono_ms` 是本进程的单调时钟毫秒值，不是日期时间；第二行的 `endpoint_to_transcript_ms` 直接给出时间差，不包含确认停口前的静默和已经完成的提前转写。中间片段不单独记录成功日志，出错时会保留警告；不记录转写正文。
+
 语音回复按中英文句号、问号、感叹号或换行切段，逗号和分号不切。每条回复首句不设最短长度；后续累计至少 30 个非空白、非标点字符才在句尾切段。单段达到 200 字符（含空白和标点）时强制切段；首段强切后也按后续规则处理。回复结束时发送剩余正文。空白或纯标点不单独请求合成，也不占用首句。
 
 MiniMax TTS 用 [`/v1/t2a_v2` HTTP SSE](https://platform.minimax.cn/docs/api-reference/speech-t2a-http)逐段发送，首块到达即可播放；每段流结束且待播放低于 `prefetch_seconds` 时才提交下一段。从语音通道开始处理起，`voice.delivery_timeout`（默认 600 秒）是不可续期的总上限。模型输出结束后，Runtime 启动 `voice.idle_timeout`（默认 30 秒）；只有设备实际取走本条回复的 PCM 才续期，补静音或只在合成不算。任一时限到期，投递记为 `UNKNOWN`，历史只保留已确认的连续完整段落，不估算半句。空闲超时由 Runtime 取消投递任务，不等清理或迟到回执。已确认的正文仍进入后续会话历史，不代表对端一定听到了。
+
+排查首声延迟时，开启 `log_level = "DEBUG"`，按相同的 `reply` 查找 `voice first audio latency`。语音投递结束时会汇总四项毫秒值：模型首字到提交首段 TTS（`first_text_to_tts_ms`）、提交到收到首块有效音频（`tts_to_first_pcm_ms`）、首块音频到首次填进本机设备回调（`first_pcm_to_output_ms`）、模型首字到本机输出（`first_text_to_output_ms`）。未到达的阶段记为 `-`。这里不测音频开头可能自带的静音、飞书传输或对端播放，不能视为用户听到声音的时间。
 
 如果本机的 `[voice]` 仍显式使用旧示例的 `delivery_timeout = 90`，可改为 `600` 或删除这行使用新默认值。
 

@@ -26,6 +26,10 @@ def _is_body_char(char: str) -> bool:
     return not char.isspace() and not category(char).startswith("P")
 
 
+def _elapsed_ms(start: float | None, end: float | None) -> str:
+    return "-" if start is None or end is None else f"{(end - start) * 1000:.0f}"
+
+
 async def _segments(reply: ReplyStream) -> AsyncGenerator[str, None]:
     pending = []
     body_chars = 0
@@ -60,8 +64,11 @@ class _PlaybackReply:
     clock: Callable[[], float]
     hard_deadline: float
     segments: list[_Segment] = field(default_factory=list)
+    first_tts_at: float | None = None
+    first_pcm_at: float | None = None
     # 由 PCM 锁保护；一旦过期，设备不能再推进本条回复的证据。
     played_bytes: int = 0
+    first_output_at: float | None = None
     idle_deadline: float = float("inf")
     idle_timeout: float = 0.0
     offered_bytes: int = 0
@@ -169,6 +176,8 @@ class _PcmQueue:
                 else:
                     self._packets[0] = pcm[size:]
             if offset:
+                if not state.played_bytes:
+                    state.first_output_at = now  # 回调只记时，日志留给事件循环。
                 state.played_bytes += offset
                 if state.idle_timeout:
                     state.idle_deadline = now + state.idle_timeout
@@ -272,6 +281,14 @@ class VoiceOutput:
                 worker.cancel()
             if not state.signal.done():
                 state.signal.cancel()
+            # 摘除后首包设备时间不会再变；失败/打断时也保留已经到达的阶段。
+            if _LOG.isEnabledFor(logging.DEBUG):
+                _LOG.debug("voice first audio latency; reply=%s first_text_to_tts_ms=%s tts_to_first_pcm_ms=%s "
+                           "first_pcm_to_output_ms=%s first_text_to_output_ms=%s", reply_id,
+                           _elapsed_ms(reply.first_text_at, state.first_tts_at),
+                           _elapsed_ms(state.first_tts_at, state.first_pcm_at),
+                           _elapsed_ms(state.first_pcm_at, state.first_output_at),
+                           _elapsed_ms(reply.first_text_at, state.first_output_at))
         # 摘除后设备不会再推进字节数。非完整回执只确认合成完成且已全量交给设备的连续段。
         if status == DeliveryStatus.FULL:
             prefix = "".join(part.text for part in state.segments) if state.played_bytes else ""
@@ -300,10 +317,14 @@ class VoiceOutput:
                 await asyncio.sleep(_TICK)
             if state.signal.done() or reply.abandoned:
                 raise asyncio.CancelledError
+            if state.first_tts_at is None:
+                state.first_tts_at = state.clock()
             async with aclosing(self._tts.synthesize(spoken, sample_rate=self._settings.output_sample_rate)) as pcm:
                 async for chunk in pcm:
                     if not chunk or len(chunk) % 2 or len(chunk) > _MAX_PCM_CHUNK:
                         raise TtsError("tts_invalid_pcm_chunk")
+                    if state.first_pcm_at is None:
+                        state.first_pcm_at = state.clock()
                     remaining = memoryview(chunk)
                     while remaining:
                         if state.signal.done() or reply.abandoned:

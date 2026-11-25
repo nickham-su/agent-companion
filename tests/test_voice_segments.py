@@ -87,6 +87,51 @@ def _loop_time_jump():
 
 
 class SegmentedVoiceTest(unittest.IsolatedAsyncioTestCase):
+    async def test_latency_logs_only_endpoint_and_full_transcript_if_early_asr_already_ready(self):
+        with (self.assertLogs("agent_companion.speech.voice", "DEBUG") as log,
+              patch("agent_companion.speech.voice.monotonic", return_value=1000) as clock):
+            async with _channel("合成文本") as (voice, frames, asr, events):
+                frames.push(True, _LONG)
+                frames.short_pause()
+                await _until(lambda: len(asr.pcm) == 1 and voice._pending == 0)
+                self.assertEqual(log.records, [])
+                clock.return_value = 1001
+                frames.push(False, _END - _SHORT)
+                await _until(lambda: not voice._input_active)
+                self.assertEqual(events[-1], ("合成文本", False))
+        endpoint, ready = [record.getMessage() for record in log.records]
+        event, fields = endpoint.split("; ", 1)
+        self.assertEqual(event, "voice turn endpoint detected")
+        self.assertIn(" at_mono_ms=1001000", fields)
+        self.assertEqual(ready, f"voice turn transcript ready; {fields} endpoint_to_transcript_ms=0")
+
+    async def test_latency_includes_wait_for_early_failure_and_final_retry(self):
+        release = asyncio.Event()
+
+        async def fail_late():
+            await release.wait()
+            raise AsrError("合成错误")
+
+        with (self.assertLogs("agent_companion.speech.voice", "DEBUG") as log,
+              patch("agent_companion.speech.voice.monotonic", return_value=1000) as clock):
+            async with _channel(fail_late, "补交成功") as (voice, frames, asr, events):
+                frames.push(True, _LONG)
+                frames.short_pause()
+                await _until(lambda: len(asr.pcm) == 1)
+                clock.return_value = 1001
+                frames.push(False, _END - _SHORT)
+                self.assertEqual(len(log.records), 1)
+                clock.return_value = 1001.25
+                release.set()
+                await _until(lambda: not voice._input_active)
+                self.assertEqual(events[-1], ("补交成功", False))
+        endpoint, warning, ready = log.records
+        turn = endpoint.getMessage().split("turn=", 1)[1].split()[0]
+        self.assertEqual(warning.levelname, "WARNING")
+        self.assertEqual(warning.getMessage(), f"voice segment transcription failed; phase=early turn={turn}")
+        self.assertEqual(ready.getMessage(), f"voice turn transcript ready; turn={turn} "
+                                             "at_mono_ms=1001250 endpoint_to_transcript_ms=250")
+
     async def test_short_turn_is_sent_once_at_final_silence(self):
         async with _channel("短句") as (voice, frames, asr, events):
             recorded = frames.push(False, 3) + frames.push(True, 3) + frames.short_pause()

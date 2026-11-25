@@ -160,6 +160,64 @@ class SpeechSegmentationTest(unittest.IsolatedAsyncioTestCase):
 
 
 class VoiceOutputTest(unittest.IsolatedAsyncioTestCase):
+    @staticmethod
+    def _render(output, frames=4):
+        data = bytearray(frames * 2)
+        output.render(memoryview(data))
+        return bytes(data)
+
+    async def test_first_audio_latency_links_model_text_to_device_output(self):
+        finish_sentence = asyncio.Event()
+        tts = _TTS()
+        output = VoiceOutput(tts, _SETTINGS)
+
+        class Model:
+            async def stream(self, messages, tools, *, thinking):
+                yield TextDelta("合成测试正文")
+                await finish_sentence.wait()
+                yield TextDelta("。")
+
+        # 启动后尚无可朗读句子，设备先收到本机补的静音。
+        with closing(History(":memory:")) as history:
+            runtime = Runtime("main", history, Model(), output)
+            try:
+                with self.assertLogs("agent_companion", level="DEBUG") as logs:
+                    runtime.submit_batch([Message("user", "合成测试输入")])
+                    await _until(lambda: any("voice playback started;" in row for row in logs.output))
+                    self.assertEqual(self._render(output), bytes(8))
+                    self.assertEqual(tts.calls, [])
+                    finish_sentence.set()
+                    await _until(lambda: bool(tts.calls))
+                    self.assertEqual(await asyncio.to_thread(self._render, output), _A * 4)
+                    await runtime.wait_idle()
+            finally:
+                await runtime.close()
+
+        first = next(row for row in logs.output if "model first text;" in row)
+        rows = [row for row in logs.output if "voice first audio latency;" in row]
+        self.assertEqual(len(rows), 1)
+        fields = dict(item.split("=", 1) for item in rows[0].split("; ", 1)[1].split())
+        self.assertIn(f"reply={fields['reply']} ", first)
+        parts = [int(fields[key]) for key in ("first_text_to_tts_ms", "tts_to_first_pcm_ms", "first_pcm_to_output_ms")]
+        self.assertTrue(all(value >= 0 for value in parts))
+        self.assertAlmostEqual(int(fields["first_text_to_output_ms"]), sum(parts), delta=2)
+        self.assertNotIn("合成测试正文", rows[0])
+
+    async def test_first_audio_latency_leaves_device_timing_missing_if_interrupted_before_output(self):
+        tts = _TTS()
+        output = VoiceOutput(tts, _SETTINGS)
+        reply = _reply("interrupted", "合成测试正文。")
+        reply.first_text_at = reply.info.started_at
+        with self.assertLogs("agent_companion.speech.playback", level="DEBUG") as logs:
+            task = asyncio.create_task(output.deliver(reply))
+            await _until(lambda: bool(tts.calls))
+            output.interrupt()  # 有 TTS 首块，但尚无设备回调取走它。
+            self.assertEqual(self._render(output), bytes(8))
+            self.assertEqual((await task).status, DeliveryStatus.ZERO)
+        latency = next(row for row in logs.output if "voice first audio latency;" in row)
+        self.assertRegex(latency, r"first_text_to_tts_ms=\d+ tts_to_first_pcm_ms=\d+ "
+                                  r"first_pcm_to_output_ms=- first_text_to_output_ms=-$")
+
     async def test_first_block_plays_before_stream_end_and_next_segment_gated_by_buffer(self):
         release = asyncio.Event()
         calls = []

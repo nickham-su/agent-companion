@@ -460,8 +460,10 @@ class Runtime:
                                 return True
                         elif isinstance(event, TextDelta) and event.text:
                             if not text:
+                                first_text_at = loop.time()
+                                reply.first_text_at = first_text_at
                                 _LOG.debug("model first text; reply=%s elapsed_ms=%.0f", info.reply_id,
-                                           (loop.time() - info.started_at) * 1000)
+                                           (first_text_at - info.started_at) * 1000)
                             text.append(event.text)
                             if channel is not None:
                                 first_handoff = delivery is None

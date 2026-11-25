@@ -288,6 +288,8 @@ class ReplyStream(AsyncIterator[str]):
         self._idle_timeout: float | None = None
         self._arm_idle: Callable[[float, float | None], float] | None = None
         self._read_playback: Callable[[], tuple[float, float, str, float | None]] | None = None
+        # Runtime 收到首个非空模型文本片段的单调时钟时间。
+        self.first_text_at: float | None = None
         self.delivery_finished_at: float | None = None
         self._closed = False
         self._exhausted = False
