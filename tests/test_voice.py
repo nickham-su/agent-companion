@@ -641,6 +641,27 @@ class VoiceInputTest(unittest.IsolatedAsyncioTestCase):
                 self.assertIn(_HOT + _QUIET + _HOT, file.readframes(file.getnframes()))
         self.assertTrue(device.closed)
 
+    async def test_omitted_segment_pause_keeps_one_asr_request_for_long_turn(self):
+        asr, vad, device = _ASR(), _Vad(), _Device()
+        settings = replace(_SETTINGS, silence_seconds=1)
+        voice = VoiceChannel(asr, _TTS(), vad, settings, asr_timeout=0.5, max_audio_seconds=500)
+        received = []
+        async with voice.connected(device, _transcripts(received.append)):
+            # 分批输入 10.24 秒人声，避免溢出设备采集队列。
+            for batch in range(1, 21):
+                device.frame(True, 16)
+                await _processed(vad, batch * 16)
+            device.frame(False, 16)  # 0.512 秒，位于短停顿示例和话轮结束阈值之间。
+            await _processed(vad, 336)
+            self.assertFalse(asr.called.is_set())
+            device.frame(True, 4)
+            await _processed(vad, 340)
+            device.frame(False, 32)
+            await _until(lambda: received == ["转写结果"])
+            self.assertEqual(len(asr.files), 1)
+            with wave.open(io.BytesIO(asr.files[0].data), "rb") as file:
+                self.assertEqual(file.readframes(file.getnframes()), _HOT * 320 + _QUIET * 16 + _HOT * 4 + _QUIET * 31)
+
     async def test_no_old_audio_during_speech_pending_asr_or_after_asr_result(self):
         for result in ("新输入", "", AsrError("synthetic")):
             with self.subTest(result=type(result).__name__):

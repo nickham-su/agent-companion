@@ -11,6 +11,8 @@ from urllib.parse import urlsplit
 
 import httpx
 
+from .speech.vad import silence_frames
+
 
 OPENAI_BASE_URL = "https://api.openai.com/v1"
 MINIMAX_ASR_MODEL = "asr-1.0"
@@ -187,6 +189,7 @@ class VoiceSettings:
     buffer_seconds: float = 2
     idle_timeout: float = 30
     delivery_timeout: float = 600
+    segment_pause_seconds: float | None = None
 
     def __post_init__(self) -> None:
         for name in ("input_device", "output_device"):
@@ -204,6 +207,13 @@ class VoiceSettings:
             raise ConfigError("voice.speech_frames 必须是 1–15 之间的整数")
         if self.silence_seconds > 10:
             raise ConfigError("voice.silence_seconds 不得超过 10 秒")
+        pause = self.segment_pause_seconds
+        if pause is not None:
+            _config_seconds(pause, "voice.segment_pause_seconds")
+            if (pause >= self.silence_seconds
+                    or silence_frames(pause, strict=True) >= silence_frames(self.silence_seconds, strict=True)):
+                raise ConfigError("voice.segment_pause_seconds 和 voice.silence_seconds 折算为帧数后，"
+                                  "前者必须小于后者")
         if type(self.output_sample_rate) is not int or self.output_sample_rate not in {16_000, 24_000, 32_000, 44_100}:
             raise ConfigError("voice.output_sample_rate 必须是 16000、24000、32000 或 44100")
         if not 0.032 <= self.buffer_seconds <= 5:

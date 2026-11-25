@@ -237,6 +237,62 @@ api_key = 123
                                   'voice.output_sample_rate 必须是 16000、24000、32000 或 44100')
         self.assert_startup_error(voice.replace('output_sample_rate', 'playback_rate'), 'voice 配置字段无效')
 
+    def test_segment_pause_is_optional_and_preserves_explicit_short_silence(self):
+        voice = _CONFIG.replace('mode = "text"', 'mode = "voice"')
+        for options, silence, pause in (
+            ('silence_seconds = 0.02', 0.02, None),
+            ('silence_seconds = 1\nsegment_pause_seconds = 0.4', 1, 0.4),
+        ):
+            with self.subTest(options=options):
+                self.path.write_text(voice.replace('[voice]', f'[voice]\n{options}'), encoding="utf-8")
+                settings = load_settings(self.path, for_run=True)
+                self.assertEqual(settings.voice.silence_seconds, silence)
+                self.assertEqual(settings.voice.segment_pause_seconds, pause)
+
+    def test_segment_pause_requires_finite_positive_seconds_and_an_earlier_frame(self):
+        voice = _CONFIG.replace('mode = "text"', 'mode = "voice"')
+        for value in ('0', '-0.1', 'inf', 'nan', 'true', '"0.4"'):
+            with self.subTest(value=value):
+                config = voice.replace('[voice]', f'[voice]\nsegment_pause_seconds = {value}')
+                self.assert_startup_error(config, 'voice.segment_pause_seconds 必须是有限正数')
+        for value in ('0.999', '1', '1.2', '1e308'):
+            with self.subTest(value=value):
+                # 0.999 虽小于默认的 1 秒，但两者都向上取整到 32 帧。
+                config = voice.replace('[voice]', f'[voice]\nsegment_pause_seconds = {value}')
+                self.assert_startup_error(config,
+                                          'voice.segment_pause_seconds 和 voice.silence_seconds 折算为帧数后，'
+                                          '前者必须小于后者')
+
+    def test_segment_pause_distinguishes_same_and_adjacent_frames(self):
+        voice = _CONFIG.replace('mode = "text"', 'mode = "voice"')
+        # 短停顿和结束静默均为 1 帧，不能区分。
+        same_frame = voice.replace('[voice]', '[voice]\nsegment_pause_seconds = 0.031\nsilence_seconds = 0.032')
+        self.assert_startup_error(same_frame,
+                                  'voice.segment_pause_seconds 和 voice.silence_seconds 折算为帧数后，'
+                                  '前者必须小于后者')
+        # 短停顿恰为 1 帧，结束静默向上取整为 2 帧。
+        adjacent_frames = voice.replace('[voice]', '[voice]\nsegment_pause_seconds = 0.032\nsilence_seconds = 0.033')
+        self.path.write_text(adjacent_frames, encoding="utf-8")
+        settings = load_settings(self.path, for_run=True)
+        self.assertEqual(settings.voice.segment_pause_seconds, 0.032)
+        self.assertEqual(settings.voice.silence_seconds, 0.033)
+
+    def test_segment_pause_distinguishes_a_frame_from_the_next_float(self):
+        voice = _CONFIG.replace('mode = "text"', 'mode = "voice"')
+        same_frame = voice.replace('[voice]', '[voice]\nsegment_pause_seconds = 0.28800000000000003\n'
+                                              'silence_seconds = 0.32')
+        self.assert_startup_error(same_frame,
+                                  'voice.segment_pause_seconds 和 voice.silence_seconds 折算为帧数后，'
+                                  '前者必须小于后者')
+        for end in ('0.28800000000000003', '0.32'):
+            with self.subTest(end=end):
+                distinct = voice.replace('[voice]', f'[voice]\nsegment_pause_seconds = 0.288\n'
+                                                     f'silence_seconds = {end}')
+                self.path.write_text(distinct, encoding="utf-8")
+                settings = load_settings(self.path, for_run=True)
+                self.assertEqual(settings.voice.segment_pause_seconds, 0.288)
+                self.assertEqual(settings.voice.silence_seconds, float(end))
+
     def test_delivery_timeouts_are_independent_and_have_defaults(self):
         self.path.write_text(_CONFIG.replace('mode = "text"', 'mode = "voice"'), encoding="utf-8")
         settings = load_settings(self.path, for_run=True)

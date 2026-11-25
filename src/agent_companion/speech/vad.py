@@ -1,5 +1,6 @@
 """Silero 16 kHz ONNX VAD；依赖和文件只在本地 voice 组装时加载。"""
 
+from math import ceil
 from pathlib import Path
 from typing import Protocol
 
@@ -7,6 +8,18 @@ INPUT_RATE = 16_000
 INPUT_FRAMES = 512
 SAMPLE_BYTES = 2
 INPUT_BYTES = INPUT_FRAMES * SAMPLE_BYTES
+
+
+def silence_frames(seconds: float, *, strict: bool = False) -> int:
+    """将静默时长向上取整为完整的 VAD 输入帧数。"""
+    frames = ceil(seconds / (INPUT_FRAMES / INPUT_RATE))
+    if strict:
+        # 用整数样本数生成整帧边界，校正浮点商在边界处可能吞掉或多算的一帧。
+        if seconds > frames * INPUT_FRAMES / INPUT_RATE:
+            return frames + 1
+        if frames > 1 and seconds <= (frames - 1) * INPUT_FRAMES / INPUT_RATE:
+            return frames - 1
+    return frames
 
 
 class VoiceSetupError(Exception):

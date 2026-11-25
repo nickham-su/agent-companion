@@ -70,6 +70,7 @@ voice_id = "male-qn-qingse"
 # vad_threshold = 0.5  # 判定人声的概率门槛，须大于 0 且小于 1
 # speech_frames = 3  # 连续多少个 32 毫秒的人声帧才确认开口
 # silence_seconds = 1  # 连续静默多久后结束本轮录音（秒）
+# segment_pause_seconds = 0.4  # 取消注释开启长语音分段转写；连续静默多久后可切段（秒）
 # output_sample_rate = 44100  # TTS 合成与本机播放共用的采样率（Hz）；录音固定 16000 Hz
 # prefetch_seconds = 0.4  # 待播音频少于此时长才合成下一段（秒）
 # buffer_seconds = 2  # 待播音频缓存上限（秒），须大于 prefetch_seconds
