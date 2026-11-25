@@ -4,6 +4,7 @@ import asyncio
 from collections.abc import Awaitable, Callable, Iterable, Mapping
 from dataclasses import dataclass
 import json
+import logging
 from typing import Any
 
 from ..protocol import ToolCall, ToolSpec
@@ -11,6 +12,13 @@ from ..workspace import Workspace
 
 
 TOOL_CANCELLED = '{"error":"tool_cancelled"}'
+_LOG = logging.getLogger(__name__)
+
+
+def _log_rejected(context: "ToolContext", reason: str, *, name: str = "-") -> None:
+    # name 只能来自已注册的定义；不回显模型提供的未知工具名、参数或调用 ID。
+    _LOG.debug("tool dispatch rejected; run=%s reply=%s tool=%s reason=%s",
+               context.run_id, context.reply_id or "-", name, reason)
 
 
 @dataclass(frozen=True, slots=True)
@@ -22,6 +30,7 @@ class ToolContext:
     agent_id: str | None = None
     has_agent_input: bool = False
     workspace: Workspace | None = None
+    reply_id: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -51,12 +60,14 @@ class Tools:
                       can_start_serial: Callable[[], bool] | None = None) -> str:
         tool = self._tools.get(call.name)
         if tool is None:
+            _log_rejected(context, "unknown_tool")
             return '{"error":"unknown_tool"}'
         if request_locks is not None and (lock := request_locks.get(call.name)) is not None:
             # asyncio.Lock 按等待顺序放行；Runtime 按工具帧顺序创建执行任务。
             async with lock:
                 # 排队期间请求可能已中断；只禁止未开始的串行调用。
                 if can_start_serial is not None and not can_start_serial():
+                    _log_rejected(context, "tool_cancelled", name=tool.spec.name)
                     return TOOL_CANCELLED
                 return await self._invoke(tool, call, context)
         return await self._invoke(tool, call, context)
@@ -68,6 +79,7 @@ class Tools:
             if not isinstance(args, dict):
                 raise ValueError
         except (ValueError, RecursionError):
+            _log_rejected(context, "invalid_arguments", name=tool.spec.name)
             return '{"error":"invalid_arguments"}'
         try:
             result = await tool.handler(args, context)

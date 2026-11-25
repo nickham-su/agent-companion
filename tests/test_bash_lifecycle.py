@@ -1,7 +1,6 @@
 import asyncio
 import ctypes
 from errno import ECHILD, EIO, ENOSYS, ESRCH
-import json
 from pathlib import Path
 import signal
 from tempfile import TemporaryDirectory
@@ -121,7 +120,7 @@ class BashChildLifecycleTests(unittest.IsolatedAsyncioTestCase):
             result = await bash._run_command(":", workspace, 1)
             kill.assert_not_called()
             process.poll.assert_not_called()
-            return json.loads(result), events, workspace in blocked
+            return result, events, workspace in blocked
 
     async def test_probe_losing_ownership_neither_signals_nor_reports_a_snapshot(self):
         process = _process()

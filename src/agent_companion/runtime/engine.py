@@ -503,7 +503,7 @@ class Runtime:
                                 raise ModelError("duplicate_tool_id")
                             context = ToolContext(self.session_id, run_id, call.id, has_user_input,
                                                   self.agent.agent_id if self.agent is not None else None,
-                                                  has_agent_input, workspace=self._workspace)
+                                                  has_agent_input, workspace=self._workspace, reply_id=info.reply_id)
                             scheduled[call.id] = (call, loop.create_task(
                                 self._tools.execute(call, context, request_locks=request_locks,
                                                     can_start_serial=can_start_serial_tool),

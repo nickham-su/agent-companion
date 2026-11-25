@@ -11,6 +11,7 @@ from pathlib import Path
 import signal
 import subprocess
 import sys
+from time import monotonic
 from typing import Any
 
 from ..protocol import ToolSpec
@@ -33,8 +34,7 @@ _PROBE_TIMEOUT = 0.25
 _PROBE_MAX_OUTPUT = 128 * 1024
 _LINUX_PROBE = Path(__file__).with_name("_proc_group_probe.py").resolve()
 _BASH_LAUNCHER = Path(__file__).with_name("_bash_launcher.py").resolve()
-_CLEANUP_ERROR = '{"error":"bash_cleanup_unconfirmed"}'
-_CLOSED_ERROR = '{"error":"bash_closed"}'
+_CLEANUP_ERROR = "bash_cleanup_unconfirmed"
 # 清理不确定时，退役再绑定也不绕过；不对旧 PGID 重新发信号。
 _BLOCKED_WORKSPACES: set[Path] = set()
 _UNREAPED_CHILDREN: set[subprocess.Popen[bytes]] = set()
@@ -64,23 +64,51 @@ class Bash:
         self._closed = True
 
     async def _execute(self, args: dict[str, Any], context: ToolContext) -> str:
+        started = monotonic()
+        try:
+            result = await self._execute_command(args, context)
+        except asyncio.CancelledError:
+            _log_result(context, started, {"error": "tool_cancelled"})
+            raise
+        except Exception:
+            _log_result(context, started, {"error": "tool_failed"})
+            raise
+        _log_result(context, started, result)
+        return json.dumps(result, separators=(",", ":") if "error" in result else None)
+
+    async def _execute_command(self, args: dict[str, Any], context: ToolContext) -> dict[str, Any]:
         command, timeout = args.get("command"), args.get("timeout", _DEFAULT_TIMEOUT)
         if (args.keys() - {"command", "timeout"} or not isinstance(command, str) or not command.strip()
                 or "\x00" in command or type(timeout) is not int or not 1 <= timeout <= _MAX_TIMEOUT):
-            return '{"error":"invalid_arguments"}'
+            return {"error": "invalid_arguments"}
         try:
             if len(command.encode("utf-8")) > _MAX_COMMAND_BYTES:
-                return '{"error":"invalid_arguments"}'
+                return {"error": "invalid_arguments"}
         except UnicodeEncodeError:
-            return '{"error":"invalid_arguments"}'
+            return {"error": "invalid_arguments"}
         if context.workspace is None:
-            return '{"error":"workspace_unavailable"}'
+            return {"error": "workspace_unavailable"}
         if self._closed:
-            return _CLOSED_ERROR  # 等待本请求上一条调用期间可能已经撤销路由。
+            return {"error": "bash_closed"}  # 等待本请求上一条调用期间可能已经撤销路由。
         workspace_key = context.workspace.directory
         if workspace_key in _BLOCKED_WORKSPACES:
-            return _CLEANUP_ERROR
+            return {"error": _CLEANUP_ERROR}
         return await _run_command(command, workspace_key, timeout)
+
+
+def _log_result(context: ToolContext, started: float, result: dict[str, Any]) -> None:
+    exit_code = result.get("exit_code")
+    status = result.get("error")
+    if status is None:
+        if result.get("timed_out"):
+            status = "timeout"
+        elif result.get("output_limit_exceeded"):
+            status = "output_limit"
+        else:
+            status = "ok" if exit_code == 0 else "nonzero_exit"
+    _LOG.debug("bash call finished; run=%s reply=%s status=%s exit_code=%s elapsed_ms=%.0f",
+               context.run_id, context.reply_id or "-", status,
+               "-" if exit_code is None else exit_code, (monotonic() - started) * 1000)
 
 
 class _Child:
@@ -352,13 +380,13 @@ def _read_launch_status(fd: int) -> bytes | None:
     return None
 
 
-async def _run_command(command: str, workspace_key: Path, timeout: int) -> str:
+async def _run_command(command: str, workspace_key: Path, timeout: int) -> dict[str, Any]:
     deadline = asyncio.get_running_loop().time() + timeout
     # 私有管道区分准备失败和 Bash 自身的非零退出；不占用 stdout / stderr。
     try:
         status_read, status_write = _open_launch_status()
     except OSError:
-        return '{"error":"bash_start_failed"}'
+        return {"error": "bash_start_failed"}
     try:
         child = None
         try:
@@ -372,33 +400,33 @@ async def _run_command(command: str, workspace_key: Path, timeout: int) -> str:
             await child.collect(deadline)
         except OSError:
             if child is None:
-                return '{"error":"bash_start_failed"}'
+                return {"error": "bash_start_failed"}
             child.io_failed = True
         except ValueError:
             if child is None:
-                return '{"error":"bash_start_failed"}'
+                return {"error": "bash_start_failed"}
             raise
         finally:
             if child is not None:
                 confirmed = await _finish(_finish_command(child, workspace_key))
         if not confirmed:
-            return _CLEANUP_ERROR
+            return {"error": _CLEANUP_ERROR}
         if child.io_failed:
-            return '{"error":"bash_io_failed"}'
+            return {"error": "bash_io_failed"}
         status = _read_launch_status(status_read)
         if not child.timed_out:
             if status == WORKSPACE_ERROR:
-                return '{"error":"workspace_unavailable"}'
+                return {"error": "workspace_unavailable"}
             if status != READY:
-                return '{"error":"bash_start_failed"}'
+                return {"error": "bash_start_failed"}
     except OSError:
-        return '{"error":"bash_io_failed"}'
+        return {"error": "bash_io_failed"}
     finally:
         os.close(status_read)
-    return json.dumps({
+    return {
         "exit_code": child.process.returncode,
         "stdout": child.stdout.decode("utf-8", errors="replace") if status == READY else "",
         "stderr": child.stderr.decode("utf-8", errors="replace") if status == READY else "",
         "timed_out": child.timed_out,
         "output_limit_exceeded": child.output_limit_exceeded,
-    })
+    }

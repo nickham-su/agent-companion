@@ -126,8 +126,37 @@ class BashExecutionTests(unittest.IsolatedAsyncioTestCase):
 
     async def _execute(self, *, workspace=True, request_locks=None, **arguments):
         call = _call("call", **arguments).call
-        context = ToolContext("test-session", "run", call.id, False, workspace=self.workspace if workspace else None)
+        context = ToolContext("test-session", "run", call.id, False, workspace=self.workspace if workspace else None,
+                              reply_id="test-reply")
         return json.loads(await self.tools.execute(call, context, request_locks=request_locks))
+
+    async def test_debug_bash_result_reports_only_safe_metadata(self):
+        name = "agent_companion.runtime.bash"
+        with self.assertLogs(name, level="DEBUG") as logs:
+            result = await self._execute(command='printf synthetic-stdout; printf synthetic-stderr >&2; exit 17')
+            with patch.object(bash_runtime, "_open_launch_status", side_effect=OSError("synthetic-exception")):
+                self.assertEqual(await self._execute(command=":"), {"error": "bash_start_failed"})
+        self.assertEqual(result["stdout"], "synthetic-stdout")
+        self.assertEqual(result["stderr"], "synthetic-stderr")
+        self.assertEqual(len(logs.output), 2)
+        self.assertIn("bash call finished; run=run reply=test-reply status=nonzero_exit exit_code=17", logs.output[0])
+        self.assertIn("status=bash_start_failed exit_code=-", logs.output[1])
+        for secret in ("printf", "synthetic-stdout", "synthetic-stderr", "synthetic-exception",
+                       str(self.workspace.directory)):
+            self.assertNotIn(secret, "\n".join(logs.output))
+        with self.assertNoLogs(name, level="INFO"):
+            self.assertEqual((await self._execute(command=":"))["exit_code"], 0)
+
+    async def test_debug_dispatch_rejection_does_not_echo_model_input(self):
+        context = ToolContext("test-session", "run", "synthetic-provider-id", False, reply_id="test-reply")
+        bad_name = ToolCall(context.call_id, "synthetic-unknown-name", "synthetic-arguments")
+        bad_args = ToolCall(context.call_id, "bash", "synthetic-arguments")
+        with self.assertLogs("agent_companion.runtime.tools", level="DEBUG") as logs:
+            self.assertEqual(json.loads(await self.tools.execute(bad_name, context)), {"error": "unknown_tool"})
+            self.assertEqual(json.loads(await self.tools.execute(bad_args, context)), {"error": "invalid_arguments"})
+        self.assertIn("reply=test-reply tool=- reason=unknown_tool", logs.output[0])
+        self.assertIn("reply=test-reply tool=bash reason=invalid_arguments", logs.output[1])
+        self.assertNotIn("synthetic-", "\n".join(logs.output))
 
     async def test_bash_starts_in_workspace_with_minimal_env_and_reset_cwd(self):
         bash_env = self.root / "synthetic-bash-env"
@@ -183,7 +212,7 @@ class BashExecutionTests(unittest.IsolatedAsyncioTestCase):
                             raise
                     else:
                         raise AssertionError(f'descriptor {fd} was not closed')
-                return {'result': json.loads(result), 'passed': passed}
+                return {'result': result, 'passed': passed}
 
             if fail_dup:
                 with patch.object(fcntl, 'fcntl', side_effect=OSError('synthetic dup failure')) as dup:
@@ -375,11 +404,16 @@ class BashExecutionTests(unittest.IsolatedAsyncioTestCase):
                 await asyncio.gather(task, return_exceptions=True)
 
     async def test_timeout_and_combined_output_limit(self):
-        result = await self._execute(command="printf ready; exec /bin/sleep 20", timeout=1)
+        with self.assertLogs("agent_companion.runtime.bash", level="DEBUG") as logs:
+            result = await self._execute(command="printf ready; exec /bin/sleep 20", timeout=1)
+        self.assertIn("status=timeout", logs.output[0])
         self.assertTrue(result["timed_out"])
         self.assertEqual(result["stdout"], "ready")
         self.assertEqual(result["exit_code"], -signal.SIGKILL)
-        result = await self._execute(command="printf '%0*d' 20000 0; printf '%0*d' 20000 0 >&2; exec /bin/sleep 20")
+        with self.assertLogs("agent_companion.runtime.bash", level="DEBUG") as logs:
+            result = await self._execute(
+                command="printf '%0*d' 20000 0; printf '%0*d' 20000 0 >&2; exec /bin/sleep 20")
+        self.assertIn("status=output_limit", logs.output[0])
         self.assertTrue(result["output_limit_exceeded"])
         self.assertFalse(result["timed_out"])
         self.assertEqual(len(result["stdout"]) + len(result["stderr"]), _MAX_OUTPUT_BYTES)
