@@ -13,7 +13,7 @@ from unittest.mock import patch
 from agent_companion.__main__ import _serve
 from agent_companion.app import private_feishu_identity, run_feishu, running_agent
 from agent_companion.channels.feishu.cli import CliError, CommandResult, FeishuDiscovery
-from agent_companion.config import (ASRSettings, FeishuSettings, LLMSettings, MiniMaxConnection, Settings,
+from agent_companion.config import (ASRSettings, FeishuSettings, LLMProvider, MiniMaxConnection, ModelProfile, RuntimeSettings, Settings,
                                     load_settings)
 from agent_companion.protocol import AGENT_REPLY_PREFIX, ChannelUser, Message, TextDelta, ToolCall, ToolReady
 from agent_companion.runtime.subtasks import AgentTree, DELEGATE_TOOL_NAME, demo_roles
@@ -613,9 +613,10 @@ class FeishuPrivateTests(unittest.IsolatedAsyncioTestCase):
             workdir = Path(tmp)
             agents = workdir / "agents"
             agents.mkdir()
-            (agents / "main.md").write_text("+++\ntools=[]\n+++\n离线角色", encoding="utf-8")
+            (agents / "main.md").write_text('+++\ntools=[]\nmodel_id="chat"\n+++\n离线角色', encoding="utf-8")
             settings = replace(self.settings, database=workdir / "production.db",
-                               llm=LLMSettings("openai_responses", "disabled", model="synthetic", api_key="synthetic"),
+                               models={"chat": ModelProfile("chat", "synthetic", "disabled", RuntimeSettings())},
+                               llm_providers={"chat": LLMProvider("openai_responses", api_key="synthetic")},
                                asr=ASRSettings(MiniMaxConnection("synthetic"), max_audio_seconds=120))
             with (patch("agent_companion.__main__.Path.cwd", return_value=workdir),
                   patch("agent_companion.app.FeishuDiscovery", return_value=runner.discovery()) as discover,

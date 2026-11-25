@@ -53,7 +53,7 @@ class _RoleFiles:
         (self.workdir / "AGENTS.md").write_text("排除旧指令", encoding="utf-8")
 
     def write_role(self, role, body, *, tools=(), description=None, newline="\n"):
-        lines = ["+++", f"tools = {json.dumps(tools)}"]
+        lines = ["+++", f"tools = {json.dumps(tools)}", 'model_id = "chat"']
         if description is not None:
             lines.append(f"description = {json.dumps(description, ensure_ascii=False)}")
         lines.extend(("+++", ""))
@@ -96,6 +96,7 @@ class RoleFileTests(_RoleFiles, unittest.TestCase):
     def test_invalid_role_fields_and_delimiters_have_fixed_diagnostics(self):
         self.write_role("main", "")
         cases = [
+            ("model_id", "+++\ndescription='fixture'\ntools=[]\n+++\n"),
             ("首行", "+++ \ndescription='fixture'\ntools=[]\n+++\n"),
             ("结束分隔线", "+++\ndescription='fixture'\ntools=[]\n +++\n"),
             ("TOML 格式错误（第 2 行", "+++\ndescription=@synthetic-detail\ntools=[]\n+++\n"),
@@ -112,7 +113,9 @@ class RoleFileTests(_RoleFiles, unittest.TestCase):
         ]
         for diagnosis, text in cases:
             with self.subTest(diagnosis=diagnosis, text=text):
-                (self.agents / "review.md").write_text(text, encoding="utf-8")
+                (self.agents / "review.md").write_text(text if diagnosis == "model_id" else
+                                                     text.replace("\n+++\n", '\nmodel_id="chat"\n+++\n'),
+                                                     encoding="utf-8")
                 self.assert_config_error(diagnosis, name="agents/review.md")
 
     def test_templates_are_valid_when_copied_to_real_role_filenames(self):

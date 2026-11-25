@@ -15,6 +15,14 @@ from ..protocol import (MAX_REPLAY_BYTES, DeliveryStatus, Image, Message, Provid
 
 
 _SCHEMA_VERSION = 1
+# v1 的可选扩展；旧库不需要回填，旧程序也可继续写入没有来源的记录。
+_MODEL_ORIGINS = """
+CREATE TABLE IF NOT EXISTS reply_model_origins (
+    reply_id TEXT PRIMARY KEY REFERENCES reply_outcomes(reply_id) ON DELETE CASCADE,
+    assistant_message_id INTEGER UNIQUE REFERENCES messages(message_id) ON DELETE CASCADE,
+    fingerprint BLOB NOT NULL CHECK (length(fingerprint) = 32)
+)
+"""
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS messages (
     message_id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -247,12 +255,12 @@ def _decode_replay(row: sqlite3.Row, scope: ReplayScope) -> ProviderReplay | Non
         return None  # 私有记录损坏时，仍可正常读取通用会话历史。
 
 
-def _decode(row: sqlite3.Row, replay: ProviderReplay | None = None) -> HistoryEntry:
+def _decode(row: sqlite3.Row, replay: ProviderReplay | None = None, *, include_reasoning: bool = True) -> HistoryEntry:
     return HistoryEntry(
         row["message_id"], row["session_id"], row["created_at"],
         Message(row["role"], _decode_content(row["content"]),
-                tuple(ToolCall(**item) for item in json.loads(row["tool_calls"])), row["tool_call_id"], row["reasoning"],
-                replay=replay),
+                tuple(ToolCall(**item) for item in json.loads(row["tool_calls"])), row["tool_call_id"],
+                row["reasoning"] if include_reasoning else None, replay=replay),
     )
 
 
@@ -306,6 +314,7 @@ class History:
                 if feishu_private_owner is not None:
                     # 打开时只预检已有归属；空库由绑定事务认领。
                     self.check_feishu_private(feishu_private_owner)
+                self._db.execute(_MODEL_ORIGINS)
         except BaseException:
             self.close()
             raise
@@ -637,7 +646,8 @@ class History:
         return self._append(session_id, (Message("user", _decode_content(content))
                                          for content in json.loads(row["contents"])))
 
-    def finalize_reply(self, outcome: ReplyOutcome, messages: Sequence[Message]) -> list[int]:
+    def finalize_reply(self, outcome: ReplyOutcome, messages: Sequence[Message], *,
+                       model_origin: bytes | None = None) -> list[int]:
         # 原子提交响应及对应结果，不在崩溃后暴露只有调用、没有结果的组。
         if messages and messages[0].role != "assistant":
             raise ValueError("reply history must start with an assistant message")
@@ -658,6 +668,11 @@ class History:
                 outcome.reply_id, outcome.session_id, outcome.run_id, outcome.model_status,
                 outcome.delivery_status, ids[0] if ids else None, outcome.model_error, outcome.input_tokens,
             ))
+            if model_origin is not None and outcome.model_status == "complete" and (
+                    outcome.input_tokens is not None or bool(messages and messages[0].reasoning is not None)):
+                self._db.execute("INSERT INTO reply_model_origins VALUES (?, ?, ?)", (
+                    outcome.reply_id, ids[0] if ids else None, model_origin,
+                ))
         return ids
 
     def finish_agent_run(self, run_id: str, *, result: str | None = None, error: str | None = None) -> None:
@@ -716,45 +731,55 @@ class History:
                 for row in self._db.execute(
                     "SELECT * FROM reply_outcomes WHERE session_id = ? ORDER BY rowid", (session_id,))]
 
-    def last_input_tokens(self, session_id: str) -> int | None:
+    def last_input_tokens(self, session_id: str, *, model_origin: bytes | None = None) -> int | None:
         row = self._db.execute(
-            "SELECT input_tokens FROM reply_outcomes WHERE session_id = ? AND model_status = 'complete'"
-            " ORDER BY rowid DESC LIMIT 1", (session_id,),
+            "SELECT o.input_tokens, p.fingerprint FROM reply_outcomes o"
+            " LEFT JOIN reply_model_origins p ON p.reply_id = o.reply_id"
+            " WHERE o.session_id = ? AND o.model_status = 'complete' ORDER BY o.rowid DESC LIMIT 1", (session_id,),
         ).fetchone()
-        return row["input_tokens"] if row is not None else None
+        # 不向前找匹配记录：最新普通请求没有可比较用量时，本轮不据此触发压缩。
+        return (row["input_tokens"] if row is not None and
+                (model_origin is None or row["fingerprint"] == model_origin) else None)
 
     def read_after(self, session_id: str, after: int = 0, *,
-                   replay_scope: ReplayScope | None = None) -> list[HistoryEntry]:
+                   replay_scope: ReplayScope | None = None, model_origin: bytes | None = None) -> list[HistoryEntry]:
+        columns, joins, select_args, join_args = ["m.*"], [], [], []
         if replay_scope is not None:
-            return [_decode(row, _decode_replay(row, replay_scope)) for row in self._db.execute(
-                "SELECT m.*,"
-                " CASE WHEN length(CAST(r.items AS BLOB)) <= ? THEN CAST(r.items AS BLOB) END AS replay_items"
-                " FROM messages m LEFT JOIN model_replays r ON r.assistant_message_id = m.message_id"
-                " AND r.protocol = ? AND r.fingerprint = ? AND r.reasoning_effort = ?"
-                " WHERE m.session_id = ? AND m.message_id > ? ORDER BY m.message_id",
-                (MAX_REPLAY_BYTES, replay_scope.protocol, replay_scope.fingerprint, replay_scope.reasoning_effort,
-                 session_id, after))]
-        return [_decode(row) for row in self._db.execute(
-            "SELECT * FROM messages WHERE session_id = ? AND message_id > ? ORDER BY message_id",
-            (session_id, after))]
+            columns.append("CASE WHEN length(CAST(r.items AS BLOB)) <= ? THEN CAST(r.items AS BLOB) END AS replay_items")
+            select_args.append(MAX_REPLAY_BYTES)
+            joins.append("LEFT JOIN model_replays r ON r.assistant_message_id = m.message_id"
+                         " AND r.protocol = ? AND r.fingerprint = ? AND r.reasoning_effort = ?")
+            join_args.extend((replay_scope.protocol, replay_scope.fingerprint, replay_scope.reasoning_effort))
+        if model_origin is not None:
+            columns.append("p.fingerprint IS NOT NULL AS matching_origin")
+            joins.append("LEFT JOIN reply_model_origins p ON p.assistant_message_id = m.message_id AND p.fingerprint = ?")
+            join_args.append(model_origin)
+        sql = (f"SELECT {', '.join(columns)} FROM messages m {' '.join(joins)}"
+               " WHERE m.session_id = ? AND m.message_id > ? ORDER BY m.message_id")
+        return [_decode(row, _decode_replay(row, replay_scope) if replay_scope is not None else None,
+                        include_reasoning=model_origin is None or bool(row["matching_origin"]))
+                for row in self._db.execute(sql, (*select_args, *join_args, session_id, after))]
 
     def context_snapshot(
-        self, session_id: str, *, replay_scope: ReplayScope | None = None,
+        self, session_id: str, *, replay_scope: ReplayScope | None = None, model_origin: bytes | None = None,
     ) -> tuple[Summary | None, list[HistoryEntry]]:
         """摘要、续尾及私有回放来自同一个 SQLite 读事务。"""
         self._db.execute("BEGIN")
         with self._db:
             summary = self.summary(session_id)
-            entries = self.read_after(session_id, summary.covers_through if summary else 0, replay_scope=replay_scope)
+            options = {"model_origin": model_origin} if model_origin is not None else {}
+            entries = self.read_after(session_id, summary.covers_through if summary else 0,
+                                      replay_scope=replay_scope, **options)
         return summary, entries
 
     def try_context_snapshot(
-        self, session_id: str, *, replay_scope: ReplayScope | None = None,
+        self, session_id: str, *, replay_scope: ReplayScope | None = None, model_origin: bytes | None = None,
     ) -> tuple[Summary | None, list[HistoryEntry]] | None:
         """压缩 CAS 失利后的单次刷新；遇锁时调用方保留原快照。"""
         with self._without_busy_wait():
             try:
-                return self.context_snapshot(session_id, replay_scope=replay_scope)
+                options = {"model_origin": model_origin} if model_origin is not None else {}
+                return self.context_snapshot(session_id, replay_scope=replay_scope, **options)
             except sqlite3.OperationalError as exc:
                 if not is_sqlite_lock_error(exc):
                     raise

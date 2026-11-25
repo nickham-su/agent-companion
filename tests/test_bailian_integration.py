@@ -12,14 +12,13 @@ import httpx
 from agent_companion.__main__ import _serve
 from agent_companion.channels.feishu.messages import BatchMediaBudget, IncomingMessage, MessageNormalizer
 from agent_companion.config import ConfigError, MiniMaxConnection, load_settings
-from agent_companion.runtime.subtasks import demo_roles
 from agent_companion.speech.audio import AudioFormat
 from agent_companion.speech.bailian_asr import BailianASR
 from agent_companion.speech.bailian_ws import ASR_MODEL, BailianConnection
 from agent_companion.speech.minimax import MiniMaxASR
 from agent_companion.speech.vad import INPUT_RATE
 
-from feishu_test_support import private_discovery
+from feishu_test_support import configured_roles, private_discovery
 from test_bailian_speech import _Socket, _opus
 from test_voice import _Device, _Vad, _until
 from test_voice_segments import _Frames
@@ -114,7 +113,7 @@ class BailianStartupIntegrationTests(unittest.IsolatedAsyncioTestCase):
                   patch("agent_companion.speech.bailian_tts.BailianTTS", side_effect=AssertionError("no TTS")),
                   patch("agent_companion.speech.bailian_ws.BailianConnection._open",
                         side_effect=AssertionError("startup must not dial"))):
-                await _serve(settings, discovery=self._discovery(), roles=demo_roles())
+                await _serve(settings, discovery=self._discovery(), roles=configured_roles())
             run.assert_awaited_once()
 
     async def test_actual_startup_routes_audio_file_pcm_stream_and_tts_with_isolated_auth(self):
@@ -198,7 +197,7 @@ class BailianStartupIntegrationTests(unittest.IsolatedAsyncioTestCase):
                       patch("agent_companion.channels.audio.macos.MacAudioDevice", return_value=device),
                       patch("agent_companion.speech.vad.SileroVAD", return_value=_Vad()),
                       patch("agent_companion.app.run_private_chats", side_effect=run_chats) as run):
-                    await _serve(settings, discovery=self._discovery(), roles=demo_roles())
+                    await _serve(settings, discovery=self._discovery(), roles=configured_roles())
                 run.assert_awaited_once()
             self.assertTrue(all(client.is_closed for client in http_clients))
             self.assertEqual(len(http_clients), 1 if use_bailian_asr and use_bailian_tts else 2)

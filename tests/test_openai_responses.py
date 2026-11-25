@@ -13,7 +13,7 @@ from feishu_test_support import private_discovery
 
 from agent_companion.__main__ import _serve
 from agent_companion.app import prepare_private_feishu, running_agent
-from agent_companion.config import LLMSettings, RuntimeSettings, load_settings
+from agent_companion.config import LLMProvider, RuntimeSettings, load_settings
 from agent_companion.models.deepseek import CHAT_COMPLETIONS, DeepSeek
 from agent_companion.models.openai_responses import OpenAIResponses
 from agent_companion.protocol import (DeliveryStatus, Image, InputUsage, Message, ModelError, Receipt,
@@ -870,10 +870,11 @@ max_audio_seconds = 500
 """
         for name, (key, address, model, effort) in profiles.items():
             tables += (f'[providers.{name}]\nadapter = "openai_responses"\napi_key = "{key}"\nbase_url = "{address}"\n'
-                       f'[providers.{name}.llm]\nmodel = "{model}"\nreasoning_effort = "{effort}"\n')
+                       f'[models.{name}]\nprovider = "{name}"\nmodel = "{model}"\nreasoning_effort = "{effort}"\n'
+                       'context_budget = 64000\ntail_budget = 16000\n')
 
         async def exercise(settings, history, model, asr, tts, roles):
-            self.assertIsInstance(model, OpenAIResponses)
+            self.assertIsInstance(model["main"].model, OpenAIResponses)
             self.assertIsNone(tts)
             async with running_agent(settings, history, model, _Channel(), session_id="test-openai",
                                      roles=roles) as (runtime, _):
@@ -896,10 +897,11 @@ max_audio_seconds = 500
             agents = config.parent / "agents"
             agents.mkdir()
             role_body = "\r\n离线验收指令\r\n"
-            (agents / "main.md").write_bytes(("+++\r\ntools=[]\r\n+++\r\n" + role_body).encode("utf-8"))
+            config.write_text(tables, encoding="utf-8")
             for name, (key, _, model, effort) in profiles.items():
                 with self.subTest(provider=name):
-                    config.write_text(f'llm_provider = "{name}"\n' + tables, encoding="utf-8")
+                    header = f'+++\r\ntools=[]\r\nmodel_id="{name}"\r\n+++\r\n'
+                    (agents / "main.md").write_bytes((header + role_body).encode("utf-8"))
                     settings = load_settings(config, for_run=True)
                     answer = (_reason(), _answer("old confirmed")) if name == "initial" else (_answer("follow-up"),)
                     target = "https://other.example.invalid/api/responses" if name == "other_address" else endpoint
@@ -938,9 +940,9 @@ max_audio_seconds = 500
         self.assertEqual([body["thinking"] for body in captured[1:]], [{"type": "enabled"}] * 2)
 
 
-class LLMSettingsTests(unittest.TestCase):
+class LLMProviderTests(unittest.TestCase):
     def test_base_url_normalization_and_validation(self):
-        llm = LLMSettings("openai_responses", "low", "fixture", "HTTPS://[2001:DB8::1]:8443/model/v1///", api_key=_KEY)
+        llm = LLMProvider("openai_responses", "HTTPS://[2001:DB8::1]:8443/model/v1///", api_key=_KEY)
         self.assertEqual(llm.base_url, "https://[2001:db8::1]:8443/model/v1")
         self.assertNotIn("base_url", repr(llm))
         for url in ("http://localhost/v1", "https://token@example.invalid/v1", "https://example.invalid/v1?",
@@ -948,5 +950,5 @@ class LLMSettingsTests(unittest.TestCase):
                     "https://example.invalid\\v1", "https://example.invalid/with space", "https:///v1",
                     "https://example.invalid/" + "路" * 300):
             with self.subTest(url=url), self.assertRaises(ValueError) as exc:
-                LLMSettings("openai_responses", "low", "fixture", url, api_key=_KEY)
+                LLMProvider("openai_responses", url, api_key=_KEY)
             self.assertTrue(url not in str(exc.exception))

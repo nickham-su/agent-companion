@@ -99,7 +99,7 @@ class WorkspaceConfigurationTests(unittest.TestCase):
             agents = root / "agents"
             agents.mkdir()
             for filename in ('main.md', 'child.md'):
-                (agents / filename).write_text('+++\ndescription = "fixture"\ntools = ["bash"]\n+++\n',
+                (agents / filename).write_text('+++\ndescription = "fixture"\ntools = ["bash"]\nmodel_id = "chat"\n+++\n',
                                                encoding="utf-8")
             self.assertEqual({name: role.tools for name, role in load_roles(root).items()},
                              {"main": (BASH_TOOL_NAME,), "child": (BASH_TOOL_NAME,)})

@@ -326,7 +326,7 @@ class BackgroundCompactionTest(unittest.IsolatedAsyncioTestCase):
         with closing(History(":memory:")) as history:
             history.append("main", [_OLD])
             _report_high_usage(history, "main")
-            compactions = Compactions(history, model)
+            compactions = Compactions(history)
 
             def new_runtime():
                 return Runtime("main", history, model, sink, settings=_SETTINGS, compactions=compactions)
@@ -383,9 +383,9 @@ class BackgroundCompactionTest(unittest.IsolatedAsyncioTestCase):
         model = _GatedModel(result_after_cancel=True)
         with (closing(History(":memory:")) as history,
               patch.object(model, "stop_stream", return_value=False, create=True) as stop_stream):
-            compactions = Compactions(history, model)
+            compactions = Compactions(history)
             try:
-                compactions.start("main", Prefix(0, 1, 1), [_SUMMARIZE], (), thinking=False, timeout=5)
+                compactions.start("main", Prefix(0, 1, 1), [_SUMMARIZE], (), model=model, thinking=False, timeout=5)
                 await _wait(model.generating)
                 task = compactions._generating
                 await asyncio.wait_for(compactions.close(), 0.5)
@@ -395,16 +395,67 @@ class BackgroundCompactionTest(unittest.IsolatedAsyncioTestCase):
             finally:
                 await compactions.close()
 
+    async def test_native_summary_close_waiters_do_not_cancel_transport_cleanup(self):
+        fixture = _NativeSummaryTransport(complete=True)
+        async with fixture.client as client:
+            with closing(History(":memory:")) as history:
+                model = DeepSeek(client)
+                compactions = Compactions(history)
+                shutdown = []
+
+                async def close_app():
+                    try:
+                        await compactions.close()
+                    finally:
+                        shutdown.append(("model", fixture.closed.is_set()))
+                        await model.aclose()
+                        shutdown.append(("client", fixture.closed.is_set()))
+                        await client.aclose()
+
+                waiters = []
+                with patch.object(model, "stop_stream", wraps=model.stop_stream) as stop_stream:
+                    try:
+                        compactions.start("main", Prefix(0, 1, 1), [_SUMMARIZE], (),
+                                          model=model, thinking=False, timeout=5)
+                        reader = compactions._generating
+                        await _wait(fixture.closing)
+                        app = asyncio.create_task(close_app())
+                        cancelled = asyncio.create_task(compactions.close())
+                        observer = asyncio.create_task(compactions.close())
+                        waiters.extend((app, cancelled, observer))
+                        await asyncio.sleep(0)  # 三个等待方都已进入 close。
+                        stop_stream.assert_called_once_with(reader)
+
+                        for waiter in (app, cancelled, app):
+                            self.assertTrue(waiter.cancel())
+                            await asyncio.sleep(0)  # 每次取消分别投递，而非合并。
+                        self.assertTrue(all(not waiter.done() for waiter in waiters))
+                        self.assertFalse(fixture.interrupted.is_set())
+                        self.assertEqual(shutdown, [])
+                        self.assertFalse(client.is_closed)
+                    finally:
+                        fixture.release.set()
+                        outcomes = await asyncio.wait_for(asyncio.gather(*waiters, return_exceptions=True), 2)
+                        await compactions.close()
+                        await model.aclose()
+
+                self.assertTrue(fixture.closed.is_set())
+                self.assertFalse(fixture.interrupted.is_set())
+                self.assertIsInstance(outcomes[0], asyncio.CancelledError)
+                self.assertIsInstance(outcomes[1], asyncio.CancelledError)
+                self.assertIsNone(outcomes[2])
+                self.assertEqual(shutdown, [("model", True), ("client", True)])
+
     async def test_native_summary_close_starts_transport_budget(self):
         fixture = _NativeSummaryTransport()
         async with fixture.client as client:
             model = DeepSeek(client)
             with closing(History(":memory:")) as history:
-                compactions = Compactions(history, model)
+                compactions = Compactions(history)
                 prefix = Prefix(0, 1, 1)
                 stopping = None
                 try:
-                    compactions.start("main", prefix, [_SUMMARIZE], (), thinking=False, timeout=5)
+                    compactions.start("main", prefix, [_SUMMARIZE], (), model=model, thinking=False, timeout=5)
                     await _wait(fixture.waiting)
                     with (patch.object(_http_stream, "_RESPONSE_CLOSE_TIMEOUT", 0.02),
                           self.assertLogs(_http_stream.__name__, "WARNING") as logged):
@@ -429,10 +480,10 @@ class BackgroundCompactionTest(unittest.IsolatedAsyncioTestCase):
                 async with fixture.client as client:
                     model = DeepSeek(client)
                     with closing(History(":memory:")) as history:
-                        compactions = Compactions(history, model)
+                        compactions = Compactions(history)
                         prefix = Prefix(0, 1, 1)
                         try:
-                            compactions.start("main", prefix, [_SUMMARIZE], (), thinking=False, timeout=5)
+                            compactions.start("main", prefix, [_SUMMARIZE], (), model=model, thinking=False, timeout=5)
                             task = compactions._generating
                             await _wait(fixture.closing)
                             self.assertFalse(compactions.can_start("another", 0, 1))
@@ -462,7 +513,7 @@ class BackgroundCompactionTest(unittest.IsolatedAsyncioTestCase):
                             with (patch.object(_http_stream, "_RESPONSE_CLOSE_TIMEOUT", 0.02),
                                   self.assertLogs("agent_companion", "WARNING") as logged):
                                 if summary:
-                                    compactions.start("main", Prefix(0, 1, 1), [_SUMMARIZE], (), thinking=False,
+                                    compactions.start("main", Prefix(0, 1, 1), [_SUMMARIZE], (), model=model, thinking=False,
                                                       timeout=0.05)
                                     settled = asyncio.shield(compactions._generating)
                                 else:

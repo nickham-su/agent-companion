@@ -1,5 +1,6 @@
-"""启动配置：仅正式启动解析已选中的 Provider。"""
+"""启动配置；语言模型档案与 Provider 连接分别定义。"""
 
+from collections.abc import Mapping
 from dataclasses import MISSING, dataclass, field, fields
 from ipaddress import IPv6Address
 import math
@@ -21,11 +22,14 @@ BAILIAN_TTS_MODEL = "qwen-audio-3.1-tts-flash"
 BAILIAN_TTS_VOICE = "longanhuan_v3.1"
 DEFAULT_ASR_TIMEOUT = 30
 DEFAULT_MODEL_TIMEOUT = 60
+DEFAULT_MAX_TOOL_ROUNDS = 8
 DEFAULT_TTS_TIMEOUT = 25
 _DEFAULT_WORKSPACE_ROOT = "workspaces"
 _DEFAULT_LOG_LEVEL = "WARNING"
 _LOG_LEVELS = ("DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL")
 _LEGACY_CONFIG_ERROR = "旧配置格式不再支持，请按 config.example.toml 迁移到命名 Provider"
+_MODEL_MIGRATION = "请迁到 [models.<ID>]，并在每个 Agent 角色文件中设置 model_id，参考 config.example.toml"
+_LLM_ADAPTERS = ("deepseek", "openai_responses")
 
 
 class ConfigError(ValueError):
@@ -79,7 +83,7 @@ class RuntimeSettings:
     model_timeout: float = DEFAULT_MODEL_TIMEOUT
     context_budget: int = 64_000
     tail_budget: int = 16_000
-    max_tool_rounds: int = 8
+    max_tool_rounds: int = DEFAULT_MAX_TOOL_ROUNDS
 
     def __post_init__(self) -> None:
         _config_seconds(self.model_timeout, "timeouts.llm")
@@ -92,32 +96,44 @@ class RuntimeSettings:
 
 
 @dataclass(frozen=True, slots=True)
-class LLMSettings:
+class LLMProvider:
     adapter: str
-    reasoning_effort: str
-    model: str | None = None
     base_url: str | None = field(default=None, repr=False)
-    api_key: str = field(kw_only=True, repr=False)
+    api_key: object = field(default=None, kw_only=True, repr=False)
 
     def __post_init__(self) -> None:
-        if self.adapter not in ("deepseek", "openai_responses"):
-            raise ConfigError("llm_provider 需要 deepseek 或 openai_responses 适配器")
-        if (not isinstance(self.reasoning_effort, str) or not self.reasoning_effort.strip()
-                or self.reasoning_effort != self.reasoning_effort.strip() or len(self.reasoning_effort) > 64
-                or not self.reasoning_effort.isprintable()):
-            raise ConfigError("llm.reasoning_effort 必须显式设置为非空字符串")
-        if self.model is not None and (not isinstance(self.model, str)
-                                       or not re.fullmatch(r"[A-Za-z0-9_.:-]{1,128}", self.model)):
-            raise ConfigError("llm.model 格式无效")
+        if self.adapter not in _LLM_ADAPTERS:
+            raise ConfigError("adapter 须为 deepseek 或 openai_responses")
         if self.adapter == "openai_responses":
-            if self.model is None:
-                raise ConfigError("openai_responses 必须设置 llm.model")
             try:
                 object.__setattr__(self, "base_url", normalize_openai_base_url(self.base_url))
             except ValueError:
-                raise ConfigError("llm_provider 的 base_url 必须是无凭据、查询或片段的 HTTPS 地址") from None
+                raise ConfigError("base_url 必须是无凭据、查询或片段的 HTTPS 地址") from None
         elif self.base_url is not None:
-            raise ConfigError("llm_provider 的 base_url 仅适用于 openai_responses")
+            raise ConfigError("base_url 仅适用于 openai_responses")
+
+    def require_api_key(self, location: str) -> str:
+        return _require_api_key(self.api_key, location)
+
+
+def valid_config_id(value: object) -> bool:
+    return isinstance(value, str) and bool(value) and value == value.strip() and value.isprintable()
+
+
+@dataclass(frozen=True, slots=True)
+class ModelProfile:
+    provider: str
+    model: str
+    reasoning_effort: str
+    runtime: RuntimeSettings
+
+    def __post_init__(self) -> None:
+        if not valid_config_id(self.provider):
+            raise ConfigError("provider 必须是非空 Provider ID")
+        if not isinstance(self.model, str) or not re.fullmatch(r"[A-Za-z0-9_.:-]{1,128}", self.model):
+            raise ConfigError("model 格式无效")
+        if not valid_config_id(self.reasoning_effort) or len(self.reasoning_effort) > 64:
+            raise ConfigError("reasoning_effort 必须是非空字符串（至多 64 字符）")
 
 
 @dataclass(frozen=True, slots=True)
@@ -240,13 +256,14 @@ class VoiceSettings:
 @dataclass(frozen=True, slots=True)
 class Settings:
     database: Path = Path("db.sqlite3")
+    # 离线模型注入使用这套运行设置；正式角色使用所引用档案的 RuntimeSettings。
     runtime: RuntimeSettings = field(default_factory=RuntimeSettings)
-    llm: LLMSettings | None = None
+    models: Mapping[str, ModelProfile] = field(default_factory=dict, repr=False)
+    llm_providers: Mapping[str, LLMProvider] = field(default_factory=dict, repr=False)
     feishu: FeishuSettings | None = None
     asr: ASRSettings | None = None
     tts: TTSSettings | None = None
     voice: VoiceSettings = field(default_factory=VoiceSettings)
-    # LLM 时限仅保存在 runtime.model_timeout，供既有 Runtime 机制使用。
     asr_timeout: float = DEFAULT_ASR_TIMEOUT
     tts_timeout: float = DEFAULT_TTS_TIMEOUT
     log_level: str = _DEFAULT_LOG_LEVEL
@@ -289,7 +306,7 @@ def _selected_provider(data: dict[str, Any], providers: dict[str, Any], ability:
     if name not in providers:
         raise ConfigError(f"{selector} 引用的 Provider 不存在")
     provider = _table(providers[name], {"adapter", "api_key", "base_url", "region", "workspace_id",
-                                        "llm", "asr", "tts"}, selector)
+                                        "asr", "tts"}, selector)
     if "workspace_id" in provider and provider.get("adapter") != "bailian":
         raise ConfigError("workspace_id 仅适用于百炼 Provider")
     if provider.get("adapter") not in adapters:
@@ -303,7 +320,10 @@ def _selected_provider(data: dict[str, Any], providers: dict[str, Any], ability:
 
 
 def _api_key(provider: dict[str, Any], selector: str) -> str:
-    key = provider.get("api_key")
+    return _require_api_key(provider.get("api_key"), selector)
+
+
+def _require_api_key(key: object, selector: str) -> str:
     if not isinstance(key, str) or not key:
         raise ConfigError(f"{selector} 引用的 Provider 必须设置非空 api_key 字符串")
     if any(not 33 <= ord(char) <= 126 for char in key):
@@ -324,17 +344,59 @@ def _speech_connection(provider: dict[str, Any], selector: str) -> SpeechConnect
         raise ConfigError("百炼 Provider 须设置有效的 workspace_id，region 为 cn-beijing 或 ap-southeast-1") from None
 
 
-def _load_providers(data: dict[str, Any], *, voice: bool) -> tuple[LLMSettings, ASRSettings, TTSSettings | None]:
+def _provider_tables(data: dict[str, Any]) -> dict[str, Any]:
     providers = data.get("providers", {})
     if not isinstance(providers, dict):
         raise ConfigError("providers 必须是命名 Provider 配置表")
-    _, provider, llm_data = _selected_provider(data, providers, "llm", ("deepseek", "openai_responses"))
-    if "region" in provider:
-        raise ConfigError("region 仅适用于语音 Provider")
-    llm_options = _section(llm_data, LLMSettings, "llm", exclude=("adapter", "base_url", "api_key"))
-    llm = LLMSettings(adapter=provider["adapter"], base_url=provider.get("base_url"),
-                      api_key=_api_key(provider, "llm_provider"), **llm_options)
+    for index, provider in enumerate(providers.values(), 1):
+        location = f"providers 第 {index} 项"
+        if isinstance(provider, dict) and "llm" in provider:
+            raise ConfigError(f"{location} 的 llm 表已移除；{_MODEL_MIGRATION}")
+    return providers
 
+
+def _load_model_profiles(data: Any, providers: dict[str, Any], model_timeout: float,
+                         ) -> tuple[dict[str, ModelProfile], dict[str, LLMProvider]]:
+    if not isinstance(data, dict):
+        raise ConfigError("models 必须是命名模型配置表")
+    llm_providers = {}
+    for index, (name, provider) in enumerate(providers.items(), 1):
+        if not isinstance(provider, dict) or provider.get("adapter") not in _LLM_ADAPTERS:
+            continue  # 非 LLM Provider 仍按语音能力的选用规则解析。
+        location = f"providers 第 {index} 项"
+        _table(provider, {"adapter", "api_key", "base_url"}, location)
+        try:
+            llm_providers[name] = LLMProvider(**provider)
+        except ConfigError as exc:
+            raise ConfigError(f"{location}：{exc}") from None
+
+    models = {}
+    required = ("provider", "model", "reasoning_effort", "context_budget", "tail_budget")
+    for index, (name, options) in enumerate(data.items(), 1):
+        location = f"models 第 {index} 项"
+        if not valid_config_id(name):
+            raise ConfigError(f"{location} 的 ID 必须是非空字符串且不能有首尾空白")
+        options = _table(options, set(required) | {"max_tool_rounds"}, location)
+        for key in required:
+            if key not in options:
+                raise ConfigError(f"{location} 的 {key} 必须显式设置")
+        try:
+            runtime = RuntimeSettings(model_timeout=model_timeout, context_budget=options["context_budget"],
+                                      tail_budget=options["tail_budget"],
+                                      max_tool_rounds=options.get("max_tool_rounds", DEFAULT_MAX_TOOL_ROUNDS))
+            profile = ModelProfile(options["provider"], options["model"], options["reasoning_effort"], runtime)
+        except ConfigError as exc:
+            raise ConfigError(f"{location}：{str(exc).replace('runtime.', '')}") from None
+        if profile.provider not in providers:
+            raise ConfigError(f"{location} 的 provider 引用的 Provider 不存在")
+        if profile.provider not in llm_providers:
+            raise ConfigError(f"{location} 的 provider 需要显式设置支持 llm 的 adapter（deepseek 或 openai_responses）")
+        models[name] = profile
+    return models, llm_providers
+
+
+def _load_speech(data: dict[str, Any], providers: dict[str, Any], *, voice: bool
+                 ) -> tuple[ASRSettings, TTSSettings | None]:
     asr_name, provider, asr_data = _selected_provider(data, providers, "asr", ("minimax", "bailian"))
     connection = _speech_connection(provider, "asr_provider")
     asr_options = _section(asr_data, ASRSettings, "asr", exclude=("connection",)).copy()
@@ -353,7 +415,7 @@ def _load_providers(data: dict[str, Any], *, voice: bool) -> tuple[LLMSettings, 
             elif "voice_id" not in tts_options:
                 raise ConfigError("切换百炼 tts.model 时必须同时设置匹配的 tts.voice_id")
         tts = TTSSettings(tts_connection, **tts_options)
-    return llm, asr, tts
+    return asr, tts
 
 
 def load_settings(path: Path | None = None, *, for_run: bool = False) -> Settings:
@@ -362,7 +424,10 @@ def load_settings(path: Path | None = None, *, for_run: bool = False) -> Setting
             raise ConfigError("正式启动需要 --config，请参考 config.example.toml")
         return Settings()
     data = _read_toml(path)
-    return _parse_settings(data, path, for_run=for_run)
+    try:
+        return _parse_settings(data, path, for_run=for_run)
+    except ConfigError as exc:
+        raise ConfigError(f"配置文件 {path.name!r}：{exc}") from None
 
 
 def _read_toml(path: Path) -> dict[str, Any]:
@@ -371,7 +436,7 @@ def _read_toml(path: Path) -> dict[str, Any]:
             return tomllib.load(file)
     except (ValueError, RecursionError):
         pass  # 原始解析异常可能保留整份 TOML，不链接到可显示的诊断。
-    raise ConfigError("TOML 无法解析，请检查配置文件格式")
+    raise ConfigError(f"配置文件 {path.name!r}：TOML 无法解析，请检查配置文件格式")
 
 
 def _load_voice(data: Any, path: Path) -> VoiceSettings:
@@ -388,11 +453,18 @@ def _load_voice(data: Any, path: Path) -> VoiceSettings:
 
 def _parse_settings(data: dict[str, Any], path: Path, *, for_run: bool) -> Settings:
     runtime_data = data.get("runtime", {})
+    if "llm_provider" in data:
+        raise ConfigError(f"顶层 llm_provider 已移除；{_MODEL_MIGRATION}")
+    if isinstance(runtime_data, dict):
+        for key in ("context_budget", "tail_budget", "max_tool_rounds"):
+            if key in runtime_data:
+                raise ConfigError(f"runtime.{key} 已移除；{_MODEL_MIGRATION}")
     if (data.keys() & {"deepseek", "llm", "minimax"}
             or isinstance(runtime_data, dict) and "model_timeout" in runtime_data):
         raise ConfigError(_LEGACY_CONFIG_ERROR)
-    _table(data, {"database", "log_level", "runtime", "feishu", "voice", "providers", "timeouts",
-                  "llm_provider", "asr_provider", "tts_provider", "workspace_root"}, "顶层")
+    _table(data, {"database", "log_level", "runtime", "feishu", "voice", "providers", "models", "timeouts",
+                  "asr_provider", "tts_provider", "workspace_root"}, "顶层")
+    _table(runtime_data, set(), "runtime")
     database = data.get("database", "db.sqlite3")
     if not isinstance(database, str) or not database.strip() or "\x00" in database:
         raise ConfigError("database 必须是非空且不含 NUL 字符的路径")
@@ -404,22 +476,25 @@ def _parse_settings(data: dict[str, Any], path: Path, *, for_run: bool) -> Setti
     if not isinstance(workspace_root, str) or not workspace_root.strip() or "\x00" in workspace_root:
         raise ConfigError("workspace_root 必须是非空且不含 NUL 字符的路径")
     timeouts = _table(data.get("timeouts", {}), {"llm", "asr", "tts"}, "timeouts")
-    runtime = RuntimeSettings(model_timeout=timeouts.get("llm", DEFAULT_MODEL_TIMEOUT),
-                              **_section(runtime_data, RuntimeSettings, "runtime", exclude=("model_timeout",)))
+    runtime = RuntimeSettings(model_timeout=timeouts.get("llm", DEFAULT_MODEL_TIMEOUT))
+    models, llm_providers = {}, {}
     feishu_data = data.get("feishu")
     feishu = FeishuSettings(**_section(feishu_data, FeishuSettings, "feishu")) if feishu_data is not None else None
     use_voice = feishu is not None and feishu.mode == "voice"
     # 离线调用仍可用来校验、读取语音配置；正式 text 不读取该段字段。
     voice = _load_voice(data.get("voice", {}), path) if not for_run or use_voice else VoiceSettings()
-    llm = asr = tts = None
+    asr = tts = None
     if for_run:
         if feishu is None:
             raise ConfigError("正式启动需要 [feishu] 配置，请参考 config.example.toml")
-        llm, asr, tts = _load_providers(data, voice=use_voice)
+        providers = _provider_tables(data)
+        models, llm_providers = _load_model_profiles(data.get("models", {}), providers, runtime.model_timeout)
+        asr, tts = _load_speech(data, providers, voice=use_voice)
     return Settings(
         database=Path(database),
         runtime=runtime,
-        llm=llm,
+        models=models,
+        llm_providers=llm_providers,
         feishu=feishu,
         asr=asr,
         tts=tts,

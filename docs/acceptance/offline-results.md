@@ -43,6 +43,18 @@ export TMPDIR="$PWD" PYTHONDONTWRITEBYTECODE=1
 - 最终源码 ZIP 在项目内临时目录构建，SHA-256 校验通过；角色文件仅含 `main.example.md` 和 `sub.example.md`，不含实际角色。解包后复用仓库的同一虚拟环境，从解包目录的 `src` 导入源码，**331 项离线测试同样全部通过**。临时产物未留在正式 `dist/`。
 - 本轮未运行真实模型、飞书或 Mac 语音，均待部署实机验收。
 
+## 按角色引用模型配置：当前离线回归
+
+在项目目录运行 `TMPDIR="$PWD/build" PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=src .venv/bin/python -m unittest discover -s tests -q`（先确保 `build/` 存在）。Linux 上 491 项离线测试全部通过，普通及委派 CLI 演示均通过。
+
+`test_model_profiles.py` 使用本地合成流和项目内临时 SQLite，验证：
+
+- 角色引用错误在飞书探测和打开数据库前被拒绝；旧入口提示迁移，未被角色选用的 LLM Provider 不需要有效密钥。
+- 主角色与复用的子 Agent 分别通过 DeepSeek 和 Responses 完成普通请求、工具续轮与摘要；配置共享、轮数上限、单摘要槽和关闭顺序均有独立断言。
+- 已有 v1 数据库可继续使用。换档案 ID 但实际连接及模型不变时，带来源的用量和私有推理保持连续；同 ID 换模型时保留可见历史，不使用旧用量或不匹配的私有推理。
+
+未调用真实模型、飞书或目标 Mac 音频；实机验证见 [Mac 清单](mac-checklist.md)。
+
 ## 本地待验收
 
 - 真实飞书多私聊列表、登录身份和权限，以及同一专用账号与两个真人私聊的实际收发和隔离。

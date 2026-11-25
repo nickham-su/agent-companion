@@ -18,13 +18,15 @@ from .protocol import Channel, ChannelUser, Model
 from .runtime.compaction import Compactions
 from .runtime.engine import Runtime
 from .runtime.sqlite_access import SQLiteAccess
-from .runtime.subtasks import AgentRole, AgentTree
+from .runtime.subtasks import AgentRole, AgentTree, ModelBinding
 from .session_scheduler import SessionSchedulers
 from .speech.asr import ASRAdapter, ASRCapabilities, FileASR, StreamingASR
 from .speech.tts import StreamingTTS
 from .speech.vad import VoiceSetupError
 from .storage.sqlite import Agent, History
 from .workspace import Workspace
+
+ModelSource = Model | Mapping[str, ModelBinding]
 
 if TYPE_CHECKING:
     from .speech.audio import AudioDevice
@@ -50,7 +52,7 @@ async def _finish_agent_cleanup(cleanups: list[Awaitable[None]]) -> None:
 
 @asynccontextmanager
 async def running_agent(
-    settings: Settings, history: History, model: Model, channel: Channel, *,
+    settings: Settings, history: History, model: ModelSource, channel: Channel, *,
     session_id: str, roles: Mapping[str, AgentRole], agent: Agent | None = None,
     user: ChannelUser | None = None,
     retry_sqlite_locks: bool = False, compactions: Compactions | None = None,
@@ -64,8 +66,12 @@ async def running_agent(
     tree = None
     owns_compactions = compactions is None
     try:
-        llm = settings.llm
-        thinking = llm is not None and llm.adapter == "deepseek" and llm.reasoning_effort != "disabled"
+        if isinstance(model, Mapping):
+            models = model
+        else:
+            # 离线演示与测试可以直接注入模型，不依赖正式角色档案。
+            binding = ModelBinding(model, settings.runtime)
+            models = dict.fromkeys(roles, binding)
         sqlite = SQLiteAccess(retry_locks=retry_sqlite_locks, stopped=lambda: False)
         if agent is None:
             agent = await sqlite.write_input(lambda: history.ensure_main_agent(session_id))
@@ -73,13 +79,13 @@ async def running_agent(
             raise ValueError("main agent does not match route")
         await sqlite.write_input(lambda: history.interrupt_agent_tree(agent.agent_id, reason="restart"))
         if compactions is None:
-            compactions = Compactions(history, model)
+            compactions = Compactions(history)
         workspace = None
         if user is not None:
             directory_name = sha256(user.key.encode("utf-8")).hexdigest()
             workspace = Workspace(settings.workspace_root.absolute() / directory_name)
-        tree = AgentTree(agent, history, model, roles=roles,
-                         schedulers=schedulers, settings=settings.runtime, thinking=thinking,
+        tree = AgentTree(agent, history, models, roles=roles,
+                         schedulers=schedulers,
                          retry_sqlite_locks=retry_sqlite_locks, compactions=compactions, workspace=workspace)
         yield tree.bind_root(channel, owner), tree
     finally:
@@ -114,7 +120,7 @@ def private_feishu_identity(account: ChannelUser) -> str:
 async def prepare_private_feishu(
     settings: Settings, history: History | None = None, *, roles: Mapping[str, AgentRole],
     discovery: FeishuDiscovery | None = None,
-) -> AsyncIterator[tuple[History, Callable[[Model, ASRAdapter | ASRCapabilities, StreamingTTS | None],
+) -> AsyncIterator[tuple[History, Callable[[ModelSource, ASRAdapter | ASRCapabilities, StreamingTTS | None],
                                            Awaitable[None]]]]:
     """查一次 CLI 登录账号后绑定数据库；仅负责关闭本函数打开的库。"""
     feishu = feishu_settings(settings)
@@ -128,7 +134,7 @@ async def prepare_private_feishu(
           if history is None else nullcontext(history)) as db:
         started_ms = db.bind_feishu_private(identity, started_ms=candidate_ms)
 
-        async def run(model: Model, asr: ASRAdapter | ASRCapabilities, tts: StreamingTTS | None) -> None:
+        async def run(model: ModelSource, asr: ASRAdapter | ASRCapabilities, tts: StreamingTTS | None) -> None:
             capabilities = asr if isinstance(asr, ASRCapabilities) else asr.capabilities()
             file_asr = capabilities.file
             if file_asr is None:
@@ -152,7 +158,7 @@ async def prepare_private_feishu(
 
                 incoming = IncomingCalls(desktop, discovery, prepare_voice, account=account,
                                          idle_timeout=settings.voice.idle_timeout, copy_confirmed=feishu.voice_text_copy)
-            compactions = Compactions(db, model)
+            compactions = Compactions(db)
             schedulers = SessionSchedulers()
             try:
                 await run_private_chats(

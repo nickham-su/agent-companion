@@ -217,10 +217,10 @@ class ModelDiagnosticTests(unittest.IsolatedAsyncioTestCase):
         async with httpx.AsyncClient(transport=httpx.MockTransport(endpoint)) as client:
             with closing(History(":memory:")) as history, self.assertLogs("agent_companion", "DEBUG") as logged:
                 model = self.model("openai_responses", client)
-                compactions = Compactions(history, model)
+                compactions = Compactions(history)
                 try:
                     compactions.start(_SESSION, Prefix(0, 1, 1), [Message("user", summary_text)], (),
-                                      thinking=False, timeout=2, run_id=summary_run)
+                                      model=model, thinking=False, timeout=2, run_id=summary_run)
                     runtime = Runtime(_SESSION, history, model, None, compactions=compactions)
                     outcome = await self.submit(runtime, history)
                     if compactions._generating is not None:

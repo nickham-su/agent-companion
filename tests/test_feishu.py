@@ -1085,7 +1085,8 @@ print(json.dumps({"ok": True, "identity": "user", "data": page}))
     def test_sample_config_offline(self):
         settings = load_settings(Path("config.example.toml"))
         self.assertIsNone(settings.feishu)
-        self.assertIsNone(settings.llm)
+        self.assertEqual(settings.models, {})
+        self.assertEqual(settings.llm_providers, {})
         self.assertIsNone(settings.asr)
         self.assertIsNone(settings.tts)
 

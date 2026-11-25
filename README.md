@@ -45,18 +45,20 @@ python -m venv .venv
 
 Bash 排查时看 `bash call finished`：记录结果类别、退出码和耗时。若工具未进入执行，查看同一 `reply` 的 `tool dispatch rejected`。两者都不记录命令、工作目录或命令输出。
 
-## 选择 Provider
+## 选择模型与 Provider
 
-正式启动通过顶层 `llm_provider`、`asr_provider` 引用 `[providers.<名字>]`；`voice` 还需 `tts_provider`，`text` 不使用它。名字是任意配置 ID，`adapter` 才是实际适配器。每套 Provider 在本机配置中直接填写 `api_key`，不从环境变量读取；未选用的 Provider 不需要密钥。改引用后重启即可切换。
+每个角色用 `model_id` 引用全局 `[models.<ID>]`。一套模型配置必填 `provider`、`model`、`reasoning_effort`、`context_budget`、`tail_budget`；`max_tool_rounds` 可省略（默认 `8`），限制一次运行中的模型请求轮数，**含首轮**，不是工具调用次数。两个预算和轮数上限都必须是正整数，且 `tail_budget < context_budget`。
 
-旧的 `[llm]`、`[deepseek]`、`[minimax]` 及旧语音模型字段不再兼容，请按 [config.example.toml](config.example.toml) 迁移。`adapter` 必须显式指定，`.llm.reasoning_effort` 必填。
+`provider` 指向 `[providers.<ID>]`，其中的 `adapter` 才是实际适配器。多个模型配置可引用同一个 Provider，多个角色也可显式引用同一个模型配置；改动一套配置会影响所有引用它的角色，修改后重启生效。各角色的普通请求、工具续轮和摘要都使用自己的配置。语音仍通过顶层 `asr_provider`、`tts_provider` 引用 Provider；`text` 不使用 TTS。密钥只填本机配置的 `api_key`，不从环境变量读取。未被实际角色或语音能力选用的 Provider 不要求有效密钥；启动先校验配置和引用，不探测模型端点。
+
+**从旧配置迁移**：参照 [config.example.toml](config.example.toml)，删除顶层 `llm_provider`、`[providers.<ID>.llm]` 和 `[runtime]`；将原 Provider 引用、模型名（以前省略时也要显式填写）、推理强度、两个预算及轮数上限集中到 `[models.<ID>]`。在每个实际角色文件显式加上 `model_id`；原先共用模型的角色可填写同一个 ID。旧格式不会回退读取，原 SQLite 数据库无需更换。切换到上下文窗口较小的模型时，旧模型的用量不会触发压缩；若已有历史过长，新模型的第一次请求仍可能被拒绝。
 
 请求时限统一配置在 `[timeouts]`，单位秒：`llm` 是单次模型请求总时限（默认 60），`asr` 是单次文件转写总时限（默认 30，包含请求握手、文件上传和等待结果）；实时流式转写的启动、停口后的等待分别使用该时限，录音时长不计入其中，`tts` 是单次网络读写及等待响应的时限（默认 25，仅 `voice` 启用）。切换 Provider 不改变这些值。旧的 `runtime.model_timeout` 和 Provider 能力表里的 `timeout` 不再兼容；语音投递与飞书 CLI 的时限独立配置。升级时删除 `[runtime]` 中旧的 `delivery_timeout`。
 
 | `adapter` | 配置 |
 | --- | --- |
-| `deepseek` | `.llm.model` 可省略，默认 `deepseek-flash`。`reasoning_effort = "disabled"` 显式关闭思考；其他值由所选模型解释。历史切到思考开启时，如有不兼容旧记录，用摘要承接，原文仍可查。 |
-| `openai_responses` | `.llm.model` 必填。可选 Provider 层 `base_url`，默认 `https://api.openai.com/v1`，请求时在其后追加 `/responses`。`reasoning_effort` 原样传给 Responses，例如 `low`，或选用明确支持 `none` 的模型来关闭推理。 |
+| `deepseek` | `model` 必填，例如 `deepseek-flash`。`reasoning_effort = "disabled"` 显式关闭思考；其他值由所选模型解释。只有来源匹配的历史才会回传私有推理字段；不匹配或无来源的旧块保留可见内容，思考模式要求推理字段时按完整块作为历史归档投影。 |
+| `openai_responses` | `model` 必填。可选 Provider 层 `base_url`，默认 `https://api.openai.com/v1`，请求时在其后追加 `/responses`。`reasoning_effort` 原样传给 Responses，例如 `low`，或选用明确支持 `none` 的模型来关闭推理。 |
 | `minimax` | Provider 层 `region` 选 `cn`（默认）或 `global`。`.asr.model` 默认 `asr-1.0`，也可填写其他兼容同一文件转写接口的模型名；`.asr.max_audio_seconds` 必填，无默认值。`.tts` 配置模型和音色。ASR、TTS 可以共用一套 Provider，也可以分别使用不同区域和 Key。 |
 | `bailian` | Provider 层填 `workspace_id` 及同地域的 Key，`region` 为 `cn-beijing`（默认）或 `ap-southeast-1`，连接百炼业务空间域名。ASR 支持 `qwen-audio-3.1-asr-flash-message`（文件和流式），`.asr.max_audio_seconds` 必填。TTS 默认 `qwen-audio-3.1-tts-flash` / `longanhuan_v3.1`；也支持 `cosyvoice-v3-flash`，须同时配置与模型和地域匹配的 `voice_id`，如 `longanyang`。 |
 
@@ -91,7 +93,7 @@ python scripts/build_source_zip.py
 
 1. 用专用飞书账号在本机完成 CLI **用户身份**登录。需要支持 [`im +chat-list --types p2p`](https://github.com/larksuite/cli/blob/main/skills/lark-im/references/lark-im-chat-list.md) 的 CLI 版本和 `im:chat:read` 权限，并确认已授权查询当前登录用户信息（`GET /open-apis/authen/v1/user_info`）、[读取私聊历史](https://open.feishu.cn/document/server-docs/im-v1/message/list)、下载媒体和发送消息。程序不会发起登录或直接读取凭据文件。运行中不要切换 CLI 登录账号或应用配置。
 2. 复制 `config.example.toml` 为 `config.local.toml`，启用 `[feishu]`，使用默认的 `mode = "text"`。如果旧配置有 `own_open_id`，请删除这一行。`database` 可指向尚不存在的新文件，首次启动会创建它并绑定当前 CLI 登录账号，请先确认登录的是专用账号。文字模式不加载音频设备或 TTS，也不监听来电、不查询会议；`cli_timeout` 限制单次飞书 CLI 调用（默认 20 秒）。
-3. 按[选择 Provider](#选择-provider)填好所选 LLM 和 ASR 的 `api_key`；只在本机私有配置填写真实 Key，不要分享或提交该文件。MiniMax 区域按账号选择 `cn`（[国内 API](https://platform.minimax.cn/docs/api-reference/speech-to-text)）或 `global`（[国际 API](https://platform.minimax.io/docs/api-reference/speech-to-text)）。百炼另需配置同地域的 `workspace_id`。工作目录需要允许建立用于资源下载的短期目录。
+3. 按[选择模型与 Provider](#选择模型与-provider)填好角色所选模型和 ASR 使用的 `api_key`；只在本机私有配置填写真实 Key，不要分享或提交该文件。MiniMax 区域按账号选择 `cn`（[国内 API](https://platform.minimax.cn/docs/api-reference/speech-to-text)）或 `global`（[国际 API](https://platform.minimax.io/docs/api-reference/speech-to-text)）。百炼另需配置同地域的 `workspace_id`。工作目录需要允许建立用于资源下载的短期目录。
 4. 在启动工作目录下复制 `agents/main.example.md` 为 `agents/main.md`，并按 [Agent 角色配置](#agent-角色配置)编辑。需要委派时，再从 `agents/sub.example.md` 创建实际子角色。
 
 ```sh
@@ -185,7 +187,7 @@ MiniMax 流式合成也可能以 HTTP 200 返回 JSON 业务错误而不是 SSE�
 正式启动时，只从进程启动工作目录的 `agents/` 加载顶层 UTF-8 `.md` 文件，不跟随符号链接，不读取旧 `AGENTS.md`。必须有通过校验的 `agents/main.md`，否则启动失败。仓库和部署包只提供 `main.example.md` 和 `sub.example.md`；`*.example.md` 不加载。本机实际角色文件由 Git 忽略。配置修改后重启生效。
 
 - `main.md` 是主角色。要添加子角色，将 `sub.example.md` 复制为 `review.md` 等实际文件；去掉 `.md` 的文件名就是角色 ID。
-- 每个文件开头用两行独占的 `+++` 包围 TOML 头部：`tools` 必须是工具名数组，可填 `delegate_subtask`、`set_timer`、`cancel_timer`、`bash`，或填 `[]` 不启用工具；`description` 是角色分工，子角色必填非空描述，主角色可省略。只有主角色也能启动，这时不向模型提供委派工具。
+- 每个文件开头用两行独占的 `+++` 包围 TOML 头部：`model_id` 必须指向已定义的 `[models.<ID>]`，没有默认、继承或角色级字段覆盖；`tools` 必须是工具名数组，可填 `delegate_subtask`、`set_timer`、`cancel_timer`、`bash`，或填 `[]` 不启用工具；`description` 是角色分工，子角色必填非空描述，主角色可省略。只有主角色也能启动，这时不向模型提供委派工具。
 - 结束分隔线后的 Markdown 正文原样作为该角色的系统提示词，包括空行与换行。角色文件限 32 KiB，格式或工具名无效会在启动时报告对应文件。**角色正文和用于选择子角色的描述会发给模型服务，不要放入密钥、凭据或隐私信息，只在可信工作目录启动。**
 
 ## 用户工作区与 Bash
@@ -214,6 +216,6 @@ MiniMax 流式合成也可能以 HTTP 200 返回 JSON 业务错误而不是 SSE�
 
 压缩指令要求模型不归纳私有协议字段。客户端会拒绝明显原样回显（摘要全文与字段相同，或原样包含较长字段），不保存该摘要、不推进覆盖点；对模型改写、截取或自行生成的文字，不能保证识别。
 
-`[runtime].context_budget` 是软阈值：同一会话上次成功普通请求的实际输入 token 数达到阈值后，下一次普通请求前才尝试压缩。这个数字随普通回复结果保存到 SQLite，摘要请求的用量不参与判断；上次没返回用量时不使用本地估算兜底。`tail_budget` 仍按 UTF-8 字节数除以 3 加固定开销，从近到远保留完整消息块；当前轮不会因超过尾部预算被截断。会话摘要完整保存和发送，不按本地估算截断或分批。配置阈值时给下一轮输入和输出留出余量。升级时请从本机配置的 `[runtime]` 移除旧的 `summary_budget`。
+`[models.<ID>].context_budget` 是软阈值：同一会话上次成功普通请求的实际输入 token 数达到阈值后，下一次普通请求前才尝试压缩。全应用同时最多生成一份摘要。用量随普通回复写入 SQLite，只有实际适配器、端点、凭据、模型和推理档位一致时才沿用；档案 ID 不作为身份。旧库没有来源标记的用量、缺失的用量和摘要用量不参与判断，不使用本地估算兜底。`tail_budget` 仍按 UTF-8 字节数除以 3 加固定开销，从近到远保留完整消息块；当前轮不会因超过尾部预算被截断。会话摘要完整保存和发送，不按本地估算截断或分批。配置阈值时给下一轮输入和输出留出余量。
 
 方案见 [首版架构方案](<docs/design/0001-MVP方案/飞书多模态 Agent 首版架构方案.md>)和[首版实施与验收计划](<docs/design/0001-MVP方案/飞书多模态 Agent 首版实施与验收计划.md>)。

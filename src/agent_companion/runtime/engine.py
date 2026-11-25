@@ -49,7 +49,7 @@ class Runtime:
                  tools: Tools | None = None, settings: RuntimeSettings | None = None,
                  thinking: bool = False, instructions: str | None = None, delivery_idle_timeout: float | None = None,
                  retry_sqlite_locks: bool = False, compactions: Compactions | None = None,
-                 workspace: Workspace | None = None, agent: Agent | None = None,
+                 workspace: Workspace | None = None, agent: Agent | None = None, model_origin: bytes | None = None,
                  reply_to_parent: Callable[[AgentReply], bool] | None = None) -> None:
         if not session_id:
             raise ValueError("session_id must be non-empty")
@@ -73,6 +73,7 @@ class Runtime:
         self._instructions = instructions
         replay_scope = getattr(model, "replay_scope", None)
         self._replay_scope = replay_scope if isinstance(replay_scope, ReplayScope) else None
+        self._origin_options = {"model_origin": model_origin} if model_origin is not None else {}
         self._pending: deque[_InputBatch] = deque()
         self._queued_inbound: set[int] = set()
         self._input_blocked: Literal["retryable", "unsafe"] | None = None
@@ -84,10 +85,10 @@ class Runtime:
         self._closed = False
         self._sqlite = SQLiteAccess(retry_locks=retry_sqlite_locks, stopped=lambda: self._closed)
         self._owns_compactions = compactions is None
-        self._compactions = compactions if compactions is not None else Compactions(history, model)
-        self._compactions.check_owner(history, model)
-        self._context = Context(history, self._settings, self._compactions, sqlite=self._sqlite,
-                                replay_scope=self._replay_scope)
+        self._compactions = compactions if compactions is not None else Compactions(history)
+        self._compactions.check_owner(history)
+        self._context = Context(history, self._settings, self._compactions, model=model, sqlite=self._sqlite,
+                                replay_scope=self._replay_scope, **self._origin_options)
         self._idle = asyncio.Event()
         self._idle.set()
         self.last_failure: str | None = None
@@ -341,7 +342,8 @@ class Runtime:
             if not can_send():
                 return None
             try:
-                last_input_tokens = await self._sqlite(self.history.last_input_tokens, self.session_id)
+                last_input_tokens = await self._sqlite(self.history.last_input_tokens, self.session_id,
+                                                       **self._origin_options)
                 messages = await self._context.prepare(self.session_id, thinking=self._thinking,
                                                        tools=self._tools.specs, instructions=self._instructions,
                                                        protected_from=protected_from, can_send=can_send,
@@ -605,7 +607,7 @@ class Runtime:
             outcome = ReplyOutcome(info.reply_id, info.session_id, run_id, model_status,
                                    receipt.status if receipt else None, model_error=model_error,
                                    input_tokens=input_tokens if model_status == "complete" else None)
-            await self._sqlite.write_input(lambda: self.history.finalize_reply(outcome, rows))
+            await self._sqlite.write_input(lambda: self.history.finalize_reply(outcome, rows, **self._origin_options))
             _LOG.debug("reply committed; reply=%s receipt=%s confirmed_chars=%d tool_results=%d elapsed_ms=%.0f",
                        info.reply_id, receipt.status if receipt else None, len(confirmed_text), len(results),
                        (loop.time() - info.started_at) * 1000)

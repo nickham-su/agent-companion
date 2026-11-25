@@ -4,7 +4,7 @@ from collections.abc import Callable, Sequence
 from dataclasses import dataclass, replace
 
 from ..config import RuntimeSettings
-from ..protocol import Message, ModelError, Part, ReplayScope, Text, ToolSpec
+from ..protocol import Message, Model, ModelError, Part, ReplayScope, Text, ToolSpec
 from ..storage.sqlite import History, HistoryEntry, Summary, SummaryWriteError
 from .compaction import Compactions, Prefix
 from .sqlite_access import SQLiteAccess
@@ -111,11 +111,14 @@ def _checked_blocks(summary: Summary | None, entries: Sequence[HistoryEntry], *,
 
 class Context:
     def __init__(self, history: History, settings: RuntimeSettings, compactions: Compactions,
-                 replay_scope: ReplayScope | None = None, *, sqlite: SQLiteAccess) -> None:
+                 replay_scope: ReplayScope | None = None, *, model: Model, sqlite: SQLiteAccess,
+                 model_origin: bytes | None = None) -> None:
         self._history = history
         self._settings = settings
+        self._model = model
         self._compactions = compactions
         self._replay_scope = replay_scope
+        self._origin_options = {"model_origin": model_origin} if model_origin is not None else {}
         self._sqlite = sqlite
 
     async def prepare(self, session_id: str, *, thinking: bool, tools: Sequence[ToolSpec], protected_from: int,
@@ -123,7 +126,7 @@ class Context:
                       last_input_tokens: int | None = None, run_id: str | None = None) -> list[Message] | None:
         fixed = [Message("system", instructions)] if instructions is not None else []
         summary, entries = await self._sqlite(self._history.context_snapshot, session_id,
-                                              replay_scope=self._replay_scope)
+                                              replay_scope=self._replay_scope, **self._origin_options)
         if not can_send():
             return None
         covered = summary.covers_through if summary else 0
@@ -150,7 +153,8 @@ class Context:
                             summary, blocks = candidate, blocks[cut:]
                         else:
                             # 另一个连接可能已推进覆盖点；用胜出的摘要和同一快照的续尾发本次请求。
-                            fresh = self._history.try_context_snapshot(session_id, replay_scope=self._replay_scope)
+                            fresh = self._history.try_context_snapshot(session_id, replay_scope=self._replay_scope,
+                                                                      **self._origin_options)
                             if fresh is not None:
                                 summary, latest_entries = fresh
                                 blocks, _ = _checked_blocks(summary, latest_entries, protected_from=protected_from,
@@ -164,7 +168,8 @@ class Context:
                 if any(message.role != "assistant" or message.content or message.tool_calls for message in old):
                     prefix = Prefix(covered, blocks[0].end_id, blocks[cut - 1].end_id)
                     self._compactions.start(session_id, prefix, fixed + _summary_message(summary) + old + [_SUMMARIZE],
-                                             tools, thinking=thinking, timeout=self._settings.model_timeout, run_id=run_id)
+                                             tools, model=self._model, thinking=thinking,
+                                             timeout=self._settings.model_timeout, run_id=run_id)
         return fixed + _summary_message(summary) + _protocol_messages(blocks, keep_reasoning)
 
     def _tail_cut(self, blocks: Sequence[_Block], protected: int, keep_reasoning: bool) -> int:

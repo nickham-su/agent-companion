@@ -147,7 +147,7 @@ class HistoryTest(unittest.TestCase):
 
     def test_default_and_explicit_configuration(self):
         default = load_settings()
-        self.assertIsNone(default.llm)
+        self.assertEqual(default.models, {})
         self.assertEqual(default.runtime.model_timeout, 60)
         self.assertEqual(default.voice.idle_timeout, 30)
         with tempfile.TemporaryDirectory(dir=Path.cwd()) as folder:
@@ -157,7 +157,7 @@ class HistoryTest(unittest.TestCase):
             actual = load_settings(path)
             self.assertEqual(actual.database, path.parent / "project-local.sqlite")
             self.assertEqual(actual.voice.idle_timeout, 1.25)
-            self.assertIsNone(actual.llm)
+            self.assertEqual(actual.models, {})
             path.write_text('[runtime]\ndelivery_timeout = nan\n', encoding="utf-8")
             with self.assertRaisesRegex(ValueError, "runtime 配置字段无效"):
                 load_settings(path)

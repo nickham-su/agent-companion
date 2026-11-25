@@ -38,25 +38,25 @@ class _Remembered:
 
 
 class Compactions:
-    """同一 History 和 Model 的应用实例最多生成一份摘要，不排队。"""
+    """同一 History 的应用实例最多生成一份摘要，不排队。"""
 
-    def __init__(self, history: History, model: Model) -> None:
+    def __init__(self, history: History) -> None:
         self._history = history
-        self._model = model
         self._generating: asyncio.Task[None] | None = None
+        self._active_model: Model | None = None
         self._remembered: OrderedDict[str, _Remembered] = OrderedDict()
         self._closed = False
 
-    def check_owner(self, history: History, model: Model) -> None:
-        if self._history is not history or self._model is not model:
-            raise ValueError("compactions must share the same history and model")
+    def check_owner(self, history: History) -> None:
+        if self._history is not history:
+            raise ValueError("compactions must share the same history")
 
     def stop(self) -> None:
         if not self._closed:
             self._closed = True
             self._remembered.clear()
             if (reader := self._generating) is not None:
-                stop_stream = getattr(self._model, "stop_stream", None)
+                stop_stream = getattr(self._active_model, "stop_stream", None)
                 if stop_stream is None or not stop_stream(reader):
                     reader.cancel()
 
@@ -64,7 +64,19 @@ class Compactions:
         self.stop()
         if self._generating is not None:
             # 适配器须配合取消并关闭响应流；槽在清理完成前不交给另一个生成任务。
-            await asyncio.gather(self._generating, return_exceptions=True)
+            pending = asyncio.gather(self._generating, return_exceptions=True)
+            interrupted = None
+            while not pending.done():
+                try:
+                    await asyncio.shield(pending)
+                except asyncio.CancelledError as exc:
+                    # 外部取消只影响此等待方，不能打断原生传输正在进行的清理。
+                    interrupted = exc
+            # 被取消时任务可能还没开始，因此生成协程的 finally 不一定执行。
+            self._generating = None
+            self._active_model = None
+            if interrupted is not None:
+                raise interrupted
 
     def _prune(self) -> None:
         now = monotonic()
@@ -102,15 +114,18 @@ class Compactions:
         )
 
     def start(self, session_id: str, prefix: Prefix, prompt: list[Message], tools: Sequence[ToolSpec], *,
-               thinking: bool, timeout: float, run_id: str | None = None) -> None:
+               model: Model, thinking: bool, timeout: float, run_id: str | None = None) -> None:
         # 与 can_start 之间无 await；冻结工具定义中可变的 schema。
+        if self._closed or self._generating is not None:
+            return
         try:
             frozen_tools = deepcopy(tuple(tools))
         except Exception:
             self.failed(session_id, prefix, "summary_freeze_failed")
             return
+        self._active_model = model
         self._generating = asyncio.create_task(self._generate(
-            session_id, prefix, tuple(prompt), frozen_tools, thinking, timeout, run_id))
+            session_id, prefix, tuple(prompt), frozen_tools, model, thinking, timeout, run_id))
 
     def failed(self, session_id: str, prefix: Prefix, reason: str) -> None:
         if not self._closed:
@@ -118,15 +133,15 @@ class Compactions:
             _LOG.warning("model summary unavailable (%s); preserving original context", reason)
 
     async def _generate(self, session_id: str, prefix: Prefix, prompt: tuple[Message, ...],
-                         tools: tuple[ToolSpec, ...], thinking: bool, timeout: float, run_id: str | None) -> None:
+                         tools: tuple[ToolSpec, ...], model: Model, thinking: bool, timeout: float, run_id: str | None) -> None:
         diagnostics = ModelRequestDiagnostics("summary", timeout, run_id=run_id)
         try:
             loop = asyncio.get_running_loop()
             expires = loop.time() + timeout
-            stop_stream = getattr(self._model, "stop_stream", None)
+            stop_stream = getattr(model, "stop_stream", None)
             with diagnostics.activate():
                 async with model_deadline_at(expires, stop_stream) as deadline:
-                    content = await _summarize(self._model, prompt, tools, thinking)
+                    content = await _summarize(model, prompt, tools, thinking)
             if deadline.expired() or loop.time() >= expires:
                 raise TimeoutError
             self._remember(session_id, _Remembered(
@@ -142,6 +157,7 @@ class Compactions:
             self.failed(session_id, prefix, "summary_model_failed")
         finally:
             self._generating = None
+            self._active_model = None
 
 
 def _private_replay_fields(replay: ProviderReplay) -> Iterator[str]:

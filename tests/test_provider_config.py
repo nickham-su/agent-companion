@@ -1,5 +1,6 @@
 import asyncio
 from contextlib import asynccontextmanager
+from dataclasses import replace
 from io import BytesIO, StringIO
 import json
 from pathlib import Path
@@ -11,14 +12,14 @@ import wave
 
 import httpcore
 import httpx
-from feishu_test_support import private_discovery
+from feishu_test_support import configured_roles, private_discovery
 
-from agent_companion.__main__ import _serve, main
+from agent_companion.__main__ import _ServingExitStack, _serve, main
 from agent_companion.app import prepare_private_feishu, running_agent
 from agent_companion.config import ConfigError, VoiceSettings, load_settings
-from agent_companion.models.deepseek import CHAT_COMPLETIONS
+from agent_companion.models.deepseek import CHAT_COMPLETIONS, DeepSeek
+from agent_companion.models.openai_responses import OpenAIResponses
 from agent_companion.protocol import DeliveryStatus, Message, Receipt
-from agent_companion.runtime.subtasks import demo_roles
 from agent_companion.speech.asr import AudioFile
 from agent_companion.speech.minimax_tts import MiniMaxTTS
 
@@ -28,8 +29,7 @@ _FEISHU = '''
 [feishu]
 mode = "text"
 '''
-_CONFIG = '''llm_provider = "chat"
-asr_provider = "speech"
+_CONFIG = '''asr_provider = "speech"
 tts_provider = "speech"
 ''' + _FEISHU + f'''
 [voice]
@@ -38,8 +38,12 @@ output_sample_rate = 24000
 [providers.chat]
 adapter = "deepseek"
 api_key = "{_KEY}"
-[providers.chat.llm]
+[models.chat]
+provider = "chat"
+model = "deepseek-flash"
 reasoning_effort = "disabled"
+context_budget = 64000
+tail_budget = 16000
 
 [providers.speech]
 adapter = "minimax"
@@ -56,7 +60,8 @@ def _native_config(adapter):
     if adapter == "deepseek":
         return _CONFIG
     return _CONFIG.replace('adapter = "deepseek"', 'adapter = "openai_responses"').replace(
-        'reasoning_effort = "disabled"', 'model = "fixture-model"\nreasoning_effort = "low"')
+        'reasoning_effort = "disabled"', 'reasoning_effort = "low"').replace(
+        'model = "deepseek-flash"', 'model = "fixture-model"')
 
 
 class ProviderConfigTests(unittest.TestCase):
@@ -83,33 +88,32 @@ class ProviderConfigTests(unittest.TestCase):
     def test_example_contains_switchable_llms_and_shared_speech_provider(self):
         example = Path("config.example.toml").read_text(encoding="utf-8")
         example = example.replace('[timeouts]\nllm = 60', '[timeouts]\nllm = 12.5')
-        for name, adapter in (("deepseek_default", "deepseek"), ("openai_default", "openai_responses")):
-            with self.subTest(adapter=adapter):
-                self.path.write_text(example.replace('llm_provider = "deepseek_default"', f'llm_provider = "{name}"')
-                                     + _FEISHU.replace('"text"', '"voice"'), encoding="utf-8")
-                with (patch("sys.argv", ["agent-companion", "--run", "--config", str(self.path)]),
-                      patch("agent_companion.__main__._serve", new_callable=AsyncMock) as serve,
-                      patch("os.getenv") as getenv):
-                    self.assertEqual(main(), 0)
-                getenv.assert_not_called()
-                settings, = serve.await_args.args
-                self.assertEqual(settings.llm.adapter, adapter)
-                self.assertEqual(settings.runtime.model_timeout, 12.5)
-                self.assertEqual(settings.asr_timeout, 30)
-                self.assertEqual(settings.tts_timeout, 25)
-                self.assertEqual(settings.asr.model, "asr-1.0")
-                self.assertEqual(settings.asr.max_audio_seconds, 500)
-                self.assertEqual(settings.tts.model, "speech-2.8-turbo")
-                self.assertIs(settings.asr.connection, settings.tts.connection)
+        self.path.write_text(example + _FEISHU.replace('"text"', '"voice"'), encoding="utf-8")
+        with (patch("sys.argv", ["agent-companion", "--run", "--config", str(self.path)]),
+              patch("agent_companion.__main__._serve", new_callable=AsyncMock) as serve,
+              patch("os.getenv") as getenv):
+            self.assertEqual(main(), 0)
+        getenv.assert_not_called()
+        settings, = serve.await_args.args
+        self.assertEqual({name: settings.llm_providers[model.provider].adapter for name, model in settings.models.items()},
+                         {"chat": "deepseek", "review": "openai_responses"})
+        self.assertEqual(settings.models["chat"].runtime.model_timeout, 12.5)
+        self.assertEqual(settings.models["review"].runtime.max_tool_rounds, 8)
+        self.assertEqual(settings.asr_timeout, 30)
+        self.assertEqual(settings.tts_timeout, 25)
+        self.assertEqual(settings.asr.model, "asr-1.0")
+        self.assertEqual(settings.asr.max_audio_seconds, 500)
+        self.assertEqual(settings.tts.model, "speech-2.8-turbo")
+        self.assertIs(settings.asr.connection, settings.tts.connection)
 
     def test_selected_references_must_exist_and_support_the_capability(self):
         for before, after, error in (
-            ('llm_provider = "chat"', '', '必须显式设置 llm_provider'),
+            ('provider = "chat"\nmodel', 'model', 'provider 必须显式设置'),
             ('asr_provider = "speech"', '', '必须显式设置 asr_provider'),
-            ('llm_provider = "chat"', f'llm_provider = "{_KEY}_absent"', 'llm_provider 引用的 Provider 不存在'),
+            ('provider = "chat"', f'provider = "{_KEY}_absent"', 'provider 引用的 Provider 不存在'),
             ('asr_provider = "speech"', 'asr_provider = "absent"', 'asr_provider 引用的 Provider 不存在'),
             ('asr_provider = "speech"', 'asr_provider = "chat"', '支持 asr 的 adapter'),
-            ('llm_provider = "chat"', 'llm_provider = "speech"', '支持 llm 的 adapter'),
+            ('provider = "chat"', 'provider = "speech"', '支持 llm 的 adapter'),
             ('[providers.speech.asr]\nmax_audio_seconds = 500\n', '', '缺少 asr 能力配置表'),
         ):
             with self.subTest(error=error):
@@ -124,7 +128,13 @@ class ProviderConfigTests(unittest.TestCase):
 
     def test_selected_credentials_are_checked_without_environment_fallback_or_repr(self):
         for value in ('', 'api_key = 123', 'api_key = ""', f'api_key = "{_KEY}\\ninvalid"'):
-            self.assert_startup_error(_CONFIG.replace(f'api_key = "{_KEY}"', value), 'api_key')
+            self.path.write_text(_CONFIG.replace(f'api_key = "{_KEY}"', value), encoding="utf-8")
+            settings = load_settings(self.path, for_run=True)
+            with (patch("agent_companion.__main__.prepare_private_feishu") as prepare,
+                  self.assertRaisesRegex(ConfigError, r"agents/main.md.*model_id.*api_key") as caught):
+                asyncio.run(_serve(settings, roles=configured_roles()))
+            prepare.assert_not_called()
+            self.assertNotIn(_KEY, str(caught.exception))
         self.assert_startup_error(_CONFIG.replace('api_key = "synthetic-speech-value"', ''), 'asr_provider')
         self.assert_startup_error(_CONFIG.replace('mode = "text"', 'mode = "voice"')
                                   .replace('tts_provider = "speech"', 'tts_provider = "speaker"')
@@ -153,6 +163,21 @@ api_key = 123
                 settings = load_settings(self.path, for_run=True)
                 self.assertEqual(settings.asr.connection.region, "cn")
                 self.assertIsNone(settings.tts)
+
+    def test_text_checks_provider_fields_and_table_shape_only_when_selected(self):
+        cases = (
+            (_CONFIG + '\n[providers.inactive]\nadapter = "minimax"\nunknown_field = true\n',
+             'asr_provider 配置字段无效'),
+            ('providers.inactive = false\n' + _CONFIG, 'asr_provider 必须是 TOML 表'),
+        )
+        for config, diagnostic in cases:
+            with self.subTest(diagnostic=diagnostic):
+                self.path.write_text(config, encoding="utf-8")
+                settings = load_settings(self.path, for_run=True)
+                self.assertEqual(settings.asr.max_audio_seconds, 500)
+                self.assertIsNone(settings.tts)
+                selected = config.replace('asr_provider = "speech"', 'asr_provider = "inactive"')
+                self.assert_startup_error(selected, diagnostic)
 
     def test_formal_text_ignores_invalid_voice_values_and_table_shape(self):
         voice_table = '[voice]\noutput_sample_rate = 24000'
@@ -195,8 +220,8 @@ api_key = 123
             (_CONFIG.replace('mode = "text"', f'mode = "{_KEY}"'), 'feishu.mode 必须是 text 或 voice'),
             (_CONFIG.replace('mode = "text"', 'mode = "text"\ncli_timeout = false'), 'feishu.cli_timeout 必须是有限正数'),
             (_CONFIG + '\n[runtime]\ndelivery_timeout = 120\n', 'runtime 配置字段无效'),
-            (_CONFIG + '\n[runtime]\ncontext_budget = 42\n',
-             'runtime.tail_budget 必须小于 runtime.context_budget'),
+            (_CONFIG.replace('context_budget = 64000', 'context_budget = 42'),
+             'tail_budget 必须小于 context_budget'),
             (_CONFIG + '\n[runtime]\nsummary_budget = 4000\n', 'runtime 配置字段无效'),
             (_CONFIG + f'\n[runtime]\n{_KEY} = 42\n', 'runtime 配置字段无效'),
             ('database = false\n' + _CONFIG, 'database 必须是非空且不含 NUL 字符的路径'),
@@ -327,7 +352,7 @@ api_key = 123
             ('reasoning_effort = "disabled"', '', 'reasoning_effort'),
             ('reasoning_effort = "disabled"', 'reasoning_effort = " "', 'reasoning_effort'),
             ('reasoning_effort = "disabled"', 'reasoning_effort = "high"\nreplay_profile = "legacy"', '配置字段无效'),
-            ('adapter = "deepseek"', 'adapter = "openai_responses"', '必须设置 llm.model'),
+            ('model = "deepseek-flash"', '', 'model 必须显式设置'),
             ('adapter = "deepseek"', 'adapter = "deepseek"\nbase_url = "https://example.invalid"', 'base_url'),
             ('adapter = "minimax"', 'adapter = "minimax"\nbase_url = "https://example.invalid"', 'base_url'),
             ('[providers.speech.asr]', '[providers.speech.asr]\nmodel = " "', 'asr.model 必须是非空字符串'),
@@ -370,7 +395,7 @@ api_key = 123
                     self.assert_startup_error(config, f'timeouts.{ability} 必须是有限正数')
 
     def test_provider_timeout_migration_only_checks_active_capabilities(self):
-        for name, ability in (('chat', 'llm'), ('speech', 'asr'), ('speech', 'tts')):
+        for name, ability in (('speech', 'asr'), ('speech', 'tts')):
             with self.subTest(ability=ability):
                 table = f'[providers.{name}.{ability}]'
                 config = _CONFIG.replace(table, f'{table}\ntimeout = "{_KEY}"')
@@ -382,8 +407,6 @@ api_key = 123
         voice = _CONFIG.replace('mode = "text"', 'mode = "voice"')
         self.path.write_text(voice + '''
 [providers.unused]
-[providers.unused.llm]
-timeout = 3
 [providers.unused.tts]
 timeout = false
 ''', encoding="utf-8")
@@ -403,7 +426,7 @@ timeout = false
         self.assertNotIn(_KEY, ''.join(traceback.format_exception(caught.exception)))
 
     def test_demo_does_not_resolve_production_fields_and_run_needs_config(self):
-        self.path.write_text('llm_provider = false\nproviders = "ignored in demo"\n[timeouts]\ntts = false\n',
+        self.path.write_text('models = false\nproviders = "ignored in demo"\n[timeouts]\ntts = false\n',
                              encoding="utf-8")
         with (patch("sys.argv", ["agent-companion", "--demo-subtasks", "--config", str(self.path)]),
               patch("sys.stdout", new_callable=StringIO) as stdout):
@@ -454,9 +477,81 @@ class ProviderCompositionTests(unittest.IsolatedAsyncioTestCase):
     async def test_native_transport_internal_close_failure_is_reported(self):
         await self._check_native_transport_close("openai_responses", eof_first=True, close_mode="failure")
 
-    async def _check_native_transport_close(self, adapter, *, eof_first, close_mode="success"):
+    async def test_serve_repeated_cancel_waits_for_native_model_cleanup_before_all_clients(self):
+        for adapter in ("deepseek", "openai_responses"):
+            with self.subTest(adapter=adapter):
+                await self._check_native_transport_close(adapter, eof_first=True, cancel_during_exit=True)
+
+    async def test_serving_exit_stack_preserves_startup_error_and_lifo_cleanup(self):
+        for fail_enter in (True, False):
+            with self.subTest(fail_enter=fail_enter):
+                startup_error = RuntimeError("fixture startup failure")
+                first_error = ValueError("fixture first cleanup failure")
+                last_error = LookupError("fixture last cleanup failure")
+                events = []
+
+                @asynccontextmanager
+                async def resource():
+                    if fail_enter:
+                        raise startup_error
+                    try:
+                        yield
+                    finally:
+                        events.append("resource closed")
+
+                async def close_first(exc_type, exc, tb):
+                    events.append(exc)
+                    raise first_error
+
+                async def close_last(exc_type, exc, tb):
+                    events.append(exc)
+                    raise last_error
+
+                with self.assertRaises(LookupError) as caught:
+                    async with _ServingExitStack() as stack:
+                        stack.push_async_exit(close_last)
+                        stack.push_async_exit(close_first)
+                        await stack.enter_async_context(resource())
+                        raise startup_error
+
+                expected = [startup_error, first_error]
+                self.assertEqual(events, expected if fail_enter else ["resource closed", *expected])
+                self.assertIs(caught.exception, last_error)
+                self.assertIs(last_error.__context__, first_error)
+                self.assertIs(first_error.__context__, startup_error)
+
+    async def test_serving_exit_stack_preserves_exception_suppression(self):
+        body_error = ValueError("fixture body failure")
+        events = []
+
+        async def observe(exc_type, exc, tb):
+            events.append((exc_type, exc, tb))
+
+        async def suppress(exc_type, exc, tb):
+            self.assertIs(exc_type, ValueError)
+            self.assertIs(exc, body_error)
+            self.assertIs(tb, body_error.__traceback__)
+            return True
+
+        async with _ServingExitStack() as stack:
+            stack.push_async_exit(observe)
+            stack.push_async_exit(suppress)
+            raise body_error
+        self.assertEqual(events, [(None, None, None)])
+
+    async def _check_native_transport_close(self, adapter, *, eof_first, close_mode="success", cancel_during_exit=False):
         trace = []
         read_waiting, wire_closing, release_close, runtime_stopped = (asyncio.Event() for _ in range(4))
+        model_closing = asyncio.Event()
+        model_class = DeepSeek if adapter == "deepseek" else OpenAIResponses
+        native_close = model_class.aclose
+
+        async def close_model(model):
+            model_closing.set()
+            await native_close(model)
+            if cancel_during_exit:
+                trace.append("model-closed")
+
         if adapter == "deepseek":
             frame = {"choices": [{"index": 0, "delta": {"content": "fixture text"}}]}
         else:
@@ -508,11 +603,6 @@ class ProviderCompositionTests(unittest.IsolatedAsyncioTestCase):
             async def connect_tcp(self, host, port, timeout=None, local_address=None, socket_options=None):
                 return Wire()
 
-        class Transport(httpx.AsyncHTTPTransport):
-            async def __aexit__(self, *args):
-                await super().__aexit__(*args)
-                trace.append("client-closed")
-
         class Voice:
             async def deliver(self, reply):
                 nonlocal stop_at
@@ -525,13 +615,18 @@ class ProviderCompositionTests(unittest.IsolatedAsyncioTestCase):
 
         pool = httpcore.AsyncConnectionPool
         with patch.object(httpcore, "AsyncConnectionPool", side_effect=lambda **kw: pool(network_backend=Backend(), **kw)):
-            transport = Transport(trust_env=False)
-        actual_client = httpx.AsyncClient
+            transport = httpx.AsyncHTTPTransport(trust_env=False)
         clients = []
 
+        class Client(httpx.AsyncClient):
+            async def __aexit__(self, *args):
+                await super().__aexit__(*args)
+                trace.append(f"client-closed:{clients.index(self)}")
+
         def client(**kwargs):
-            owned = transport if not clients else httpx.MockTransport(lambda _: httpx.Response(500))
-            result = actual_client(transport=owned, **kwargs)
+            active_index = int(cancel_during_exit)
+            owned = transport if len(clients) == active_index else httpx.MockTransport(lambda _: httpx.Response(500))
+            result = Client(transport=owned, **kwargs)
             clients.append(result)
             return result
 
@@ -554,27 +649,57 @@ class ProviderCompositionTests(unittest.IsolatedAsyncioTestCase):
 
         with TemporaryDirectory(dir=Path.cwd()) as folder:
             config = Path(folder) / "native.toml"
-            config.write_text('database = "fixture.sqlite"\n' + _native_config(adapter), encoding="utf-8")
+            text = 'database = "fixture.sqlite"\n' + _native_config(adapter)
+            roles = configured_roles()
+            if cancel_during_exit:
+                other = "openai_responses" if adapter == "deepseek" else "deepseek"
+                text += f'''
+[providers.other]
+adapter = "{other}"
+api_key = "fixture-other"
+[models.other]
+provider = "other"
+model = "fixture-other-model"
+reasoning_effort = "low"
+context_budget = 64000
+tail_budget = 16000
+'''
+                # 活动主模型最后注册，先开始收尾；另一模型及所有客户端仍在栈中。
+                roles = {"general": replace(roles["general"], model_id="other"), "main": roles["main"]}
+            config.write_text(text, encoding="utf-8")
             settings = load_settings(config, for_run=True)
             with (patch("agent_companion.__main__.httpx.AsyncClient", side_effect=client),
                   patch("agent_companion.__main__.prepare_private_feishu", side_effect=prepare),
+                  patch.object(model_class, "aclose", close_model),
                   self.assertLogs("agent_companion", level="WARNING") as logged):
                 discovery = private_discovery("oc_fixture", "ou_peer", "ou_self")
-                serving = asyncio.create_task(_serve(settings, discovery=discovery, roles=demo_roles()))
+                serving = asyncio.create_task(_serve(settings, discovery=discovery, roles=roles))
                 initial = (["body-eof", "wire-close-start", "voice-zero"] if eof_first else
                            ["voice-zero", "body-read-cancelled", "wire-close-start"])
                 try:
                     await asyncio.wait_for(runtime_stopped.wait(), 4)
                     self.assertFalse(serving.done())
                     self.assertEqual(trace, [*initial, "runtime-stopped"])
-                    if close_mode == "timeout":
+                    if cancel_during_exit:
+                        await asyncio.wait_for(model_closing.wait(), 2)
+                        self.assertEqual(len(clients), 3)  # 两个 Provider 的模型客户端和语音客户端。
+                        for message in ("first cancellation", "second cancellation"):
+                            self.assertTrue(serving.cancel(message))
+                            await asyncio.sleep(0)
+                        self.assertFalse(serving.done())
+                        self.assertTrue(all(not owned.is_closed for owned in clients))
+                        self.assertEqual(trace, [*initial, "runtime-stopped"])
+                    elif close_mode == "timeout":
                         await asyncio.wait_for(asyncio.shield(serving), 6)
                         self.assertGreaterEqual(loop.time() - stop_at, 4.9)
-                    else:
-                        release_close.set()
                 finally:
                     release_close.set()
-                    await asyncio.wait_for(serving, 4)
+                    if cancel_during_exit:
+                        outcome, = await asyncio.wait_for(asyncio.gather(serving, return_exceptions=True), 4)
+                    else:
+                        await asyncio.wait_for(serving, 4)
+                if cancel_during_exit:
+                    self.assertIsInstance(outcome, asyncio.CancelledError)
             self.assertTrue(any("still running after shutdown grace" in row for row in logged.output))
             if close_mode == "timeout":
                 self.assertTrue(any("transport_close_timeout" in row for row in logged.output))
@@ -584,7 +709,9 @@ class ProviderCompositionTests(unittest.IsolatedAsyncioTestCase):
                 terminal = "wire-close-failed"
             else:
                 terminal = "wire-closed"
-            self.assertEqual(trace, [*initial, "runtime-stopped", terminal, "client-closed"])
+            model_closed = ["model-closed"] if cancel_during_exit else []
+            clients_closed = [f"client-closed:{index}" for index in reversed(range(len(clients)))]
+            self.assertEqual(trace, [*initial, "runtime-stopped", terminal, *model_closed, *clients_closed])
             self.assertTrue(all(owned.is_closed for owned in clients))
 
     async def test_native_eof_close_outlives_runtime_grace_and_precedes_client_close(self):
@@ -660,7 +787,7 @@ class ProviderCompositionTests(unittest.IsolatedAsyncioTestCase):
                       patch("agent_companion.__main__.prepare_private_feishu", side_effect=prepare),
                       self.assertLogs("agent_companion.runtime.engine", level="WARNING") as logged):
                     discovery = private_discovery("oc_fixture", "ou_peer", "ou_self")
-                    serving = asyncio.create_task(_serve(settings, discovery=discovery, roles=demo_roles()))
+                    serving = asyncio.create_task(_serve(settings, discovery=discovery, roles=configured_roles()))
                     try:
                         # 真实的旧 1 秒 Runtime 宽限已耗尽，原生关闭和客户端必须还活着。
                         await asyncio.wait_for(runtime_stopped.wait(), 4)
@@ -731,7 +858,8 @@ voice_id = "synthetic-other-voice"
                     self.assertEqual(asr._timeout, 2)
                     self.assertEqual(settings.asr.max_audio_seconds, asr._max_audio_seconds)
                     self.assertEqual(settings.asr.max_audio_seconds, 600.5)
-                    _ = [event async for event in model.stream([Message("user", "合成输入")], (), thinking=False)]
+                    _ = [event async for event in model["main"].model.stream(
+                        [Message("user", "合成输入")], (), thinking=False)]
                     self.assertEqual(await asr.transcribe(audio), "合成识别文本")
                     if mode == "text":
                         self.assertIsNone(tts)
@@ -754,7 +882,7 @@ voice_id = "synthetic-other-voice"
                       patch("agent_companion.channels.feishu.macos_calls.MacCallDesktop") as desktop,
                       patch("agent_companion.app.run_private_chats", new_callable=AsyncMock) as run_chats):
                     await _serve(settings, discovery=private_discovery("oc_fixture", "ou_peer", "ou_self"),
-                                 roles=demo_roles())
+                                 roles=configured_roles())
                 run_chats.assert_awaited_once()
                 self.assertEqual(desktop.call_count, int(mode != "text"))
                 self.assertEqual(run_chats.await_args.kwargs["incoming"] is not None, mode != "text")

@@ -30,6 +30,15 @@ class AgentRole:
     instructions: str | None = field(repr=False)
     tools: tuple[str, ...] = ()
     description: str = ""
+    model_id: str | None = None  # 内置/替身角色可不引用生产档案。
+
+
+@dataclass(frozen=True, slots=True)
+class ModelBinding:
+    model: Model
+    settings: RuntimeSettings
+    thinking: bool = False
+    origin: bytes | None = field(default=None, repr=False)
 
 
 def demo_roles() -> dict[str, AgentRole]:
@@ -51,16 +60,14 @@ class _Binding:
 class AgentTree:
     """一个已绑定主路由的 Agent 树；各 Agent 的唯一工作队列由 Runtime 持有。"""
 
-    def __init__(self, root: Agent, history: History, model: Model, *, roles: Mapping[str, AgentRole],
-                 schedulers: SessionSchedulers, settings: RuntimeSettings, thinking: bool,
+    def __init__(self, root: Agent, history: History, models: Mapping[str, ModelBinding], *, roles: Mapping[str, AgentRole],
+                 schedulers: SessionSchedulers,
                  retry_sqlite_locks: bool, compactions: Compactions, workspace: Workspace | None = None) -> None:
         self._root = root
         self._history = history
-        self._model = model
+        self._models = dict(models)
         self._roles = dict(roles)
         self._schedulers = schedulers
-        self._settings = settings
-        self._thinking = thinking
         self._retry_sqlite_locks = retry_sqlite_locks
         self._compactions = compactions
         self._bindings: dict[str, _Binding] = {}
@@ -121,8 +128,10 @@ class AgentTree:
                     return False
                 return parent.scheduler.submit_internal(InternalInput(notice))
 
-            runtime = Runtime(agent.session_id, self._history, self._model, channel, tools=tools,
-                              settings=self._settings, thinking=self._thinking, instructions=role.instructions,
+            model = self._models[agent.role_id]
+            runtime = Runtime(agent.session_id, self._history, model.model, channel, tools=tools,
+                              settings=model.settings, thinking=model.thinking, model_origin=model.origin,
+                              instructions=role.instructions,
                               retry_sqlite_locks=self._retry_sqlite_locks, compactions=self._compactions,
                               workspace=self._workspace, agent=agent,
                               reply_to_parent=reply_to_parent if parent_id is not None else None)

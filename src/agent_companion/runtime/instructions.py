@@ -7,7 +7,7 @@ import re
 import stat
 import tomllib
 
-from ..config import ConfigError
+from ..config import ConfigError, valid_config_id
 from .subtasks import AGENT_TOOL_NAMES, AgentRole
 
 
@@ -69,8 +69,11 @@ def _parse_role(name: str, text: str) -> AgentRole:
         raise _invalid_role(name, f"头部 TOML 格式错误（第 {int(line) + 1} 行，第 {column} 列）") from None
     except (ValueError, RecursionError):
         raise _invalid_role(name, "头部 TOML 格式错误") from None
-    if fields.keys() - {"description", "tools"}:
-        raise _invalid_role(name, "头部有未知字段，仅支持 description 和 tools")
+    if fields.keys() - {"description", "tools", "model_id"}:
+        raise _invalid_role(name, "头部有未知字段，仅支持 description、tools 和 model_id")
+    model_id = fields.get("model_id")
+    if not valid_config_id(model_id):
+        raise _invalid_role(name, "model_id 必须显式设置为非空模型配置 ID，请参考 [models.<ID>]")
     description = fields.get("description", "")
     if not isinstance(description, str) or (name != "main.md" and not description.strip()):
         raise _invalid_role(name, "description 必须为字符串，子角色须填写非空描述")
@@ -82,7 +85,7 @@ def _parse_role(name: str, text: str) -> AgentRole:
     if len(set(tools)) != len(tools):
         raise _invalid_role(name, "tools 不得重复声明工具")
     # 二进制读取和偏移切片保留 CRLF、正文分隔线及其他字符。
-    return AgentRole(text[closing.end():], tuple(tools), description)
+    return AgentRole(text[closing.end():], tuple(tools), description, model_id)
 
 
 def _role_id(name: str) -> str:

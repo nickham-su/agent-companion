@@ -6,8 +6,7 @@ database = "db.sqlite3"
 workspace_root = "workspaces"
 # 日志只写标准输出，部署默认 WARNING；排查时改为 DEBUG，修改后重启。
 log_level = "WARNING"
-# 切换时只改对应引用，再重启；真实 Key 请只填写在本机私有配置中。
-llm_provider = "deepseek_default"  # 或 "openai_default"
+# 真实 Key 只填写在本机私有配置中；Agent 的语言模型由各自的 model_id 选择。
 asr_provider = "minimax_cn"       # 或 "bailian_beijing"；语音条和实时通话共用
 tts_provider = "minimax_cn"       # 或 "bailian_beijing"；仅 voice 使用，可与 ASR 独立选择
 
@@ -17,30 +16,32 @@ llm = 60  # 单次模型请求总时限
 asr = 30  # 文件转写总时限，含握手、上传和等结果；流式 ASR 的启动和停口后等待分别计时
 tts = 25  # 单次网络读写、等待响应的时限
 
-[runtime]
-# 压缩软阈值，不是模型上限：上次普通请求的实际输入 token 达到该值时，下次请求前尝试压缩。
-# 请按实际使用的模型和服务端点的上下文上限配置，为下一轮新增输入、工具结果和模型输出留足空间。
-context_budget = 64000
-tail_budget = 16000  # 压缩历史时保留最近消息原文的预算，须小于 context_budget
-max_tool_rounds = 8  # 一次运行的模型请求轮数上限，含首轮
-
-# 正式启动必须显式选择适配器及推理强度。
+# Provider 只定义连接；可供多个模型配置共用。
 [providers.deepseek_default]
 adapter = "deepseek"
 api_key = "your-deepseek-api-key"
-
-[providers.deepseek_default.llm]
-model = "deepseek-flash"       # DeepSeek 可省略模型名，默认此值
-reasoning_effort = "disabled"  # 关闭思考；启用时按模型填写强度
 
 [providers.openai_default]
 adapter = "openai_responses"
 api_key = "your-openai-api-key"
 # base_url = "https://api.openai.com/v1"  # 可省略；仅设可信 HTTPS 地址，自定义服务会收到 Key 和模型输入
 
-[providers.openai_default.llm]
+# 模型配置 ID 由角色文件的 model_id 引用，不是服务商模型名。
+[models.chat]
+provider = "deepseek_default"
+model = "deepseek-flash"
+reasoning_effort = "disabled"  # 关闭思考；启用时按模型填写强度
+context_budget = 64000  # 压缩软阈值，不是模型上限；请为下一轮新增内容和输出留余量
+tail_budget = 16000  # 压缩时保留近期历史原文的预算，须小于 context_budget
+max_tool_rounds = 8  # 可省略（默认 8），一次运行的模型请求轮数上限，含首轮
+
+# 如给角色设置 model_id = "review"，请填真实可用的模型名和对应 Provider 的 Key。
+[models.review]
+provider = "openai_default"
 model = "your-openai-model"
 reasoning_effort = "low"  # 支持的值取决于所选模型
+context_budget = 32000
+tail_budget = 8000
 
 [providers.minimax_cn]
 adapter = "minimax"

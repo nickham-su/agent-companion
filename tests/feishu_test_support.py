@@ -1,6 +1,8 @@
+from dataclasses import replace
 import json
 
 from agent_companion.channels.feishu.cli import CommandResult, FeishuDiscovery
+from agent_companion.runtime.subtasks import demo_roles
 
 
 def private_discovery(chat_id, sender_open_id, own_open_id, *, cli=None):
@@ -25,3 +27,7 @@ def private_discovery(chat_id, sender_open_id, own_open_id, *, cli=None):
             return super().for_chat(resolved_chat_id)
 
     return Discovery("lark-cli", timeout=2, runner=runner)
+
+
+def configured_roles(model_id="chat"):
+    return {name: replace(role, model_id=model_id) for name, role in demo_roles().items()}
