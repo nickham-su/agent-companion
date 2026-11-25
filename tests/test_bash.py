@@ -1,5 +1,6 @@
 import asyncio
 from contextlib import nullcontext
+from errno import EIO, EPERM, ESRCH
 from hashlib import sha256
 from io import BytesIO
 import json
@@ -448,6 +449,78 @@ class BashExecutionTests(unittest.IsolatedAsyncioTestCase):
         with (patch.object(os, "killpg"), patch.object(bash_runtime, "_inspect_group", return_value=(True, None)),
               patch.object(bash_runtime, "_GROUP_CLOSE_TIMEOUT", 0.05)):
             self.assertFalse(await asyncio.wait_for(bash_runtime._confirm_group_exit(99), 2))
+
+    async def test_darwin_eperm_preserves_exit_code_only_after_group_confirmation(self):
+        for platform, signal_errno, check_errno, live, exit_code, error in (
+            ("darwin", EPERM, ESRCH, None, 0, None),
+            ("darwin", EPERM, ESRCH, None, 17, None),
+            ("darwin", EPERM, EPERM, False, 17, None),
+            ("darwin", EPERM, EPERM, True, 0, "bash_cleanup_unconfirmed"),
+            ("darwin", EPERM, EPERM, None, 0, "bash_cleanup_unconfirmed"),
+            ("darwin", EPERM, EIO, None, 0, "bash_cleanup_unconfirmed"),
+            ("darwin", EIO, ESRCH, None, 0, "bash_io_failed"),
+            ("linux", EPERM, ESRCH, None, 0, "bash_io_failed"),
+            ("linux", EPERM, EPERM, False, 0, "bash_cleanup_unconfirmed"),
+        ):
+            processes = []
+
+            def signal_group(pid, signum):
+                child, = processes
+                self.assertEqual(pid, child.pid)
+                if signum == signal.SIGKILL:
+                    self.assertIsNone(child.returncode)  # 尚未回收才允许发终止信号。
+                    raise OSError(signal_errno, "synthetic group signal failure")
+                self.assertEqual(signum, 0)
+                self.assertEqual(child.returncode, exit_code)
+                raise OSError(check_errno, "synthetic group check failure")
+
+            platform_info = SimpleNamespace(platform=platform, executable=sys.executable)
+            with (self.subTest(platform=platform, signal_errno=signal_errno, check_errno=check_errno,
+                               live=live, exit_code=exit_code),
+                  _record_processes(processes), patch.object(bash_runtime, "sys", platform_info),
+                  patch.object(os, "killpg", side_effect=signal_group) as killpg,
+                  patch.object(os, "kill") as kill,
+                  patch.object(bash_runtime, "_inspect_group", return_value=(True, live)) as inspect,
+                  patch.object(bash_runtime, "_BLOCKED_WORKSPACES", set()) as blocked,
+                  patch.object(bash_runtime, "_GROUP_CLOSE_TIMEOUT", 0.1),
+                  patch.object(bash_runtime._LOG, "warning")):
+                result = await self._execute(command=f"printf out; exit {exit_code}")
+                if error is None:
+                    self.assertEqual((result.get("exit_code"), result.get("stdout")), (exit_code, "out"))
+                else:
+                    self.assertEqual(result, {"error": error})
+                self.assertEqual(self.workspace.directory in blocked, error == "bash_cleanup_unconfirmed")
+                child, = processes
+                self.assertEqual([call.args[1] for call in killpg.call_args_list].count(signal.SIGKILL), 1)
+                kill.assert_called_once_with(child.pid, signal.SIGKILL)
+                self.assertEqual(inspect.called, platform == "darwin" and check_errno == EPERM)
+
+    async def test_darwin_probe_with_eperm_uses_snapshot_only_if_own_group_disappears(self):
+        argv = ("/bin/bash", "--noprofile", "--norc", "-c", "printf '99 Z+\\n'")
+        for check_errno, expected in ((ESRCH, (True, False)), (EPERM, (False, None)), (None, (False, None))):
+            processes = []
+
+            def signal_group(pid, signum):
+                child, = processes
+                self.assertEqual(pid, child.pid)
+                if signum == signal.SIGKILL:
+                    self.assertIsNone(child.returncode)
+                    raise PermissionError(EPERM, "synthetic probe signal failure")
+                self.assertEqual(signum, 0)
+                self.assertEqual(child.returncode, 0)
+                if check_errno is not None:
+                    raise OSError(check_errno, "synthetic probe check failure")
+
+            with (self.subTest(check_errno=check_errno), _record_processes(processes),
+                  patch.object(bash_runtime, "sys", SimpleNamespace(platform="darwin")),
+                  patch.object(bash_runtime, "_probe_command", return_value=argv) as command,
+                  patch.object(os, "killpg", side_effect=signal_group) as killpg, patch.object(os, "kill")):
+                result = await bash_runtime._inspect_group(99, asyncio.get_running_loop().time() + 1)
+                self.assertEqual(result, expected)
+                command.assert_called_once_with(99)  # 不为探测器再启动探测器。
+                child, = processes
+                self.assertEqual([call.args for call in killpg.call_args_list],
+                                 [(child.pid, signal.SIGKILL), (child.pid, 0)])
 
     def test_macos_process_snapshot_distinguishes_zombies_and_active_members(self):
         self.assertIs(bash_runtime._macos_live_members(99, b"\n99 Z+\n100 R\n"), False)

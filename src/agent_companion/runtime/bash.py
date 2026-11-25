@@ -2,7 +2,7 @@
 
 import asyncio
 from collections.abc import Coroutine
-from errno import ECHILD, ESRCH
+from errno import ECHILD, EPERM, ESRCH
 import fcntl
 import json
 import logging
@@ -111,6 +111,10 @@ def _log_result(context: ToolContext, started: float, result: dict[str, Any]) ->
                "-" if exit_code is None else exit_code, (monotonic() - started) * 1000)
 
 
+def _is_darwin_group_eperm(exc: OSError) -> bool:
+    return sys.platform == "darwin" and exc.errno == EPERM
+
+
 class _Child:
     """始终先持有 PID 和两路管道，再配置非阻塞 I/O。"""
 
@@ -123,6 +127,7 @@ class _Child:
         self.stdout, self.stderr = bytearray(), bytearray()
         self.output_limit = output_limit
         self.output_limit_exceeded = self.timed_out = self.io_failed = False
+        self.group_signal_needs_confirmation = False
         self.pipes_drained = False
         self._stopped = False
         self._ownership_lost = False
@@ -151,8 +156,12 @@ class _Child:
             os.killpg(self.process.pid, signal.SIGKILL)
         except ProcessLookupError:
             pass
-        except OSError:
-            self.io_failed = True
+        except OSError as exc:
+            if _is_darwin_group_eperm(exc):
+                # Darwin 也会拒绝给只剩僵尸的组发信号；回收后仍须独立确认。
+                self.group_signal_needs_confirmation = True
+            else:
+                self.io_failed = True
             try:
                 os.kill(self.process.pid, signal.SIGKILL)
             except OSError:
@@ -302,9 +311,21 @@ async def _inspect_group(group: int, deadline: float) -> tuple[bool, bool | None
         child.io_failed = True
     finally:
         reaped = await _finish(child.reap())
-    if (not reaped or child.io_failed or child.timed_out or child.output_limit_exceeded
+    if not reaped:
+        return False, None
+    if child.group_signal_needs_confirmation:
+        # 探测器不能再启动探测器；只有自身进程组已消失，才采信快照。
+        try:
+            os.killpg(child.process.pid, 0)
+        except ProcessLookupError:
+            pass
+        except OSError:
+            return False, None
+        else:
+            return False, None
+    if (child.io_failed or child.timed_out or child.output_limit_exceeded
             or not child.pipes_drained or child.process.returncode != 0):
-        return reaped, None
+        return True, None
     if sys.platform == "linux":
         return True, {b"live": True, b"zombies": False}.get(bytes(child.stdout).strip())
     try:
@@ -322,8 +343,9 @@ async def _confirm_group_exit(group: int) -> bool:
             os.killpg(group, 0)
         except ProcessLookupError:
             return True
-        except OSError:
-            return False
+        except OSError as exc:
+            if not _is_darwin_group_eperm(exc):
+                return False
         reaped, live = await _inspect_group(group, min(deadline, now + _PROBE_TIMEOUT))
         if not reaped:
             return False
