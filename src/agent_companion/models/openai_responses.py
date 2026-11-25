@@ -12,6 +12,7 @@ from typing import Any
 import httpx
 
 from ..config import normalize_openai_base_url
+from ..model_diagnostics import adapter_started, failure_category
 from ..protocol import (MAX_REPLAY_BYTES, Image, InputUsage, Message, ModelClosing, ModelError, ModelEvent,
                         ProviderReplay, ReplayItem, ReplayReady, ReplayScope, Text, TextDelta, ToolCall,
                         ToolReady, ToolSpec)
@@ -358,7 +359,10 @@ class OpenAIResponses:
     async def stream(self, messages: Sequence[Message], tools: Sequence[ToolSpec], *,
                      thinking: bool) -> AsyncGenerator[ModelEvent, None]:
         # thinking 是 DeepSeek 内部协议参数；Responses 只采用用户选定的 effort。
+        diagnostics = adapter_started("openai_responses")
         body = request_body(self._payload(messages, tools))
+        if diagnostics is not None:
+            diagnostics.request_ready(len(body))
         terminal: list[ModelEvent] = []
         try:
             request = self._client.stream("POST", self._endpoint, content=body, follow_redirects=False,
@@ -367,22 +371,32 @@ class OpenAIResponses:
                 "Accept": "text/event-stream", "Content-Type": "application/json", "Accept-Encoding": "identity",
             })
             async with self._responses.open(request) as response:
+                if diagnostics is not None:
+                    diagnostics.response_received(response.status_code)
                 if not response.is_success:
                     raise ModelError(f"http_{response.status_code}")
                 if response.headers.get("Content-Encoding", "").strip().lower() not in ("", "identity"):
                     raise ModelError("responses_unsupported_encoding")
                 if response.headers.get("Content-Type", "").split(";", 1)[0].strip().lower() != "text/event-stream":
                     raise ModelError("responses_unexpected_response")
+                if diagnostics is not None:
+                    diagnostics.stage = "sse_read"
                 async with aclosing(_events(response.aiter_raw(), self.replay_scope)) as events:
                     async for event in events:
                         if isinstance(event, TextDelta):
                             yield event
                         else:
                             terminal.append(event)
+                if diagnostics is not None:
+                    diagnostics.stage = "response_close"
                 yield ModelClosing(complete=False)
-        except httpx.RequestError:
+        except httpx.RequestError as error:
+            if diagnostics is not None:
+                diagnostics.transport_failure = failure_category(error)
             raise ModelError("transport_error") from None
         # HTTP 传输完成收尾后才提交工具和私有回放；此前仅允许文本交付。
+        if diagnostics is not None:
+            diagnostics.stage = "sse_read"
         for event in terminal:
             yield event
 

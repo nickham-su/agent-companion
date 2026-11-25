@@ -120,7 +120,7 @@ class Context:
 
     async def prepare(self, session_id: str, *, thinking: bool, tools: Sequence[ToolSpec], protected_from: int,
                       can_send: Callable[[], bool], instructions: str | None = None,
-                      last_input_tokens: int | None = None) -> list[Message] | None:
+                      last_input_tokens: int | None = None, run_id: str | None = None) -> list[Message] | None:
         fixed = [Message("system", instructions)] if instructions is not None else []
         summary, entries = await self._sqlite(self._history.context_snapshot, session_id,
                                               replay_scope=self._replay_scope)
@@ -164,7 +164,7 @@ class Context:
                 if any(message.role != "assistant" or message.content or message.tool_calls for message in old):
                     prefix = Prefix(covered, blocks[0].end_id, blocks[cut - 1].end_id)
                     self._compactions.start(session_id, prefix, fixed + _summary_message(summary) + old + [_SUMMARIZE],
-                                            tools, thinking=thinking, timeout=self._settings.model_timeout)
+                                             tools, thinking=thinking, timeout=self._settings.model_timeout, run_id=run_id)
         return fixed + _summary_message(summary) + _protocol_messages(blocks, keep_reasoning)
 
     def _tail_cut(self, blocks: Sequence[_Block], protected: int, keep_reasoning: bool) -> int:

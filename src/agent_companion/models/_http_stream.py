@@ -9,6 +9,7 @@ from typing import TypeVar
 from anyio import CancelScope
 import httpx
 
+from ..model_diagnostics import current_request, failure_category
 from ..protocol import ModelError
 
 
@@ -24,7 +25,7 @@ def _is_close_timeout(error: Exception) -> bool:
 def _report_close_error(error: Exception) -> None:
     # 预算耗尽已由关闭任务记录，避免每个等待方都打印一次。
     if not _is_close_timeout(error):
-        _LOG.warning("native HTTP response cleanup failed; error_type=%s", type(error).__name__)
+        _LOG.warning("native HTTP response cleanup failed; category=%s", failure_category(error))
 
 
 class _RequestOwner:
@@ -167,10 +168,15 @@ class ResponseStreams:
                         else:
                             await response.aclose()
                     except Exception as error:
+                        diagnostics = current_request()
+                        if diagnostics is not None:
+                            diagnostics.close_failure = failure_category(error)
                         # 保持既有传输错误语义；关闭超时不覆盖原失败，关闭失败不掩盖取消。
                         if isinstance(primary_error, asyncio.CancelledError):
                             _report_close_error(error)
                         elif primary_error is None or not _is_close_timeout(error):
+                            if diagnostics is not None:
+                                diagnostics.stage = "response_close"
                             raise
         finally:
             self._requests.remove(owner)

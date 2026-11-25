@@ -9,6 +9,7 @@ from dataclasses import dataclass
 import logging
 from time import monotonic
 
+from ..model_diagnostics import ModelRequestDiagnostics
 from ..protocol import (Message, Model, ModelError, ProviderReplay, ReasoningDelta,
                         ReplayReady, TextDelta, ToolReady, ToolSpec)
 from ..storage.sqlite import History, Summary
@@ -101,7 +102,7 @@ class Compactions:
         )
 
     def start(self, session_id: str, prefix: Prefix, prompt: list[Message], tools: Sequence[ToolSpec], *,
-              thinking: bool, timeout: float) -> None:
+               thinking: bool, timeout: float, run_id: str | None = None) -> None:
         # 与 can_start 之间无 await；冻结工具定义中可变的 schema。
         try:
             frozen_tools = deepcopy(tuple(tools))
@@ -109,7 +110,7 @@ class Compactions:
             self.failed(session_id, prefix, "summary_freeze_failed")
             return
         self._generating = asyncio.create_task(self._generate(
-            session_id, prefix, tuple(prompt), frozen_tools, thinking, timeout))
+            session_id, prefix, tuple(prompt), frozen_tools, thinking, timeout, run_id))
 
     def failed(self, session_id: str, prefix: Prefix, reason: str) -> None:
         if not self._closed:
@@ -117,22 +118,27 @@ class Compactions:
             _LOG.warning("model summary unavailable (%s); preserving original context", reason)
 
     async def _generate(self, session_id: str, prefix: Prefix, prompt: tuple[Message, ...],
-                        tools: tuple[ToolSpec, ...], thinking: bool, timeout: float) -> None:
+                         tools: tuple[ToolSpec, ...], thinking: bool, timeout: float, run_id: str | None) -> None:
+        diagnostics = ModelRequestDiagnostics("summary", timeout, run_id=run_id)
         try:
             loop = asyncio.get_running_loop()
             expires = loop.time() + timeout
             stop_stream = getattr(self._model, "stop_stream", None)
-            async with model_deadline_at(expires, stop_stream) as deadline:
-                content = await _summarize(self._model, prompt, tools, thinking)
+            with diagnostics.activate():
+                async with model_deadline_at(expires, stop_stream) as deadline:
+                    content = await _summarize(self._model, prompt, tools, thinking)
             if deadline.expired() or loop.time() >= expires:
                 raise TimeoutError
             self._remember(session_id, _Remembered(
                 prefix, monotonic() + _READY_SECONDS, Summary(prefix.through, content)))
-        except TimeoutError:
+        except TimeoutError as exc:
+            diagnostics.failed(exc)
             self.failed(session_id, prefix, "timeout")
         except ModelError as exc:
+            diagnostics.failed(exc)
             self.failed(session_id, prefix, exc.diagnostic)
-        except Exception:
+        except Exception as exc:
+            diagnostics.failed(exc)
             self.failed(session_id, prefix, "summary_model_failed")
         finally:
             self._generating = None

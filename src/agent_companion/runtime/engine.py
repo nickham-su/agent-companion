@@ -11,6 +11,7 @@ from typing import Literal
 from uuid import uuid4
 
 from ..config import RuntimeSettings
+from ..model_diagnostics import ModelRequestDiagnostics, failure_category
 from ..protocol import (AgentReply, Channel, DelegationTask, DeliveryStatus, InputItem, InputUsage, InternalInput,
                          Message, Model, ModelClosing, ModelError, PersistedInput, ReasoningDelta, Receipt, ReplayReady,
                          ReplayScope, ReplyDelivery, ReplyInfo, ReplyStream, SelectableChannel, TextDelta, ToolCall,
@@ -344,7 +345,7 @@ class Runtime:
                 messages = await self._context.prepare(self.session_id, thinking=self._thinking,
                                                        tools=self._tools.specs, instructions=self._instructions,
                                                        protected_from=protected_from, can_send=can_send,
-                                                       last_input_tokens=last_input_tokens)
+                                                       last_input_tokens=last_input_tokens, run_id=run_id)
             except OperationalError as exc:
                 if not is_sqlite_lock_error(exc):
                     raise
@@ -380,6 +381,7 @@ class Runtime:
                      has_user_input: bool, has_agent_input: bool) -> tuple[str, bool, str | None]:
         loop = asyncio.get_running_loop()
         info = ReplyInfo(uuid4().hex, self.session_id, run_id, loop.time())
+        diagnostics = ModelRequestDiagnostics("reply", self._settings.model_timeout, run_id, info.reply_id)
         text: list[str] = []
         reasoning: list[str] = []
         replay = None
@@ -523,7 +525,8 @@ class Runtime:
 
         async def complete_model() -> str:
             nonlocal model_task
-            model_task = loop.create_task(read_model())
+            with diagnostics.activate():
+                model_task = loop.create_task(read_model())
             while not model_task.done():
                 if voice_interrupted():
                     retire_reader(model_task)
@@ -533,7 +536,7 @@ class Runtime:
                 waiting = (model_task,) if not has_user_channel or signal.done() else (model_task, signal)
                 await asyncio.wait(waiting, return_when=asyncio.FIRST_COMPLETED)
             if model_complete:
-                self._report_model_cleanup(model_task)
+                self._report_model_cleanup(model_task, diagnostics=diagnostics)
                 return "complete"
             if model_task.cancelled():
                 # 只观察子任务的取消；真正的外层取消由 asyncio.wait 继续抛出。
@@ -549,15 +552,18 @@ class Runtime:
                 model_status = await complete_model()
                 if model_status == "model_interrupted":
                     reply.abandon()
-            except TimeoutError:
+            except TimeoutError as exc:
                 model_status = "model_timeout"
+                diagnostics.failed(exc)
                 _LOG.warning("model request timed out; reply=%s", info.reply_id)
             except ModelError as exc:
                 model_status = "model_failed"
                 model_error = exc.diagnostic
+                diagnostics.failed(exc)
                 _LOG.warning("model response failed (%s); reply=%s", model_error, info.reply_id)
-            except Exception:
+            except Exception as exc:
                 model_status = "model_failed"
+                diagnostics.failed(exc)
                 _LOG.error("model adapter failed")
             finally:
                 if selected is not None and selected.require_complete_model and model_status != "complete":
@@ -645,11 +651,14 @@ class Runtime:
             self._start_worker(task.get_loop())
 
     @staticmethod
-    def _report_model_cleanup(task: asyncio.Task[bool]) -> None:
+    def _report_model_cleanup(task: asyncio.Task[bool], *,
+                              diagnostics: ModelRequestDiagnostics | None = None) -> None:
         if not task.cancelled():
             error = task.exception()
             if error is not None:
-                detail = error.diagnostic if isinstance(error, ModelError) else type(error).__name__
+                if diagnostics is not None and isinstance(error, Exception):
+                    diagnostics.failed(error)
+                detail = error.diagnostic if isinstance(error, ModelError) else failure_category(error)
                 _LOG.warning("model cleanup failed (%s)", detail)
 
     def _abandon_delivery(self, reply: ReplyStream, task: asyncio.Task[Receipt]) -> None:

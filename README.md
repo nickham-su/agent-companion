@@ -41,6 +41,8 @@ python -m venv .venv
 
 排查时改为 `log_level = "DEBUG"`。用 `run` 和 `reply` ID 串起输入、模型、工具与投递；另外记录上下文压缩、子任务和实时语音的阶段状态。日志只有计数、耗时、状态等诊断信息，不包含消息正文、语音转写、工具参数、原始请求或密钥；不逐 token、逐音频帧或逐空轮询输出。
 
+模型调用失败时看 `model request failure`：`purpose` 区分回复和后台摘要，`stage`、`reason`、`category` 帮助判断出错阶段和类别；已知时还会记录 HTTP 状态和请求字节数。不会输出请求地址、响应内容或打开第三方 HTTP 库的调试日志。
+
 ## 选择 Provider
 
 正式启动通过顶层 `llm_provider`、`asr_provider` 引用 `[providers.<名字>]`；`voice` 还需 `tts_provider`，`text` 不使用它。名字是任意配置 ID，`adapter` 才是实际适配器。每套 Provider 在本机配置中直接填写 `api_key`，不从环境变量读取；未选用的 Provider 不需要密钥。改引用后重启即可切换。
