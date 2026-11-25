@@ -14,7 +14,10 @@ from ..protocol import (MAX_REPLAY_BYTES, DeliveryStatus, Image, Message, Provid
                         ReplayScope, Text, ToolCall)
 
 
-_SCHEMA_VERSION = 1
+_SCHEMA_VERSION = 3
+_FEISHU_INBOX = ("feishu-inbox", "feishu-private")
+_FEISHU_INITIAL_RETRY_SECONDS = 10
+_FEISHU_MAX_RETRY_SECONDS = 900
 # v1 的可选扩展；旧库不需要回填，旧程序也可继续写入没有来源的记录。
 _MODEL_ORIGINS = """
 CREATE TABLE IF NOT EXISTS reply_model_origins (
@@ -80,17 +83,32 @@ CREATE TABLE IF NOT EXISTS inbound_batches (
     batch_id INTEGER PRIMARY KEY AUTOINCREMENT,
     session_id TEXT NOT NULL,
     source TEXT NOT NULL,
-    contents TEXT NOT NULL
+    contents TEXT NOT NULL,
+    peer_open_id TEXT
 );
 CREATE INDEX IF NOT EXISTS inbound_pending ON inbound_batches(session_id, source, batch_id);
+CREATE INDEX IF NOT EXISTS inbound_feishu_peers ON inbound_batches(peer_open_id) WHERE peer_open_id IS NOT NULL;
+CREATE TABLE IF NOT EXISTS feishu_raw_batches (
+    batch_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    peer_open_id TEXT NOT NULL,
+    has_media INTEGER NOT NULL,
+    contents TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS feishu_raw_pending ON feishu_raw_batches(peer_open_id, batch_id);
+CREATE TABLE IF NOT EXISTS feishu_recovery (
+    message_id TEXT PRIMARY KEY NOT NULL,
+    peer_open_id TEXT NOT NULL,
+    chat_digest TEXT NOT NULL,
+    kind TEXT NOT NULL,
+    created_second INTEGER NOT NULL,
+    retry_at INTEGER NOT NULL,
+    retry_delay INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS feishu_recovery_due ON feishu_recovery(retry_at, message_id);
 CREATE TABLE IF NOT EXISTS feishu_private_account (
     singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
     owner_fingerprint TEXT NOT NULL,
     started_ms INTEGER NOT NULL
-);
-CREATE TABLE IF NOT EXISTS feishu_private_routes (
-    session_id TEXT PRIMARY KEY,
-    chat_fingerprint TEXT UNIQUE NOT NULL
 );
 CREATE TABLE IF NOT EXISTS agents (
     agent_id TEXT PRIMARY KEY NOT NULL,
@@ -293,11 +311,27 @@ def is_sqlite_lock_error(exc: sqlite3.OperationalError) -> bool:
                         "database is busy"}
 
 
+@dataclass(frozen=True, slots=True, repr=False)
+class FeishuCandidate:
+    message_id: str
+    peer_open_id: str
+    chat_digest: str
+    kind: str
+    created_second: int
+
+
+FeishuRaw = tuple[str, int, str, str]  # 消息 ID、毫秒时间、类型、原始正文（不含来源字段）
+
+
 class History:
     def __init__(self, path: str | Path, *, feishu_private_owner: str | None = None) -> None:
         self._connection: sqlite3.Connection | None = sqlite3.connect(path)
         self._db.row_factory = sqlite3.Row
         try:
+            # 旧格式直接拒绝，无需争用写锁。初始化仍会在写事务内复查，防止并发建表。
+            version = self._db.execute("PRAGMA user_version").fetchone()[0]
+            if version not in (0, _SCHEMA_VERSION):
+                raise DatabaseFormatError("不支持当前 SQLite 数据库格式；请保留原库并配置新的数据库路径。")
             self._db.execute("PRAGMA foreign_keys = ON")
             with self._db:
                 # 串行化首次初始化。检查格式后才可写入 schema，并且版本标记与建表一起提交。
@@ -352,8 +386,9 @@ class History:
             UNION ALL SELECT 1 FROM inbound_windows
             UNION ALL SELECT 1 FROM inbound_seen
             UNION ALL SELECT 1 FROM inbound_batches
+            UNION ALL SELECT 1 FROM feishu_raw_batches
+            UNION ALL SELECT 1 FROM feishu_recovery
             UNION ALL SELECT 1 FROM message_search
-            UNION ALL SELECT 1 FROM feishu_private_routes
             LIMIT 1
             """).fetchone() is not None
 
@@ -379,21 +414,8 @@ class History:
             raise FeishuBindingError("现有数据库有历史但没有飞书账号绑定；请保留旧数据库并配置新的数据库路径。")
         return None
 
-    def _bind_feishu_private_route(self, session_id: str, chat_fingerprint: str) -> bool:
-        self._db.execute("INSERT INTO feishu_private_routes VALUES (?, ?) ON CONFLICT DO NOTHING",
-                         (session_id, chat_fingerprint))
-        return self._db.execute("SELECT 1 FROM feishu_private_routes WHERE session_id = ? AND chat_fingerprint = ?",
-                                (session_id, chat_fingerprint)).fetchone() is not None
-
-    def bind_feishu_private_agent(self, session_id: str, chat_fingerprint: str) -> Agent | None:
-        """绑定已核验的私聊路由并取得主 Agent；路由冲突时不创建 Agent。"""
-        with self._input_transaction(retryable_io=False):
-            if not self._bind_feishu_private_route(session_id, chat_fingerprint):
-                return None
-            return self._ensure_main_agent(session_id)
-
     def ensure_main_agent(self, session_id: str) -> Agent:
-        """给非飞书入口按内部 Session 键建立可复用的主 Agent。"""
+        """按内部 Session 键建立可复用的主 Agent。"""
         with self._input_transaction(retryable_io=False):
             return self._ensure_main_agent(session_id)
 
@@ -532,26 +554,133 @@ class History:
     def record_inbound(self, session_id: str, source: str, through: int,
                        items: Sequence[tuple[str, Message | None]]) -> set[str]:
         """同一事务记录水位、去重键和待接收的批次；None 表示已处理但没有输入。"""
-        recorded: set[str] = set()
-        contents: list[str] = []
         key = (session_id, source)
         with self._db:
-            for external_id, message in items:
-                cursor = self._db.execute("INSERT INTO inbound_seen VALUES (?, ?, ?) ON CONFLICT DO NOTHING",
-                                          (*key, external_id))
-                if cursor.rowcount == 1:
-                    recorded.add(external_id)
-                    if message is not None:
-                        if (message.role != "user" or message.tool_calls or message.tool_call_id is not None
-                                or message.reasoning is not None or message.replay is not None):
-                            raise ValueError("inbound batches require plain user messages")
-                        contents.append(_encode(message)[0])
-            if contents:
-                self._db.execute("INSERT INTO inbound_batches (session_id, source, contents) VALUES (?, ?, ?)",
-                                 (*key, json.dumps(contents, ensure_ascii=False)))
-            self._db.execute("UPDATE inbound_windows SET scanned_until = max(scanned_until, ?)"
-                             " WHERE session_id = ? AND source = ?", (through, *key))
+            recorded = self._record_inbound_items(key, session_id, items)
+            self._advance_inbound(key, through)
         return recorded
+
+    def _mark_inbound_seen(self, key: tuple[str, str], message_id: str) -> bool:
+        return self._db.execute("INSERT INTO inbound_seen VALUES (?, ?, ?) ON CONFLICT DO NOTHING",
+                                (*key, message_id)).rowcount == 1
+
+    def _record_inbound_items(self, seen_key: tuple[str, str], session_id: str,
+                              items: Sequence[tuple[str, Message | None]]) -> set[str]:
+        recorded: set[str] = set()
+        messages = []
+        for external_id, message in items:
+            if self._mark_inbound_seen(seen_key, external_id):
+                recorded.add(external_id)
+                if message is not None:
+                    messages.append(message)
+        self._insert_inbound_batch(session_id, seen_key[1], messages)
+        return recorded
+
+    def _insert_inbound_batch(self, session_id: str, source: str, messages: Sequence[Message], *,
+                              peer_open_id: str | None = None) -> None:
+        contents = []
+        for message in messages:
+            if (message.role != "user" or message.tool_calls or message.tool_call_id is not None
+                    or message.reasoning is not None or message.replay is not None):
+                raise ValueError("inbound batches require plain user messages")
+            contents.append(_encode(message)[0])
+        if contents:
+            self._db.execute("INSERT INTO inbound_batches (session_id, source, contents, peer_open_id)"
+                             " VALUES (?, ?, ?, ?)", (session_id, source, json.dumps(contents, ensure_ascii=False), peer_open_id))
+
+    def _advance_inbound(self, key: tuple[str, str], through: int) -> None:
+        self._db.execute("UPDATE inbound_windows SET scanned_until = max(scanned_until, ?)"
+                         " WHERE session_id = ? AND source = ?", (through, *key))
+
+    def feishu_inbound_window(self, initial: int) -> tuple[int, int]:
+        return self.inbound_window(*_FEISHU_INBOX, initial)
+
+    def feishu_inbound_seen(self, message_id: str) -> bool:
+        return self.inbound_seen(*_FEISHU_INBOX, message_id)
+
+    def feishu_recovery_candidate(self, message_id: str) -> FeishuCandidate | None:
+        row = self._db.execute(
+            "SELECT message_id, peer_open_id, chat_digest, kind, created_second FROM feishu_recovery"
+            " WHERE message_id = ?", (message_id,)).fetchone()
+        return None if row is None else FeishuCandidate(*row)
+
+    def reconcile_feishu_search(self, hits: Iterable[FeishuCandidate], *, now: int) -> list[FeishuCandidate]:
+        """返回新 ID；待恢复项仅在新搜索依据有变化时刷新并提前到期。"""
+        fresh, changed = [], []
+        for hit in hits:
+            prior = self.feishu_recovery_candidate(hit.message_id)
+            if prior is None:
+                # 固定窗口可能跨多轮分页，其间旧候选可能已经恢复。
+                if not self.feishu_inbound_seen(hit.message_id):
+                    fresh.append(hit)
+            elif prior != hit:
+                changed.append(hit)
+        if changed:
+            with self._input_transaction(retryable_io=False):
+                self._db.executemany(
+                    "UPDATE feishu_recovery SET peer_open_id = ?, chat_digest = ?, kind = ?, created_second = ?,"
+                    " retry_at = min(retry_at, ?) WHERE message_id = ?",
+                    ((hit.peer_open_id, hit.chat_digest, hit.kind, hit.created_second, now, hit.message_id)
+                     for hit in changed))
+        return fresh
+
+    def due_feishu_candidates(self, now: int, limit: int) -> list[FeishuCandidate]:
+        return [FeishuCandidate(*row) for row in self._db.execute(
+            "SELECT message_id, peer_open_id, chat_digest, kind, created_second FROM feishu_recovery"
+            " WHERE retry_at <= ? ORDER BY retry_at, message_id LIMIT ?", (now, limit))]
+
+    def record_feishu_window(self, through: int | None, *, now: int,
+                             verified: dict[str, list[FeishuRaw]], discarded: Sequence[str],
+                             retry: Sequence[FeishuCandidate]) -> None:
+        """原始输入、去重、恢复项和水位同事务；恢复本身不改变主水位。"""
+        with self._input_transaction(retryable_io=False):
+            for hit in retry:
+                self._db.execute(
+                    "INSERT INTO feishu_recovery VALUES (?, ?, ?, ?, ?, ?, ?)"
+                    " ON CONFLICT(message_id) DO UPDATE SET retry_delay = min(retry_delay * 2, ?),"
+                    " retry_at = ? + min(retry_delay * 2, ?)",
+                    (hit.message_id, hit.peer_open_id, hit.chat_digest, hit.kind, hit.created_second,
+                     now + _FEISHU_INITIAL_RETRY_SECONDS, _FEISHU_INITIAL_RETRY_SECONDS,
+                     _FEISHU_MAX_RETRY_SECONDS, now, _FEISHU_MAX_RETRY_SECONDS))
+            for mid in discarded:
+                self._accept_feishu_candidate(mid)
+            for peer, batch in verified.items():
+                fresh = [row for row in batch if self._accept_feishu_candidate(row[0])]
+                if fresh:
+                    self._db.execute("INSERT INTO feishu_raw_batches (peer_open_id, has_media, contents)"
+                                     " VALUES (?, ?, ?)", (peer, any(row[2] != "text" for row in fresh),
+                                                           json.dumps(fresh)))
+            if through is not None:
+                self._advance_inbound(_FEISHU_INBOX, through)
+
+    def _accept_feishu_candidate(self, mid: str) -> bool:
+        self._db.execute("DELETE FROM feishu_recovery WHERE message_id = ?", (mid,))
+        return self._mark_inbound_seen(_FEISHU_INBOX, mid)
+
+    def pending_feishu_users(self) -> list[str]:
+        return [row[0] for row in self._db.execute(
+            "SELECT peer_open_id FROM feishu_raw_batches UNION SELECT peer_open_id FROM inbound_batches"
+            " WHERE source = ? AND peer_open_id IS NOT NULL", (_FEISHU_INBOX[1],))]
+
+    def next_feishu_raw(self, peer: str) -> tuple[int, bool] | None:
+        row = self._db.execute("SELECT batch_id, has_media FROM feishu_raw_batches WHERE peer_open_id = ?"
+                               " ORDER BY batch_id LIMIT 1", (peer,)).fetchone()
+        return None if row is None else (row["batch_id"], bool(row["has_media"]))
+
+    def read_feishu_raw(self, peer: str, batch_id: int) -> list[FeishuRaw]:
+        row = self._db.execute("SELECT contents FROM feishu_raw_batches WHERE batch_id = ? AND peer_open_id = ?",
+                               (batch_id, peer)).fetchone()
+        if row is None:
+            raise ValueError("missing Feishu raw batch")
+        return [tuple(item) for item in json.loads(row[0])]
+
+    def finish_feishu_raw(self, peer: str, batch_id: int, session_id: str, messages: Sequence[Message]) -> None:
+        with self._input_transaction(retryable_io=False):
+            removed = self._db.execute("DELETE FROM feishu_raw_batches WHERE batch_id = ? AND peer_open_id = ?",
+                                       (batch_id, peer)).rowcount
+            if removed != 1:
+                raise ValueError("missing Feishu raw batch")
+            self._insert_inbound_batch(session_id, _FEISHU_INBOX[1], messages, peer_open_id=peer)
 
     def pending_inbound(self, session_id: str, source: str) -> list[int]:
         rows = self._db.execute("SELECT batch_id FROM inbound_batches WHERE session_id = ? AND source = ?"

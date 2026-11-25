@@ -1,30 +1,42 @@
-"""飞书私聊按时间窗口轮询，文字回复、转写回显和通知独立发送。"""
+"""飞书账号统一搜索私聊，文字回复、转写回显和通知独立发送。"""
 
 import asyncio
-from collections import deque
-from collections.abc import Awaitable, Callable
+from collections import defaultdict, deque
+from collections.abc import Callable
+from contextlib import nullcontext
 from dataclasses import dataclass, field
+from datetime import datetime
+from hashlib import sha256
 import logging
 from sqlite3 import OperationalError
 from time import time
 
-from ...protocol import ChannelUser, DeliveryStatus, Message, Receipt, ReplyDelivery, ReplyInfo, ReplyStream
+from ...protocol import ChannelUser, DeliveryStatus, Receipt, ReplyDelivery, ReplyInfo, ReplyStream
 from ...speech.asr import FileASR
-from ...storage.sqlite import History, is_sqlite_lock_error
-from .cli import MAX_PAGE_SIZE, MIN_PAGE_SIZE, CliError, CliStdoutLimit, FeishuCLI
-from .messages import MAX_BATCH_BYTES, NORMALIZE_ERRORS, BatchMediaBudget, IncomingMessage, MessageNormalizer, incoming
+from ...storage.sqlite import FeishuCandidate, FeishuRaw, History, is_sqlite_lock_error
+from .cli import (DEFAULT_SEARCH_PAGE_SIZE, MAX_MGET_SIZE, MIN_PAGE_SIZE, CliError, CliStdoutLimit, FeishuCLI,
+                  FeishuDiscovery, _valid_id, parse_open_id)
+from .messages import (MAX_BATCH_BYTES, NORMALIZE_ERRORS, SUPPORTED_TYPES, BatchMediaBudget, IncomingMessage,
+                       MessageNormalizer, incoming)
 
 
 _LOG = logging.getLogger(__name__)
 _POLL_SECONDS = 10
-_OVERLAP_SECONDS = 10
-_MAX_PAGES = 200
+_OVERLAP_SECONDS = 120
+_MAX_DETAIL_BATCHES = 10
+_MAX_SCAN_SECONDS = 3600
+_MAX_PAGES = 10
 _MAX_WINDOW_PAGES = 1_000
 _MAX_WINDOW_MESSAGES = 20_000
 _MAX_WINDOW_RAW_BYTES = 32 * 1024 * 1024
 _VOICE_FAILURE = "语音接收失败，请重新发送。"
 _MAX_PENDING_REPLIES = 8
 _MAX_PENDING_TRANSCRIPTS = 8
+_MAX_PENDING_NOTICES = 8
+_MAX_RECOVERY_BATCH = 20
+_DENSE_WINDOW_RETRY_SECONDS = 60
+_MAX_MEDIA_WORKERS = 4
+_STORAGE_RETRY_SECONDS = 0.25
 
 
 class FeishuChannel:
@@ -36,6 +48,8 @@ class FeishuChannel:
         self._sender: asyncio.Task[None] | None = None
         self._transcripts: deque[bytes] = deque()
         self._transcript_sender: asyncio.Task[None] | None = None
+        self._pending_notices = 0
+        self._notice_sender: asyncio.Task[None] | None = None
         self._closed = False
 
     def select_delivery(self, reply: ReplyStream) -> ReplyDelivery:
@@ -112,6 +126,27 @@ class FeishuChannel:
         finally:
             self._transcript_sender = None
 
+    def enqueue_audio_failure(self) -> None:
+        if self._closed:
+            return
+        if self._pending_notices >= _MAX_PENDING_NOTICES:
+            _LOG.warning("Feishu audio failure notice dropped (queue_full)")
+            return
+        self._pending_notices += 1
+        if self._notice_sender is None:
+            self._notice_sender = asyncio.create_task(self._send_audio_notices())
+
+    async def _send_audio_notices(self) -> None:
+        try:
+            while not self._closed and self._pending_notices:
+                self._pending_notices -= 1
+                try:
+                    await self.notify_audio_failure()
+                except Exception:
+                    _LOG.warning("Feishu audio failure notice unavailable")
+        finally:
+            self._notice_sender = None
+
     def stop_accepting(self) -> None:
         """在让出事件循环前关停发送入口和在途任务。"""
         if self._closed:
@@ -127,14 +162,19 @@ class FeishuChannel:
             self._transcripts.clear()
         if self._transcript_sender is not None:
             self._transcript_sender.cancel()
+        self._pending_notices = 0
+        if self._notice_sender is not None:
+            self._notice_sender.cancel()
 
     async def close(self) -> None:
         self.stop_accepting()
-        senders = tuple(task for task in (self._sender, self._transcript_sender) if task is not None)
+        senders = tuple(task for task in (self._sender, self._transcript_sender, self._notice_sender)
+                        if task is not None)
         if senders:
             await asyncio.gather(*senders, return_exceptions=True)
         self._sender = None
         self._transcript_sender = None
+        self._notice_sender = None
 
     async def notify_audio_failure(self) -> None:
         if self._closed:
@@ -143,64 +183,153 @@ class FeishuChannel:
             _LOG.warning("Feishu audio failure notice not confirmed")
 
 
-@dataclass(slots=True)
+def private_session_id(user: ChannelUser) -> str:
+    return "feishu-private:" + sha256(user.key.encode("ascii")).hexdigest()
+
+
+def _chat_digest(chat_id: str) -> str:
+    return sha256(chat_id.encode("ascii")).hexdigest()
+
+
+def _search_hit(row: object, account: ChannelUser) -> FeishuCandidate | None:
+    meta = row.get("meta_data") if isinstance(row, dict) else None
+    if not isinstance(meta, dict) or type(meta.get("is_p2p_chat")) is not bool:
+        raise CliError("cli_invalid_search_hit")
+    if not meta["is_p2p_chat"]:
+        return None
+    kind = meta.get("type")
+    if not isinstance(kind, str) or not kind:
+        raise CliError("cli_invalid_search_hit")
+    if kind not in SUPPORTED_TYPES:
+        return None
+    sender = meta.get("from_id")
+    if _valid_id(sender, "cli") or _valid_id(sender, "bot"):
+        return None
+    user = parse_open_id(sender)
+    if user == account:
+        return None
+    mid, chat, stamp = meta.get("message_id"), meta.get("chat_id"), meta.get("create_time")
+    if user is None or not _valid_id(mid, "om") or not _valid_id(chat, "oc") or not isinstance(stamp, str):
+        raise CliError("cli_invalid_search_hit")
+    try:
+        dt = datetime.fromisoformat(stamp)
+        if dt.tzinfo is None:
+            raise ValueError
+        created = int(dt.timestamp())
+    except (ValueError, OverflowError, OSError):
+        raise CliError("cli_invalid_search_time") from None
+    return FeishuCandidate(mid, user.key, _chat_digest(chat), kind, created)
+
+
+class FeishuInput:
+    """每个用户的顺序工作任务调用；媒体并发受限，纯文字不占媒体槽。"""
+
+    def __init__(self, discovery: FeishuDiscovery, asr: FileASR, history: History, *,
+                 batch_budget: int = MAX_BATCH_BYTES) -> None:
+        self._normalizer = MessageNormalizer(discovery, asr)
+        self._history = history
+        self._batch_budget = batch_budget
+        self._media_slots = asyncio.Semaphore(_MAX_MEDIA_WORKERS)
+
+    async def process_next(self, user: ChannelUser, channel: FeishuChannel, dispatch: Callable[[], None]) -> bool:
+        pending = self._history.next_feishu_raw(user.key)
+        if pending is None:
+            return False
+        batch_id, has_media = pending
+        # 持有媒体槽直到提交，避免 SQLite 争用期间积累过多已展开的批次。
+        async with self._media_slots if has_media else nullcontext():
+            budget = BatchMediaBudget(self._batch_budget)
+            received = []
+            audio = []
+            for row in self._history.read_feishu_raw(user.key, batch_id):
+                raw = IncomingMessage(*row)
+                normalized = None
+                try:
+                    normalized = await self._normalizer.normalize(raw, budget)
+                except NORMALIZE_ERRORS:
+                    if raw.kind != "audio":
+                        _LOG.warning("Feishu input could not be normalized")
+                if raw.kind == "audio":
+                    text = normalized.content if normalized is not None else None
+                    audio.append(text if isinstance(text, str) else None)
+                received.append((raw.message_id, normalized))
+            messages = [msg for _, msg in budget.finish(received) if msg is not None]
+            warned = False
+            while True:
+                try:
+                    self._history.finish_feishu_raw(user.key, batch_id, private_session_id(user), messages)
+                    break
+                except OperationalError as exc:
+                    if not is_sqlite_lock_error(exc):
+                        raise
+                    if not warned:
+                        _LOG.warning("Feishu user input storage busy; retrying prepared batch")
+                        warned = True
+                    await asyncio.sleep(_STORAGE_RETRY_SECONDS)
+            for text in audio:
+                if text is None:
+                    channel.enqueue_audio_failure()
+                else:
+                    channel.enqueue_transcript(text)
+            dispatch()  # 已就绪 Session 在提交归一化输入的同一事件循环刻度交接。
+        return True
+
+
+@dataclass(slots=True, repr=False)
 class _ScanWindow:
     start: int
     end: int
-    through: int
-    page_size: int = MAX_PAGE_SIZE
+    page_size: int = DEFAULT_SEARCH_PAGE_SIZE
     token: str | None = None
     tokens: set[str] = field(default_factory=set)
-    messages: dict[str, IncomingMessage] = field(default_factory=dict)
+    hits: dict[str, FeishuCandidate] = field(default_factory=dict)
+    remaining: deque[FeishuCandidate] | None = None
+    details: dict[str, IncomingMessage | None] = field(default_factory=dict)
+    detail_batch_size: int = MAX_MGET_SIZE
     raw_bytes: int = 0
+    oversized: int = 0
     completed: bool = False
     failures: int = 0
-    prepared: tuple[list[tuple[str, Message | None]], list[str]] | None = None
 
-    def restart(self, *, end: int | None = None, page_size: int | None = None) -> "_ScanWindow":
-        return _ScanWindow(
-            start=self.start,
-            end=self.end if end is None else end,
-            through=self.through,
-            page_size=self.page_size if page_size is None else page_size,
-        )
+    def restart(self, *, page_size: int | None = None) -> "_ScanWindow":
+        return _ScanWindow(self.start, self.end, self.page_size if page_size is None else page_size)
 
 
 class FeishuPoller:
-    def __init__(self, cli: FeishuCLI, asr: FileASR, channel: FeishuChannel, *,
-                 chat_id: str, user: ChannelUser, account: ChannelUser, session_id: str, history: History,
-                 submit: Callable[[int], Awaitable[None] | None], private_started_ms: int,
-                 clock: Callable[[], float] = time,
-                 batch_budget: int = MAX_BATCH_BYTES, before_close: Callable[[], None] | None = None) -> None:
-        self._cli = cli
-        self._normalizer = MessageNormalizer(cli, asr)
-        self._batch_budget = batch_budget
-        self._channel = channel
-        self._chat_id = chat_id
-        self._user = user
+    def __init__(self, discovery: FeishuDiscovery, *, account: ChannelUser, history: History,
+                 notify_user: Callable[[ChannelUser], None], private_started_ms: int,
+                 clock: Callable[[], float] = time, before_close: Callable[[], None] | None = None) -> None:
+        self._discovery = discovery
+        self._notify_user = notify_user
         self._account = account
-        self._session_id = session_id
         self._private_started_ms = private_started_ms
-        self._source = "feishu-private"
         self._history = history
-        self._submit = submit
         self._before_close = before_close
         self._clock = clock
         self._poll_lock = asyncio.Lock()
-        self._notices: set[asyncio.Task[None]] = set()
         self._window: _ScanWindow | None = None
+        self._right_segments: list[_ScanWindow] = []
+        self._scan_retry_at = 0
 
-    async def _submit_pending(self) -> None:
-        for batch_id in self._history.pending_inbound(self._session_id, self._source):
-            result = self._submit(batch_id)
-            if result is not None:
-                await result
+    def _submit_pending(self) -> None:
+        for key in self._history.pending_feishu_users():
+            user = parse_open_id(key)
+            if user is None or user == self._account:
+                raise ValueError("invalid stored Feishu inbox recipient")
+            self._notify_user(user)
+
+    def _pause_scan(self) -> None:
+        self._scan_retry_at = int(self._clock()) + _DENSE_WINDOW_RETRY_SECONDS
 
     def _narrow_window(self, window: _ScanWindow) -> None:
-        # 只有完整读取的时间范围才提交水位；超出总状态上限时可从较短范围重读。
-        base = max(window.start, window.through)
-        self._window = (window.restart(end=base + (window.end - base) // 2)
-                        if window.end > base + 1 else None)
+        if window.end - window.start <= 1:
+            self._window = window.restart()
+            self._pause_scan()
+            raise CliError("cli_single_second_window_limit")
+        mid = (window.start + window.end) // 2
+        # [start, end) 二分整个区段，包括回看部分；从左往右完成，不重扫已完成的左段。
+        self._right_segments.append(_ScanWindow(mid, window.end, window.page_size))
+        self._window = _ScanWindow(window.start, mid, window.page_size)
         raise CliError("cli_window_limit")
 
     async def _collect(self, window: _ScanWindow) -> bool:
@@ -208,37 +337,38 @@ class FeishuPoller:
             return True
         for _ in range(_MAX_PAGES):
             try:
-                items, token = await self._cli.list_page(
-                    window.start, window.end, window.token, page_size=window.page_size,
-                )
+                items, token = await self._discovery.search_page(
+                    window.start, window.end, window.token, page_size=window.page_size)
+                if token is not None and token in window.tokens:
+                    self._window = window.restart()
+                    raise CliError("cli_page_cycle")
+                page: dict[str, FeishuCandidate] = {}
+                for row in items:
+                    hit = _search_hit(row, self._account)
+                    if hit is None or not window.start <= hit.created_second < window.end:
+                        continue
+                    mid = hit.message_id
+                    previous = page.get(mid) or window.hits.get(mid)
+                    if previous is not None and previous != hit:
+                        self._window = window.restart()
+                        raise CliError("cli_conflicting_search_hit")
+                    if previous is None and not self._history.feishu_inbound_seen(mid):
+                        page[mid] = hit
             except CliStdoutLimit:
                 if window.page_size == MIN_PAGE_SIZE:
+                    self._pause_scan()
                     raise CliError("cli_single_result_output_limit") from None
-                # 游标绑定原页大小，必须丢弃未提交的内容，从同一时间窗口首页重读。
                 self._window = window.restart(page_size=max(MIN_PAGE_SIZE, window.page_size // 2))
                 return False
             except CliError:
                 window.failures += 1
                 if window.token is not None and window.failures >= 3:
-                    # 过期游标等持续错误从固定窗口开头重试；不丢已提交水位。
                     self._window = window.restart()
                 raise
             window.failures = 0
-            if token is not None and token in window.tokens:
-                self._window = window.restart()
-                raise CliError("cli_page_cycle")
-            for item in items:
-                message = incoming(item, chat_id=self._chat_id, user=self._user, account=self._account)
-                if (message is not None and window.start * 1000 <= message.created_ms < window.end * 1000
-                        and message.created_ms >= self._private_started_ms
-                        and message.message_id not in window.messages
-                        and not self._history.inbound_seen(self._session_id, self._source, message.message_id)):
-                    size = 4 * len(message.content)  # Python 字符串每个码点至多占 4 字节。
-                    if (len(window.messages) >= _MAX_WINDOW_MESSAGES
-                            or window.raw_bytes + size > _MAX_WINDOW_RAW_BYTES):
-                        self._narrow_window(window)
-                    window.raw_bytes += size
-                    window.messages[message.message_id] = message
+            if len(window.hits) + len(page) > _MAX_WINDOW_MESSAGES:
+                self._narrow_window(window)
+            window.hits.update(page)
             if token is None:
                 window.completed = True
                 return True
@@ -246,70 +376,139 @@ class FeishuPoller:
                 self._narrow_window(window)
             window.token = token
             window.tokens.add(token)
-        return False  # 本次调用到页预算，下个刻度仍查询同一窗口和后续页。
+        return False
 
-    async def _prepare(self, window: _ScanWindow) -> tuple[list[tuple[str, Message | None]], list[str]]:
-        received = []
-        media_budget = BatchMediaBudget(self._batch_budget)
-        failed_audio = []
-        # 稳定排序，时间相同则保留服务端第一次见到的相对顺序。
-        for raw in sorted(window.messages.values(), key=lambda message: message.created_ms):
+    def _verify_details(self, expected: dict[str, FeishuCandidate], rows: list) -> dict[str, IncomingMessage | None]:
+        accepted: dict[str, IncomingMessage | None] = {}
+        returned: set[str] = set()
+        for row in rows:
+            mid = row.get("message_id") if isinstance(row, dict) else None
+            if not isinstance(mid, str) or mid not in expected or mid in returned:
+                raise CliError("cli_invalid_message_details")
+            returned.add(mid)
+            hit = expected[mid]
+            if row.get("deleted") is True:
+                # 显式撤回只用于跳过已知 ID；缺失详情不等于撤回。
+                accepted[mid] = None
+                continue
+            chat = row.get("chat_id")
+            user = parse_open_id(hit.peer_open_id)
+            if user is None or not _valid_id(chat, "oc") or _chat_digest(chat) != hit.chat_digest:
+                continue
+            raw = incoming(row, user=user, account=self._account)
+            if (raw is None or not raw.content or raw.kind != hit.kind
+                    or raw.created_ms // 1000 != hit.created_second):
+                continue
+            accepted[mid] = raw if raw.created_ms >= self._private_started_ms else None
+        return accepted
+
+    async def _fetch_details(self, window: _ScanWindow, remaining: deque[FeishuCandidate]) -> bool:
+        for _ in range(_MAX_DETAIL_BATCHES):
+            if not remaining:
+                return True
+            expected = {}
+            for hit in remaining:
+                expected[hit.message_id] = hit
+                if len(expected) == window.detail_batch_size:
+                    break
             try:
-                normalized = await self._normalizer.normalize(raw, media_budget)
-            except NORMALIZE_ERRORS:
-                normalized = None
-                if raw.kind == "audio":
-                    failed_audio.append(raw.message_id)
+                rows = await self._discovery.messages(tuple(expected))
+            except CliStdoutLimit:
+                if len(expected) == 1:
+                    # 单条超限与缺项一样待恢复；不标为已见，后续条目恢复正常批量。
+                    remaining.popleft()
+                    window.oversized += 1
+                    window.detail_batch_size = MAX_MGET_SIZE
                 else:
-                    _LOG.warning("Feishu input could not be normalized")
-            received.append((raw.message_id, normalized))
-        return media_budget.finish(received), failed_audio
+                    window.detail_batch_size = max(1, len(expected) // 2)
+                continue
+            details = self._verify_details(expected, rows)
+            size = sum(4 * len(raw.content) for raw in details.values() if raw is not None)
+            if window.raw_bytes + size > _MAX_WINDOW_RAW_BYTES:
+                self._narrow_window(window)
+            window.raw_bytes += size
+            window.details.update((mid, details[mid]) for mid in expected if mid in details)
+            for _ in expected:
+                remaining.popleft()
+        return not remaining
+
+    def _record(self, through: int | None, now: int, hits: dict[str, FeishuCandidate],
+                details: dict[str, IncomingMessage | None]) -> None:
+        verified: dict[str, list[FeishuRaw]] = defaultdict(list)
+        discarded = []
+        for mid, raw in sorted(details.items(), key=lambda item: item[1].created_ms if item[1] else 0):
+            if raw is None:
+                discarded.append(mid)
+            else:
+                verified[hits[mid].peer_open_id].append((mid, raw.created_ms, raw.kind, raw.content))
+        retry = [hit for mid, hit in hits.items() if mid not in details]
+        self._history.record_feishu_window(through, now=now, verified=verified, discarded=discarded, retry=retry)
+        if retry:
+            _LOG.warning("Feishu details unavailable or mismatched; deferred=%d", len(retry))
+        if verified:
+            self._submit_pending()
+
+    async def _recover(self, now: int) -> None:
+        hits = {hit.message_id: hit for hit in self._history.due_feishu_candidates(now, _MAX_RECOVERY_BATCH)}
+        if not hits:
+            return
+        try:
+            try:
+                rows = await self._discovery.messages(tuple(hits))
+            except CliStdoutLimit:
+                if len(hits) == 1:
+                    raise
+                # 只额外探测最早到期的一条；其余保持原到期时间，下一轮优先于已退避的队首。
+                head = next(iter(hits))
+                hits = {head: hits[head]}
+                rows = await self._discovery.messages((head,))
+            details = self._verify_details(hits, rows)
+        except CliError as exc:
+            self._history.record_feishu_window(None, now=now, verified={}, discarded=(), retry=tuple(hits.values()))
+            if isinstance(exc, CliStdoutLimit):
+                _LOG.warning("Feishu single-message recovery output limit; deferred=1")
+            else:
+                _LOG.warning("Feishu detail recovery request failed; deferred=%d", len(hits))
+            return
+        self._record(None, now, hits, details)
+
+    async def _scan(self, now: int) -> None:
+        if now < self._scan_retry_at:
+            return
+        if self._window is None:
+            if self._right_segments:
+                self._window = self._right_segments.pop()
+            else:
+                floor, through = self._history.feishu_inbound_window(self._private_started_ms // 1000)
+                start = max(floor, through - _OVERLAP_SECONDS)
+                end = min(now, through + _MAX_SCAN_SECONDS)
+                if end <= start:
+                    return
+                self._window = _ScanWindow(start, end)
+        window = self._window
+        if not await self._collect(window):
+            return
+        if window.remaining is None:
+            # 只信任完整且无冲突的搜索段。刷新不推进水位，恢复总是使用最新已提交的核验依据。
+            fresh = self._history.reconcile_feishu_search(window.hits.values(), now=now)
+            window.hits = {hit.message_id: hit for hit in fresh}
+            window.remaining = deque(fresh)
+        if await self._fetch_details(window, window.remaining):
+            self._record(window.end, now, window.hits, window.details)
+            if window.oversized:
+                _LOG.warning("Feishu single-message detail output limit; deferred=%d", window.oversized)
+            self._window = None
 
     async def poll_once(self) -> None:
         async with self._poll_lock:
-            # 恢复上次进程在「接收已落库、仍未移交历史」时留下的批次。
-            await self._submit_pending()
-            if self._window is None:
-                now = int(self._clock())
-                initial = self._private_started_ms // 1000
-                floor, through = self._history.inbound_window(self._session_id, self._source, initial)
-                start = max(floor, through - _OVERLAP_SECONDS)
-                if now <= start:
-                    return
-                self._window = _ScanWindow(start, now, through)
-            window = self._window
-            if not await self._collect(window):
-                return
-            started = asyncio.get_running_loop().time()
-            if window.prepared is None:
-                # 写入遇锁不丢窗口；下轮重试同一批，不重复下载与转写。
-                window.prepared = await self._prepare(window)
-            normalized_items, failed_audio = window.prepared
-            recorded = self._history.record_inbound(self._session_id, self._source, window.end, normalized_items)
-            if normalized_items and _LOG.isEnabledFor(logging.DEBUG):
-                accepted = sum(message is not None and key in recorded for key, message in normalized_items)
-                _LOG.debug("Feishu input window recorded; candidates=%d accepted=%d audio_failures=%d elapsed_ms=%.0f",
-                           len(normalized_items), accepted, len(failed_audio),
-                           (asyncio.get_running_loop().time() - started) * 1000)
-            self._window = None
-            for message_id, message in normalized_items:
-                if (message_id in recorded and window.messages[message_id].kind == "audio"
-                        and message is not None and isinstance(message.content, str)):
-                    self._channel.enqueue_transcript(message.content)
+            self._submit_pending()  # 重启时不用再次搜到已落库的消息。
+            now = int(self._clock())
             try:
-                await self._submit_pending()
-            finally:
-                for message_id in failed_audio:
-                    if message_id in recorded:
-                        task = asyncio.create_task(self._notify())
-                        self._notices.add(task)
-                        task.add_done_callback(self._notices.discard)
-
-    async def _notify(self) -> None:
-        try:
-            await self._channel.notify_audio_failure()
-        except Exception:
-            _LOG.warning("Feishu audio failure notice unavailable")
+                await self._scan(now)
+            except CliError:
+                await self._recover(now)
+                raise
+            await self._recover(now)
 
     async def run(self) -> None:
         """不重叠轮询，长批次完成后跳过错过的时钟刻度。"""
@@ -333,14 +532,5 @@ class FeishuPoller:
                     next_tick += (int((now - next_tick) // _POLL_SECONDS) + 1) * _POLL_SECONDS
                 await asyncio.sleep(max(0, next_tick - loop.time()))
         finally:
-            try:
-                if self._before_close is not None:
-                    self._before_close()  # 入口与发送先同步关闭，再等待固定通知的取消清理。
-            finally:
-                await self.close()
-
-    async def close(self) -> None:
-        pending = tuple(self._notices)
-        for task in pending:
-            task.cancel()
-        await asyncio.gather(*pending, return_exceptions=True)
+            if self._before_close is not None:
+                self._before_close()  # 同步关闭所有用户的入口与发送队列。

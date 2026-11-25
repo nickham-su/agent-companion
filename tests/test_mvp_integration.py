@@ -3,6 +3,7 @@
 import asyncio
 from contextlib import asynccontextmanager, closing, suppress
 from dataclasses import replace
+from datetime import datetime, timezone
 from hashlib import sha256
 import io
 import json
@@ -79,9 +80,6 @@ class _CLITransport:
         assert argv[0] == "mock-lark-cli"
         if argv[1:4] == ("api", "GET", "/open-apis/authen/v1/user_info"):
             return _success({"open_id": _OWN})
-        if argv[1:5] == ("im", "+chat-list", "--types", "p2p"):
-            return _success({"chats": [{"chat_id": _CHAT, "chat_mode": "p2p", "p2p_target_type": "user",
-                                        "p2p_target_id": _PEER}], "has_more": False})
         if argv[1:3] == ("vc", "+meeting-list-active"):
             self.meeting_lookups.append("list")
             return _success({"meetings": [{"meeting_id": "1"}]})
@@ -89,15 +87,25 @@ class _CLITransport:
             self.meeting_lookups.append("detail")
             return _success({"meeting": {"id": "1", "status": 1, "host_user": {"id": _PEER},
                                          "participants": [{"id": _PEER}]}})
-        if argv[1:3] == ("api", "GET"):
-            params = json.loads(argv[argv.index("--params") + 1])
-            start, end = (1000 * int(params[key]) for key in ("start_time", "end_time"))
-            # Expose overlapping pages, including messages from the prior app instance.
-            items = [item for item in self.inbox if start <= int(item["create_time"]) < end]
-            return _success({"items": items, "has_more": False})
-        assert argv[1:3] == ("api", "POST")
+        assert argv[-4:] == ("--as", "user", "--format", "json")
+        params = json.loads(argv[argv.index("--params") + 1])
+        if argv[1:4] == ("api", "POST", "/open-apis/im/v1/messages/search"):
+            query = json.loads(data)
+            assert query["query"] == "" and query["filter"]["chat_type"] == "p2p"
+            bounds = query["filter"]["time_range"]
+            start, end = (1000 * datetime.fromisoformat(bounds[key]).timestamp()
+                          for key in ("start_time", "end_time"))
+            return _success({"items": [{"meta_data": {
+                "message_id": item["message_id"], "chat_id": item["chat_id"], "type": item["msg_type"],
+                "from_id": item["sender"]["id"], "is_p2p_chat": True,
+                "create_time": datetime.fromtimestamp(int(item["create_time"]) / 1000, timezone.utc).isoformat(),
+            }} for item in self.inbox if start <= int(item["create_time"]) < end], "has_more": False})
+        if argv[1:4] == ("api", "GET", "/open-apis/im/v1/messages/mget"):
+            return _success({"items": [item for item in self.inbox if item["message_id"] in params["message_ids"]]})
+        assert argv[1:4] == ("api", "POST", "/open-apis/im/v1/messages")
+        assert params == {"receive_id_type": "open_id"}
         payload = json.loads(data)
-        assert payload["receive_id"] == _CHAT
+        assert payload["receive_id"] == _PEER
         content = json.loads(payload["content"])
         if payload["msg_type"] == "post":
             self.posts.append(content)

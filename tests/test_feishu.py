@@ -1,7 +1,8 @@
 import asyncio
+from collections import deque
 from base64 import b64decode
 from contextlib import closing
-from functools import partial
+from datetime import datetime, timezone
 import io
 import json
 from pathlib import Path
@@ -15,8 +16,8 @@ import wave
 from feishu_test_support import private_discovery
 
 from agent_companion.app import run_feishu, running_agent
-from agent_companion.channels.feishu.channel import FeishuChannel, FeishuPoller
-from agent_companion.channels.feishu.cli import CliError, CliStdoutLimit, CommandResult, FeishuCLI, run_command
+from agent_companion.channels.feishu.channel import FeishuChannel, FeishuInput, FeishuPoller, private_session_id
+from agent_companion.channels.feishu.cli import CliError, CliStdoutLimit, CommandResult, FeishuCLI, FeishuDiscovery, run_command
 from agent_companion.config import FeishuSettings, Settings, load_settings
 from agent_companion.protocol import (OMITTED_INPUT_IMAGE, ChannelUser, DeliveryStatus, Image, Message, Receipt,
                                       ReplyDelivery, ReplyInfo, Text, TextDelta)
@@ -26,6 +27,9 @@ from agent_companion.storage.sqlite import History
 
 
 _CHAT, _PEER, _SELF = "oc_synthetic", "ou_peer", "ou_self"
+_SESSION = private_session_id(ChannelUser(_PEER))
+_SEARCH = "/open-apis/im/v1/messages/search"
+_MGET = "/open-apis/im/v1/messages/mget"
 _NOTICE = "语音接收失败，请重新发送。"
 # Synthetic 1x1 PNG.
 _PNG = b64decode("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGMw7XoHAAKlAa6/EWr0AAAAAElFTkSuQmCC")
@@ -55,6 +59,18 @@ def _raw(message_id, stamp, kind, content, *, sender=_PEER, chat=_CHAT, deleted=
             "body": {"content": json.dumps(content) if not isinstance(content, str) else content}}
 
 
+def _hit(row, *, p2p=True):
+    return {"meta_data": {"message_id": row["message_id"], "type": row["msg_type"],
+                          "chat_id": row["chat_id"], "from_id": row["sender"]["id"], "is_p2p_chat": p2p,
+                          "create_time": datetime.fromtimestamp(int(row["create_time"]) / 1000,
+                                                                timezone.utc).isoformat()}}
+
+
+def _search_bounds(stdin):
+    times = json.loads(stdin)["filter"]["time_range"]
+    return tuple(int(datetime.fromisoformat(times[k]).timestamp()) for k in ("start_time", "end_time"))
+
+
 class _Runner:
     def __init__(self):
         self.pages = {None: {"items": [], "has_more": False}}
@@ -72,9 +88,18 @@ class _Runner:
         self.calls.append((argv, timeout))
         if len(argv) > 4 and argv[3].endswith("_file_limit.py"):
             argv = argv[5:]
-        if argv[1:3] == ("api", "GET"):
-            page = self.pages[json.loads(argv[argv.index("--params") + 1]).get("page_token")]
-            return _success(page) if isinstance(page, dict) else page
+        if argv[3] == _SEARCH:
+            page = self.pages[json.loads(argv[5]).get("page_token")]
+            if isinstance(page, dict):
+                return _success({**page, "items": [row if "meta_data" in row else _hit(
+                    row, p2p=row["chat_id"] != "oc_group") for row in page.get("items", [])
+                    if "meta_data" in row or row["sender"]["sender_type"] == "user"]})
+            return page
+        if argv[3] == _MGET:
+            requested = json.loads(argv[5])["message_ids"]
+            found = {row["message_id"]: row for page in self.pages.values() if isinstance(page, dict)
+                     for row in page.get("items", []) if "message_id" in row}
+            return _success({"items": [found[mid] for mid in requested if mid in found]})
         if argv[1:3] == ("im", "+messages-resources-download"):
             target = Path(argv[argv.index("--output") + 1])
             if blob := self.files.get(argv[argv.index("--file-key") + 1]):
@@ -123,11 +148,32 @@ class _Model:
         yield TextDelta("模拟回复")
 
 
-def _poller(history, main, cli, asr, clock):
-    return FeishuPoller(cli, asr, FeishuChannel(cli), chat_id=_CHAT, user=ChannelUser(_PEER),
-                        account=ChannelUser(_SELF),
-                        session_id="main", history=history, submit=main, private_started_ms=clock[0] * 1000,
-                        clock=lambda: clock[0])
+def _poller(history, main, cli, asr, clock, *, batch_budget=None, initial_ms=100_000):
+    discovery = FeishuDiscovery(cli._executable, timeout=cli._timeout, runner=cli._runner)
+    channel = FeishuChannel(cli)
+    submitted = set()
+
+    def notify(user):
+        assert user == ChannelUser(_PEER)
+        for batch in history.pending_inbound(_SESSION, "feishu-private"):
+            if batch not in submitted:
+                main(batch)
+                submitted.add(batch)
+
+    inputs = FeishuInput(discovery, asr, history, **({} if batch_budget is None else {"batch_budget": batch_budget}))
+
+    class DrainedPoller(FeishuPoller):
+        async def poll_once(self):
+            await super().poll_once()
+            user = ChannelUser(_PEER)
+            while await inputs.process_next(user, channel, lambda: notify(user)):
+                pass
+
+        async def close(self):
+            await channel.close()
+
+    return DrainedPoller(discovery, account=ChannelUser(_SELF), history=history, notify_user=notify,
+                         private_started_ms=initial_ms, clock=lambda: clock[0])
 
 
 class FeishuCLITests(unittest.IsolatedAsyncioTestCase):
@@ -138,23 +184,29 @@ class FeishuCLITests(unittest.IsolatedAsyncioTestCase):
             calls.append((argv, stdin, timeout))
             return _success({"message_id": "om_example", "items": [], "has_more": False})
 
-        cli = FeishuCLI("lark-cli", _CHAT, timeout=2, runner=runner)
-        self.assertEqual(await cli.list_page(10, 20, 'opaque+/?="'), ([], None))
+        cli = FeishuCLI("lark-cli", ChannelUser(_PEER), timeout=2, runner=runner)
+        reader = FeishuDiscovery("lark-cli", timeout=2, runner=runner)
+        self.assertEqual(await reader.search_page(10, 20, 'opaque+/?="'), ([], None))
+        self.assertEqual(await reader.messages(("om_one", "om_two")), [])
         text = '多行 "hello"\n--as bot; not an option'
         self.assertEqual(await cli.send_text(text), DeliveryStatus.FULL)
         first, stdin, _ = calls[0]
+        self.assertEqual(first[:5], ("lark-cli", "api", "POST", _SEARCH, "--params"))
+        self.assertEqual(json.loads(first[5]), {"user_id_type": "open_id", "page_size": 20,
+                                               "page_token": 'opaque+/?="'})
+        self.assertEqual(json.loads(stdin), {"query": "", "filter": {"chat_type": "p2p", "from_types": ["user"],
+            "time_range": {"start_time": "1970-01-01T00:00:10+00:00", "end_time": "1970-01-01T00:00:20+00:00"}}})
+        read, stdin, _ = calls[1]
         self.assertIsNone(stdin)
-        self.assertEqual(first[:5], ("lark-cli", "api", "GET", "/open-apis/im/v1/messages", "--params"))
-        self.assertEqual(json.loads(first[5]), {"container_id_type": "chat", "container_id": _CHAT,
-                         "start_time": "10", "end_time": "20", "sort_type": "ByCreateTimeAsc",
-                         "page_size": 50, "page_token": 'opaque+/?="'})
-        second, stdin, _ = calls[1]
+        self.assertEqual(read[1:5], ("api", "GET", _MGET, "--params"))
+        self.assertEqual(json.loads(read[5]), {"message_ids": ["om_one", "om_two"], "user_id_type": "open_id"})
+        second, stdin, _ = calls[2]
         self.assertNotIn(text, " ".join(second))
         self.assertEqual(second[6:8], ("--data", "-"))
         self.assertEqual(second[-4:], ("--as", "user", "--format", "json"))
         body = json.loads(stdin)
         self.assertEqual((body["receive_id"], body["msg_type"], json.loads(body["content"])),
-                          (_CHAT, "text", {"text": text}))
+                          (_PEER, "text", {"text": text}))
 
     async def test_transcript_uses_literal_bold_post_in_stdin(self):
         calls = []
@@ -163,7 +215,7 @@ class FeishuCLITests(unittest.IsolatedAsyncioTestCase):
             calls.append((argv, stdin))
             return _success({"message_id": "om_post", "chat_id": _CHAT})
 
-        cli = FeishuCLI("lark-cli", _CHAT, timeout=2, runner=runner)
+        cli = FeishuCLI("lark-cli", ChannelUser(_PEER), timeout=2, runner=runner)
         text = '  多行 "hello" &amp; **注意**\r\n<at>\\路径\n🙂\n'
         payload = cli.prepare_transcript(text)
         assert payload is not None
@@ -171,27 +223,27 @@ class FeishuCLITests(unittest.IsolatedAsyncioTestCase):
         (argv, stdin), = calls
         self.assertIs(stdin, payload)
         self.assertEqual(argv, ("lark-cli", "api", "POST", "/open-apis/im/v1/messages", "--params",
-                                '{"receive_id_type":"chat_id"}', "--data", "-", "--as", "user", "--format", "json"))
+                                '{"receive_id_type":"open_id"}', "--data", "-", "--as", "user", "--format", "json"))
         body = json.loads(stdin)
         self.assertEqual((body["receive_id"], body["msg_type"], json.loads(body["content"])),
-                         (_CHAT, "post", {"zh_cn": {"content": [[{"tag": "text", "text": text, "style": ["bold"]}]]}}))
+                         (_PEER, "post", {"zh_cn": {"content": [[{"tag": "text", "text": text, "style": ["bold"]}]]}}))
 
     def test_transcript_preparation_rejects_invalid_encoding_or_oversized_post(self):
         runner = _Runner()
-        cli = FeishuCLI("lark-cli", _CHAT, timeout=2, runner=runner)
+        cli = FeishuCLI("lark-cli", ChannelUser(_PEER), timeout=2, runner=runner)
         for text in ("\ud800", "字" * 10_000, '"' * 10_000, "a" * 30_001):
             with self.subTest(length=len(text)):
                 self.assertIsNone(cli.prepare_transcript(text))
         self.assertEqual(runner.calls, [])
 
-    async def test_list_page_size_bounds(self):
+    async def test_search_page_size_bounds(self):
         runner = _Runner()
-        cli = FeishuCLI("lark-cli", _CHAT, timeout=2, runner=runner)
+        cli = FeishuDiscovery("lark-cli", timeout=2, runner=runner)
         for size in (1, 50):
-            self.assertEqual(await cli.list_page(10, 20, None, page_size=size), ([], None))
+            self.assertEqual(await cli.search_page(10, 20, None, page_size=size), ([], None))
         for size in (-1, 0, 51, 1.5, True, "25"):
-            with self.subTest(size=size), self.assertRaisesRegex(ValueError, "invalid Feishu page size"):
-                await cli.list_page(10, 20, None, page_size=size)
+            with self.subTest(size=size), self.assertRaisesRegex(ValueError, "invalid Feishu search page size"):
+                await cli.search_page(10, 20, None, page_size=size)
         self.assertEqual([json.loads(argv[5])["page_size"] for argv, _ in runner.calls], [1, 50])
 
     async def test_text_receipts_are_terminal_and_not_retried(self):
@@ -220,12 +272,12 @@ class FeishuCLITests(unittest.IsolatedAsyncioTestCase):
                         raise raw
                     return raw
 
-                cli = FeishuCLI("lark-cli", _CHAT, timeout=2, runner=runner)
+                cli = FeishuCLI("lark-cli", ChannelUser(_PEER), timeout=2, runner=runner)
                 self.assertEqual((await cli.send_text("第一第二"), num), (expected, 1))
 
     async def test_bad_resources_are_not_read_or_sent(self):
         runner = _Runner()
-        cli = FeishuCLI("lark-cli", _CHAT, timeout=2, runner=runner)
+        cli = FeishuCLI("lark-cli", ChannelUser(_PEER), timeout=2, runner=runner)
         with self.assertRaisesRegex(CliError, "invalid_resource_reference"):
             await cli.download("om_one", "img_../bad", "image", limit=100)
         self.assertEqual(runner.calls, [])
@@ -272,7 +324,7 @@ if failed:
 print(json.dumps({"ok": True, "identity": "user", "data": {"size_bytes": peak}}))
 ''', encoding="utf-8")
             worker.chmod(0o700)
-            cli = FeishuCLI(str(worker), _CHAT, timeout=3)
+            cli = FeishuCLI(str(worker), ChannelUser(_PEER), timeout=3)
             with self.assertRaisesRegex(CliError, "^cli_result_unknown$"):
                 await cli.download("om_one", "img_large", "image", limit=128)
             peak, directory, child_limit = json.loads(audit.read_text())
@@ -301,7 +353,7 @@ class FeishuBackgroundDeliveryTests(unittest.IsolatedAsyncioTestCase):
                                 ("无效编码", "\ud800")):
             with self.subTest(reason=reason):
                 runner = _Runner()
-                channel = FeishuChannel(FeishuCLI("lark-cli", _CHAT, timeout=2, runner=runner))
+                channel = FeishuChannel(FeishuCLI("lark-cli", ChannelUser(_PEER), timeout=2, runner=runner))
                 self.addAsyncCleanup(channel.close)
                 with self.assertLogs("agent_companion.channels.feishu.channel", level="WARNING") as logs:
                     for _ in range(8):
@@ -340,7 +392,7 @@ class FeishuBackgroundDeliveryTests(unittest.IsolatedAsyncioTestCase):
             return _success({"message_id": "om_reply"})
 
         model = _Model()
-        channel = FeishuChannel(FeishuCLI("lark-cli", _CHAT, timeout=2, runner=runner))
+        channel = FeishuChannel(FeishuCLI("lark-cli", ChannelUser(_PEER), timeout=2, runner=runner))
         self.addAsyncCleanup(channel.close)
         with closing(History(":memory:")) as history:
             async with running_agent(Settings(), history, model, channel, session_id="main",
@@ -377,7 +429,7 @@ class FeishuBackgroundDeliveryTests(unittest.IsolatedAsyncioTestCase):
             finally:
                 cancelled.set()
 
-        channel = FeishuChannel(FeishuCLI("lark-cli", _CHAT, timeout=2, runner=runner))
+        channel = FeishuChannel(FeishuCLI("lark-cli", ChannelUser(_PEER), timeout=2, runner=runner))
         self.addAsyncCleanup(channel.close)
         channel.enqueue_transcript("发送中")
         await asyncio.wait_for(started.wait(), 1)
@@ -410,7 +462,7 @@ class FeishuBackgroundDeliveryTests(unittest.IsolatedAsyncioTestCase):
             async def stream(self, messages, tools, *, thinking):
                 yield TextDelta(f"回复 {messages[-1].content}")
 
-        channel = FeishuChannel(FeishuCLI("lark-cli", _CHAT, timeout=2, runner=runner))
+        channel = FeishuChannel(FeishuCLI("lark-cli", ChannelUser(_PEER), timeout=2, runner=runner))
         self.addAsyncCleanup(channel.close)
         with closing(History(":memory:")) as history:
             async with running_agent(Settings(), history, Echo(), channel, session_id="main",
@@ -511,7 +563,7 @@ class FeishuBackgroundDeliveryTests(unittest.IsolatedAsyncioTestCase):
                         return result
 
                 runner = Runner()
-                cli = FeishuCLI("lark-cli", _CHAT, timeout=2, runner=runner)
+                cli = FeishuCLI("lark-cli", ChannelUser(_PEER), timeout=2, runner=runner)
                 finalize_reply = history.finalize_reply
 
                 def finalize(outcome, messages):
@@ -540,7 +592,7 @@ class FeishuBackgroundDeliveryTests(unittest.IsolatedAsyncioTestCase):
                                 await asyncio.sleep(0)  # 若错误入队，给发送器执行机会。
                 finally:
                     await channel.close()
-                self.assertEqual(outbound, [(_CHAT, saved, Message("assistant", saved))] if expected_to_send else [])
+                self.assertEqual(outbound, [(_PEER, saved, Message("assistant", saved))] if expected_to_send else [])
                 assistant = [entry.message for entry in history.read_after("main") if entry.message.role == "assistant"]
                 outcomes = history.outcomes("main")
                 self.assertEqual(assistant, [] if case in ("commit failed", "zero") else [Message("assistant", saved)])
@@ -552,7 +604,12 @@ class FeishuBackgroundDeliveryTests(unittest.IsolatedAsyncioTestCase):
         active, poll_ready, poll_cleaning, release_poll = (asyncio.Event() for _ in range(4))
         release_send, send_cancelled, send_cleaned = (asyncio.Event() for _ in range(3))
         sent = []
-        submit = None
+        channel = None
+
+        def capture_channel(*args, **kwargs):
+            nonlocal channel
+            channel = FeishuChannel(*args, **kwargs)
+            return channel
 
         class CLI(FeishuCLI):
             async def send_text(self, text):
@@ -568,22 +625,24 @@ class FeishuBackgroundDeliveryTests(unittest.IsolatedAsyncioTestCase):
                 return DeliveryStatus.FULL
 
         async def poll(poller):
-            nonlocal submit
-            submit = poller._submit
+            poller._notify_user(ChannelUser(_PEER))
             info = ReplyInfo("simulated", "main", "run", 0)
-            poller._channel.enqueue(info, "当前")
+            channel.enqueue(info, "当前")
             await active.wait()
-            poller._channel.enqueue(info, "不能开始")
+            channel.enqueue(info, "不能开始")
             poll_ready.set()
             try:
                 await asyncio.Future()
             finally:
+                poller._before_close()
                 poll_cleaning.set()
                 await release_poll.wait()
 
         settings = Settings(feishu=FeishuSettings())
-        discovery = private_discovery(_CHAT, _PEER, _SELF, cli=CLI("lark-cli", _CHAT, timeout=2))
-        with (closing(History(":memory:")) as history, patch.object(FeishuPoller, "run", poll),
+        discovery = private_discovery(_CHAT, _PEER, _SELF, cli=CLI("lark-cli", ChannelUser(_PEER), timeout=2))
+        with (closing(History(":memory:")) as history,
+              patch("agent_companion.feishu_private.FeishuChannel", side_effect=capture_channel),
+              patch.object(FeishuPoller, "run", poll),
               self.assertLogs("agent_companion.channels.feishu.channel", level="WARNING")):
             app = asyncio.create_task(run_feishu(settings, history, _Model(), _ASR(), discovery=discovery,
                                                  roles=demo_roles()))
@@ -592,7 +651,7 @@ class FeishuBackgroundDeliveryTests(unittest.IsolatedAsyncioTestCase):
                 app.cancel()
                 await asyncio.wait_for(poll_cleaning.wait(), 1)
                 self.assertTrue(send_cancelled.is_set())
-                self.assertIsNone(await submit(-1))
+                self.assertTrue(channel._closed)
                 release_send.set()
                 await asyncio.wait_for(send_cleaned.wait(), 1)
                 self.assertFalse(app.done())
@@ -608,11 +667,16 @@ class FeishuBackgroundDeliveryTests(unittest.IsolatedAsyncioTestCase):
         send_cancelled, notice_cleaning = asyncio.Event(), asyncio.Event()
         sent = []
         clock = [100]
-        submit = None
+        channel = None
+
+        def capture_channel(*args, **kwargs):
+            nonlocal channel
+            channel = FeishuChannel(*args, **kwargs)
+            return channel
 
         class Runner(_Runner):
             async def __call__(self, argv, data, timeout):
-                if argv[1:3] != ("api", "POST"):
+                if argv[1:4] != ("api", "POST", "/open-apis/im/v1/messages"):
                     return await super().__call__(argv, data, timeout)
                 text = json.loads(json.loads(data)["content"])["text"]
                 if text == _NOTICE:
@@ -639,27 +703,27 @@ class FeishuBackgroundDeliveryTests(unittest.IsolatedAsyncioTestCase):
         runner.pages[None] = {"items": [_raw("om_bad_audio", 101_000, "audio", {"file_key": "file_a"})],
                               "has_more": False}
         asr.error = AsrError("asr_transport")
-        cli = FeishuCLI("lark-cli", _CHAT, timeout=2, runner=runner)
+        cli = FeishuCLI("lark-cli", ChannelUser(_PEER), timeout=2, runner=runner)
         real_poll_once = FeishuPoller.poll_once
 
         async def poll_once(poller):
-            nonlocal submit
-            submit = poller._submit
             await real_poll_once(poller)
             clock[0] = 110
-            await real_poll_once(poller)  # 走真实 ASR 失败路径，启动固定通知。
+            await real_poll_once(poller)
+            await runner.notice_entered.wait()  # 实际按用户任务归一化失败并启动通知。
             info = ReplyInfo("simulated", "main", "run", 0)
-            poller._channel.enqueue(info, "当前")
-            poller._channel.enqueue(info, "不能开始")
+            channel.enqueue(info, "当前")
+            channel.enqueue(info, "不能开始")
             await active.wait()
-            await runner.notice_entered.wait()
             raise RuntimeError("synthetic poll failure")
 
         settings = Settings(feishu=FeishuSettings())
-        discovery = private_discovery(_CHAT, _PEER, _SELF, cli=cli)
-        with (closing(History(":memory:")) as history, patch.object(FeishuPoller, "poll_once", poll_once),
-              patch("agent_companion.app.time", return_value=clock[0]),
-              patch("agent_companion.feishu_private.FeishuPoller", partial(FeishuPoller, clock=lambda: clock[0]))):
+        discovery = private_discovery(_CHAT, _PEER, _SELF, cli=cli, search_runner=runner)
+        with (closing(History(":memory:")) as history,
+              patch("agent_companion.feishu_private.FeishuChannel", side_effect=capture_channel),
+              patch.object(FeishuPoller, "poll_once", poll_once),
+              patch("agent_companion.app.time", side_effect=lambda: clock[0]),
+              patch("agent_companion.feishu_private.time", side_effect=lambda: clock[0])):
             app = asyncio.create_task(run_feishu(settings, history, _Model(), asr, discovery=discovery,
                                                  roles=demo_roles()))
             try:
@@ -669,7 +733,7 @@ class FeishuBackgroundDeliveryTests(unittest.IsolatedAsyncioTestCase):
                 self.assertFalse(app.done())
                 self.assertEqual(sent, ["当前"])
                 self.assertTrue(send_cancelled.is_set())
-                self.assertIsNone(await submit(-1))
+                self.assertTrue(channel._closed)
             finally:
                 release_send.set()
                 runner.release_notice.set()
@@ -679,10 +743,304 @@ class FeishuBackgroundDeliveryTests(unittest.IsolatedAsyncioTestCase):
 
 
 class FeishuPollingTests(unittest.IsolatedAsyncioTestCase):
+    async def test_idle_single_query_and_overlap_recovers_a_late_hit(self):
+        clock, runner = [100], _Runner()
+        cli = FeishuCLI("lark-cli", ChannelUser(_PEER), timeout=2, runner=runner)
+        with closing(History(":memory:")) as history:
+            def accept(batch):
+                history.consume_inbound(_SESSION, batch)
+
+            poller = _poller(history, accept, cli, _ASR(), clock)
+            await poller.poll_once()
+            clock[0] = 220
+            await poller.poll_once()
+            self.assertEqual([argv[3] for argv, _ in runner.calls], [_SEARCH])
+            clock[0] = 250
+            runner.pages[None]["items"] = [_raw("om_late", 131_000, "text", {"text": "迟到"}),
+                                           _raw("om_expired", 99_999, "text", {"text": "旧历史"})]
+            await poller.poll_once()
+            clock[0] = 251
+            await poller.poll_once()
+            self.assertEqual([row.message.content for row in history.tail(_SESSION, 10)], ["迟到"])
+            self.assertEqual([argv[3] for argv, _ in runner.calls], [_SEARCH, _SEARCH, _MGET, _SEARCH])
+            self.assertEqual(history.feishu_inbound_window(0), (100, 251))
+
+    async def test_missing_and_mismatched_candidates_recover_after_restart_without_blocking(self):
+        clock, requested = [110], []
+        missing = _raw("om_missing", 101_100, "text", {"text": "迟到正文"})
+        mismatch = _raw("om_mismatch", 101_200, "text", {"text": "迟到核验"})
+        good = _raw("om_good", 102_000, "text", {"text": "同页正文"})
+        later = _raw("om_later", 250_000, "text", {"text": "后续窗口"})
+        deletion = _raw("om_deleted", 101_500, "text", {"text": "已撤回"}, deleted=True)
+        search = [missing, mismatch, good, deletion, later]
+        details = {row["message_id"]: row for row in (good, later, deletion)}
+        details["om_mismatch"] = {**mismatch, "chat_id": "oc_wrong"}
+
+        async def runner(argv, data, timeout):
+            if argv[3] == _SEARCH:
+                start, end = _search_bounds(data)
+                return _success({"items": [_hit(row) for row in search if start <= int(row["create_time"]) // 1000 < end],
+                                 "has_more": False})
+            ids = json.loads(argv[5])["message_ids"]
+            requested.append(ids)
+            return _success({"items": [details[mid] for mid in ids if mid in details]})
+
+        cli = FeishuCLI("lark-cli", ChannelUser(_PEER), timeout=2, runner=runner)
+        with TemporaryDirectory() as root:
+            path = Path(root) / "synthetic.db"
+            with closing(History(path)) as history, self.assertLogs(level="WARNING") as logs:
+                poller = _poller(history, lambda batch: history.consume_inbound(_SESSION, batch), cli, _ASR(), clock)
+                await poller.poll_once()
+                self.assertEqual(history.feishu_inbound_window(0), (100, 110))
+                self.assertEqual([row.message.content for row in history.tail(_SESSION, 20)], ["同页正文"])
+                self.assertTrue(history.feishu_inbound_seen("om_deleted"))
+                for mid in ("om_missing", "om_mismatch"):
+                    self.assertFalse(history.feishu_inbound_seen(mid))
+                    self.assertIsNotNone(history.feishu_recovery_candidate(mid))
+                clock[0] = 119
+                await poller.poll_once()
+                self.assertEqual(len(requested), 1)
+                self.assertNotIn("om_missing", " ".join(logs.output))
+                self.assertNotIn("oc_wrong", " ".join(logs.output))
+            with (closing(History(path)) as history,
+                  patch("agent_companion.channels.feishu.channel._MAX_RECOVERY_BATCH", 1)):
+                poller = _poller(history, lambda batch: history.consume_inbound(_SESSION, batch), cli, _ASR(), clock)
+                clock[0] = 300  # 搜索窗口已过两个候选的原始时间。
+                await poller.poll_once()
+                self.assertEqual(requested[1:], [["om_later"], ["om_mismatch"]])
+                self.assertEqual(history.feishu_inbound_window(0), (100, 300))
+                self.assertFalse(history.feishu_inbound_seen("om_mismatch"))
+                details.update(om_missing=missing, om_mismatch=mismatch)
+                clock[0] = 301
+                await poller.poll_once()
+                clock[0] = 319
+                await poller.poll_once()
+                self.assertEqual(requested[-1], ["om_missing"])
+                clock[0] = 320
+                await poller.poll_once()
+                self.assertEqual(requested[-1], ["om_mismatch"])
+                self.assertEqual([row.message.content for row in history.tail(_SESSION, 20)],
+                                 ["同页正文", "后续窗口", "迟到正文", "迟到核验"])
+                self.assertEqual(history.due_feishu_candidates(9999, 10), [])
+
+    async def test_single_oversized_detail_does_not_block_scan_or_other_recovery(self):
+        clock, requests = [110], []
+        poison = _raw("om_0_oversized", 101_000, "text", {"text": "超限后恢复"})
+        recoverable = _raw("om_1_recoverable", 102_000, "text", {"text": "独立恢复"})
+        regular = _raw("om_2_regular", 103_000, "text", {"text": "同页正常"})
+        later = _raw("om_3_later", 115_000, "text", {"text": "后续窗口"})
+        rows = {row["message_id"]: row for row in (poison, regular, recoverable, later)}
+
+        async def runner(argv, data, timeout):
+            if argv[3] == _SEARCH:
+                start, end = _search_bounds(data)
+                return _success({"items": [_hit(row) for row in rows.values()
+                                           if start <= int(row["create_time"]) // 1000 < end], "has_more": False})
+            ids = json.loads(argv[5])["message_ids"]
+            requests.append(ids)
+            if "om_0_oversized" in ids and clock[0] < 140:
+                raise CliStdoutLimit("cli_output_limit")
+            return _success({"items": [rows[mid] for mid in ids if mid != "om_1_recoverable" or clock[0] >= 120]})
+
+        cli = FeishuCLI("lark-cli", ChannelUser(_PEER), timeout=2, runner=runner)
+        with TemporaryDirectory() as root:
+            db = Path(root) / "synthetic.db"
+            with closing(History(db)) as history, self.assertLogs(level="WARNING") as logs:
+                poller = _poller(history, lambda batch: history.consume_inbound(_SESSION, batch), cli, _ASR(), clock)
+                await poller.poll_once()
+                self.assertEqual(requests, [["om_0_oversized", "om_2_regular", "om_1_recoverable"],
+                                            ["om_0_oversized"], ["om_2_regular", "om_1_recoverable"]])
+                self.assertEqual(history.feishu_inbound_window(0), (100, 110))
+                self.assertIsNotNone(history.feishu_recovery_candidate("om_0_oversized"))
+                self.assertFalse(history.feishu_inbound_seen("om_0_oversized"))
+                self.assertEqual([row.message.content for row in history.tail(_SESSION, 10)], ["同页正常"])
+                self.assertIn("single-message detail output limit", " ".join(logs.output))
+                self.assertNotIn("om_0_oversized", " ".join(logs.output))
+            with closing(History(db)) as history, self.assertLogs(level="WARNING") as logs:
+                poller = _poller(history, lambda batch: history.consume_inbound(_SESSION, batch), cli, _ASR(), clock)
+                clock[0] = 120
+                await poller.poll_once()
+                self.assertEqual(requests[3:], [["om_3_later"], ["om_0_oversized", "om_1_recoverable"],
+                                                ["om_0_oversized"]])
+                self.assertEqual(history.feishu_inbound_window(0), (100, 120))
+                self.assertIn("single-message recovery output limit", " ".join(logs.output))
+                self.assertFalse(history.feishu_inbound_seen("om_0_oversized"))
+                self.assertEqual([hit.message_id for hit in history.due_feishu_candidates(120, 5)], ["om_1_recoverable"])
+                clock[0] = 121
+                await poller.poll_once()
+                self.assertEqual(requests[6:], [["om_1_recoverable"]])
+                self.assertEqual([row.message.content for row in history.tail(_SESSION, 10)],
+                                 ["同页正常", "后续窗口", "独立恢复"])
+                clock[0] = 139
+                await poller.poll_once()
+                self.assertEqual(len(requests), 7)
+                clock[0] = 140
+                await poller.poll_once()
+                self.assertEqual(requests[7:], [["om_0_oversized"]])
+                self.assertIsNone(history.feishu_recovery_candidate("om_0_oversized"))
+                self.assertEqual([row.message.content for row in history.tail(_SESSION, 10)],
+                                 ["同页正常", "后续窗口", "独立恢复", "超限后恢复"])
+
+    async def test_corrected_recovery_metadata_is_persisted_and_reverified_once(self):
+        clock, requests = [110], []
+        mid = "om_corrected"
+        old = _raw(mid, 101_200, "text", {"text": "旧来源"}, sender="ou_wrong", chat="oc_old")
+        corrected = _raw(mid, 102_300, "text", {"text": "已更正"})
+        hits, rows = [_hit(old)], []
+
+        async def runner(argv, data, timeout):
+            if argv[3] == _SEARCH:
+                return _success({"items": hits, "has_more": False})
+            requests.append(json.loads(argv[5])["message_ids"])
+            return _success({"items": rows})
+
+        cli = FeishuCLI("lark-cli", ChannelUser(_PEER), timeout=2, runner=runner)
+        with TemporaryDirectory() as root:
+            db = Path(root) / "synthetic.db"
+            with closing(History(db)) as history:
+                poller = _poller(history, lambda batch: history.consume_inbound(_SESSION, batch), cli, _ASR(), clock)
+                await poller.poll_once()
+                prior = history.feishu_recovery_candidate(mid)
+                self.assertEqual(prior.peer_open_id, "ou_wrong")
+                clock[0] = 111
+                await poller.poll_once()
+                self.assertEqual(requests, [[mid]])  # 相同回看命中不提前到期。
+
+                clock[0] = 120
+                hits[:] = [_hit(corrected, p2p=False)]
+                rows[:] = [corrected]
+                await poller.poll_once()
+                self.assertEqual(requests, [[mid], [mid]])  # 正常到期，但非 P2P 不能改写核验依据。
+                self.assertEqual(history.feishu_recovery_candidate(mid), prior)
+                self.assertFalse(history.feishu_inbound_seen(mid))
+
+                clock[0] = 121
+                hits[:] = [_hit({**corrected, "create_time": "121000"})]
+                await poller.poll_once()  # 恰在结束边界的候选不可信。
+                self.assertEqual(history.feishu_recovery_candidate(mid), prior)
+                self.assertEqual(len(requests), 2)
+
+                clock[0] = 122
+                hits[:] = [_hit(old), _hit(corrected)]
+                with self.assertRaisesRegex(CliError, "cli_conflicting_search_hit"):
+                    await poller.poll_once()
+                self.assertEqual(history.feishu_inbound_window(0), (100, 121))
+                self.assertEqual(history.feishu_recovery_candidate(mid), prior)
+
+                clock[0] = 123
+                hits[:] = [_hit(corrected)]
+                rows[:] = [old]
+                await poller.poll_once()
+                refreshed = history.feishu_recovery_candidate(mid)
+                self.assertEqual((refreshed.peer_open_id, refreshed.created_second), (_PEER, 102))
+                self.assertNotEqual(refreshed.chat_digest, prior.chat_digest)
+                self.assertEqual(requests, [[mid], [mid], [mid]])  # 新依据提前重试，旧正文不通过。
+                self.assertFalse(history.feishu_inbound_seen(mid))
+                self.assertEqual(history.pending_feishu_users(), [])
+
+                clock[0] = 124
+                rows[:] = [corrected]
+                await poller.poll_once()
+                self.assertEqual(len(requests), 3)
+            with closing(History(db)) as history:
+                self.assertEqual(history.feishu_recovery_candidate(mid), refreshed)
+                clock[0] = 163
+                hits.clear()  # 不靠重启后再搜到该消息。
+                poller = _poller(history, lambda batch: history.consume_inbound(_SESSION, batch), cli, _ASR(), clock)
+                await poller.poll_once()
+                self.assertTrue(history.feishu_inbound_seen(mid))
+                self.assertIsNone(history.feishu_recovery_candidate(mid))
+                clock[0] = 164
+                hits[:] = [_hit(old), _hit(corrected)]
+                await poller.poll_once()
+                self.assertEqual(requests, [[mid], [mid], [mid], [mid]])
+                self.assertEqual([row.message.content for row in history.tail(_SESSION, 10)], ["已更正"])
+
+    async def test_valid_id_with_wrong_sender_type_timestamp_or_body_is_not_routed(self):
+        clock = [110]
+        good = _raw("om_checked", 101_400, "text", {"text": "verified"})
+        variants = deque([
+            {**good, "sender": {**good["sender"], "id": "ou_wrong"}},
+            {**good, "sender": {**good["sender"], "sender_type": "app"}},
+            {**good, "create_time": "102400"},
+            {**good, "msg_type": "post"},
+            {**good, "body": {}},
+            good,
+        ])
+
+        async def runner(argv, data, timeout):
+            if argv[3] == _SEARCH:
+                return _success({"items": [_hit(good)], "has_more": False})
+            return _success({"items": [variants.popleft()]})
+
+        cli = FeishuCLI("lark-cli", ChannelUser(_PEER), timeout=2, runner=runner)
+        with closing(History(":memory:")) as history:
+            poller = _poller(history, lambda batch: history.consume_inbound(_SESSION, batch), cli, _ASR(), clock)
+            for step in range(5):
+                await poller.poll_once()
+                self.assertFalse(history.feishu_inbound_seen("om_checked"))
+                self.assertEqual(history.tail(_SESSION, 10), [])
+                clock[0] += 10 * 2 ** step
+            await poller.poll_once()
+            self.assertEqual([row.message.content for row in history.tail(_SESSION, 10)], ["verified"])
+
+    async def test_details_respect_batch_limit_and_keep_already_verified_parts(self):
+        clock, requested = [110], []
+        rows = {f"om_{i}": _raw(f"om_{i}", 101_000 + i, "text", {"text": str(i)}) for i in range(51)}
+        broken = deque(["auth", "network", "null", "omitted", "duplicate"])
+
+        async def runner(argv, data, timeout):
+            if argv[3] == _SEARCH:
+                token = json.loads(argv[5]).get("page_token")
+                hits = [_hit(row) for row in rows.values()]
+                return _success({"items": hits[:20], "has_more": True, "page_token": "middle"} if token is None else
+                                {"items": hits[20:40], "has_more": True, "page_token": "tail"} if token == "middle" else
+                                {"items": hits[40:], "has_more": False})
+            ids = json.loads(argv[5])["message_ids"]
+            requested.append(ids)
+            if broken and "om_50" in ids:
+                failure = broken.popleft()
+                if failure == "auth":
+                    return _failure("authorization")
+                if failure == "network":
+                    raise CliError("cli_timeout")
+                if failure == "null":
+                    return _success({"items": None})
+                if failure == "omitted":
+                    return _success({})
+                return _success({"items": [rows["om_50"], rows["om_50"]]})
+            return _success({"items": [rows[mid] for mid in ids]})
+
+        cli = FeishuCLI("lark-cli", ChannelUser(_PEER), timeout=2, runner=runner)
+        with closing(History(":memory:")) as history:
+            poller = _poller(history, lambda batch: history.consume_inbound(_SESSION, batch), cli, _ASR(), clock)
+            for error in ("cli_rejected", "cli_timeout", *(["cli_invalid_message_details"] * 3)):
+                with self.assertRaisesRegex(CliError, error):
+                    await poller.poll_once()
+                self.assertFalse(history.feishu_inbound_seen("om_0"))
+                self.assertEqual(history.feishu_inbound_window(0), (100, 100))
+                self.assertEqual(history.pending_feishu_users(), [])
+            await poller.poll_once()
+            self.assertEqual(requested, [[f"om_{i}" for i in range(50)], *([["om_50"]] * 6)])
+            self.assertEqual([row.message.content for row in history.tail(_SESSION, 60)], [str(i) for i in range(51)])
+
+    async def test_cyclic_cursor_never_fetches_details_or_advances(self):
+        clock, runner = [110], _Runner()
+        row = _raw("om_seen", 101_000, "text", {"text": "合成"})
+        runner.pages = {key: {"items": [row], "has_more": True, "page_token": "cycle"} for key in (None, "cycle")}
+        cli = FeishuCLI("lark-cli", ChannelUser(_PEER), timeout=2, runner=runner)
+        with closing(History(":memory:")) as history:
+            poller = _poller(history, self.fail, cli, _ASR(), clock)
+            with self.assertRaisesRegex(CliError, "cli_page_cycle"):
+                await poller.poll_once()
+            self.assertEqual([argv[3] for argv, _ in runner.calls], [_SEARCH, _SEARCH])
+            self.assertEqual(history.feishu_inbound_window(0), (100, 100))
+            self.assertFalse(history.feishu_inbound_seen("om_seen"))
+
     async def test_across_pages_order_filter_post_and_delayed_voice(self):
         clock = [100]
         runner, asr, model = _Runner(), _ASR(), _Model()
-        cli = FeishuCLI("lark-cli", _CHAT, timeout=2, runner=runner)
+        cli = FeishuCLI("lark-cli", ChannelUser(_PEER), timeout=2, runner=runner)
         audio = _raw("om_voice", 102_000, "audio", {"file_key": "file_a"})
         rich = _raw("om_rich", 103_000, "post", {"zh_cn": {"title": "标题", "content": [[
             {"tag": "text", "text": "前"}, {"tag": "img", "image_key": "img_a"},
@@ -690,8 +1048,7 @@ class FeishuPollingTests(unittest.IsolatedAsyncioTestCase):
         ], [{"tag": "text", "text": "次行"}]]}})
         runner.pages = {None: {"items": [audio, _raw("om_text", 101_000, "text", {"text": "先到"}),
                                         _raw("om_own", 103_100, "text", {"text": "自身"}, sender=_SELF),
-                                        _raw("om_other", 102_100, "text", {"text": "其他人"}, sender="ou_other"),
-                                        _raw("om_wrong", 102_100, "text", {"text": "其他频道"}, chat="oc_other"),
+                                        _raw("om_wrong", 102_100, "text", {"text": "其他频道"}, chat="oc_group"),
                                         _raw("om_bot", 102_100, "text", {"text": "应用"}, sender_type="app"),
                                         _raw("om_deleted", 102_100, "text", {"text": "撤回"}, deleted=True)],
                                "has_more": True, "page_token": "next"},
@@ -701,23 +1058,34 @@ class FeishuPollingTests(unittest.IsolatedAsyncioTestCase):
         with closing(History(":memory:")) as history:
             channel = FeishuChannel(cli)
             self.addAsyncCleanup(channel.close)
-            async with running_agent(Settings(), history, model, channel, session_id="main",
+            async with running_agent(Settings(), history, model, channel, session_id=_SESSION,
                                      roles=demo_roles()) as (main, _):
                 submit = main.submit_persisted_batch
                 poller = _poller(history, submit, cli, asr, clock)
                 await poller.poll_once()
                 clock[0] = 110
-                with patch.object(history, "record_inbound", side_effect=sqlite3.OperationalError("database is locked")):
+                finish = history.finish_feishu_raw
+                commit_rejected = asyncio.Event()
+                can_commit = False
+
+                def finish_with_lock(*args):
+                    if not can_commit:
+                        commit_rejected.set()
+                        raise sqlite3.OperationalError("database is locked")
+                    return finish(*args)
+
+                with patch.object(history, "finish_feishu_raw", side_effect=finish_with_lock):
                     polling = asyncio.create_task(poller.poll_once())
                     await asyncio.wait_for(asr.entered.wait(), 1)
+                    self.assertEqual(history.feishu_inbound_window(0), (100, 110))
                     self.assertEqual(model.calls, [])
-                    self.assertEqual(history.tail("main", 20), [])
+                    self.assertEqual(history.tail(_SESSION, 20), [])
                     self.assertEqual(runner.posts, [])
                     asr.release.set()
-                    with self.assertRaisesRegex(sqlite3.OperationalError, "database is locked"):
-                        await polling
-                self.assertEqual(runner.posts, [])
-                await poller.poll_once()
+                    await asyncio.wait_for(commit_rejected.wait(), 1)
+                    self.assertEqual(runner.posts, [])
+                    can_commit = True
+                    await asyncio.wait_for(polling, 1)
                 await asyncio.wait_for(runner.transcript_sent.wait(), 1)
                 await main.wait_idle()
                 self.assertEqual(runner.posts, [{"zh_cn": {"content": [[
@@ -738,8 +1106,8 @@ class FeishuPollingTests(unittest.IsolatedAsyncioTestCase):
                 await main.wait_idle()
                 self.assertEqual((len(model.calls), asr.calls), (1, 1))
                 self.assertEqual(len(runner.posts), 1)
-                self.assertFalse(history.inbound_seen("main", "feishu-private", "om_echo"))
-                self.assertEqual([row.message.content for row in history.tail("main", 20)].count("模拟转写"), 1)
+                self.assertFalse(history.feishu_inbound_seen("om_echo"))
+                self.assertEqual([row.message.content for row in history.tail(_SESSION, 20)].count("模拟转写"), 1)
                 self.assertEqual(runner.sent, ["模拟回复"])
                 await poller.close()
 
@@ -753,13 +1121,13 @@ class FeishuPollingTests(unittest.IsolatedAsyncioTestCase):
                                                 _raw("om_after", 101_001, "text", {"text": "后"})], "has_more": False}
                 runner.block_notice = True
                 asr.error = error
-                cli = FeishuCLI("lark-cli", _CHAT, timeout=2, runner=runner)
+                cli = FeishuCLI("lark-cli", ChannelUser(_PEER), timeout=2, runner=runner)
                 with closing(History(":memory:")) as history:
                     submitted = asyncio.Event()
                     accepted = []
 
                     def submit(batch):
-                        history.consume_inbound("main", batch)
+                        history.consume_inbound(_SESSION, batch)
                         accepted.append(batch)
                         submitted.set()
 
@@ -769,7 +1137,7 @@ class FeishuPollingTests(unittest.IsolatedAsyncioTestCase):
                     await poller.poll_once()
                     await asyncio.wait_for(runner.notice_entered.wait(), 1)
                     self.assertTrue(submitted.is_set())
-                    self.assertEqual([row.message.content for row in history.tail("main", 20)], ["前", "后"])
+                    self.assertEqual([row.message.content for row in history.tail(_SESSION, 20)], ["前", "后"])
                     self.assertEqual((runner.sent, asr.calls, len(accepted)), ([_NOTICE], 1, 1))
                     clock[0] = 120
                     await poller.poll_once()
@@ -781,7 +1149,7 @@ class FeishuPollingTests(unittest.IsolatedAsyncioTestCase):
     async def test_failed_page_does_not_advance_window_or_publish(self):
         clock = [100]
         runner, asr = _Runner(), _ASR()
-        cli = FeishuCLI("lark-cli", _CHAT, timeout=2, runner=runner)
+        cli = FeishuCLI("lark-cli", ChannelUser(_PEER), timeout=2, runner=runner)
         runner.pages = {None: {"items": [_raw("om_one", 101_000, "text", {"text": "正常"})],
                                "has_more": True, "page_token": "next"}, "next": _failure("network")}
         with closing(History(":memory:")) as history:
@@ -796,13 +1164,14 @@ class FeishuPollingTests(unittest.IsolatedAsyncioTestCase):
             runner.pages["next"] = {"items": [], "has_more": False}
             await poller.poll_once()
             self.assertEqual(len(accepted), 1)
-            self.assertEqual(json.loads(runner.calls[-1][0][5])["start_time"], "100")
+            self.assertEqual(poller._window, None)
+            self.assertEqual(history.feishu_inbound_window(0), (100, 110))
             await poller.close()
 
     async def test_page_budget_resumes_fixed_window_and_commits_only_once_complete(self):
         clock = [100]
         runner = _Runner()
-        cli = FeishuCLI("lark-cli", _CHAT, timeout=2, runner=runner)
+        cli = FeishuCLI("lark-cli", ChannelUser(_PEER), timeout=2, runner=runner)
         one = _raw("om_first", 101_000, "text", {"text": "最先"})
         two = _raw("om_second", 101_000, "text", {"text": "同一毫秒"})
         three = _raw("om_third", 104_000, "text", {"text": "最后"})
@@ -818,82 +1187,16 @@ class FeishuPollingTests(unittest.IsolatedAsyncioTestCase):
                 clock[0] = current_time
                 await poller.poll_once()
                 if current_time < 130:
-                    self.assertEqual(history.inbound_window("main", source, current_time), (100, 100))
+                    self.assertEqual(history.feishu_inbound_window(current_time), (100, 100))
                     self.assertEqual(accepted, [])
-            pages = [json.loads(argv[5]) for argv, _ in runner.calls]
-            self.assertEqual([(p["start_time"], p["end_time"], p.get("page_token")) for p in pages],
-                             [("100", "110", None), ("100", "110", "next"), ("100", "110", "last")])
-            self.assertEqual(history.inbound_window("main", source, 130), (100, 110))
+            self.assertEqual([json.loads(argv[5]).get("page_token") for argv, _ in runner.calls if argv[3] == _SEARCH],
+                             [None, "next", "last"])
+            self.assertEqual([json.loads(argv[5])["message_ids"] for argv, _ in runner.calls if argv[3] == _MGET],
+                             [["om_first", "om_second", "om_third"]])
+            self.assertEqual(history.feishu_inbound_window(130), (100, 110))
             self.assertEqual(len(accepted), 1)
-            history.consume_inbound("main", accepted[0])
-            self.assertEqual([row.message.content for row in history.tail("main", 5)], ["最先", "同一毫秒", "最后"])
-            await poller.close()
-
-    @unittest.skipUnless(sys.platform in ("linux", "darwin"), "POSIX executable CLI substitute")
-    async def test_large_list_stdout_restarts_fixed_window_and_commits_one_ordered_batch(self):
-        clock = [100]
-        source = "feishu-private"
-        with TemporaryDirectory(dir=Path.cwd()) as root, closing(History(":memory:")) as history:
-            worker = Path(root) / "synthetic-cli"
-            audit = Path(root) / "queries.jsonl"
-            worker.write_text(f"#!{sys.executable}\n" + '''
-import json
-from pathlib import Path
-import sys
-
-params = json.loads(sys.argv[sys.argv.index("--params") + 1])
-start, end, size = params["start_time"], params["end_time"], params["page_size"]
-token = params.get("page_token")
-with Path(__file__).with_name("queries.jsonl").open("a", encoding="utf-8") as audit:
-    audit.write(json.dumps([start, end, size, token]) + "\\n")
-prefix = f"{start}:{end}:{size}:"
-assert token is None or token.startswith(prefix)
-offset = 0 if token is None else int(token.removeprefix(prefix))
-items = []
-for position in range(offset, min(offset + size, 100)):
-    i = 74 if position == 75 else position  # 两个小页之间重复一条消息。
-    text = str(i) + ":" + ("x" * 90_000 if i >= 50 else "")
-    if size == 50 and i == 0:
-        text += "stale"  # 重读必须丢弃旧页，而不是用 ID 去重留下旧正文。
-    items.append({"message_id": f"om_{i}", "create_time": str(101_000 + i // 2),
-                  "msg_type": "text", "chat_id": params["container_id"],
-                  "sender": {"id": "ou_peer", "id_type": "open_id", "sender_type": "user"},
-                  "body": {"content": json.dumps({"text": text})}})
-next_offset = offset + len(items)
-page = {"items": items, "has_more": next_offset < 100}
-if page["has_more"]:
-    page["page_token"] = prefix + str(next_offset)
-print(json.dumps({"ok": True, "identity": "user", "data": page}))
-''', encoding="utf-8")
-            worker.chmod(0o700)
-            cli = FeishuCLI(str(worker), _CHAT, timeout=3)
-            accepted = []
-            poller = _poller(history, accepted.append, cli, _ASR(), clock)
-            await poller.poll_once()
-            with patch("agent_companion.channels.feishu.channel._MAX_PAGES", 2):
-                for current_time in (110, 120):
-                    clock[0] = current_time
-                    await poller.poll_once()
-                    self.assertEqual(history.inbound_window("main", source, current_time), (100, 100))
-                    self.assertEqual(accepted, [])
-                    self.assertEqual(history.pending_inbound("main", source), [])
-                    self.assertFalse(history.inbound_seen("main", source, "om_0"))
-                clock[0] = 130
-                await poller.poll_once()
-
-            queries = [json.loads(line) for line in audit.read_text(encoding="utf-8").splitlines()]
-            self.assertEqual(queries, [["100", "110", size, token] for size, token in (
-                (50, None), (50, "100:110:50:50"), (25, None), (25, "100:110:25:25"),
-                (25, "100:110:25:50"), (25, "100:110:25:75"),
-            )])
-            self.assertEqual(history.inbound_window("main", source, 130), (100, 110))
-            self.assertEqual(len(accepted), 1)
-            self.assertEqual(history.pending_inbound("main", source), accepted)
-            history.consume_inbound("main", accepted[0])
-            contents = [row.message.content for row in history.tail("main", 101)]
-            self.assertEqual([(text.split(":", 1)[0], len(text)) for text in contents], [
-                (str(i), len(str(i)) + 1 + (90_000 if i >= 50 else 0)) for i in range(100) if i != 75
-            ])
+            history.consume_inbound(_SESSION, accepted[0])
+            self.assertEqual([row.message.content for row in history.tail(_SESSION, 5)], ["最先", "同一毫秒", "最后"])
             await poller.close()
 
     async def test_single_result_stdout_limit_does_not_skip_or_commit(self):
@@ -905,34 +1208,38 @@ print(json.dumps({"ok": True, "identity": "user", "data": page}))
         async def runner(argv, data, timeout):
             params = json.loads(argv[5])
             size, token = params["page_size"], params.get("page_token")
-            queries.append((params["start_time"], params["end_time"], size, token))
+            queries.append((*_search_bounds(data), size, token))
             if size == 1 and token is None:
-                return _success({"items": [first], "has_more": True, "page_token": "blocked"})
+                return _success({"items": [_hit(first)], "has_more": True, "page_token": "blocked"})
             raise CliStdoutLimit("cli_output_limit")
 
-        cli = FeishuCLI("lark-cli", _CHAT, timeout=2, runner=runner)
+        cli = FeishuCLI("lark-cli", ChannelUser(_PEER), timeout=2, runner=runner)
         with closing(History(":memory:")) as history:
             poller = _poller(history, self.fail, cli, _ASR(), clock)
             await poller.poll_once()
-            for current_time in (110, 120, 130, 140, 150):
+            for current_time in (110, 120, 130, 140):
                 clock[0] = current_time
                 await poller.poll_once()
-            for current_time in (160, 170):
+            for current_time in (160, 220):
                 clock[0] = current_time
                 with self.assertRaisesRegex(CliError, "^cli_single_result_output_limit$"):
                     await poller.poll_once()
-                self.assertEqual(history.inbound_window("main", source, current_time), (100, 100))
-                self.assertEqual(history.pending_inbound("main", source), [])
-                self.assertFalse(history.inbound_seen("main", source, "om_first"))
-            self.assertEqual(queries, [("100", "110", size, token) for size, token in (
-                (50, None), (25, None), (12, None), (6, None), (3, None), (1, None), (1, "blocked"), (1, "blocked"),
+                self.assertEqual(history.feishu_inbound_window(current_time), (100, 100))
+                self.assertEqual(history.pending_inbound(_SESSION, source), [])
+                self.assertFalse(history.feishu_inbound_seen("om_first"))
+                sent_count = len(queries)
+                clock[0] += 10
+                await poller.poll_once()
+                self.assertEqual(len(queries), sent_count)
+            self.assertEqual(queries, [(100, 110, size, token) for size, token in (
+                (20, None), (10, None), (5, None), (2, None), (1, None), (1, "blocked"), (1, "blocked"),
             )])
             await poller.close()
 
     async def test_partial_paginated_scan_restarts_at_durable_watermark(self):
         clock = [100]
         runner = _Runner()
-        cli = FeishuCLI("lark-cli", _CHAT, timeout=2, runner=runner)
+        cli = FeishuCLI("lark-cli", ChannelUser(_PEER), timeout=2, runner=runner)
         runner.pages = {None: {"items": [], "has_more": True, "page_token": "next"},
                         "next": {"items": [], "has_more": False}}
         with TemporaryDirectory(dir=Path.cwd()) as root, patch("agent_companion.channels.feishu.channel._MAX_PAGES", 1):
@@ -945,8 +1252,7 @@ print(json.dumps({"ok": True, "identity": "user", "data": page}))
             clock[0] = 130
             with closing(History(db)) as history:
                 await _poller(history, self.fail, cli, _ASR(), clock).poll_once()
-            params = json.loads(runner.calls[-1][0][5])
-            self.assertEqual((params["start_time"], params["end_time"], params.get("page_token")), ("100", "130", None))
+            self.assertIsNone(json.loads(runner.calls[-1][0][5]).get("page_token"))
 
     async def test_total_window_state_limit_can_narrow_without_skipping_history(self):
         clock = [100]
@@ -957,35 +1263,96 @@ print(json.dumps({"ok": True, "identity": "user", "data": page}))
 
         async def runner(argv, data, timeout):
             params = json.loads(argv[5])
-            start, end = int(params["start_time"]), int(params["end_time"])
+            if argv[3] == _MGET:
+                return _success({"items": [item for item in (early, late) if item["message_id"] in params["message_ids"]]})
+            start, end = _search_bounds(data)
             token = params.get("page_token")
             queries.append((start, end, token))
-            if end == 140:
-                return _success({"items": [] if token else [early], "has_more": True,
+            if (start, end) == (100, 140):
+                return _success({"items": [] if token else [_hit(early)], "has_more": True,
                                  "page_token": "overflow" if token else "next"})
-            return _success({"items": [early, late], "has_more": False})
+            return _success({"items": [_hit(early), _hit(late)], "has_more": False})
 
-        cli = FeishuCLI("lark-cli", _CHAT, timeout=2, runner=runner)
+        cli = FeishuCLI("lark-cli", ChannelUser(_PEER), timeout=2, runner=runner)
         with closing(History(":memory:")) as history, patch("agent_companion.channels.feishu.channel._MAX_WINDOW_PAGES", 2):
             collected = []
 
             def submit(batch_id):
-                collected.append(history.consume_inbound("main", batch_id))
+                collected.append(history.consume_inbound(_SESSION, batch_id))
 
             poller = _poller(history, submit, cli, _ASR(), clock)
             await poller.poll_once()
             clock[0] = 140
             with self.assertRaisesRegex(CliError, "^cli_window_limit$"):
                 await poller.poll_once()
-            self.assertEqual(history.inbound_window("main", source, 140), (100, 100))
+            self.assertEqual(history.feishu_inbound_window(140), (100, 100))
             self.assertEqual(collected, [])
             clock[0] = 150
             await poller.poll_once()
-            self.assertEqual(history.inbound_window("main", source, 150), (100, 120))
+            self.assertEqual(history.feishu_inbound_window(150), (100, 120))
             clock[0] = 160
             await poller.poll_once()
-            self.assertEqual([row.message.content for row in history.tail("main", 5)], ["第一段", "第二段"])
-            self.assertEqual(queries, [(100, 140, None), (100, 140, "next"), (100, 120, None), (110, 160, None)])
+            self.assertEqual([row.message.content for row in history.tail(_SESSION, 5)], ["第一段", "第二段"])
+            self.assertEqual(queries, [(100, 140, None), (100, 140, "next"), (100, 120, None), (120, 140, None)])
+
+    async def test_dense_overlap_is_bisected_before_scanning_right(self):
+        clock = [340]
+        rows = [_raw(f"om_{second}", 1000 * second, "text", {"text": str(second)}) for second in (200, 265, 315)]
+        queries = []
+
+        async def runner(argv, data, timeout):
+            params = json.loads(argv[5])
+            if argv[3] == _MGET:
+                return _success({"items": [row for row in rows if row["message_id"] in params["message_ids"]]})
+            start, end = _search_bounds(data)
+            token = params.get("page_token")
+            queries.append((start, end, token))
+            hits = [_hit(row) for row in rows if start <= int(row["create_time"]) // 1000 < end]
+            if len(hits) > 1:
+                return _success({"items": hits[:1], "has_more": True, "page_token": "overflow" if token else "next"})
+            return _success({"items": hits, "has_more": False})
+
+        cli = FeishuCLI("lark-cli", ChannelUser(_PEER), timeout=2, runner=runner)
+        with closing(History(":memory:")) as history, patch("agent_companion.channels.feishu.channel._MAX_WINDOW_PAGES", 2):
+            history.feishu_inbound_window(100)
+            history.record_feishu_window(300, now=300, verified={}, discarded=(), retry=())
+            poller = _poller(history, lambda batch: history.consume_inbound(_SESSION, batch), cli, _ASR(), clock)
+            for expected_error, through in ((True, 300), (False, 300), (True, 300), (False, 300), (False, 340)):
+                if expected_error:
+                    with self.assertRaisesRegex(CliError, "cli_window_limit"):
+                        await poller.poll_once()
+                else:
+                    await poller.poll_once()
+                self.assertEqual(history.feishu_inbound_window(0), (100, through))
+                clock[0] += 10
+            self.assertEqual(queries, [(180, 340, None), (180, 340, "next"), (180, 260, None),
+                                       (260, 340, None), (260, 340, "next"), (260, 300, None), (300, 340, None)])
+            self.assertEqual([row.message.content for row in history.tail(_SESSION, 5)], ["200", "265", "315"])
+
+    async def test_dense_single_second_backs_off_without_skipping(self):
+        clock = [101]
+        runner = _Runner()
+        queries = []
+
+        async def capture(argv, data, timeout):
+            queries.append(_search_bounds(data))
+            return await runner(argv, data, timeout)
+
+        runner.pages[None] = {"items": [], "has_more": True, "page_token": "overflow"}
+        cli = FeishuCLI("lark-cli", ChannelUser(_PEER), timeout=2, runner=capture)
+        with closing(History(":memory:")) as history, patch("agent_companion.channels.feishu.channel._MAX_WINDOW_PAGES", 1):
+            poller = _poller(history, self.fail, cli, _ASR(), clock)
+            with self.assertRaisesRegex(CliError, "cli_single_second_window_limit"):
+                await poller.poll_once()
+            clock[0] = 120
+            await poller.poll_once()
+            self.assertEqual(len(runner.calls), 1)
+            self.assertEqual(history.feishu_inbound_window(0), (100, 100))
+            runner.pages[None] = {"items": [], "has_more": False}
+            clock[0] = 161
+            await poller.poll_once()
+            self.assertEqual(history.feishu_inbound_window(0), (100, 101))
+            self.assertEqual(queries, [(100, 101), (100, 101)])
 
     async def test_persisted_batch_is_not_visible_before_busy_session_boundary(self):
         started, release = asyncio.Event(), asyncio.Event()
@@ -1000,13 +1367,13 @@ print(json.dumps({"ok": True, "identity": "user", "data": page}))
 
         clock = [100]
         runner, asr, model = _Runner(), _ASR(), BlockedModel()
-        cli = FeishuCLI("lark-cli", _CHAT, timeout=2, runner=runner)
+        cli = FeishuCLI("lark-cli", ChannelUser(_PEER), timeout=2, runner=runner)
         runner.pages[None] = {"items": [_raw("om_next", 101_000, "text", {"text": "稍后处理"})],
                               "has_more": False}
         with closing(History(":memory:")) as history:
             channel = FeishuChannel(cli)
             self.addAsyncCleanup(channel.close)
-            async with running_agent(Settings(), history, model, channel, session_id="main",
+            async with running_agent(Settings(), history, model, channel, session_id=_SESSION,
                                      roles=demo_roles()) as (main, _):
                 submit = main.submit_persisted_batch
                 poller = _poller(history, submit, cli, asr, clock)
@@ -1015,19 +1382,19 @@ print(json.dumps({"ok": True, "identity": "user", "data": page}))
                 await asyncio.wait_for(started.wait(), 1)
                 clock[0] = 110
                 await poller.poll_once()
-                self.assertEqual([row.message.content for row in history.tail("main", 5)], ["先处理"])
+                self.assertEqual([row.message.content for row in history.tail(_SESSION, 5)], ["先处理"])
                 clock[0] = 120
                 await poller.poll_once()  # Recovery scan must not queue the same pending ID twice.
                 release.set()
                 await main.wait_idle()
                 self.assertEqual(len(model.calls), 2)
-                self.assertEqual([row.message.content for row in history.tail("main", 5)],
+                self.assertEqual([row.message.content for row in history.tail(_SESSION, 5)],
                                  ["先处理", "模拟回复", "稍后处理", "模拟回复"])
 
     async def test_restart_recovers_pending_then_deduplicates_consumed(self):
         clock = [100]
         runner, asr, model = _Runner(), _ASR(), _Model()
-        cli = FeishuCLI("lark-cli", _CHAT, timeout=2, runner=runner)
+        cli = FeishuCLI("lark-cli", ChannelUser(_PEER), timeout=2, runner=runner)
         runner.pages[None] = {"items": [_raw("om_once", 103_000, "text", {"text": "只消费一次"})], "has_more": False}
         with TemporaryDirectory(dir=Path.cwd()) as root:
             path = Path(root) / "test.sqlite3"
@@ -1038,25 +1405,28 @@ print(json.dumps({"ok": True, "identity": "user", "data": page}))
                 clock[0] = 110
                 await poller.poll_once()
                 self.assertEqual(len(seen), 1)  # durable acceptance; simulate exit before consumption
-                self.assertEqual(history.tail("main", 5), [])
+                self.assertEqual(history.tail(_SESSION, 5), [])
+            # 不可依赖搜索还能找到这条消息才恢复待处理输入。
+            runner.pages[None] = {"items": [], "has_more": False}
+            clock[0] = 400
             for expected_calls in (1, 1):
                 clock[0] += 1
                 with closing(History(path)) as history:
                     channel = FeishuChannel(cli)
                     self.addAsyncCleanup(channel.close)
-                    async with running_agent(Settings(), history, model, channel, session_id="main",
+                    async with running_agent(Settings(), history, model, channel, session_id=_SESSION,
                                              roles=demo_roles()) as (main, _):
                         submit = main.submit_persisted_batch
                         await _poller(history, submit, cli, asr, clock).poll_once()
                         await main.wait_idle()
                         self.assertEqual(len(model.calls), expected_calls)
-                        self.assertEqual([row.message.content for row in history.tail("main", 20)],
+                        self.assertEqual([row.message.content for row in history.tail(_SESSION, 20)],
                                          ["只消费一次", "模拟回复"])
 
     async def test_media_budget_keeps_small_image_and_text_in_one_ordered_batch(self):
         clock = [100]
         runner, asr, model = _Runner(), _ASR(), _Model()
-        cli = FeishuCLI("lark-cli", _CHAT, timeout=2, runner=runner)
+        cli = FeishuCLI("lark-cli", ChannelUser(_PEER), timeout=2, runner=runner)
         post = _raw("om_rich_budget", 102_000, "post", {"content": [[
             {"tag": "text", "text": "前"}, {"tag": "img", "image_key": "img_a"},
             {"tag": "img", "image_key": "img_a"}, {"tag": "text", "text": "后"},
@@ -1064,13 +1434,10 @@ print(json.dumps({"ok": True, "identity": "user", "data": page}))
         with closing(History(":memory:")) as history:
             channel = FeishuChannel(cli)
             self.addAsyncCleanup(channel.close)
-            async with running_agent(Settings(), history, model, channel, session_id="main",
+            async with running_agent(Settings(), history, model, channel, session_id=_SESSION,
                                      roles=demo_roles()) as (main, _):
                 submit = main.submit_persisted_batch
-                poller = FeishuPoller(cli, asr, channel, chat_id=_CHAT, user=ChannelUser(_PEER),
-                                      account=ChannelUser(_SELF),
-                                      session_id="main", history=history, submit=submit,
-                                      private_started_ms=100_000, clock=lambda: clock[0], batch_budget=470)
+                poller = _poller(history, submit, cli, asr, clock, batch_budget=470)
                 await poller.poll_once()
                 runner.pages[None]["items"] = [post, _raw("om_text_budget", 101_000, "text", {"text": "同批文字"})]
                 clock[0] = 110

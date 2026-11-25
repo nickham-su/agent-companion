@@ -7,7 +7,7 @@ from threading import Barrier
 import unittest
 
 from agent_companion.protocol import Message
-from agent_companion.storage.sqlite import AgentReplyInput, DelegatedInput, History, is_sqlite_lock_error
+from agent_companion.storage.sqlite import AgentReplyInput, DatabaseFormatError, DelegatedInput, FeishuCandidate, History, is_sqlite_lock_error
 
 
 def _user(text: str) -> Message:
@@ -19,7 +19,7 @@ def _start(history: History, agent_id: str, run_id: str) -> None:
 
 
 class AgentStorageTests(unittest.TestCase):
-    def test_route_binding_is_unique_across_connections_and_restart(self) -> None:
+    def test_main_identity_is_unique_across_connections_and_restart(self) -> None:
         with TemporaryDirectory() as directory:
             path = Path(directory) / "history.db"
             with closing(History(path)) as history:
@@ -29,7 +29,7 @@ class AgentStorageTests(unittest.TestCase):
             def bind():
                 with closing(History(path)) as history:
                     ready.wait(timeout=5)
-                    return history.bind_feishu_private_agent("session-a", "chat-a")
+                    return history.ensure_main_agent("session-a")
 
             with ThreadPoolExecutor(max_workers=2) as pool:
                 first, second = pool.submit(bind), pool.submit(bind)
@@ -39,21 +39,65 @@ class AgentStorageTests(unittest.TestCase):
 
             with closing(History(path)) as history:
                 self.assertEqual((agent.session_id, agent.role_id, agent.parent_agent_id), ("session-a", "main", None))
-                self.assertEqual(history.bind_feishu_private_agent("session-a", "chat-a"), agent)
-                self.assertIsNone(history.bind_feishu_private_agent("session-b", "chat-a"))
-                self.assertIsNone(history.bind_feishu_private_agent("session-a", "chat-b"))
+                self.assertEqual(history.ensure_main_agent("session-a"), agent)
                 self.assertEqual(history._db.execute("SELECT count(*) FROM agents").fetchone()[0], 1)
-                other = history.bind_feishu_private_agent("session-b", "chat-b")
+                other = history.ensure_main_agent("session-b")
                 self.assertNotEqual(other.agent_id, agent.agent_id)
                 self.assertEqual(history.ensure_main_agent("session-a"), agent)
 
-    def test_route_binding_rolls_back_when_main_creation_fails(self) -> None:
+    def test_old_database_is_not_changed(self) -> None:
+        for version in (1, 2):
+            with self.subTest(version=version), TemporaryDirectory(dir=Path.cwd()) as directory:
+                path = Path(directory) / "old.db"
+                with closing(sqlite3.connect(path)) as db:
+                    db.executescript("CREATE TABLE legacy (value TEXT); INSERT INTO legacy VALUES ('fixture');"
+                                     f" PRAGMA user_version = {version};")
+                before = path.read_bytes()
+                with self.assertRaisesRegex(DatabaseFormatError, "保留原库"):
+                    History(path)
+                self.assertEqual(path.read_bytes(), before)
+
+    def test_feishu_window_and_all_users_roll_back_together(self) -> None:
         with closing(History(":memory:")) as history:
-            history._db.execute("CREATE TRIGGER reject_agent BEFORE INSERT ON agents"
-                                " BEGIN SELECT RAISE(ABORT, 'injected'); END")
+            history.feishu_inbound_window(100)
+            groups = {"ou_a": [("om_a", 101_000, "text", '"A"')], "ou_b": [("om_b", 101_000, "text", '"B"')]}
+            retry = [FeishuCandidate("om_missing", "ou_a", "digest", "text", 101)]
+            history._db.execute("CREATE TRIGGER reject_second BEFORE INSERT ON feishu_raw_batches"
+                                " WHEN NEW.peer_open_id = 'ou_b' BEGIN SELECT RAISE(ABORT, 'synthetic'); END")
             with self.assertRaises(sqlite3.IntegrityError):
-                history.bind_feishu_private_agent("session", "chat")
-            self.assertEqual(history._db.execute("SELECT count(*) FROM feishu_private_routes").fetchone()[0], 0)
+                history.record_feishu_window(110, now=110, verified=groups, discarded=("om_deleted",), retry=retry)
+            self.assertEqual(history.feishu_inbound_window(0), (100, 100))
+            self.assertFalse(history.feishu_inbound_seen("om_a"))
+            self.assertFalse(history.feishu_inbound_seen("om_deleted"))
+            self.assertIsNone(history.feishu_recovery_candidate("om_missing"))
+            self.assertEqual(history.pending_feishu_users(), [])
+            history._db.execute("DROP TRIGGER reject_second")
+            history.record_feishu_window(110, now=110, verified=groups, discarded=("om_deleted",), retry=retry)
+            self.assertEqual(history.feishu_inbound_window(0), (100, 110))
+            self.assertEqual(history.pending_feishu_users(), ["ou_a", "ou_b"])
+            self.assertTrue(history.feishu_inbound_seen("om_deleted"))
+            self.assertFalse(history.feishu_inbound_seen("om_missing"))
+            self.assertEqual(history.due_feishu_candidates(119, 1), [])
+            self.assertEqual(history.due_feishu_candidates(120, 1), retry)
+            history.record_feishu_window(120, now=120, verified=groups, discarded=(), retry=())
+            (raw_a, _) = history.next_feishu_raw("ou_a")
+            history._db.execute("CREATE TRIGGER reject_normalized BEFORE INSERT ON inbound_batches"
+                                " BEGIN SELECT RAISE(ABORT, 'synthetic'); END")
+            with self.assertRaises(sqlite3.IntegrityError):
+                history.finish_feishu_raw("ou_a", raw_a, "session-A", [_user("A")])
+            self.assertEqual(history.read_feishu_raw("ou_a", raw_a), groups["ou_a"])
+            self.assertEqual(history.pending_inbound("session-A", "feishu-private"), [])
+            history._db.execute("DROP TRIGGER reject_normalized")
+            for session, peer, text in (("session-A", "ou_a", "A"), ("session-B", "ou_b", "B")):
+                raw_id, has_media = history.next_feishu_raw(peer)
+                self.assertFalse(has_media)
+                self.assertEqual(history.read_feishu_raw(peer, raw_id), groups[peer])
+                history.finish_feishu_raw(peer, raw_id, session, [_user(text)])
+                self.assertIsNone(history.next_feishu_raw(peer))
+                (batch,) = history.pending_inbound(session, "feishu-private")
+                history.consume_inbound(session, batch)
+                self.assertEqual([row.message.content for row in history.tail(session, 5)], [text])
+            self.assertEqual(history.pending_feishu_users(), [])
 
     def test_delegation_create_reuse_and_direct_ownership(self) -> None:
         with closing(History(":memory:")) as history:
@@ -101,7 +145,7 @@ class AgentStorageTests(unittest.TestCase):
             path = Path(directory) / "history.db"
             with closing(History(path)) as history, closing(sqlite3.connect(path, timeout=0)) as reader:
                 history.bind_feishu_private("owner", started_ms=1)  # 运行时连接遇锁时不在 SQLite 内等待。
-                parent = history.bind_feishu_private_agent("parent", "chat")
+                parent = history.ensure_main_agent("parent")
                 _start(history, parent.agent_id, "parent-run")
                 reader.execute("BEGIN")
                 reader.execute("SELECT * FROM agents").fetchall()

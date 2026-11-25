@@ -21,7 +21,7 @@ from agent_companion.speech.vad import INPUT_FRAMES, INPUT_RATE
 from agent_companion.speech.voice import VoiceChannel
 from agent_companion.storage.sqlite import History
 
-from test_feishu_private import _CHATS, _OWN, _SENDERS, _Runner, _chat, _eventually, _message
+from test_feishu_private import _CHATS, _OWN, _SENDERS, _Runner, _eventually, _message
 from test_voice import _A, _ASR, _Device, _SETTINGS, _TTS, _Vad
 
 
@@ -203,7 +203,6 @@ class DesktopTests(unittest.TestCase):
 class _CallRunner(_Runner):
     def __init__(self):
         super().__init__()
-        self.pages[None] = ([_chat(chat, sender) for chat, sender in zip(_CHATS, _SENDERS)], None)
         self.caller = None
         self.meeting_id = None
         self.lookups = 0
@@ -319,7 +318,6 @@ class IncomingCallTests(unittest.IsolatedAsyncioTestCase):
               patch("agent_companion.app.running_agent", wraps=running_agent) as agents,
               patch("agent_companion.app.time", side_effect=lambda: self.clock),
               patch("agent_companion.feishu_private.time", side_effect=lambda: self.clock),
-              patch("agent_companion.feishu_private._DISCOVERY_SECONDS", 0.015),
               patch("agent_companion.channels.feishu.channel._POLL_SECONDS", 0.015),
               patch("agent_companion.feishu_calls._POLL_SECONDS", 0.005),
               patch("agent_companion.feishu_calls._CONNECT_SECONDS", 0.12)):
@@ -363,7 +361,7 @@ class IncomingCallTests(unittest.IsolatedAsyncioTestCase):
         model, tts = _Echo(), _TTS()
         sender = _SENDERS[0]
         async with self._serve(model, tts=tts) as (history, agents):
-            await _eventually(lambda: bool(self.runner.queries))
+            await self.runner.verified.wait()
             self.assertEqual(self.runner.lookups, 0)
             self.desktop.ring(sender, 1)
             await self.runner.details_asked.wait()
@@ -384,14 +382,14 @@ class IncomingCallTests(unittest.IsolatedAsyncioTestCase):
             _talk(device)
             await _eventually(lambda: bool(tts.calls))
             await _eventually(lambda: any(device.pull(32)))
-            await _eventually(lambda: self.runner.sent[_CHATS[0]] == ["测试语音1。"])
+            await _eventually(lambda: self.runner.sent[_SENDERS[0]] == ["测试语音1。"])
             self._text(0, "通话中发文字")
             await _eventually(lambda: len(tts.calls) == 2)
             await _eventually(lambda: any(device.pull(32)))
-            await _eventually(lambda: len(self.runner.sent[_CHATS[0]]) == 2)
-            self.assertEqual(self.runner.sent[_CHATS[0]][1], "通话中发文字。")
+            await _eventually(lambda: len(self.runner.sent[_SENDERS[0]]) == 2)
+            self.assertEqual(self.runner.sent[_SENDERS[0]][1], "通话中发文字。")
             self.assertEqual(tts.calls[-1], ("通话中发文字。", 16000))
-            self.assertEqual(dict(self.runner.posts), {_CHATS[0]: [{"zh_cn": {"content": [[
+            self.assertEqual(dict(self.runner.posts), {_SENDERS[0]: [{"zh_cn": {"content": [[
                 {"tag": "text", "text": "测试语音1", "style": ["bold"]}
             ]]}}]})
             self.assertEqual(agents.call_count, 1)
@@ -399,21 +397,26 @@ class IncomingCallTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual([row.message.content for row in history.tail(_session(sender), 10)],
                              ["测试语音1", "测试语音1。", "通话中发文字", "通话中发文字。"])
 
-    async def test_retries_same_window_with_fresh_lookup_after_route_becomes_ready(self):
-        self.runner.pages[None] = ([], None)
-        async with self._serve(_Echo()) as (_, agents):
-            await _eventually(lambda: bool(self.runner.queries))
-            self.desktop.ring(_SENDERS[0], 1)
-            await _eventually(lambda: bool(self.devices) and self.devices[0].closed)
-            self.assertEqual(agents.call_count, 0)
-            self.assertFalse(self.desktop.clicks)
-            lookups_before = self.runner.lookups
+    async def test_retries_same_window_when_user_session_is_temporarily_busy(self):
+        prepare = _Route.prepare_agent
+        blocked = True
 
-            self.runner.pages[None] = ([_chat(_CHATS[0], _SENDERS[0])], None)
-            self.clock = 102.0
-            await _eventually(lambda: bool(self.desktop.clicks))
-            self.assertEqual(self.desktop.clicks[0].numbers, {1})
-            self.assertGreater(self.runner.lookups, lookups_before)
+        async def prepare_once(route, *, wait_for_lock=True):
+            if blocked:
+                return False
+            return await prepare(route, wait_for_lock=wait_for_lock)
+
+        with patch.object(_Route, "prepare_agent", prepare_once):
+            async with self._serve(_Echo()) as (_, agents):
+                self.desktop.ring(_SENDERS[0], 1)
+                await _eventually(lambda: bool(self.devices) and self.devices[0].closed)
+                self.assertEqual(agents.call_count, 0)
+                self.assertFalse(self.desktop.clicks)
+                lookups_before = self.runner.lookups
+                blocked = False
+                await _eventually(lambda: bool(self.desktop.clicks))
+                self.assertEqual(self.desktop.clicks[0].numbers, {1})
+                self.assertGreater(self.runner.lookups, lookups_before)
 
     async def test_window_replaced_during_lookup_uses_next_lookup_for_the_new_window(self):
         self.runner.release_detail.clear()
@@ -700,12 +703,12 @@ class IncomingCallTests(unittest.IsolatedAsyncioTestCase):
             await asyncio.wait_for(next_sample.wait(), 2)
             self.assertEqual(pulled, [bytes(64)])
             await _eventually(lambda: device.closed)
-            self.assertEqual(self.runner.sent[_CHATS[0]], [])  # voice_text_copy=False 不发送模型副本。
-            self.assertEqual(self.runner.posts[_CHATS[0]], [{"zh_cn": {"content": [[
+            self.assertEqual(self.runner.sent[_SENDERS[0]], [])  # voice_text_copy=False 不发送模型副本。
+            self.assertEqual(self.runner.posts[_SENDERS[0]], [{"zh_cn": {"content": [[
                 {"tag": "text", "text": "测试语音1", "style": ["bold"]}
             ]]}}])
 
-    async def test_window_errors_and_verified_route_revocation(self):
+    async def test_window_errors_and_fresh_redial(self):
         async with self._serve(_Echo()) as (_, agents):
             await self._ring_connect(_SENDERS[0], 1, 1)
             window = self.desktop.main
@@ -715,9 +718,10 @@ class IncomingCallTests(unittest.IsolatedAsyncioTestCase):
             self.desktop.error = False
             self.desktop.main = ()
             await self._ring_connect(_SENDERS[0], 2, 2)
-            self.runner.pages[None] = ([], None)
-            await _eventually(lambda: self.devices[1].closed)
+            self.assertFalse(self.devices[1].closed)
             self.assertEqual(len(self.desktop.main), len(window))
+            self.desktop.main = ()
+            await _eventually(lambda: self.devices[1].closed)
             self.assertEqual(agents.call_count, 1)
 
     async def test_old_tts_model_and_asr_do_not_leak_on_a_to_b_or_b_redial(self):
@@ -801,8 +805,8 @@ class IncomingCallTests(unittest.IsolatedAsyncioTestCase):
                 _talk(self.devices[2])
                 await _eventually(lambda: bool(tts.calls))
                 await _eventually(lambda: any(self.devices[2].pull(32)))
-                await _eventually(lambda: self.runner.sent[_CHATS[1]] == ["测试语音3。"])
-                self.assertFalse(self.runner.sent[_CHATS[0]])
+                await _eventually(lambda: self.runner.sent[_SENDERS[1]] == ["测试语音3。"])
+                self.assertFalse(self.runner.sent[_SENDERS[0]])
                 self.assertEqual(tts.calls, [("测试语音3。", 16000)])
                 self.assertEqual(agents.call_count, 2)
                 self.assertEqual(len({id(vad) for vad in self.vads}), 3)
@@ -842,7 +846,7 @@ class IncomingCallTests(unittest.IsolatedAsyncioTestCase):
             self.assertFalse(any(self.devices[1].pull(32)))
             _talk(self.devices[1])
             await _eventually(lambda: any(self.devices[1].pull(32)))
-            await _eventually(lambda: self.runner.sent[_CHATS[0]] == ["已播放的旧句。", "测试语音2。"])
+            await _eventually(lambda: self.runner.sent[_SENDERS[0]] == ["已播放的旧句。", "测试语音2。"])
             self.assertEqual(agents.call_count, 1)
             self.assertIn("已播放的旧句。", new_model_inputs)
             self.assertEqual([row.message.content for row in history.tail(_session(sender), 10)],
@@ -868,7 +872,7 @@ class IncomingCallTests(unittest.IsolatedAsyncioTestCase):
             await _eventually(lambda: self.devices[0].closed)
             self.assertFalse(finished.is_set())
             resume.set()
-            await _eventually(lambda: self.runner.sent[_CHATS[0]] == ["文字仍可回复。"])
+            await _eventually(lambda: self.runner.sent[_SENDERS[0]] == ["文字仍可回复。"])
 
     async def test_queued_voice_and_delayed_child_survive_ordinary_hangup(self):
         parent_wait, parent_release = asyncio.Event(), asyncio.Event()
@@ -913,9 +917,9 @@ class IncomingCallTests(unittest.IsolatedAsyncioTestCase):
                 self.desktop.main = ()
                 await _eventually(lambda: self.devices[0].closed)
                 parent_release.set()
-                await _eventually(lambda: self.runner.sent[_CHATS[0]] == ["挂断前排队转写。"])
+                await _eventually(lambda: self.runner.sent[_SENDERS[0]] == ["挂断前排队转写。"])
                 child_release.set()
-                await _eventually(lambda: self.runner.sent[_CHATS[0]] == ["挂断前排队转写。", "收到任务结果。"])
+                await _eventually(lambda: self.runner.sent[_SENDERS[0]] == ["挂断前排队转写。", "收到任务结果。"])
                 self.assertEqual(tts.calls, [])
                 self.assertEqual(agents.call_count, 1)
                 rows = history.tail(_session(sender), 20)
@@ -971,7 +975,7 @@ class IncomingCallTests(unittest.IsolatedAsyncioTestCase):
                     self.assertEqual(tts.calls, [])
                     asr.release.set()
                 await _eventually(lambda: any(self.devices[0].pull(32)))
-                await _eventually(lambda: self.runner.sent[_CHATS[0]] == ["新话轮。"])
+                await _eventually(lambda: self.runner.sent[_SENDERS[0]] == ["新话轮。"])
                 self.assertEqual(tts.calls, [("新话轮。", 16000)])
                 self.assertEqual([row.message.role for row in history.tail(session, 10)],
                                  ["user", "user", "assistant"])
@@ -1001,7 +1005,7 @@ class IncomingCallTests(unittest.IsolatedAsyncioTestCase):
             asr.release.set()
             await _eventually(lambda: len(tts.calls) == 1)
             await _eventually(lambda: any(self.devices[0].pull(32)))
-            await _eventually(lambda: self.runner.sent[_CHATS[0]] == ["最后转写。"])
+            await _eventually(lambda: self.runner.sent[_SENDERS[0]] == ["最后转写。"])
             self.assertEqual(model.calls, [("飞书补充", "内部结果", "最后转写")])
             self.assertFalse(history.pending_inbound(session, "feishu-private"))
 
@@ -1027,7 +1031,7 @@ class IncomingCallTests(unittest.IsolatedAsyncioTestCase):
                 await _eventually(lambda: bool(history.pending_inbound(session, "feishu-private")))
                 self.assertEqual(model.calls, [])
                 self.desktop.main = ()
-                await _eventually(lambda: self.runner.sent[_CHATS[0]] == ["挂断前补充。"])
+                await _eventually(lambda: self.runner.sent[_SENDERS[0]] == ["挂断前补充。"])
                 await self._ring_connect(sender, 2, 2)
                 _talk(self.devices[1])
                 await asyncio.wait_for(new.called.wait(), 2)
@@ -1042,9 +1046,9 @@ class IncomingCallTests(unittest.IsolatedAsyncioTestCase):
                 self.assertFalse(self.runner.posts)
                 new.release.set()
                 await _eventually(lambda: any(self.devices[1].pull(32)))
-                await _eventually(lambda: self.runner.sent[_CHATS[0]] == ["挂断前补充。", "新通转写。"])
+                await _eventually(lambda: self.runner.sent[_SENDERS[0]] == ["挂断前补充。", "新通转写。"])
                 self.assertEqual(model.calls[-1], ("挂断前补充", "新通补充", "新通转写"))
-                self.assertEqual(dict(self.runner.posts), {_CHATS[0]: [{"zh_cn": {"content": [[
+                self.assertEqual(dict(self.runner.posts), {_SENDERS[0]: [{"zh_cn": {"content": [[
                     {"tag": "text", "text": "新通转写", "style": ["bold"]}
                 ]]}}]})
 
@@ -1070,7 +1074,7 @@ class IncomingCallTests(unittest.IsolatedAsyncioTestCase):
                                  [DeliveryStatus.ZERO])
                 self.assertEqual([row.message.content for row in history.tail(session, 10)], ["测试语音1"])
                 self.assertEqual(tts.calls, [])
-                self.assertEqual(self.runner.sent[_CHATS[0]], [])
+                self.assertEqual(self.runner.sent[_SENDERS[0]], [])
 
     async def _assert_first_handoff_rechecks_window(self, *, desktop_error):
         started, release_model = asyncio.Event(), asyncio.Event()
@@ -1094,7 +1098,7 @@ class IncomingCallTests(unittest.IsolatedAsyncioTestCase):
             else:
                 self.desktop.main = ()
             release_model.set()
-            await _eventually(lambda: self.runner.sent[_CHATS[0]] == ["文字请求。"])
+            await _eventually(lambda: self.runner.sent[_SENDERS[0]] == ["文字请求。"])
             self.assertTrue(old.closed)
             self.assertFalse(resume.is_set())
             self.assertEqual(tts.calls, [])
@@ -1117,7 +1121,7 @@ class IncomingCallTests(unittest.IsolatedAsyncioTestCase):
             await _eventually(lambda: len(history.outcomes(session)) == 2)
             self.assertEqual(tts.calls, [("测试语音2。", 16000)])
             self.assertEqual(model.calls, [("文字请求",), ("文字请求", "测试语音2")])
-            self.assertEqual(self.runner.sent[_CHATS[0]], ["文字请求。"])
+            self.assertEqual(self.runner.sent[_SENDERS[0]], ["文字请求。"])
 
     async def test_first_handoff_rechecks_window_before_follow_poll(self):
         await self._assert_first_handoff_rechecks_window(desktop_error=False)
@@ -1139,7 +1143,7 @@ class IncomingCallTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(model.calls, [])
             self.desktop.main = ()
             asr.release.set()
-            await _eventually(lambda: self.runner.sent[_CHATS[0]] == ["挂断前补充。"])
+            await _eventually(lambda: self.runner.sent[_SENDERS[0]] == ["挂断前补充。"])
             self.assertTrue(binding.closed)
             self.assertFalse(resume.is_set())
             self.assertFalse(self.runner.posts)
@@ -1194,7 +1198,7 @@ class IncomingCallTests(unittest.IsolatedAsyncioTestCase):
 
                 with self.assertLogs("agent_companion.speech.voice", level="ERROR") as log:
                     clock[0] += .25  # 不再提供 PCM，桌面和设备状态均未改变。
-                    await _eventually(lambda: self.runner.sent[_CHATS[0]] == ["内部结果。"])
+                    await _eventually(lambda: self.runner.sent[_SENDERS[0]] == ["内部结果。"])
                 self.assertIn("capture PCM stalled", "\n".join(log.output))
                 self.assertTrue(device.closed)
                 self.assertTrue(self.desktop.window_exists(window))
@@ -1204,7 +1208,7 @@ class IncomingCallTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(len(asr.files), int(capped))
                 self.assertEqual(tts.calls, [])
                 self._text(0, "故障后的文字")
-                await _eventually(lambda: self.runner.sent[_CHATS[0]] == ["内部结果。", "故障后的文字。"])
+                await _eventually(lambda: self.runner.sent[_SENDERS[0]] == ["内部结果。", "故障后的文字。"])
                 self.assertEqual(agents.call_count, 1)
 
     async def test_capture_watchdog_releases_inputs_and_allows_redial_while_vad_is_blocked(self):
@@ -1246,7 +1250,7 @@ class IncomingCallTests(unittest.IsolatedAsyncioTestCase):
 
                     with self.assertLogs("agent_companion.speech.voice", level="ERROR") as log:
                         clock[0] += .125
-                        await _eventually(lambda: self.runner.sent[_CHATS[0]] == ["内部结果。"])
+                        await _eventually(lambda: self.runner.sent[_SENDERS[0]] == ["内部结果。"])
                     self.assertIn("capture PCM stalled", "\n".join(log.output))
                     self.assertTrue(old.closed)
                     self.assertTrue(self.desktop.window_exists(window))
@@ -1262,7 +1266,7 @@ class IncomingCallTests(unittest.IsolatedAsyncioTestCase):
                     await asyncio.wait_for(finished.wait(), 1)
                     _talk(self.devices[1])
                     await _eventually(lambda: any(self.devices[1].pull(32)))
-                    await _eventually(lambda: self.runner.sent[_CHATS[0]] == ["内部结果。", "测试语音2。"])
+                    await _eventually(lambda: self.runner.sent[_SENDERS[0]] == ["内部结果。", "测试语音2。"])
                     self.assertEqual(self.asrs[0].files, [])
                     self.assertEqual(model.calls[-1], ("飞书补充", "内部结果", "测试语音2"))
                     self.assertEqual(agents.call_count, 1)
@@ -1294,6 +1298,6 @@ class IncomingCallTests(unittest.IsolatedAsyncioTestCase):
                 device.frame(False, 2)
                 await _eventually(lambda: any(device.pull(32)))
             expected = ("飞书补充", "内部结果") + (("封顶转写",) if end == "silence" else ())
-            await _eventually(lambda: self.runner.sent[_CHATS[0]] == [expected[-1] + "。"])
+            await _eventually(lambda: self.runner.sent[_SENDERS[0]] == [expected[-1] + "。"])
             self.assertEqual(model.calls, [expected])
             self.assertFalse(history.pending_inbound(session, "feishu-private"))

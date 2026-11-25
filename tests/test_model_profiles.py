@@ -20,7 +20,7 @@ from agent_companion.runtime.compaction import Compactions
 from agent_companion.runtime.context import _SUMMARIZE
 from agent_companion.runtime.engine import Runtime
 from agent_companion.runtime.instructions import load_roles
-from agent_companion.storage.sqlite import History, ReplyOutcome, _SCHEMA
+from agent_companion.storage.sqlite import History, ReplyOutcome, _SCHEMA, _SCHEMA_VERSION
 from test_openai_responses import _Wire, _answer, _call, _completed
 
 
@@ -252,9 +252,9 @@ class ProfileRuntimeTests(_Files, unittest.IsolatedAsyncioTestCase):
     async def test_existing_database_and_same_id_model_switch_isolate_usage_and_deepseek_reasoning(self):
         self.role("unused_child", 'model_id="chat"')
         database = self.settings().database
-        # 模拟无来源表的 v1 库，以及升级前的普通用量和私有推理记录。
+        # 模拟当前格式中无来源表的库，以及升级前的普通用量和私有推理记录。
         with closing(sqlite3.connect(database)) as raw:
-            raw.executescript(_SCHEMA + "\nPRAGMA user_version = 1;")
+            raw.executescript(_SCHEMA + f"\nPRAGMA user_version = {_SCHEMA_VERSION};")
             raw.execute("INSERT INTO messages (session_id, created_at, role, content, tool_calls, reasoning)"
                         " VALUES ('root', 1, 'assistant', ?, '[]', ?)",
                         (json.dumps("legacy answer"), "prior unknown reasoning"))

@@ -1,19 +1,17 @@
-"""飞书真人私聊发现与每个对端的运行时生命周期。"""
+"""飞书按已核验用户注册 Runtime，文字和来电共用主 Session。"""
 
 from __future__ import annotations
 
 import asyncio
-from collections import defaultdict
 from collections.abc import Callable
 from contextlib import AbstractAsyncContextManager, AsyncExitStack
-from hashlib import sha256
 import logging
 from sqlite3 import OperationalError
 from time import time
 from typing import TYPE_CHECKING
 
-from .channels.feishu.channel import FeishuChannel, FeishuPoller
-from .channels.feishu.cli import CliError, FeishuDiscovery, PrivateChat
+from .channels.feishu.channel import FeishuChannel, FeishuInput, FeishuPoller, private_session_id
+from .channels.feishu.cli import FeishuDiscovery
 from .protocol import ChannelUser, Message, PersistedInput, ReplyDelivery, ReplyStream
 from .runtime.engine import Runtime
 from .runtime.subtasks import AgentTree
@@ -27,21 +25,17 @@ if TYPE_CHECKING:
 
 
 _LOG = logging.getLogger(__name__)
-_DISCOVERY_SECONDS = 10
+_INBOUND_SOURCE = "feishu-private"
 _OpenAgent = Callable[[Agent, FeishuChannel, ChannelUser], AbstractAsyncContextManager[tuple[Runtime, AgentTree]]]
 
 
-def _fingerprint(value: str) -> str:
-    return sha256(value.encode("ascii")).hexdigest()
-
-
 class _Route:
-    def __init__(self, discovery: FeishuDiscovery, chat: PrivateChat, agent: Agent, *, history: History,
-                 asr: FileASR, account: ChannelUser, started_ms: int, open_agent: _OpenAgent,
-                 schedulers: SessionSchedulers) -> None:
-        self._root_agent = agent
-        self._user = chat.user
-        self._session_id = agent.session_id
+    def __init__(self, discovery: FeishuDiscovery, user: ChannelUser, *, history: History, open_agent: _OpenAgent,
+                 schedulers: SessionSchedulers, inputs: FeishuInput) -> None:
+        self._history = history
+        self._inputs = inputs
+        self._user = user
+        self._session_id = private_session_id(user)
         self._schedulers = schedulers
         self._scheduler: SessionScheduler | None = None
         self._revoke_input: Callable[[], None] | None = None
@@ -52,12 +46,12 @@ class _Route:
         self._stop_call: Callable[[], None] | None = None
         self._select_call: Callable[[ReplyStream], ReplyDelivery | None] | None = None
         self._open_agent = open_agent
-        cli = discovery.for_chat(chat.chat_id)
-        self._channel = FeishuChannel(cli, select_voice=self._select_voice)
-        self._poller = FeishuPoller(cli, asr, self._channel, chat_id=chat.chat_id, user=chat.user,
-                                    account=account, session_id=agent.session_id, history=history, clock=time,
-                                    private_started_ms=started_ms, submit=self._submit,
-                                    before_close=self.stop_accepting)
+        self._inbound = asyncio.Event()
+        self._last_submitted = 0
+        self.channel = FeishuChannel(discovery.for_user(user), select_voice=self._select_voice)
+
+    def notify_inbound(self) -> None:
+        self._inbound.set()
 
     async def prepare_agent(self, *, wait_for_lock: bool = True) -> bool:
         if not wait_for_lock and self._agent_lock.locked():
@@ -66,9 +60,10 @@ class _Route:
             if self._closed:
                 return False
             if self._agent is None:
-                # 文字批次和来电使用同一个入口；发现私聊时尚不创建 Runtime。
+                # 文字批次和来电共用同一存储身份和初始化锁。
+                root = self._history.ensure_main_agent(self._session_id)
                 self._agent = await self._stack.enter_async_context(
-                    self._open_agent(self._root_agent, self._channel, self._user))
+                    self._open_agent(root, self.channel, self._user))
                 if self._closed:
                     self._agent[1].stop_accepting()
                 else:
@@ -76,10 +71,21 @@ class _Route:
                     self._revoke_input = self._scheduler.input_revoker()
             return not self._closed
 
-    async def _submit(self, batch_id: int) -> None:
-        if await self.prepare_agent():
-            assert self._scheduler is not None
-            self._scheduler.session_input((PersistedInput(batch_id),))
+    def _dispatch_pending(self) -> None:
+        scheduler = self._scheduler
+        if scheduler is None:
+            return
+        try:
+            pending = self._history.pending_inbound(self._session_id, _INBOUND_SOURCE)
+        except OperationalError as exc:
+            if not is_sqlite_lock_error(exc):
+                raise
+            _LOG.warning("Feishu user inbox storage busy; retrying pending input on next poll")
+            return
+        for batch_id in pending:
+            if batch_id > self._last_submitted:
+                scheduler.session_input((PersistedInput(batch_id),))
+                self._last_submitted = batch_id
 
     def watch_call(self, stop: Callable[[], None]) -> bool:
         if self._closed or self._stop_call is not None:
@@ -95,7 +101,7 @@ class _Route:
             return False
 
         target = ReplyDelivery(voice.deliver, idle_timeout=idle_timeout,
-                               after_commit=self._channel.enqueue if copy_confirmed else None)
+                               after_commit=self.channel.enqueue if copy_confirmed else None)
 
         def select(reply: ReplyStream) -> ReplyDelivery | None:
             if voice.failed or not check_window():
@@ -112,7 +118,7 @@ class _Route:
             return
         items = (Message("user", text),) if text else ()
         if scheduler.call_input(stop, items, input_active=input_active) and text:
-            self._channel.enqueue_transcript(text)
+            self.channel.enqueue_transcript(text)
 
     def call_ended(self, stop: Callable[[], None]) -> None:
         if self._stop_call != stop:
@@ -129,7 +135,7 @@ class _Route:
         if self._closed:
             return
         self._closed = True
-        self._channel.stop_accepting()
+        self.channel.stop_accepting()
         if self._revoke_input is not None:
             self._revoke_input()
             self._revoke_input = None
@@ -143,104 +149,76 @@ class _Route:
     async def run(self) -> None:
         try:
             async with self._stack:
-                self._stack.push_async_callback(self._channel.close)
+                self._stack.push_async_callback(self.channel.close)
                 try:
-                    await self._poller.run()
+                    while True:
+                        await self._inbound.wait()
+                        self._inbound.clear()
+                        try:
+                            await self._submit_inbound()
+                            while await self._inputs.process_next(self._user, self.channel, self._dispatch_pending):
+                                if self._scheduler is None:
+                                    await self._submit_inbound()
+                                await asyncio.sleep(0)
+                        except OperationalError as exc:
+                            if not is_sqlite_lock_error(exc):
+                                raise
+                            _LOG.warning("Feishu user session storage busy; retrying pending input on next poll")
                 finally:
                     self.stop_accepting()
-                    # 不让最后一个懒建的 Runtime 注册到已退出的栈。
+                    # 关停会取消来电任务；先等共享锁释放再退出栈。
                     async with self._agent_lock:
                         pass
         except OperationalError as exc:
             if not is_sqlite_lock_error(exc):
                 raise
-            # 轮询内部已处理遇锁；若关停时无法标记运行及委派，下次启动或重新打开该路由时收尾。
-            _LOG.warning("Feishu private route cleanup storage busy; deferred agent recovery")
+            _LOG.warning("Feishu user session cleanup storage busy; deferred agent recovery")
 
 
-def _conflicts(chats: set[PrivateChat]) -> tuple[set[ChannelUser], set[str]]:
-    by_user, by_chat = defaultdict(set), defaultdict(set)
-    for chat in chats:
-        by_user[chat.user].add(chat.chat_id)
-        by_chat[chat.chat_id].add(chat.user)
-    return ({user for user, peers in by_user.items() if len(peers) > 1},
-            {chat for chat, peers in by_chat.items() if len(peers) > 1})
+    async def _submit_inbound(self) -> None:
+        if self._scheduler is None and self._history.pending_inbound(self._session_id, _INBOUND_SOURCE):
+            await self.prepare_agent()
+        if self._scheduler is not None:
+            self._dispatch_pending()
 
 
 async def run_private_chats(discovery: FeishuDiscovery, history: History, asr: FileASR, *, account: ChannelUser,
                             started_ms: int, open_agent: _OpenAgent, schedulers: SessionSchedulers,
                             incoming: IncomingCalls | None = None) -> None:
-    active: dict[PrivateChat, tuple[_Route, asyncio.Task[None]]] = {}
-    by_user: dict[ChannelUser, _Route] = {}
-    # 一个通道用户对应一个父会话；退役不会阻塞其他会话的新核验结果。
-    retiring: dict[ChannelUser, asyncio.Task[None]] = {}
-
-    async def run_route(chat: PrivateChat, route: _Route) -> None:
-        try:
-            await route.run()
-        except Exception as exc:
-            if retiring.get(chat.user) is not asyncio.current_task():
-                raise  # 在线路由的异常仍由 TaskGroup 上报。
-            _LOG.warning("Feishu private route retirement failed; error_type=%s", type(exc).__name__)
-
-    def retire(chat: PrivateChat, route: _Route, task: asyncio.Task[None]) -> None:
-        route.stop_accepting()
-        retiring[chat.user] = task
-        if not task.cancelling():
-            task.cancel()
+    inputs = FeishuInput(discovery, asr, history)
+    routes: dict[ChannelUser, _Route] = {}
+    tasks: list[asyncio.Task[None]] = []
+    stopping = False
 
     async with asyncio.TaskGroup() as group:
-        calls = group.create_task(incoming.run(by_user.get)) if incoming is not None else None
+        def route_for(user: ChannelUser) -> _Route:
+            # 不让出事件循环：文字与来电同时到达时也只生成一条用户路由。
+            if user == account or stopping:
+                raise ValueError("invalid Feishu peer registration")
+            route = routes.get(user)
+            if route is None:
+                route = _Route(discovery, user, history=history, open_agent=open_agent,
+                               schedulers=schedulers, inputs=inputs)
+                routes[user] = route
+                tasks.append(group.create_task(route.run()))
+            return route
+
+        def stop() -> None:
+            nonlocal stopping
+            if not stopping:
+                stopping = True
+                for route in routes.values():
+                    route.stop_accepting()
+                for task in tasks:
+                    if not task.cancelling():
+                        task.cancel()
+
+        poller = FeishuPoller(discovery, account=account, history=history, private_started_ms=started_ms,
+                              clock=time,
+                              notify_user=lambda user: route_for(user).notify_inbound(), before_close=stop)
+        if incoming is not None:
+            tasks.append(group.create_task(incoming.run(route_for)))
         try:
-            while True:
-                # 只有在发起新一轮发现前已完成退役的会话，才可参加本轮核验。
-                for user, task in tuple(retiring.items()):
-                    if task.done():
-                        del retiring[user]
-                try:
-                    chats = await discovery.private_chats(account)
-                except CliError as exc:
-                    _LOG.warning("Feishu private chat discovery failed (%s)", exc)
-                    await asyncio.sleep(_DISCOVERY_SECONDS)
-                    continue
-
-                blocked_users, blocked_chats = _conflicts(chats)
-                verified = {chat for chat in chats
-                            if chat.user not in blocked_users and chat.chat_id not in blocked_chats}
-                if chats != verified:
-                    _LOG.warning("Feishu private chat route conflict; conflicting routes ignored")
-
-                # 只有成功读完的快照会撤销信任；在注册或等待收尾之前同步关闭旧入口。
-                for chat in active.keys() - verified:
-                    route, task = active.pop(chat)
-                    by_user.pop(chat.user)
-                    retire(chat, route, task)
-                for chat in verified - active.keys():
-                    if chat.user in retiring:
-                        continue  # 旧 Runtime 可能仍持有父会话；下次发现重新核验。
-                    session_id = "feishu-private:" + _fingerprint(chat.user.key)
-                    try:
-                        agent = history.bind_feishu_private_agent(session_id, _fingerprint(chat.chat_id))
-                    except OperationalError as exc:
-                        if not is_sqlite_lock_error(exc):
-                            _LOG.error("Feishu private route storage failed; sqlite_code=%s",
-                                       getattr(exc, "sqlite_errorcode", None))
-                            raise
-                        _LOG.warning("Feishu private route storage busy; retrying on next discovery")
-                        continue
-                    if agent is None:
-                        _LOG.warning("Feishu private chat route conflict; conflicting route ignored")
-                        continue
-                    route = _Route(discovery, chat, agent, history=history, asr=asr, account=account,
-                                   started_ms=started_ms, open_agent=open_agent, schedulers=schedulers)
-                    by_user[chat.user] = route
-                    active[chat] = route, group.create_task(run_route(chat, route))
-                await asyncio.sleep(_DISCOVERY_SECONDS)
+            await poller.run()
         finally:
-            # 在等待任一子任务收尾前，同步关闭全部路由入口与发送队列。
-            if calls is not None:
-                calls.cancel()
-            for chat, (route, task) in active.items():
-                retire(chat, route, task)
-            if retiring:
-                await asyncio.wait(retiring.values())
+            stop()

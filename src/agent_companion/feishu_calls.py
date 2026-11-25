@@ -176,28 +176,28 @@ class IncomingCalls:
                         return
                     peer = resolve(caller.user)
                     if peer is None:
-                        _LOG.debug("Feishu auto-answer skipped: private route not ready")
+                        _LOG.debug("Feishu auto-answer skipped: user session not ready")
                         return
                     try:
                         async with asyncio.timeout_at(click_deadline):
                             ready = await peer.prepare_agent(wait_for_lock=False)
                     except TimeoutError:
-                        _LOG.debug("Feishu auto-answer skipped: caller lookup result expired during private binding")
+                        _LOG.debug("Feishu auto-answer skipped: caller lookup result expired during user session preparation")
                         return
                     except OperationalError as exc:
                         if not is_sqlite_lock_error(exc):
                             raise
-                        _LOG.debug("Feishu auto-answer skipped: private route storage busy")
+                        _LOG.debug("Feishu auto-answer skipped: user session storage busy")
                         return
                     if not ready:
-                        _LOG.debug("Feishu auto-answer skipped: private route not ready")
+                        _LOG.debug("Feishu auto-answer skipped: user session not ready")
                         return
                     binding = _CallBinding(peer, voice, self._desktop, idle_timeout=self._idle_timeout,
                                            copy_confirmed=self._copy_confirmed)
                     if not peer.watch_call(binding.stop):
                         return
                     if (binding.closed or resolve(caller.user) is not peer or self._desktop.main_windows()):
-                        _LOG.debug("Feishu auto-answer skipped: private route or desktop changed before click")
+                        _LOG.debug("Feishu auto-answer skipped: user route or desktop changed before click")
                         return
                     _require_audio(voice, device)
                     if not before_deadline():

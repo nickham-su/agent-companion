@@ -1,8 +1,9 @@
-"""lark-cli 的私聊发现、raw API 与资源下载协议，固定使用用户身份。"""
+"""lark-cli raw API、来电识别与资源下载，固定使用用户身份。"""
 
 import asyncio
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 import json
 import logging
 import os
@@ -20,6 +21,8 @@ _LOG = logging.getLogger(__name__)
 _MESSAGES = "/open-apis/im/v1/messages"
 MIN_PAGE_SIZE = 1
 MAX_PAGE_SIZE = 50
+DEFAULT_SEARCH_PAGE_SIZE = 20
+MAX_MGET_SIZE = 50
 _JSON_LIMIT = 4 * 1024 * 1024
 _ERROR_LIMIT = 64 * 1024
 _TEXT_LIMIT = 150_000
@@ -172,11 +175,30 @@ class _UserCLI:
         _check_exit(result)
         return result
 
-
-@dataclass(frozen=True, slots=True)
-class PrivateChat:
-    chat_id: str = field(repr=False)
-    user: ChannelUser
+    async def download(self, message_id: str, key: str, kind: str, *, limit: int) -> bytes:
+        prefix = {"image": "img", "file": "file"}.get(kind)
+        if prefix is None or not re.fullmatch(r"om_[\w-]{1,160}", message_id, flags=re.ASCII) or not re.fullmatch(
+            rf"{prefix}_[\w-]{{1,160}}", key, flags=re.ASCII
+        ):
+            raise CliError("invalid_resource_reference", definite=True)
+        try:
+            with TemporaryDirectory(prefix=".feishu-", dir=Path.cwd()) as tmp:
+                # 指定扩展名，使该命令不会采用远端提供的文件名；不信任 CLI 返回的路径。
+                target = Path(tmp) / "media.bin"
+                result = await self._run(("im", "+messages-resources-download", "--message-id", message_id,
+                                          "--file-key", key, "--type", kind, "--output", str(target)), file_limit=limit)
+                reported_size = _success_data(result).get("size_bytes")
+                info = target.lstat()
+                if (not stat.S_ISREG(info.st_mode) or not 0 < info.st_size <= limit
+                        or type(reported_size) is not int or reported_size != info.st_size):
+                    raise CliError("invalid_resource_size", definite=True)
+                with target.open("rb") as file:
+                    data = file.read(limit + 1)
+                if len(data) != reported_size:
+                    raise CliError("invalid_resource_size", definite=True)
+                return data
+        except OSError:
+            raise CliError("resource_file_unavailable", definite=True) from None
 
 
 @dataclass(frozen=True, slots=True, repr=False)
@@ -194,22 +216,6 @@ def parse_open_id(value: Any) -> ChannelUser | None:
     return ChannelUser(value) if _valid_id(value, "ou") else None
 
 
-def _classify_chat(row: Any, account: ChannelUser) -> tuple[str, ChannelUser | None]:
-    """返回可信私聊 ID 与对端；明确不允许的路由没有对端，无法分类则拒绝快照。"""
-    if not isinstance(row, dict) or not _valid_id(chat_id := row.get("chat_id"), "oc"):
-        raise CliError("cli_invalid_chat_page")
-    mode = row.get("chat_mode")
-    if mode in ("group", "topic"):
-        return chat_id, None
-    if mode == "p2p":
-        target = row.get("p2p_target_type")
-        if target == "bot":
-            return chat_id, None
-        if target == "user" and (user := parse_open_id(row.get("p2p_target_id"))) is not None:
-            return chat_id, user if user != account else None
-    raise CliError("cli_invalid_chat_page")
-
-
 class FeishuDiscovery(_UserCLI):
     async def account_user(self) -> ChannelUser:
         data = _success_data(await self._run(("api", "GET", "/open-apis/authen/v1/user_info")))
@@ -218,36 +224,41 @@ class FeishuDiscovery(_UserCLI):
             raise CliError("cli_invalid_account")
         return user
 
-    async def private_chats(self, account: ChannelUser) -> set[PrivateChat]:
-        """只有完整分页扫描才用于绑定；不会用未读完的列表判断是否有冲突。"""
-        chats: set[PrivateChat] = set()
-        unverified_chats: set[str] = set()
-        tokens: set[str] = set()
-        args = ("im", "+chat-list", "--types", "p2p", "--user-id-type", "open_id",
-                "--page-size", str(MAX_PAGE_SIZE))
-        token_args: tuple[str, ...] = ()
-        while True:
-            data = _success_data(await self._run((*args, *token_args)))
-            rows, more, token = data.get("chats"), data.get("has_more"), data.get("page_token")
-            # 上游快捷指令有时将空 Go slice 序列化成 null；字段缺失不是合法空页。
-            if "chats" in data and rows is None:
-                rows = []
-            if not isinstance(rows, list) or type(more) is not bool or (more and (
-                not isinstance(token, str) or not token or len(token) > 2048 or "\x00" in token
-            )):
-                raise CliError("cli_invalid_chat_page")
-            for row in rows:
-                chat_id, user = _classify_chat(row, account)
-                if user is None:
-                    unverified_chats.add(chat_id)
-                else:
-                    chats.add(PrivateChat(chat_id, user))
-            if not more:
-                return {chat for chat in chats if chat.chat_id not in unverified_chats}
-            if token in tokens:
-                raise CliError("cli_chat_page_cycle")
-            tokens.add(token)
-            token_args = ("--page-token", token)
+    async def search_page(self, start: int, end: int, token: str | None, *,
+                          page_size: int = DEFAULT_SEARCH_PAGE_SIZE) -> tuple[list, str | None]:
+        if type(page_size) is not int or not MIN_PAGE_SIZE <= page_size <= MAX_PAGE_SIZE:
+            raise ValueError("invalid Feishu search page size")
+        params = {"page_size": page_size, "user_id_type": "open_id"}
+        if token is not None:
+            params["page_token"] = token
+        payload = {"query": "", "filter": {"chat_type": "p2p", "from_types": ["user"], "time_range": {
+            "start_time": datetime.fromtimestamp(start, timezone.utc).isoformat(),
+            "end_time": datetime.fromtimestamp(end, timezone.utc).isoformat(),
+        }}}
+        result = await self._run(("api", "POST", _MESSAGES + "/search", "--params", _json_bytes(params).decode(),
+                                  "--data", "-"), data=_json_bytes(payload))
+        data = _success_data(result)
+        items, more, next_token = data.get("items"), data.get("has_more"), data.get("page_token")
+        # 飞书的空结果可以是 null 或省略 items；只有明确完成的页才接受这种形态。
+        if items is None and more is False:
+            items = []
+        if not isinstance(items, list) or type(more) is not bool or (more and (
+            not isinstance(next_token, str) or not 0 < len(next_token) <= 2048 or "\x00" in next_token
+        )):
+            raise CliError("cli_invalid_search_page")
+        return items, next_token if more else None
+
+    async def messages(self, message_ids: tuple[str, ...]) -> list:
+        if not 0 < len(message_ids) <= MAX_MGET_SIZE or not all(_valid_id(mid, "om") for mid in message_ids):
+            raise ValueError("invalid Feishu message batch")
+        # raw CLI 将 JSON 数组编码为重复的 message_ids 查询参数；路径本身不能带查询串。
+        params = _json_bytes({"message_ids": list(message_ids), "user_id_type": "open_id"}).decode()
+        data = _success_data(await self._run(("api", "GET", _MESSAGES + "/mget", "--params", params)))
+        items = data.get("items")
+        # 未确认 mget 契约允许 null / 省略 items；不能把无法核验的整批响应当作合法缺项。
+        if not isinstance(items, list):
+            raise CliError("cli_invalid_message_details")
+        return items
 
     async def _ringing_query(self, step: str, args: tuple[str, ...]) -> dict[str, Any]:
         loop = asyncio.get_running_loop()
@@ -294,58 +305,17 @@ class FeishuDiscovery(_UserCLI):
             return None
         return RingingCaller(meeting_id, caller)
 
-    def for_chat(self, chat_id: str) -> "FeishuCLI":
-        return FeishuCLI(self._executable, chat_id, timeout=self._timeout, runner=self._runner)
+    def for_user(self, user: ChannelUser) -> "FeishuCLI":
+        return FeishuCLI(self._executable, user, timeout=self._timeout, runner=self._runner)
 
 
 class FeishuCLI(_UserCLI):
-    def __init__(self, executable: str, chat_id: str, *, timeout: float, runner: CommandRunner = run_command) -> None:
+    def __init__(self, executable: str, user: ChannelUser, *, timeout: float,
+                 runner: CommandRunner = run_command) -> None:
         super().__init__(executable, timeout=timeout, runner=runner)
-        self._chat_id = chat_id
-
-    async def list_page(self, start: int, end: int, token: str | None, *,
-                        page_size: int = MAX_PAGE_SIZE) -> tuple[list, str | None]:
-        if type(page_size) is not int or not MIN_PAGE_SIZE <= page_size <= MAX_PAGE_SIZE:
-            raise ValueError("invalid Feishu page size")
-        params = {"container_id_type": "chat", "container_id": self._chat_id,
-                  "start_time": str(start), "end_time": str(end), "sort_type": "ByCreateTimeAsc",
-                  "page_size": page_size}
-        if token is not None:
-            params["page_token"] = token
-        data = _success_data(await self._run(("api", "GET", _MESSAGES, "--params", _json_bytes(params).decode())))
-        items = data.get("items", [])
-        has_more = data.get("has_more")
-        page_token = data.get("page_token")
-        if not isinstance(items, list) or type(has_more) is not bool or (has_more and (
-            not isinstance(page_token, str) or not page_token or len(page_token) > 2048
-        )):
-            raise CliError("cli_invalid_page")
-        return items, page_token if has_more else None
-
-    async def download(self, message_id: str, key: str, kind: str, *, limit: int) -> bytes:
-        prefix = {"image": "img", "file": "file"}.get(kind)
-        if prefix is None or not re.fullmatch(r"om_[\w-]{1,160}", message_id, flags=re.ASCII) or not re.fullmatch(
-            rf"{prefix}_[\w-]{{1,160}}", key, flags=re.ASCII
-        ):
-            raise CliError("invalid_resource_reference", definite=True)
-        try:
-            with TemporaryDirectory(prefix=".feishu-", dir=Path.cwd()) as tmp:
-                # 指定扩展名，使该命令不会采用远端提供的文件名；不信任 CLI 返回的路径。
-                target = Path(tmp) / "media.bin"
-                result = await self._run(("im", "+messages-resources-download", "--message-id", message_id,
-                                          "--file-key", key, "--type", kind, "--output", str(target)), file_limit=limit)
-                reported_size = _success_data(result).get("size_bytes")
-                info = target.lstat()
-                if (not stat.S_ISREG(info.st_mode) or not 0 < info.st_size <= limit
-                        or type(reported_size) is not int or reported_size != info.st_size):
-                    raise CliError("invalid_resource_size", definite=True)
-                with target.open("rb") as file:
-                    data = file.read(limit + 1)
-                if len(data) != reported_size:
-                    raise CliError("invalid_resource_size", definite=True)
-                return data
-        except OSError:
-            raise CliError("resource_file_unavailable", definite=True) from None
+        if parse_open_id(user.key) is None:
+            raise ValueError("invalid Feishu recipient")
+        self._open_id = user.key
 
     async def send_text(self, text: str) -> DeliveryStatus:
         content = json.dumps({"text": text}, ensure_ascii=False, separators=(",", ":"))
@@ -355,7 +325,7 @@ class FeishuCLI(_UserCLI):
             return DeliveryStatus.FAILED
         if oversized:
             return DeliveryStatus.FAILED
-        payload = _json_bytes({"receive_id": self._chat_id, "msg_type": "text", "content": content})
+        payload = _json_bytes({"receive_id": self._open_id, "msg_type": "text", "content": content})
         return await self._send_message(payload)
 
     def prepare_transcript(self, text: str) -> bytes | None:
@@ -365,7 +335,7 @@ class FeishuCLI(_UserCLI):
         content = json.dumps({"zh_cn": {"content": [[{"tag": "text", "text": text, "style": ["bold"]}]]}},
                              ensure_ascii=False, separators=(",", ":"))
         try:
-            payload = _json_bytes({"receive_id": self._chat_id, "msg_type": "post", "content": content},
+            payload = _json_bytes({"receive_id": self._open_id, "msg_type": "post", "content": content},
                                   ensure_ascii=False)
         except UnicodeError:
             return None
@@ -377,12 +347,11 @@ class FeishuCLI(_UserCLI):
 
     async def _send_message(self, payload: bytes) -> DeliveryStatus:
         try:
-            result = await self._run(("api", "POST", _MESSAGES, "--params", '{"receive_id_type":"chat_id"}',
+            result = await self._run(("api", "POST", _MESSAGES, "--params", '{"receive_id_type":"open_id"}',
                                       "--data", "-"), data=payload)
             data = _success_data(result)
             message_id = data.get("message_id")
-            if (not isinstance(message_id, str) or not re.fullmatch(r"om_[\w-]{1,160}", message_id, flags=re.ASCII)
-                    or data.get("chat_id", self._chat_id) != self._chat_id):
+            if not _valid_id(message_id, "om") or ("chat_id" in data and not _valid_id(data["chat_id"], "oc")):
                 return DeliveryStatus.UNKNOWN
         except CliError as exc:
             return DeliveryStatus.FAILED if exc.definite else DeliveryStatus.UNKNOWN

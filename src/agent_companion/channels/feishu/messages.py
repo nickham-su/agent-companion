@@ -4,11 +4,11 @@ from base64 import b64encode
 from dataclasses import dataclass, field, replace
 import json
 import re
-from typing import Any
+from typing import Any, Protocol
 
 from ...protocol import OMITTED_INPUT_IMAGE, ChannelUser, Image, Message, Part, Text
 from ...speech.asr import AsrError, AudioFile, FileASR, MAX_AUDIO_BYTES
-from .cli import CliError, FeishuCLI, parse_open_id
+from .cli import CliError, parse_open_id
 
 
 SUPPORTED_TYPES = {"audio", "image", "post", "text"}
@@ -29,8 +29,8 @@ class IncomingMessage:
     content: str = field(repr=False)
 
 
-def incoming(raw: Any, *, chat_id: str, user: ChannelUser, account: ChannelUser) -> IncomingMessage | None:
-    if not isinstance(raw, dict) or raw.get("chat_id") != chat_id or raw.get("deleted") is True:
+def incoming(raw: Any, *, user: ChannelUser, account: ChannelUser) -> IncomingMessage | None:
+    if not isinstance(raw, dict) or raw.get("deleted") is True:
         return None
     sender = raw.get("sender")
     if (not isinstance(sender, dict) or sender.get("sender_type") != "user"
@@ -142,8 +142,12 @@ class BatchMediaBudget:
         return final
 
 
+class ResourceDownloader(Protocol):
+    async def download(self, message_id: str, key: str, kind: str, *, limit: int) -> bytes: ...
+
+
 class MessageNormalizer:
-    def __init__(self, cli: FeishuCLI, asr: FileASR) -> None:
+    def __init__(self, cli: ResourceDownloader, asr: FileASR) -> None:
         self._cli = cli
         self._asr = asr
 

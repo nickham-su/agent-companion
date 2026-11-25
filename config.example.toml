@@ -1,7 +1,7 @@
 # 相对路径以配置文件所在目录为准。
 # 角色文件另从启动工作目录的 agents/ 读取；正式启动前从 agents/main.example.md 复制并配置 main.md。
 # 如需委派，从 agents/sub.example.md 创建实际子角色；角色正文会发给模型，不要填写敏感信息。
-database = "db.sqlite3"
+database = "db-search.sqlite3"  # 搜索版使用新路径；保留旧库，不迁移或清空。
 # 用户工作区的共同根目录；子目录按用户分配、按需创建，不是沙箱。
 workspace_root = "workspaces"
 # 日志只写标准输出，部署默认 WARNING；排查时改为 DEBUG，修改后重启。
@@ -74,6 +74,7 @@ model = "qwen-audio-3.1-tts-flash"
 voice_id = "longanhuan_v3.1"  # 示例配对；也可将两项同时改为 cosyvoice-v3-flash / longanyang
 
 # 默认文字模式自动发现真人私聊，每人独立会话；服务账号由启动时的 CLI 登录身份决定。
+# 飞书 CLI 需用户身份、search:message 及批量取正文/下载/发消息权限。
 # [feishu]
 # mode = "text"  # 默认 text；voice 保留文字，并自动接听符合条件的飞书来电
 # voice_text_copy = true  # 仅 voice：已确认并入库的正文另发到原对端私聊

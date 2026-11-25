@@ -2,6 +2,7 @@ import asyncio
 from collections import defaultdict
 from contextlib import ExitStack, asynccontextmanager, closing
 from dataclasses import replace
+from datetime import datetime, timezone
 from hashlib import sha256
 import json
 from pathlib import Path
@@ -26,12 +27,8 @@ _CHATS = ("oc_private_a", "oc_private_b", "oc_private_c")
 _SENDERS = ("ou_private_a", "ou_private_b", "ou_private_c")
 
 
-def _chat(chat, sender, *, mode="p2p", peer="user"):
-    return {"chat_id": chat, "p2p_target_id": sender, "chat_mode": mode, "p2p_target_type": peer}
-
-
 def _message(id_, chat, sender, body, *, stamp=100_250, sender_type="user", id_type="open_id", kind="text"):
-    return {"message_id": "om_" + id_, "chat_id": chat, "create_time": str(stamp), "msg_type": kind,
+    return {"message_id": "om_" + chat + "_" + id_, "chat_id": chat, "create_time": str(stamp), "msg_type": kind,
             "sender": {"id": sender, "id_type": id_type, "sender_type": sender_type},
             "body": {"content": json.dumps(body if isinstance(body, dict) else {"text": body})}}
 
@@ -43,12 +40,10 @@ class _Runner:
         self.checking_account = asyncio.Event()
         self.release_account = asyncio.Event()
         self.release_account.set()
-        self.pages = {None: (None, None)}
-        self.discovery_failed = False
+        self.verified = asyncio.Event()
         self.queries = []
         self.messages = defaultdict(list)
-        self.windows = defaultdict(list)
-        self.fail = set()
+        self.details = []
         self.sent = defaultdict(list)
         self.posts = defaultdict(list)
         self.hold_sends = False
@@ -66,38 +61,45 @@ class _Runner:
             await self.release_account.wait()
             if self.account_failed:
                 return CommandResult(1, b"", b"")
+            self.verified.set()
             result = {"open_id": self.account}
-        elif op[:2] == ("im", "+chat-list"):
-            assert argv[argv.index("--types") + 1] == "p2p"
-            assert argv[argv.index("--user-id-type") + 1] == "open_id"
-            cursor = argv[argv.index("--page-token") + 1] if "--page-token" in argv else None
-            self.queries.append(cursor)
-            if self.discovery_failed:
-                return CommandResult(1, b"", b"")
-            rows, next_cursor = self.pages[cursor]
-            result = {"chats": rows, "has_more": next_cursor is not None, "page_token": next_cursor}
-        elif op == ("api", "GET", "/open-apis/im/v1/messages"):
-            query = json.loads(argv[argv.index("--params") + 1])
-            chat = query["container_id"]
-            self.windows[chat].append((int(query["start_time"]), int(query["end_time"])))
-            if chat in self.fail:
-                return CommandResult(1, b"", b"")
-            result = {"has_more": False, "items": self.messages[chat]}
+        elif op == ("api", "POST", "/open-apis/im/v1/messages/search"):
+            search = json.loads(data)
+            assert search["query"] == "" and search["filter"]["chat_type"] == "p2p"
+            dates = search["filter"]["time_range"]
+            start, end = (datetime.fromisoformat(dates[k]).timestamp() for k in ("start_time", "end_time"))
+            self.queries.append((start, end))
+            hits = []
+            for rows in self.messages.values():
+                for row in rows:
+                    if row["sender"]["sender_type"] == "user" and start * 1000 <= int(row["create_time"]) < end * 1000:
+                        hits.append({"meta_data": {"message_id": row["message_id"], "chat_id": row["chat_id"],
+                                                   "type": row["msg_type"], "from_id": row["sender"]["id"],
+                                                   "create_time": datetime.fromtimestamp(int(row["create_time"]) / 1000,
+                                                                                         timezone.utc).isoformat(),
+                                                   "is_p2p_chat": True}})
+            result = {"items": hits, "has_more": False}
+        elif op == ("api", "GET", "/open-apis/im/v1/messages/mget"):
+            ids = json.loads(argv[argv.index("--params") + 1])["message_ids"]
+            self.details.append(ids)
+            result = {"items": [row for rows in self.messages.values() for row in rows if row["message_id"] in ids]}
         elif op == ("api", "POST", "/open-apis/im/v1/messages"):
             msg = json.loads(data)
-            chat = msg["receive_id"]
+            assert json.loads(argv[argv.index("--params") + 1]) == {"receive_id_type": "open_id"}
+            peer = msg["receive_id"]
+            assert peer.startswith("ou_")
             content = json.loads(msg["content"])
             if msg["msg_type"] == "post":
-                self.posts[chat].append(content)
+                self.posts[peer].append(content)
                 return CommandResult(0, json.dumps({"ok": True, "identity": "user", "data": {
-                    "chat_id": chat, "message_id": "om_post"}}).encode(), b"")
-            self.sent[chat].append(content["text"])
-            if self.hold_sends or chat in self.hold_destinations:
+                    "chat_id": "oc_synthetic_sent", "message_id": "om_post"}}).encode(), b"")
+            self.sent[peer].append(content["text"])
+            if self.hold_sends or peer in self.hold_destinations:
                 try:
                     await asyncio.Event().wait()
                 finally:
-                    self.closed_sends.add(chat)
-            result = {"chat_id": chat, "message_id": "om_sent"}
+                    self.closed_sends.add(peer)
+            result = {"chat_id": "oc_synthetic_sent", "message_id": "om_sent"}
         else:
             assert "+messages-resources-download" in argv
             self.downloads += 1
@@ -130,34 +132,10 @@ class _Model:
             yield TextDelta("reply: " + last.content)
 
 
-class _SlowRetiringChild(_Model):
-    def __init__(self):
-        super().__init__()
-        self.started = asyncio.Event()
-        self.retiring = asyncio.Event()
-        self.release_retirement = asyncio.Event()
-
-    async def stream(self, messages, tools, *, thinking):
-        last = messages[-1]
-        if tools and last.content == "delegate slow A":
-            yield ToolReady(ToolCall("slow-child-a", DELEGATE_TOOL_NAME, '{"agent":"general","prompt":"slow child A"}'))
-        elif not tools and last.content == "slow child A":
-            self.started.set()
-            try:
-                await asyncio.Future()
-            finally:
-                self.retiring.set()
-                await self.release_retirement.wait()
-        else:
-            async for event in super().stream(messages, tools, thinking=thinking):
-                yield event
-
-
 @asynccontextmanager
 async def _serve_private(settings, history, model, runner, clock):
     with (patch("agent_companion.app.time", side_effect=lambda: clock[0]),
           patch("agent_companion.feishu_private.time", side_effect=lambda: clock[0]),
-          patch("agent_companion.feishu_private._DISCOVERY_SECONDS", 0.02),
           patch("agent_companion.channels.feishu.channel._POLL_SECONDS", 0.02),
           patch("agent_companion.app.running_agent", wraps=running_agent) as agents):
         task = asyncio.create_task(run_feishu(settings, history, model, object(), discovery=runner.discovery(),
@@ -215,358 +193,19 @@ class FeishuPrivateTests(unittest.IsolatedAsyncioTestCase):
                 History(unbound, feishu_private_owner=owner)
             self.assertEqual(unbound.read_bytes(), original)
 
-    async def test_verified_user_reuses_legacy_account_and_route_on_restart(self):
-        chat_id, open_id = _CHATS[0], _SENDERS[0]
-        owner = sha256(f'["private","{_OWN}"]'.encode("ascii")).hexdigest()
-        session_id = "feishu-private:" + sha256(open_id.encode("ascii")).hexdigest()
-        chat_fingerprint = sha256(chat_id.encode("ascii")).hexdigest()
-        self.runner.pages = {None: ([_chat(chat_id, open_id)], None)}
-        self.runner.messages[chat_id] = [_message("next", chat_id, open_id, "new input")]
-        with TemporaryDirectory() as tmp:
-            database = Path(tmp) / "legacy.db"
-            with closing(History(database)) as history:
-                history.bind_feishu_private(owner, started_ms=99_000)
-                legacy_agent = history.bind_feishu_private_agent(session_id, chat_fingerprint)
-                self.assertIsNotNone(legacy_agent)
-                history.append(session_id, [Message("user", "existing history")])
-
-            model = _Model()
-            with closing(History(database)) as history:
-                async with _serve_private(self.settings, history, model, self.runner, [101.0]) as agents:
-                    await _eventually(lambda: self.runner.sent[chat_id] == ["reply: new input"])
-                    agents.assert_called_once()
-                    self.assertEqual(agents.call_args.kwargs["agent"], legacy_agent)
-                    self.assertEqual(model.calls, [(True, ("existing history", "new input"))])
-                    self.assertEqual(history.check_feishu_private(owner), 99_000)
-
-    async def test_lazy_sessions_parallel_delivery_and_restart(self):
-        a, b, c = _CHATS
-        sa, sb, sc = _SENDERS
-        runner, model, clock = self.runner, _Model(), [100.25]
-        with TemporaryDirectory() as tmp:
-            database = Path(tmp) / "private.db"
-            with closing(History(database)) as history:
-                async with _serve_private(self.settings, history, model, runner, clock) as agents:
-                    await _eventually(lambda: runner.queries == [None])
-                    agents.assert_not_called()
-                    runner.pages = {None: ([_chat(a, sa), _chat("oc_group", sa, mode="group"),
-                                            _chat("oc_self", _OWN), _chat("oc_bot", "ou_bot", peer="bot")], "next"),
-                                    "next": ([_chat(b, sb), _chat(a, sa), _chat("oc_empty", "ou_empty")], None)}
-                    runner.messages[a] = [_message("old", a, sa, "old A", stamp=100_249),
-                                          _message("first_a", a, sa, "first A"),
-                                          _message("wrong_peer", a, sb, "wrong peer"),
-                                          _message("own", a, _OWN, "own reply"),
-                                          _message("wrong_chat", b, sa, "wrong chat"),
-                                          _message("not_user", a, sa, "bot", sender_type="app"),
-                                          _message("wrong_id_type", a, sa, "wrong ID type", id_type="user_id")]
-                    runner.messages[b] = [_message("first_b", b, sb, "first B"),
-                                          _message("bad_voice", b, sb, {"file_key": "file_synthetic"}, kind="audio")]
-                    clock[0] = 101.1
-                    await asyncio.wait_for(model.a_waiting.wait(), 3)
-                    await _eventually(lambda: "returned B" in runner.sent[b])
-                    self.assertEqual(runner.sent[b].count("语音接收失败，请重新发送。"), 1)
-                    self.assertEqual(runner.sent[a], [])
-                    self.assertEqual(set(runner.windows), {a, b, "oc_empty"})
-                    self.assertIn("next", runner.queries)
-                    self.assertEqual(agents.call_count, 2)
-                    session_a, session_b = [next(call.kwargs["session_id"] for call in agents.call_args_list
-                                                  if call.args[-1]._cli._chat_id == chat) for chat in (a, b)]
-                    model.release_a.set()
-                    await _eventually(lambda: runner.sent[a] == ["reply: first A"])
-                    self.assertEqual([e.message.content for e in history.read_after(session_a)], ["first A", "reply: first A"])
-                    self.assertIn((False, ("child B",)), model.calls)
-                    self.assertTrue(all("first A" not in inputs or inputs == ("first A",) for _, inputs in model.calls))
-
-                # 模拟进程在已保存入站但尚未移交 Runtime 时退出。
-                history.record_inbound(session_b, "feishu-private", 101,
-                                       [("om_pending", Message("user", "pending B"))])
-
-            resumed = _Model()
-            runner.pages["next"] = ([_chat(b, sb), _chat(c, sc), _chat("oc_empty", "ou_empty")], None)
-            runner.messages[c] = [_message("early_c", c, sc, "early C", stamp=100_251)]
-            clock[0] = 105.0
-            with closing(History(database)) as history:
-                async with _serve_private(self.settings, history, resumed, runner, clock) as agents:
-                    await _eventually(lambda: "reply: pending B" in runner.sent[b] and "reply: early C" in runner.sent[c])
-                    self.assertEqual(runner.sent[a], ["reply: first A"])
-                    self.assertEqual(runner.sent[b].count("returned B"), 1)
-                    self.assertEqual(len(resumed.calls), 2)
-                    self.assertEqual(agents.call_count, 2)
-                    self.assertIn(session_b, [call.kwargs["session_id"] for call in agents.call_args_list])
-                    b_inputs = next(inputs for _, inputs in resumed.calls if inputs[-1] == "pending B")
-                    self.assertEqual(b_inputs[0], "first B")
-                    self.assertIn("reply: pending B", [e.message.content for e in history.read_after(session_b)])
-                    self.assertIn((100, 105), runner.windows[c])
-                    self.assertEqual(history.pending_inbound(session_b, "feishu-private"), [])
-
-    async def test_discovery_cycle_error_does_not_stop_routes_and_conflicts_do_not_rebind(self):
-        a, b, c = _CHATS
-        sa, sb, sc = _SENDERS
-        runner, model, clock = self.runner, _Model(), [100.25]
-        runner.pages = {None: ([_chat(a, sa), _chat(b, sb)], None)}
-        with closing(History(":memory:")) as history:
-            async with _serve_private(self.settings, history, model, runner, clock) as agents:
-                await _eventually(lambda: runner.queries)
-                runner.pages = {None: ([], "loop"), "loop": ([_chat(c, sc)], "loop")}
-                with self.assertLogs("agent_companion.feishu_private", level="WARNING") as logs:
-                    await _eventually(lambda: runner.queries.count("loop") >= 2)
-                    clock[0] = 102.0
-                    runner.fail.add(a)
-                    runner.messages[b] = [_message("independent", b, sb, "independent B")]
-                    await _eventually(lambda: runner.sent[b] == ["reply: independent B"])
-                    runner.pages = {None: ([_chat(a, sc), _chat(c, sa), _chat(b, sb),
-                                            _chat("oc_conflict1", "ou_duplicate"),
-                                            _chat("oc_conflict2", "ou_duplicate")], None)}
-                    await _eventually(lambda: any("route conflict" in text for text in logs.output))
-                self.assertTrue(any("cli_chat_page_cycle" in text for text in logs.output))
-                self.assertNotIn(a, "\n".join(logs.output))
-                self.assertNotIn(c, runner.windows)
-                self.assertNotIn("oc_conflict1", runner.windows)
-                self.assertEqual(agents.call_count, 1)
-
-    async def test_malformed_discovery_protocol_is_rejected(self):
-        a, sa = _CHATS[0], _SENDERS[0]
-        chat = _chat(a, sa)
-        bad_rows = [dict(chat, **{field: value}) for field, values in (
-            ("p2p_target_id", (None, "oc_wrong_namespace", [])),
-            ("chat_mode", (None, "unknown", [])),
-            ("p2p_target_type", (None, "unknown", {})),
-        ) for value in values]
-        for rows, cursor in (([_chat(_CHATS[0], _SENDERS[0])], ["not a cursor"]), ([None], None),
-                             ([{}], None), ([_chat("bad_chat_id", _SENDERS[1])], None),
-                             *(([row], None) for row in bad_rows)):
-            with self.subTest(rows=rows, cursor=cursor):
-                self.runner.pages = {None: (rows, cursor)}
-                with self.assertRaisesRegex(CliError, "cli_invalid_chat_page"):
-                    await self.runner.discovery().private_chats(ChannelUser(_OWN))
-        self.runner.pages = {None: (None, None)}
-        self.assertEqual(await self.runner.discovery().private_chats(ChannelUser(_OWN)), set())
-
     async def test_shutdown_awaits_outbound_closure_in_every_route(self):
         a, b, _ = _CHATS
         sa, sb, _ = _SENDERS
         runner, model, clock = self.runner, _Model(), [101.0]
-        runner.pages = {None: ([_chat(a, sa), _chat(b, sb)], None)}
         runner.hold_sends = True
         runner.messages[a] = [_message("shutdown_a", a, sa, "shutdown A", stamp=101_001)]
         runner.messages[b] = [_message("shutdown_b", b, sb, "shutdown B", stamp=101_002)]
         with closing(History(":memory:")) as history:
             async with _serve_private(self.settings, history, model, runner, clock):
-                await _eventually(lambda: runner.queries)
+                await runner.verified.wait()
                 clock[0] = 102.0
-                await _eventually(lambda: set(runner.sent) == {a, b})
-            self.assertEqual(runner.closed_sends, {a, b})
-
-    async def test_slow_retirement_does_not_delay_other_chat_activation_or_revocation(self):
-        a, b, _ = _CHATS
-        sa, sb, _ = _SENDERS
-        runner, model, clock = self.runner, _SlowRetiringChild(), [100.25]
-        runner.pages = {None: ([_chat(a, sa)], None)}
-        runner.messages[a] = [_message("delegate_a", a, sa, "delegate slow A")]
-        runner.hold_destinations.add(b)
-        session_a = "feishu-private:" + sha256(sa.encode()).hexdigest()
-        close = AgentTree.close
-
-        async def close_with_fault(subtasks):
-            await close(subtasks)
-            if subtasks._root.session_id == session_a:
-                raise RuntimeError("synthetic exception body not for logs")
-
-        with (closing(History(":memory:")) as history, patch.object(AgentTree, "close", close_with_fault)):
-            async with _serve_private(self.settings, history, model, runner, clock):
-                try:
-                    await _eventually(lambda: runner.queries)
-                    clock[0] = 101.0
-                    await asyncio.wait_for(model.started.wait(), 3)
-                    runner.messages[b] = [_message("independent_b", b, sb, "independent B", stamp=101_100)]
-                    clock[0] = 102.0
-                    runner.pages = {None: ([_chat(b, sb)], None)}
-                    await asyncio.wait_for(model.retiring.wait(), 3)
-                    await _eventually(lambda: runner.sent[b] == ["reply: independent B"])
-                    runner.pages = {None: ([], None)}
-                    await _eventually(lambda: b in runner.closed_sends)
-                    with self.assertLogs("agent_companion.feishu_private", level="WARNING") as logs:
-                        model.release_retirement.set()
-                        await _eventually(lambda: any("retirement failed" in line for line in logs.output))
-                    self.assertEqual(len(logs.records), 1)
-                    self.assertTrue(logs.records[0].getMessage().endswith("error_type=RuntimeError"))
-                    self.assertNotIn("synthetic exception body", logs.records[0].getMessage())
-                    self.assertIsNone(logs.records[0].exc_info)
-                    count = len(runner.queries)
-                    await _eventually(lambda: len(runner.queries) > count)
-                finally:
-                    model.release_retirement.set()
-
-    async def test_retiring_session_requires_a_new_verified_snapshot_after_old_exit(self):
-        a, sa = _CHATS[0], _SENDERS[0]
-        runner, model, clock = self.runner, _SlowRetiringChild(), [100.25]
-        verified = {None: ([_chat(a, sa)], None)}
-        runner.pages = verified
-        runner.messages[a] = [_message("delegate_a", a, sa, "delegate slow A")]
-        with closing(History(":memory:")) as history:
-            with patch.object(history, "bind_feishu_private_agent", wraps=history.bind_feishu_private_agent) as bind:
-                async with _serve_private(self.settings, history, model, runner, clock) as agents:
-                    try:
-                        await _eventually(lambda: runner.queries)
-                        clock[0] = 101.0
-                        await asyncio.wait_for(model.started.wait(), 3)
-                        session = agents.call_args.kwargs["session_id"]
-                        await _eventually(lambda: any(e.message.role == "tool" for e in history.read_after(session)))
-                        accepted = next(json.loads(e.message.content) for e in history.read_after(session)
-                                        if e.message.role == "tool")
-                        runner.pages = {None: ([], None)}
-                        await asyncio.wait_for(model.retiring.wait(), 3)
-
-                        runner.messages[a].append(_message("after_a", a, sa, "fresh A", stamp=101_100))
-                        clock[0] = 102.0
-                        runner.pages = verified
-                        count = len(runner.queries)
-                        await _eventually(lambda: len(runner.queries) >= count + 2)
-                        self.assertEqual((bind.call_count, agents.call_count), (1, 1))
-
-                        runner.pages = {None: ([], None)}
-                        model.release_retirement.set()
-                        run_id = history.delegation(accepted["delegation_id"]).run_id
-                        await _eventually(lambda: history.agent_run(run_id).status == "interrupted")
-                        count = len(runner.queries)
-                        await _eventually(lambda: len(runner.queries) >= count + 2)
-                        self.assertEqual((bind.call_count, agents.call_count), (1, 1))
-
-                        runner.pages = verified
-                        await _eventually(lambda: "reply: fresh A" in runner.sent[a])
-                        self.assertEqual((bind.call_count, agents.call_count), (2, 2))
-                    finally:
-                        model.release_retirement.set()
-
-    async def test_revoked_route_cancels_queued_and_inflight_work_then_restores_only_pending_input(self):
-        class PausedModel(_Model):
-            def __init__(self):
-                super().__init__()
-                self.waiting = {label: asyncio.Event() for label in ("hold main A", "hold child A")}
-                self.cancelled = {label: asyncio.Event() for label in self.waiting}
-
-            async def stream(self, messages, tools, *, thinking):
-                last = messages[-1]
-                if last.content in self.waiting:
-                    self.waiting[last.content].set()
-                    try:
-                        await asyncio.Event().wait()
-                    finally:
-                        self.cancelled[last.content].set()
-                if last.content == "start child A" and tools:
-                    yield ToolReady(ToolCall("delegate_a", DELEGATE_TOOL_NAME, '{"agent":"general","prompt":"hold child A"}'))
-                elif last.tool_call_id == "delegate_a":
-                    yield TextDelta("queued reply A")
-                else:
-                    async for part in super().stream(messages, tools, thinking=thinking):
-                        yield part
-
-        a, b, _ = _CHATS
-        sa, sb, _ = _SENDERS
-        runner, model, clock = self.runner, PausedModel(), [100.25]
-        chats = [_chat(a, sa), _chat(b, sb)]
-        runner.pages = {None: (chats, None)}
-        runner.hold_destinations.add(a)
-        runner.messages[a] = [_message("initial_a", a, sa, "initial A")]
-        with closing(History(":memory:")) as history:
-            async with _serve_private(self.settings, history, model, runner, clock) as agents:
-                await _eventually(lambda: runner.queries)
-                clock[0] = 101.0
-                await _eventually(lambda: runner.sent[a] == ["reply: initial A"])
-                session_a = agents.call_args.kwargs["session_id"]
-                channel_a = agents.call_args.args[-1]
-
-                runner.messages[a].append(_message("start_child", a, sa, "start child A", stamp=101_100))
-                clock[0] = 102.0
-                await _eventually(lambda: model.waiting["hold child A"].is_set() and len(channel_a._pending) == 1)
-                tool = next(e.message for e in history.read_after(session_a) if e.message.role == "tool")
-                child = json.loads(tool.content)
-                runner.messages[a].append(_message("hold_main", a, sa, "hold main A", stamp=102_100))
-                clock[0] = 103.0
-                await asyncio.wait_for(model.waiting["hold main A"].wait(), 3)
-                runner.messages[a].append(_message("queued_a", a, sa, "pending A", stamp=103_100))
-                clock[0] = 104.0
-                await _eventually(lambda: len(history.pending_inbound(session_a, "feishu-private")) == 1)
-
-                # 普通 CLI 错误、坏页（首个分页已遗漏 A）和循环游标都不能撤销旧路由。
-                runner.discovery_failed = True
-                count = len(runner.queries)
-                await _eventually(lambda: len(runner.queries) > count)
-                runner.pages = {None: ([_chat(b, sb)], "bad"), "bad": ([None], None)}
-                runner.discovery_failed = False
-                await _eventually(lambda: "bad" in runner.queries)
-                runner.pages = {None: ([_chat(b, sb)], "missing-id"), "missing-id": ([{}], None)}
-                await _eventually(lambda: "missing-id" in runner.queries)
-                for field, value in (("p2p_target_id", "invalid_id"), ("p2p_target_id", None),
-                                     ("chat_mode", None), ("p2p_target_type", [])):
-                    row = _chat(a, sa)
-                    if value is None:
-                        row.pop(field)
-                    else:
-                        row[field] = value
-                    with self.assertLogs("agent_companion.feishu_private", level="WARNING") as logs:
-                        runner.pages = {None: (chats, "ambiguous"), "ambiguous": ([row], None)}
-                        await _eventually(lambda: any("cli_invalid_chat_page" in line for line in logs.output))
-                    self.assertNotIn(a, runner.closed_sends)
-                runner.pages = {None: ([_chat(b, sb)], "cycle"), "cycle": ([], "cycle")}
-                await _eventually(lambda: runner.queries.count("cycle") >= 2)
-                self.assertFalse(runner.closed_sends)
-                self.assertFalse(any(event.is_set() for event in model.cancelled.values()))
-                self.assertEqual(len(channel_a._pending), 1)
-
-                runner.pages = {None: ([_chat(a, sa, mode="group"), _chat(b, sb)], None)}
-                await _eventually(lambda: a in runner.closed_sends and all(event.is_set() for event in model.cancelled.values()))
-                self.assertFalse(channel_a._pending)
-                run_id = history.delegation(child["delegation_id"]).run_id
-                await _eventually(lambda: history.agent_run(run_id).status == "interrupted")
-                self.assertIsNone(history.agent_run(run_id).reply_enqueued_at)
-                before = len(runner.windows[a])
-                runner.messages[b].append(_message("revoked_a_b", b, sb, "first B", stamp=104_100))
-                clock[0] = 105.0
-                await _eventually(lambda: "returned B" in runner.sent[b])
-                self.assertEqual(len(runner.windows[a]), before)
-                self.assertEqual(runner.sent[a], ["reply: initial A"])
-                self.assertEqual(len(history.pending_inbound(session_a, "feishu-private")), 1)
-
-                runner.hold_destinations.remove(a)
-                runner.pages = {None: (chats, None)}
-                clock[0] = 106.0
-                await _eventually(lambda: runner.sent[a] == ["reply: initial A", "reply: pending A"])
-                self.assertEqual(agents.call_args.kwargs["session_id"], session_a)
-                self.assertEqual(agents.call_count, 3)
-                self.assertEqual(history.pending_inbound(session_a, "feishu-private"), [])
-                a_user = [entry.message.content for entry in history.read_after(session_a) if entry.message.role == "user"]
-                self.assertEqual(a_user, ["initial A", "start child A", "hold main A", "pending A"])
-                self.assertEqual(sum(inputs[-1] == "pending A" for _, inputs in model.calls), 1)
-
-    async def test_successful_snapshot_pauses_disappeared_mismatched_and_conflicting_routes(self):
-        a, b, c = _CHATS
-        sa, sb, sc = _SENDERS
-        for label, invalid in (
-            ("gone", []), ("new_peer_same_chat", [_chat(a, sc)]),
-            ("conflicting_chat_type", [_chat(a, sa), _chat(a, sa, mode="group")]),
-            ("topic", [{"chat_id": a, "chat_mode": "topic"}]),
-            ("bot", [{"chat_id": a, "chat_mode": "p2p", "p2p_target_type": "bot"}]),
-            ("self", [_chat(a, _OWN)]),
-            ("conflicting", [_chat(a, sa), _chat(c, sa)]),
-        ):
-            with self.subTest(label=label), closing(History(":memory:")) as history:
-                runner, model, clock = _Runner(), _Model(), [100.25]
-                runner.pages = {None: ([_chat(a, sa), _chat(b, sb)], None)}
-                runner.messages[a] = [_message("inflight", a, sa, "inflight A")]
-                runner.hold_destinations.add(a)
-                async with _serve_private(self.settings, history, model, runner, clock):
-                    await _eventually(lambda: runner.queries)
-                    clock[0] = 101.0
-                    await _eventually(lambda: runner.sent[a])
-                    runner.pages = {None: (invalid + [_chat(b, sb)], None)}
-                    await _eventually(lambda: a in runner.closed_sends)
-                    before = len(runner.windows[a])
-                    runner.messages[b] = [_message("unaffected", b, sb, "unaffected B", stamp=101_100)]
-                    clock[0] = 102.0
-                    await _eventually(lambda: runner.sent[b] == ["reply: unaffected B"])
-                    self.assertEqual(len(runner.windows[a]), before)
-                    self.assertNotIn(c, runner.windows)
+                await _eventually(lambda: set(runner.sent) == {sa, sb})
+            self.assertEqual(runner.closed_sends, {sa, sb})
 
     async def test_failed_account_verification_leaves_new_database_available_and_keeps_startup_message(self):
         runner, model, clock = self.runner, _Model(), [100.25]
@@ -592,7 +231,6 @@ class FeishuPrivateTests(unittest.IsolatedAsyncioTestCase):
                 runner.checking_account.clear()
                 runner.release_account.clear()
                 self_chat = _CHATS[1]
-                runner.pages = {None: ([_chat(a, sa), _chat(self_chat, _OWN)], None)}
                 runner.messages[a] = [_message("too_early", a, sa, "old A", stamp=100_249),
                                       _message("from_self", a, _OWN, "ignore self", stamp=100_251),
                                       _message("during_auth", a, sa, "during verification", stamp=100_251)]
@@ -602,8 +240,8 @@ class FeishuPrivateTests(unittest.IsolatedAsyncioTestCase):
                     self.assertFalse(runner.queries)
                     clock[0] = 102.0
                     runner.release_account.set()
-                    await _eventually(lambda: runner.sent[a] == ["reply: during verification"])
-                    self.assertNotIn(self_chat, runner.windows)
+                    await _eventually(lambda: runner.sent[sa] == ["reply: during verification"])
+                    self.assertFalse(history.feishu_inbound_seen(f"om_{a}_from_self"))
                     self.assertEqual(history.check_feishu_private(owner), 100_250)
 
     async def test_production_checks_owner_and_uses_single_cli_verification_before_providers(self):
@@ -659,76 +297,105 @@ class FeishuPrivateTests(unittest.IsolatedAsyncioTestCase):
                 client.assert_not_called()
                 get_salt.assert_not_called()
 
-    async def test_inbox_and_registration_busy_retry_without_blocking_other_routes(self):
-        a, b, c = _CHATS
-        sa, sb, sc = _SENDERS
+    async def test_restart_recovers_each_user_without_search_hits(self):
+        runner, clock = self.runner, [450]
+        users = _SENDERS[:2]
+        sessions = tuple("feishu-private:" + sha256(peer.encode()).hexdigest() for peer in users)
+        with TemporaryDirectory(dir=Path.cwd()) as root:
+            database = Path(root) / "search.sqlite3"
+            with closing(History(database)) as history:
+                history.bind_feishu_private(private_feishu_identity(ChannelUser(_OWN)), started_ms=100_000)
+                history.feishu_inbound_window(100)
+                history.record_feishu_window(115, now=115, verified={
+                    peer: [(f"om_pending_{i}", 110_000 + i, "text", json.dumps({"text": f"pending {i}"}))]
+                    for i, peer in enumerate(users)}, discarded=(), retry=())
+            with closing(History(database)) as history:
+                async with _serve_private(self.settings, history, _Model(), runner, clock) as agents:
+                    await _eventually(lambda: all(len(runner.sent[peer]) == 1 for peer in users))
+                    self.assertEqual(agents.call_count, 2)
+                    self.assertEqual(runner.details, [])
+                    self.assertEqual(history.pending_feishu_users(), [])
+                    for i, (session, peer) in enumerate(zip(sessions, users)):
+                        self.assertEqual(runner.sent[peer], [f"reply: pending {i}"])
+                        self.assertEqual([r.message.content for r in history.tail(session, 5)],
+                                         [f"pending {i}", f"reply: pending {i}"])
+
+    async def test_blocked_media_does_not_delay_another_user_or_the_next_search(self):
+        runner, clock = self.runner, [100.25]
+        a, b = _CHATS[:2]
+        sa, sb = _SENDERS[:2]
+        session_a, session_b = ("feishu-private:" + sha256(u.encode()).hexdigest() for u in (sa, sb))
+        downloading, release = asyncio.Event(), asyncio.Event()
+
+        async def download(*args, **kwargs):
+            downloading.set()
+            await release.wait()
+            raise CliError("synthetic_media_unavailable")
+
+        with (closing(History(":memory:")) as history,
+              patch("agent_companion.channels.feishu.channel._MAX_MEDIA_WORKERS", 1),
+              patch.object(FeishuDiscovery, "download", side_effect=download) as media):
+            async with _serve_private(self.settings, history, _Model(), runner, clock):
+                await runner.verified.wait()
+                runner.messages[a].extend([
+                    _message("voice", a, sa, {"file_key": "file_synthetic"}, kind="audio"),
+                    _message("text", a, sa, "A 同批文字", stamp=100_300),
+                ])
+                runner.messages[b].append(_message("b1", b, sb, "B 第一条"))
+                clock[0] = 102
+                await asyncio.wait_for(downloading.wait(), 1)
+                await _eventually(lambda: runner.sent[sb] == ["reply: B 第一条"])
+                self.assertEqual(history.feishu_inbound_window(0), (100, 102))
+                self.assertIsNotNone(history.next_feishu_raw(sa))
+                self.assertEqual(history.tail(session_a, 10), [])
+                runner.messages[a].append(_message("a2", a, sa, "A 后续文字", stamp=102_100))
+                runner.messages[b].append(_message("b2", b, sb, "B 后续文字", stamp=102_100))
+                clock[0] = 104
+                await _eventually(lambda: runner.sent[sb] == ["reply: B 第一条", "reply: B 后续文字"])
+                self.assertIn((100.0, 104.0), runner.queries)
+                self.assertEqual(history.feishu_inbound_window(0), (100, 104))
+                self.assertEqual([row.message.content for row in history.tail(session_b, 10) if row.message.role == "user"],
+                                 ["B 第一条", "B 后续文字"])
+                self.assertEqual(history.tail(session_a, 10), [])
+                release.set()
+                await _eventually(lambda: "reply: A 后续文字" in runner.sent[sa])
+                self.assertEqual([row.message.content for row in history.tail(session_a, 10) if row.message.role == "user"],
+                                 ["A 同批文字", "A 后续文字"])
+                media.assert_awaited_once()
+
+    async def test_busy_user_registration_does_not_block_another_user(self):
+        runner, clock = self.runner, [100.25]
+        a, b = _CHATS[:2]
+        sa, sb = _SENDERS[:2]
         session_a = "feishu-private:" + sha256(sa.encode()).hexdigest()
-        session_c = "feishu-private:" + sha256(sc.encode()).hexdigest()
-        runner, model, clock = self.runner, _Model(), [100.25]
-        runner.pages = {None: ([_chat(a, sa), _chat(b, sb)], None)}
-        a_attempts, c_attempts = [], []
-        busy_a = busy_c = True
+        blocked = True
         with closing(History(":memory:")) as history:
-            store, bind = history.record_inbound, history.bind_feishu_private_agent
+            register = history.ensure_main_agent
 
-            def save_window(session, source, through, items):
-                if session == session_a:
-                    a_attempts.append((through, tuple(items)))
-                    if busy_a:
-                        exc = sqlite3.OperationalError("synthetic storage contention")
-                        exc.sqlite_errorcode = sqlite3.SQLITE_BUSY_SNAPSHOT
-                        raise exc
-                return store(session, source, through, items)
+            def ensure(session):
+                if blocked and session == session_a:
+                    raise sqlite3.OperationalError("database is locked")
+                return register(session)
 
-            def register(session, chat):
-                if session == session_c:
-                    c_attempts.append(session)
-                    if busy_c:
-                        raise sqlite3.OperationalError("database table is locked")
-                return bind(session, chat)
-
-            with (patch.object(history, "record_inbound", side_effect=save_window),
-                  patch.object(history, "bind_feishu_private_agent", side_effect=register),
-                  self.assertLogs("agent_companion", level="WARNING") as logs):
-                async with _serve_private(self.settings, history, model, runner, clock):
-                    await _eventually(lambda: runner.queries)
-                    runner.messages[a] = [_message("a_once", a, sa, "saved once A"),
-                                          _message("a_failed_audio", a, sa, {"file_key": "file_a"}, kind="audio")]
-                    runner.messages[b] = [_message("b_first", b, sb, "first B")]
-                    runner.messages[c] = [_message("c_first", c, sc, "late route C")]
-                    runner.pages = {None: ([_chat(a, sa), _chat(b, sb), _chat(c, sc)], None)}
-                    clock[0] = 101.0
-                    await _eventually(lambda: len(a_attempts) >= 2 and len(c_attempts) >= 2 and "returned B" in runner.sent[b])
-                    self.assertEqual(runner.windows[a], [(100, 101)])
-                    self.assertFalse(runner.sent[a])
-                    self.assertNotIn(c, runner.windows)
-                    self.assertFalse(history.inbound_seen(session_a, "feishu-private", "om_a_once"))
-                    self.assertFalse(history.read_after(session_a))
-                    self.assertEqual(history.inbound_window(session_a, "feishu-private", 100), (100, 100))
-                    fetched, runner.messages[a] = runner.messages[a], []  # 不依赖 CLI 再返回已拉取的窗口。
-                    busy_c = False
-                    await _eventually(lambda: runner.sent[c] == ["reply: late route C"])
-                    self.assertFalse(runner.sent[a])
-                    busy_a = False
-                    await _eventually(lambda: "reply: saved once A" in runner.sent[a]
-                                      and "语音接收失败，请重新发送。" in runner.sent[a])
-                    runner.messages[a] = fetched  # 下一窗口再次收到同一事件，也只能处理一次。
-                    clock[0] = 102.0
-                    await _eventually(lambda: (100, 102) in runner.windows[a])
-                    self.assertTrue(all(item == a_attempts[0] for item in a_attempts if item[0] == 101))
-                    self.assertEqual(runner.sent[a].count("reply: saved once A"), 1)
-                    self.assertEqual(runner.sent[a].count("语音接收失败，请重新发送。"), 1)
-                    self.assertEqual(sum(inputs[-1] == "saved once A" for _, inputs in model.calls), 1)
-                    self.assertEqual(runner.downloads, 1)
-                self.assertTrue(any("inbox storage busy" in line for line in logs.output))
-                self.assertTrue(any("route storage busy" in line for line in logs.output))
+            with patch.object(history, "ensure_main_agent", side_effect=ensure):
+                async with _serve_private(self.settings, history, _Model(), runner, clock):
+                    await runner.verified.wait()
+                    runner.messages[a].append(_message("a", a, sa, "等待 A"))
+                    runner.messages[b].append(_message("b", b, sb, "独立 B"))
+                    clock[0] = 102
+                    await _eventually(lambda: runner.sent[sb] == ["reply: 独立 B"])
+                    self.assertEqual(runner.sent[sa], [])
+                    self.assertEqual(history.feishu_inbound_window(0), (100, 102))
+                    self.assertEqual(history.pending_feishu_users(), [sa])
+                    blocked = False
+                    await _eventually(lambda: runner.sent[sa] == ["reply: 等待 A"])
+                    self.assertEqual(len(runner.details), 1)
 
     async def test_runtime_consumes_pending_batches_in_order_while_other_route_progresses(self):
         a, b, _ = _CHATS
         sa, sb, _ = _SENDERS
         session_a = "feishu-private:" + sha256(sa.encode()).hexdigest()
         runner, model, clock = self.runner, _Model(), [100.25]
-        runner.pages = {None: ([_chat(a, sa), _chat(b, sb)], None)}
         blocked, attempts, committed = True, [], []
         with closing(History(":memory:")) as history:
             consume = history._consume_inbound
@@ -747,7 +414,7 @@ class FeishuPrivateTests(unittest.IsolatedAsyncioTestCase):
 
             with patch.object(history, "_consume_inbound", side_effect=consume_batch):
                 async with _serve_private(self.settings, history, model, runner, clock):
-                    await _eventually(lambda: runner.queries)
+                    await runner.verified.wait()
                     runner.messages[a] = [_message("a1", a, sa, "queued A1")]
                     clock[0] = 101.0
                     await _eventually(lambda: attempts)
@@ -755,20 +422,20 @@ class FeishuPrivateTests(unittest.IsolatedAsyncioTestCase):
                     runner.messages[a].append(_message("a2", a, sa, "queued A2", stamp=101_100))
                     runner.messages[b] = [_message("b1", b, sb, "independent B", stamp=101_100)]
                     clock[0] = 102.0
-                    await _eventually(lambda: len(attempts) >= 2 and runner.sent[b] == ["reply: independent B"])
+                    await _eventually(lambda: len(attempts) >= 2 and runner.sent[sb] == ["reply: independent B"])
                     pending = history.pending_inbound(session_a, "feishu-private")
                     self.assertEqual(len(pending), 2)
                     self.assertEqual(pending[0], first)
                     self.assertEqual(set(attempts), {first})
                     self.assertEqual(history.read_after(session_a), [])
-                    self.assertEqual(runner.sent[a], [])
+                    self.assertEqual(runner.sent[sa], [])
 
                     blocked = False
-                    await _eventually(lambda: len(runner.sent[a]) >= 2)
-                    self.assertEqual(runner.sent[a], ["reply: queued A1", "reply: queued A2"])
+                    await _eventually(lambda: len(runner.sent[sa]) >= 2)
+                    self.assertEqual(runner.sent[sa], ["reply: queued A1", "reply: queued A2"])
                     self.assertEqual(committed, pending)
                     self.assertEqual(history.pending_inbound(session_a, "feishu-private"), [])
-                    self.assertEqual(history.inbound_window(session_a, "feishu-private", 100), (100, 102))
+                    self.assertEqual(history.feishu_inbound_window(100), (100, 102))
                     self.assertEqual([e.message.content for e in history.read_after(session_a)],
                                      ["queued A1", "reply: queued A1", "queued A2", "reply: queued A2"])
                     self.assertEqual([inputs for _, inputs in model.calls if inputs[0] == "queued A1"],
@@ -785,7 +452,6 @@ class FeishuPrivateTests(unittest.IsolatedAsyncioTestCase):
         b, sb = _CHATS[1], _SENDERS[1]
         session_b = "feishu-private:" + sha256(sb.encode()).hexdigest()
         runner, model, clock = self.runner, Model(), [100.25]
-        runner.pages = {None: ([_chat(b, sb)], None)}
         blocked = {"accept", "start", "tool_reply", "tool_input", "finish", "mark", "result_input"}
         attempts, committed = defaultdict(list), defaultdict(list)
         with closing(History(":memory:")) as history, ExitStack() as patches:
@@ -823,14 +489,14 @@ class FeishuPrivateTests(unittest.IsolatedAsyncioTestCase):
             delegate = patches.enter_context(patch.object(AgentTree, "_delegate", autospec=True,
                                                            side_effect=AgentTree._delegate))
             async with _serve_private(self.settings, history, model, runner, clock):
-                await _eventually(lambda: runner.queries)
+                await runner.verified.wait()
                 runner.messages[b] = [_message("tool", b, sb, "first B")]
                 clock[0] = 101.0
                 await _eventually(lambda: len(attempts["accept"]) >= 2)
                 blocked.remove("accept")
                 await _eventually(lambda: len(attempts["tool_reply"]) >= 2 and len(attempts["start"]) >= 2)
                 self.assertEqual([e.message.role for e in history.read_after(session_b)], ["user"])
-                self.assertEqual(runner.sent[b], [])
+                self.assertEqual(runner.sent[sb], [])
                 self.assertEqual(model.calls, [(True, ("first B",))])
                 # 工具轮次之间吸收排队的用户输入时也只等当前事务。
                 runner.messages[b].append(_message("during_tool", b, sb, "during tool B", stamp=101_100))
@@ -840,7 +506,7 @@ class FeishuPrivateTests(unittest.IsolatedAsyncioTestCase):
                 await _eventually(lambda: len(attempts["tool_input"]) >= 2)
                 self.assertEqual(model.calls, [(True, ("first B",))])
                 blocked.remove("tool_input")
-                await _eventually(lambda: len(runner.sent[b]) >= 2)
+                await _eventually(lambda: len(runner.sent[sb]) >= 2)
                 tool = next(e.message for e in history.read_after(session_b) if e.message.role == "tool")
                 accepted = json.loads(tool.content)
                 delegation_id = accepted["delegation_id"]
@@ -857,9 +523,9 @@ class FeishuPrivateTests(unittest.IsolatedAsyncioTestCase):
                 await _eventually(lambda: len(attempts["result_input"]) >= 2 and len(attempts["mark"]) >= 2)
                 self.assertEqual(history.agent_run(run_id).status, "completed")
                 self.assertIsNone(history.agent_run(run_id).reply_enqueued_at)
-                self.assertEqual(runner.sent[b], ["tool-stage B", "reply: during tool B"])
+                self.assertEqual(runner.sent[sb], ["tool-stage B", "reply: during tool B"])
                 blocked.remove("result_input")
-                await _eventually(lambda: "returned B" in runner.sent[b])
+                await _eventually(lambda: "returned B" in runner.sent[sb])
                 # 标记仍锁住时，主 Runtime 已能消费回投；释放标记不能重复回投。
                 self.assertIsNone(history.agent_run(run_id).reply_enqueued_at)
                 blocked.remove("mark")
@@ -867,7 +533,7 @@ class FeishuPrivateTests(unittest.IsolatedAsyncioTestCase):
 
                 delegate.assert_awaited_once()
                 self.assertEqual(len(model.calls), 4)  # 主会话三轮、子会话一轮
-                self.assertEqual(runner.sent[b], ["tool-stage B", "reply: during tool B", "returned B"])
+                self.assertEqual(runner.sent[sb], ["tool-stage B", "reply: during tool B", "returned B"])
                 self.assertEqual([e.message.role for e in history.read_after(session_b)],
                                  ["user", "assistant", "tool", "user", "assistant", "user", "assistant"])
                 self.assertEqual([e.message.content for e in history.read_after(child)], ["child B", "reply: child B"])
@@ -876,56 +542,6 @@ class FeishuPrivateTests(unittest.IsolatedAsyncioTestCase):
                     self.assertTrue(all(args == committed[stage][0] for args in attempts[stage]), stage)
                 outcome, rows = attempts["tool_reply"][0][0]
                 self.assertTrue(all(args[0] is outcome and args[1] is rows for args, _ in attempts["tool_reply"]))
-
-    async def test_route_revocation_cancels_uncommitted_reply_even_if_storage_stays_locked(self):
-        a, b, _ = _CHATS
-        sa, sb, _ = _SENDERS
-        session_a = "feishu-private:" + sha256(sa.encode()).hexdigest()
-        runner, model, clock = self.runner, _Model(), [100.25]
-        chats = [_chat(a, sa), _chat(b, sb)]
-        runner.pages = {None: (chats, None)}
-        attempts, shutdowns = [], []
-        with closing(History(":memory:")) as history:
-            finalize, interrupt = history.finalize_reply, history.interrupt_agent_tree
-
-            def commit(outcome, rows):
-                if outcome.session_id == session_a and rows[0].content == "reply: cancelled A":
-                    attempts.append(outcome.reply_id)
-                    raise sqlite3.OperationalError("database is locked")
-                return finalize(outcome, rows)
-
-            def interrupt_jobs(agent_id, *, reason):
-                if history.agent(agent_id).session_id == session_a and reason == "shutdown":
-                    shutdowns.append(agent_id)
-                    raise sqlite3.OperationalError("database is locked")
-                return interrupt(agent_id, reason=reason)
-
-            with (patch.object(history, "finalize_reply", side_effect=commit),
-                  patch.object(history, "interrupt_agent_tree", side_effect=interrupt_jobs),
-                  patch("agent_companion.runtime.sqlite_access._LOCK_RETRIES", 5),
-                  self.assertLogs("agent_companion.feishu_private", level="WARNING") as logs):
-                async with _serve_private(self.settings, history, model, runner, clock):
-                    await _eventually(lambda: runner.queries)
-                    runner.messages[a] = [_message("cancelled", a, sa, "cancelled A")]
-                    clock[0] = 101.0
-                    await _eventually(lambda: len(attempts) >= 2)
-                    runner.messages[a].append(_message("pending", a, sa, "pending A", stamp=101_100))
-                    clock[0] = 102.0
-                    await _eventually(lambda: history.pending_inbound(session_a, "feishu-private"))
-                    runner.pages = {None: ([_chat(b, sb)], None)}
-                    await _eventually(lambda: shutdowns)
-                    stopped = len(attempts)
-                    runner.messages[b] = [_message("survived", b, sb, "surviving B", stamp=102_100)]
-                    clock[0] = 103.0
-                    await _eventually(lambda: runner.sent[b] == ["reply: surviving B"])
-                    self.assertFalse(runner.sent[a])
-                    # 再验证成功证明旧路由已收尾；重开只处理仍待移交的批次。
-                    runner.pages = {None: (chats, None)}
-                    await _eventually(lambda: runner.sent[a] == ["reply: pending A"])
-                    self.assertEqual(len(attempts), stopped)
-                    self.assertEqual([e.message.content for e in history.read_after(session_a)],
-                                     ["cancelled A", "pending A", "reply: pending A"])
-                self.assertTrue(any("cleanup storage busy" in line for line in logs.output))
 
     async def test_real_sqlite_read_lock_retries_only_completed_child_result(self):
         release_child = asyncio.Event()
@@ -940,7 +556,6 @@ class FeishuPrivateTests(unittest.IsolatedAsyncioTestCase):
         b, sb = _CHATS[1], _SENDERS[1]
         session = "feishu-private:" + sha256(sb.encode()).hexdigest()
         runner, model, clock = self.runner, PausedChild(), [100.25]
-        runner.pages = {None: ([_chat(b, sb)], None)}
         failures = []
         with TemporaryDirectory() as tmp:
             database = Path(tmp) / "result.db"
@@ -964,10 +579,10 @@ class FeishuPrivateTests(unittest.IsolatedAsyncioTestCase):
                 with (patch.object(history, "finalize_reply", side_effect=commit),
                       patch.object(history, "run_delegation_ids", side_effect=read_result)):
                     async with _serve_private(self.settings, history, model, runner, clock):
-                        await _eventually(lambda: runner.queries)
+                        await runner.verified.wait()
                         runner.messages[b] = [_message("delegate", b, sb, "first B")]
                         clock[0] = 101.0
-                        await _eventually(lambda: runner.sent[b] == ["delegated B"])
+                        await _eventually(lambda: runner.sent[sb] == ["delegated B"])
                         tool = next(e.message for e in history.read_after(session) if e.message.role == "tool")
                         accepted = json.loads(tool.content)
                         child = history.agent(accepted["agent_id"]).session_id
@@ -977,11 +592,11 @@ class FeishuPrivateTests(unittest.IsolatedAsyncioTestCase):
                             release_child.set()
                             await _eventually(lambda: len(failures) >= 2)
                             self.assertEqual(set(failures), {(run_id, sqlite3.SQLITE_BUSY)})
-                            self.assertEqual(runner.sent[b], ["delegated B"])
+                            self.assertEqual(runner.sent[sb], ["delegated B"])
                         finally:
                             blocker.rollback()
-                        await _eventually(lambda: "returned B" in runner.sent[b])
-                        self.assertEqual(runner.sent[b], ["delegated B", "returned B"])
+                        await _eventually(lambda: "returned B" in runner.sent[sb])
+                        self.assertEqual(runner.sent[sb], ["delegated B", "returned B"])
                         self.assertEqual(len(model.calls), 4)
                         self.assertEqual(sum(not tools for tools, _ in model.calls), 1)
                         self.assertEqual([outcome.run_id for outcome in history.outcomes(child)], [run_id])
@@ -998,7 +613,6 @@ class FeishuPrivateTests(unittest.IsolatedAsyncioTestCase):
         a, sa = _CHATS[0], _SENDERS[0]
         session = "feishu-private:" + sha256(sa.encode()).hexdigest()
         runner, model, clock = self.runner, _Model(), [100.25]
-        runner.pages = {None: ([_chat(a, sa)], None)}
         failures = []
         with TemporaryDirectory() as tmp:
             database = Path(tmp) / "commit.db"
@@ -1015,7 +629,7 @@ class FeishuPrivateTests(unittest.IsolatedAsyncioTestCase):
 
                 with patch.object(history, "finalize_reply", side_effect=commit):
                     async with _serve_private(self.settings, history, model, runner, clock):
-                        await _eventually(lambda: runner.queries)
+                        await runner.verified.wait()
                         runner.messages[a] = [_message("held", a, sa, "first A")]
                         clock[0] = 101.0
                         await asyncio.wait_for(model.a_waiting.wait(), 3)
@@ -1026,10 +640,10 @@ class FeishuPrivateTests(unittest.IsolatedAsyncioTestCase):
                             model.release_a.set()
                             await _eventually(lambda: len(failures) >= 2)
                             self.assertEqual([e.message.content for e in history.read_after(session)], ["first A"])
-                            self.assertEqual(runner.sent[a], [])
+                            self.assertEqual(runner.sent[sa], [])
                         finally:
                             reader.rollback()
-                        await _eventually(lambda: runner.sent[a] == ["reply: first A"])
+                        await _eventually(lambda: runner.sent[sa] == ["reply: first A"])
                         self.assertEqual([e.message.content for e in history.read_after(session)],
                                          ["first A", "reply: first A"])
                         self.assertEqual(model.calls, [(True, ("first A",))])
@@ -1040,7 +654,6 @@ class FeishuPrivateTests(unittest.IsolatedAsyncioTestCase):
     async def test_runtime_preserves_the_non_lock_failure_path(self):
         a, sa = _CHATS[0], _SENDERS[0]
         runner, model, clock = self.runner, _Model(), [100.25]
-        runner.pages = {None: ([_chat(a, sa)], None)}
         error = sqlite3.OperationalError("database is locked")
         error.sqlite_errorcode = sqlite3.SQLITE_IOERR
         failures = []
@@ -1056,20 +669,19 @@ class FeishuPrivateTests(unittest.IsolatedAsyncioTestCase):
             with (patch.object(history, "finalize_reply", side_effect=commit),
                   self.assertLogs("agent_companion.runtime.engine", level="ERROR") as logs):
                 async with _serve_private(self.settings, history, model, runner, clock):
-                    await _eventually(lambda: runner.queries)
+                    await runner.verified.wait()
                     runner.messages[a] = [_message("failing", a, sa, "failing A")]
                     clock[0] = 101.0
                     await _eventually(lambda: logs.output)
                     runner.messages[a].append(_message("next", a, sa, "next A", stamp=101_100))
                     clock[0] = 102.0
-                    await _eventually(lambda: runner.sent[a] == ["reply: next A"])
+                    await _eventually(lambda: runner.sent[sa] == ["reply: next A"])
                     self.assertEqual(len(failures), 1)
                 self.assertTrue(any("OperationalError" in line for line in logs.output))
 
     async def test_non_lock_sqlite_error_is_not_retried_as_poll_contention(self):
         a, sa = _CHATS[0], _SENDERS[0]
         runner = self.runner
-        runner.pages = {None: ([_chat(a, sa)], None)}
         runner.messages[a] = [_message("fatal", a, sa, "no retry")]
         error = sqlite3.OperationalError("database is locked")
         error.sqlite_errorcode = sqlite3.SQLITE_IOERR
@@ -1079,7 +691,7 @@ class FeishuPrivateTests(unittest.IsolatedAsyncioTestCase):
         locked.sqlite_errorcode = sqlite3.SQLITE_LOCKED_SHAREDCACHE
         self.assertTrue(is_sqlite_lock_error(locked))
         with (closing(History(":memory:")) as history,
-              patch.object(history, "record_inbound", side_effect=error) as record,
+              patch.object(history, "record_feishu_window", side_effect=error) as record,
               patch("agent_companion.app.time", return_value=100.25),
               patch("agent_companion.feishu_private.time", return_value=101.0),
               self.assertLogs("agent_companion.channels.feishu.channel", level="ERROR") as logs):
