@@ -8,6 +8,7 @@ import unittest
 from unittest.mock import patch
 
 from agent_companion.protocol import DeliveryStatus
+from agent_companion.speech.asr import AsrError
 from agent_companion.speech.vad import INPUT_BYTES, INPUT_RATE, SAMPLE_BYTES
 from agent_companion.speech.voice import VoiceChannel
 
@@ -447,22 +448,45 @@ class StreamingVoiceTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(live.calls), 1)
         self.assertEqual(voice._pending, 0)
 
+    async def test_failed_transcript_logs_safe_reason_phase_and_endpoint_turn(self):
+        async def fail_after_eof(frames, chunks):
+            await _read(frames, chunks)
+            raise AsrError("asr_empty_transcript", phase="finish")
+
+        async with _channel(fail_after_eof) as (voice, frames, _, _, events):
+            with self.assertLogs("agent_companion.speech.voice", "DEBUG") as captured:
+                frames.push(True, 3)
+                _finish(voice, frames)
+                await _until(lambda: not voice._input_active)
+            endpoint, failed = captured.records
+            self.assertEqual((endpoint.levelname, failed.levelname), ("DEBUG", "WARNING"))
+            turn, _ = endpoint.args
+            self.assertEqual(failed.getMessage(), f"voice streaming transcription failed; turn={turn}"
+                                                 " reason=asr_empty_transcript phase=finish")
+            self.assertEqual(_texts(events), [])
+
     async def test_adapter_failure_or_premature_success_drops_only_its_turn(self):
         async def fail(frames, chunks):
             chunks.append(await anext(frames))
             raise ValueError("不应记录的响应内容")
 
+        async def unknown(frames, chunks):
+            chunks.append(await anext(frames))
+            raise AsrError("不应记录的错误码", phase="不应记录的阶段")
+
         async def early(frames, chunks):
             chunks.append(await anext(frames))
             return "不完整合成文本"
 
-        for handler in (fail, early):
+        for handler, reason in ((fail, "asr_failed"), (unknown, "asr_failed"), (early, "asr_premature_result")):
             async with _channel(handler) as (voice, frames, live, _, events):
                 with self.assertLogs("agent_companion.speech.voice", "WARNING") as captured:
                     frames.push(True, 3)
                     await _until(lambda: len(live.calls) == 1 and voice._pending == 0)
                     _finish(voice, frames)
-                self.assertNotIn("不应记录", captured.output[0])
+                warning, = captured.output
+                self.assertTrue(warning.endswith(f" reason={reason} phase=-"))
+                self.assertNotIn("不应记录", warning)
                 self.assertEqual(_texts(events), [])
                 frames.push(True, 3)
                 _finish(voice, frames)

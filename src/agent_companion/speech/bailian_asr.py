@@ -1,7 +1,8 @@
 """百炼 ASR：文件和实时 PCM 共用一个 WebSocket 任务协议。"""
 
 import asyncio
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 import io
 import struct
@@ -10,7 +11,7 @@ import wave
 from websockets.exceptions import InvalidStatus, WebSocketException
 
 from ..config import require_asr_audio_seconds, require_seconds
-from .asr import MAX_AUDIO_BYTES, ASRCapabilities, AsrError, AudioFile
+from .asr import MAX_AUDIO_BYTES, ASRCapabilities, AsrError, AsrPhase, AudioFile
 from .bailian_ws import ASR_MODEL, MAX_EVENTS, BailianConnection, InvalidEvent, SpeechTask, TaskFailed
 
 
@@ -205,6 +206,23 @@ def _reap(worker: asyncio.Task) -> None:
         worker.exception()
 
 
+@contextmanager
+def _asr_errors(phase: AsrPhase) -> Iterator[None]:
+    """将网络或协议异常转成固定诊断类别，不保留异常原文。"""
+    try:
+        yield
+    except TimeoutError:
+        raise AsrError("asr_timeout", phase=phase) from None
+    except InvalidStatus as exc:
+        raise AsrError(f"asr_http_{exc.response.status_code}", phase=phase) from None
+    except (OSError, WebSocketException):
+        raise AsrError("asr_transport", phase=phase) from None
+    except InvalidEvent:
+        raise AsrError("asr_invalid_response", phase=phase) from None
+    except TaskFailed:
+        raise AsrError("asr_business_error", phase=phase) from None
+
+
 class BailianASR:
     def __init__(self, connection: BailianConnection, *, timeout: float, max_audio_seconds: float,
                  model: str = ASR_MODEL, file_upload_bytes_per_second: int = 128_000) -> None:
@@ -279,24 +297,15 @@ class BailianASR:
             self._live_upload = None
 
     async def _transcribe(self, frames: AsyncIterator[bytes], audio_format: str, upload: _Upload) -> str:
-        try:
+        with _asr_errors("connect"):
             async with self._connection._open(self._timeout) as socket:
                 task = SpeechTask(socket)
-                await task.start("asr", "recognition", self._model, {
-                    "format": audio_format, "sample_rate": _SAMPLE_RATE,
-                    "intermediate_result_enabled": False,
-                }, self._timeout)
+                with _asr_errors("start"):
+                    await task.start("asr", "recognition", self._model, {
+                        "format": audio_format, "sample_rate": _SAMPLE_RATE,
+                        "intermediate_result_enabled": False,
+                    }, self._timeout)
                 return await self._exchange(task, frames, audio_format, upload)
-        except TimeoutError:
-            raise AsrError("asr_timeout") from None
-        except InvalidStatus as exc:
-            raise AsrError(f"asr_http_{exc.response.status_code}") from None
-        except (OSError, WebSocketException):
-            raise AsrError("asr_transport") from None
-        except InvalidEvent:
-            raise AsrError("asr_invalid_response") from None
-        except TaskFailed:
-            raise AsrError("asr_business_error") from None
 
     async def _exchange(self, task: SpeechTask, frames: AsyncIterator[bytes], audio_format: str,
                         upload: _Upload) -> str:
@@ -314,8 +323,9 @@ class BailianASR:
                 return text
             sender.result()
             assert upload.finish_by is not None
-            async with asyncio.timeout_at(upload.finish_by):
-                return await asyncio.shield(receiver)
+            with _asr_errors("finish"):
+                async with asyncio.timeout_at(upload.finish_by):
+                    return await asyncio.shield(receiver)
         finally:
             upload.stopped = True
             for worker in (sender, receiver):
@@ -332,22 +342,23 @@ class BailianASR:
             except StopAsyncIteration:
                 break
             except Exception:
-                raise AsrError("asr_input_failed") from None
+                raise AsrError("asr_input_failed", phase="send") from None
             if not isinstance(chunk, bytes) or not chunk or (audio_format == "pcm" and len(chunk) % 2):
-                raise AsrError("invalid_audio_chunk")
+                raise AsrError("invalid_audio_chunk", phase="send")
             length += len(chunk)
             if length > MAX_AUDIO_BYTES:
-                raise AsrError("invalid_audio_size")
+                raise AsrError("invalid_audio_size", phase="send")
             for offset in range(0, len(chunk), _PACKET_BYTES):
                 if not upload.can_send():
                     return
-                async with asyncio.timeout(self._timeout):
-                    await task.socket.send(chunk[offset:offset + _PACKET_BYTES])
+                with _asr_errors("send"):
+                    async with asyncio.timeout(self._timeout):
+                        await task.socket.send(chunk[offset:offset + _PACKET_BYTES])
                 await asyncio.sleep(0)  # send 可能同步完成，让接收协程有机会处理服务端失败。
         if not upload.can_send():
             return
         if not length:
-            raise AsrError("invalid_audio_size")
+            raise AsrError("invalid_audio_size", phase="send")
         # EOF 和入站消息可以同时就绪。先把执行权交给读端：websockets.recv 会连续
         # 取出已经可以读取的完整消息，不能把缓冲中的提前终止归到还未发送的 finish。
         await asyncio.sleep(0)
@@ -355,16 +366,18 @@ class BailianASR:
             return
         clock = asyncio.get_running_loop().time
         upload.finish_by = clock() + self._timeout
-        async with asyncio.timeout_at(upload.finish_by):
-            # 单个字符串帧写入传输后才等待排空，所以读端可先收到正常 task-finished；
-            # 但 _exchange 仍要确认本地 send 成功，才会交付文本。
-            await task.send("finish-task", {"input": {}})
-        if clock() >= upload.finish_by:
-            raise TimeoutError
+        with _asr_errors("finish"):
+            async with asyncio.timeout_at(upload.finish_by):
+                # 单个字符串帧写入传输后才等待排空，所以读端可先收到正常 task-finished；
+                # 但 _exchange 仍要确认本地 send 成功，才会交付文本。
+                await task.send("finish-task", {"input": {}})
+            if clock() >= upload.finish_by:
+                raise TimeoutError
 
     async def _receive_text(self, task: SpeechTask, upload: _Upload) -> str:
         try:
-            return await self._collect_text(task, upload)
+            with _asr_errors("receive"):
+                return await self._collect_text(task, upload)
         finally:
             # 在读取协程结束前关闭发送闸门，不依赖协调协程先得到调度。
             upload.stopped = True
@@ -380,12 +393,12 @@ class BailianASR:
                 if upload.finish_by is None:
                     raise InvalidEvent
                 if clock() >= upload.finish_by:
-                    raise TimeoutError
+                    raise AsrError("asr_timeout", phase="finish")
                 if unfinished or (sentences and max(sentences) != len(sentences)):
                     raise InvalidEvent
                 text = "\n".join(value for _, value in sorted(sentences.items()) if value)
                 if not text:
-                    raise AsrError("asr_empty_transcript")
+                    raise AsrError("asr_empty_transcript", phase="finish")
                 return text
             if event != "result-generated":
                 raise InvalidEvent
@@ -422,6 +435,6 @@ class BailianASR:
                 continue
             text_chars += len(text) + 1
             if text_chars > _MAX_TRANSCRIPT_CHARS:
-                raise AsrError("asr_response_limit")
+                raise AsrError("asr_response_limit", phase="receive")
             sentences[index] = text
-        raise AsrError("asr_response_limit")
+        raise AsrError("asr_response_limit", phase="receive")

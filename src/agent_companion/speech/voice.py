@@ -13,7 +13,7 @@ import wave
 
 from ..config import VoiceSettings, require_asr_audio_seconds
 from ..protocol import DeliveryStatus, Receipt, ReplyStream
-from .asr import MAX_AUDIO_BYTES, AudioFile, FileASR, StreamingASR
+from .asr import MAX_AUDIO_BYTES, AsrError, AudioFile, FileASR, StreamingASR
 from .audio import AudioDevice, AudioFormat
 from .playback import VoiceOutput
 from .tts import StreamingTTS
@@ -620,7 +620,7 @@ class VoiceChannel:
                 text = await streaming.transcribe_stream(turn.frames(monotonic))
                 # 适配器返回即验证；后台消费事后补到的停口或 EOF 不能使结果生效。
                 if turn.endpoint_at is None or not turn.exhausted:
-                    raise RuntimeError("streaming ASR returned before endpoint or EOF")
+                    raise AsrError("asr_premature_result")
                 return text
             finally:
                 request.finished_at = monotonic()
@@ -645,7 +645,7 @@ class VoiceChannel:
             if not task.done() or (request.finished_at is not None and request.finished_at >= deadline):
                 raise TimeoutError
         if task.cancelled():
-            raise RuntimeError("streaming ASR cancelled by adapter")
+            raise AsrError("asr_adapter_cancelled")
         text = task.result().strip()
         if not turn.started.done() or turn.started.result() >= start_deadline:
             raise TimeoutError
@@ -661,9 +661,12 @@ class VoiceChannel:
             if result is not None:
                 text, ready_at = result
         except TimeoutError:
-            _LOG.warning("voice streaming transcription deadline reached; turn=%s", turn.id)
-        except Exception:
-            _LOG.warning("voice streaming transcription failed; turn=%s", turn.id)
+            _LOG.warning("voice streaming transcription deadline reached; turn=%s reason=asr_timeout", turn.id)
+        except Exception as exc:
+            # 不记录异常原文；它可能来自服务端响应或携带用户转写内容。
+            reason, phase = (exc.diagnostic, exc.phase) if isinstance(exc, AsrError) else ("asr_failed", None)
+            _LOG.warning("voice streaming transcription failed; turn=%s reason=%s phase=%s",
+                         turn.id, reason, phase or "-")
         finally:
             self._stream_in_flight = None
             if not text:

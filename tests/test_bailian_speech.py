@@ -579,11 +579,18 @@ class BailianASRTests(unittest.IsolatedAsyncioTestCase):
                     await source_started.wait()
                     socket.sentence(1, "不得交付的残文")
                     socket.event(terminal)
-                    with self.assertRaisesRegex(AsrError, error):
+                    with self.assertRaisesRegex(AsrError, error) as raised:
                         await call
+                    self.assertEqual((raised.exception.diagnostic, raised.exception.phase), (error, "receive"))
                 self.assertTrue(source_ended.is_set())
                 self.assertTrue(socket.closed)
                 self.assertFalse(socket.finish.is_set())
+
+    async def test_connection_failure_has_safe_phase(self):
+        with patch.object(BailianConnection, "_open", side_effect=OSError("不应暴露的内容")):
+            with self.assertRaisesRegex(AsrError, "^asr_transport$") as raised:
+                await self.asr().transcribe_stream(_frames(b"\x00\x00"))
+        self.assertEqual((raised.exception.diagnostic, raised.exception.phase), ("asr_transport", "connect"))
 
     async def test_finish_cannot_succeed_if_local_send_fails(self):
         async def fail_finish(socket, _):
@@ -608,10 +615,12 @@ class BailianASRTests(unittest.IsolatedAsyncioTestCase):
             if socket.finish.is_set():
                 await asyncio.Future()
 
-        for socket in (_Socket(started=False), _Socket(on_send=block_audio), _Socket(on_send=block_finish), _Socket()):
+        for socket, phase in ((_Socket(started=False), "start"), (_Socket(on_send=block_audio), "send"),
+                              (_Socket(on_send=block_finish), "finish"), (_Socket(), "finish")):
             async with _using_socket(socket, timeout=1):
-                with self.assertRaisesRegex(AsrError, "^asr_timeout$"):
+                with self.assertRaisesRegex(AsrError, "^asr_timeout$") as raised:
                     await self.asr(timeout=0.025).transcribe_stream(_frames(b"\x00\x00"))
+                self.assertEqual((raised.exception.diagnostic, raised.exception.phase), ("asr_timeout", phase))
             self.assertTrue(socket.closed)
         socket = _Socket()
         with patch.object(BailianConnection, "_open", return_value=socket):

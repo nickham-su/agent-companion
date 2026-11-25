@@ -3,17 +3,41 @@
 from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
 import io
+import re
 import struct
-from typing import Protocol
+from typing import Literal, Protocol
 import wave
 
 
 # 本地单文件字节保护；非 WAV 的时长仍由服务端校验。
 MAX_AUDIO_BYTES = 50_000_000
+AsrPhase = Literal["connect", "start", "send", "receive", "finish"]
+_ASR_PHASES = frozenset({"connect", "start", "send", "receive", "finish"})
+_ASR_DIAGNOSTICS = frozenset({
+    "asr_adapter_cancelled", "asr_business_error", "asr_busy", "asr_empty_transcript", "asr_input_failed",
+    "asr_invalid_response", "asr_premature_result", "asr_response_limit", "asr_timeout", "asr_transport",
+    "asr_unsupported_audio_format", "invalid_audio_chunk", "invalid_audio_duration", "invalid_audio_size",
+    "invalid_wav", "unsupported_audio_format",
+})
 
 
 class AsrError(Exception):
     """已脱敏的文件格式、识别协议或传输错误。"""
+
+    def __init__(self, *args: object, phase: AsrPhase | None = None) -> None:
+        super().__init__(*args)
+        self._phase = phase
+
+    @property
+    def diagnostic(self) -> str:
+        code = self.args[0] if len(self.args) == 1 and type(self.args[0]) is str else ""
+        if code in _ASR_DIAGNOSTICS or re.fullmatch(r"asr_http_[1-5][0-9]{2}", code):
+            return code
+        return "asr_failed"
+
+    @property
+    def phase(self) -> AsrPhase | None:
+        return self._phase if type(self._phase) is str and self._phase in _ASR_PHASES else None
 
 
 @dataclass(frozen=True, slots=True)
