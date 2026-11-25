@@ -557,8 +557,92 @@ class RuntimeTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((first.model_status, first.delivery_status), ("complete", DeliveryStatus.PARTIAL))
         self.assertNotEqual(first.run_id, second.run_id)
         self.assertEqual(model.requests[1][0], [Message("user", "one"), Message("assistant", "first", (CALL,), replay=replay),
-                                               Message("tool", "tool result", tool_call_id=CALL.id),
-                                               Message("user", "two")])
+                                                Message("tool", "tool result", tool_call_id=CALL.id),
+                                                Message("user", "two")])
+
+    async def test_voice_interruption_blocks_queued_serial_tool(self):
+        for model_complete in (False, True):
+            with self.subTest(model_complete=model_complete):
+                started, release = asyncio.Event(), asyncio.Event()
+                queued = ToolCall("queued", SPEC.name, "{}")
+                invocations = []
+
+                async def script():
+                    yield TextDelta("first unconfirmed")
+                    yield ToolReady(CALL)
+                    yield ToolReady(queued)
+                    if not model_complete:
+                        await asyncio.Future()
+
+                async def tool(args, context):
+                    invocations.append(context.call_id)
+                    if context.call_id == CALL.id:
+                        started.set()
+                        await release.wait()
+                    return "tool result"
+
+                class Voice:
+                    async def deliver(self, reply):
+                        reply.select_voice_delivery()
+                        await anext(reply)
+                        await started.wait()
+                        # 锁释放与回执汇合竞争：等待者不能依赖 worker 已先结算回执。
+                        release.set()
+                        return Receipt(reply.info.reply_id, DeliveryStatus.PARTIAL, "first")
+
+                model = ScriptModel(script)
+                runtime, history = self.setup_runtime(model, Voice(), tools=Tools([Tool(SPEC, tool, serial_per_request=True)]))
+                runtime.submit_batch([Message("user", "one")])
+                await self.idle(runtime)
+                self.assertEqual(invocations, [CALL.id])
+                self.assertEqual(len(model.requests), 1)
+                self.assertEqual([row.message for row in history.read_after("main")][-2:], [
+                    Message("tool", "tool result", tool_call_id=CALL.id),
+                    Message("tool", '{"error":"tool_cancelled"}', tool_call_id=queued.id),
+                ])
+                outcome, = history.outcomes("main")
+                self.assertEqual(outcome.model_status, "complete" if model_complete else "model_interrupted")
+
+    async def test_runtime_shutdown_blocks_queued_serial_tool_at_lock_handoff(self):
+        for close_now in (False, True):
+            with self.subTest(close_now=close_now):
+                started, release = asyncio.Event(), asyncio.Event()
+                queued = ToolCall("queued", SPEC.name, "{}")
+                queued_result = asyncio.get_running_loop().create_future()
+                invocations = []
+
+                async def tool(args, context):
+                    invocations.append(context.call_id)
+                    if context.call_id == CALL.id:
+                        started.set()
+                        await release.wait()
+                    return "tool result"
+
+                tools = Tools([Tool(SPEC, tool, serial_per_request=True)])
+                execute = tools.execute
+
+                async def record(call, context, **options):
+                    result = await execute(call, context, **options)
+                    if call.id == queued.id:
+                        queued_result.set_result(result)
+                    return result
+
+                model = ScriptModel(events(ToolReady(CALL), ToolReady(queued)))
+                runtime, _ = self.setup_runtime(model, None, tools=tools)
+                with patch.object(tools, "execute", new=record):
+                    runtime.submit_batch([Message("user", "one")])
+                    await asyncio.wait_for(started.wait(), 2)
+                    release.set()
+                    if close_now:
+                        # 第一条释放锁后，close 先同步关停，再在等待者之后唤醒 worker 处理取消。
+                        closing = asyncio.create_task(runtime.close())
+                        self.addAsyncCleanup(asyncio.wait_for, closing, 2)
+                    else:
+                        runtime.stop_accepting()
+                    self.assertEqual(await asyncio.wait_for(queued_result, 2), '{"error":"tool_cancelled"}')
+                    await self.idle(runtime)
+                self.assertEqual(invocations, [CALL.id])
+                self.assertEqual(len(model.requests), 1)
 
     async def test_pure_tool_does_not_call_channel_and_records_failure(self):
         async def tool(args, context):

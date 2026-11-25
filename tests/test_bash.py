@@ -124,10 +124,10 @@ class BashExecutionTests(unittest.IsolatedAsyncioTestCase):
         )
         return launcher
 
-    async def _execute(self, *, workspace=True, **arguments):
+    async def _execute(self, *, workspace=True, request_locks=None, **arguments):
         call = _call("call", **arguments).call
         context = ToolContext("test-session", "run", call.id, False, workspace=self.workspace if workspace else None)
-        return json.loads(await self.tools.execute(call, context))
+        return json.loads(await self.tools.execute(call, context, request_locks=request_locks))
 
     async def test_bash_starts_in_workspace_with_minimal_env_and_reset_cwd(self):
         bash_env = self.root / "synthetic-bash-env"
@@ -467,6 +467,7 @@ class BashExecutionTests(unittest.IsolatedAsyncioTestCase):
 
     async def _check_group_confirmation_with_queued_command(self, confirmed, cancel):
         confirming, release, queued = (asyncio.Event() for _ in range(3))
+        request_locks = self.tools.request_locks()
         actual_confirm = bash_runtime._confirm_group_exit
 
         async def confirm(group):
@@ -478,14 +479,15 @@ class BashExecutionTests(unittest.IsolatedAsyncioTestCase):
 
         async def queued_command():
             queued.set()
-            return await self._execute(command="printf next")
+            return await self._execute(command="printf next", request_locks=request_locks)
 
         processes = []
         with (patch.object(bash_runtime, "_BLOCKED_WORKSPACES", set()),
               patch.object(bash_runtime._LOG, "warning") as warning,
               patch.object(bash_runtime, "_confirm_group_exit", side_effect=confirm),
               _record_processes(processes)):
-            first = asyncio.create_task(self._execute(command="/bin/sleep 20 >/dev/null 2>&1 & printf first"))
+            first = asyncio.create_task(self._execute(command="/bin/sleep 20 >/dev/null 2>&1 & printf first",
+                                                      request_locks=request_locks))
             second = None
             try:
                 await asyncio.wait_for(confirming.wait(), 2)
@@ -526,6 +528,7 @@ class BashExecutionTests(unittest.IsolatedAsyncioTestCase):
     async def test_startup_cancellation_reaps_before_allowing_next_command(self):
         actual_set_blocking = os.set_blocking
         actual_confirm = bash_runtime._confirm_group_exit
+        request_locks = self.tools.request_locks()
         entered, confirming, release = asyncio.Event(), asyncio.Event(), asyncio.Event()
         processes = []
 
@@ -543,12 +546,12 @@ class BashExecutionTests(unittest.IsolatedAsyncioTestCase):
 
         with (_record_processes(processes), patch.object(os, "set_blocking", side_effect=configure),
               patch.object(bash_runtime, "_confirm_group_exit", side_effect=confirm)):
-            first = asyncio.create_task(self._execute(command="exec /bin/sleep 20"))
+            first = asyncio.create_task(self._execute(command="exec /bin/sleep 20", request_locks=request_locks))
             second = None
             try:
                 await asyncio.wait_for(confirming.wait(), 2)
                 first.cancel()
-                second = asyncio.create_task(self._execute(command="printf next"))
+                second = asyncio.create_task(self._execute(command="printf next", request_locks=request_locks))
                 await asyncio.sleep(0)
                 self.assertFalse(first.done())
                 self.assertFalse(second.done())
@@ -608,8 +611,7 @@ class BashRuntimeTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(_results(model.requests[-1][0])["last"]["stdout"], output)
             self.assertEqual((self._workspace(self.user) / "fixture").read_text(), "marker")
 
-    async def test_roles_share_workspace_and_wait_while_other_user_runs_and_reply_can_use_bash(self):
-        child_requested = asyncio.Event()
+    async def test_bash_calls_serialize_only_within_one_model_request(self):
         workspace = self._workspace(self.user)
         other_user = ChannelUser("synthetic/channel:user B")
         other_workspace = self._workspace(other_user)
@@ -618,12 +620,12 @@ class BashRuntimeTests(unittest.IsolatedAsyncioTestCase):
             last = messages[-1]
             if last.content == "begin":
                 return (_call("main-bash", command="touch started; until [[ -e release ]]; do /bin/sleep 0.01; done; "
-                                                   "printf main > shared"),
+                                                   "printf main > shared", timeout=15),
+                        _call("main-next", command="touch second-ran; test -f shared && printf second >> shared"),
                         _call("delegate", name=DELEGATE_TOOL_NAME, agent="worker", prompt="child"))
             if last.content == "child":
-                child_requested.set()
-                return (_call("child-bash", command="if [[ -f shared ]]; then printf child >> shared; fi; "
-                                                    "touch child-ran"),)
+                return (_call("child-bash", command="until [[ -e started ]]; do /bin/sleep 0.01; done; "
+                                                    "test ! -e release && printf child > child-ran"),)
             if last.content == "other user":
                 return (_call("other-bash", command="printf other > shared"),)
             if last.role == "user" and last.content.startswith(AGENT_REPLY_PREFIX):
@@ -639,20 +641,21 @@ class BashRuntimeTests(unittest.IsolatedAsyncioTestCase):
                                   user=other_user) as (other, _)):
             runtime.submit_batch((Message("user", "begin"),))
             await _eventually(lambda: (workspace / "started").exists())
-            await asyncio.wait_for(child_requested.wait(), 3)
+            await _eventually(lambda: any("child-bash" in _results(messages) for messages, _ in model.requests))
+            self.assertEqual((workspace / "child-ran").read_text(), "child")
             other.submit_batch((Message("user", "other user"),))
             await asyncio.wait_for(other.wait_idle(), 3)
             self.assertEqual((other_workspace / "shared").read_text(), "other")
-            self.assertFalse((workspace / "child-ran").exists())
-            before_release = [messages[-1].content for messages, _ in model.requests]
-            self.assertEqual(before_release[:3], ["begin", "child", "other user"])
-            self.assertEqual(len(before_release), 4)  # 前两条各发一次；另一个用户自己完成工具续轮。
+            self.assertFalse((workspace / "second-ran").exists())
+            main_requests = [messages for messages, _ in model.requests
+                             if any(message.role == "user" and message.content == "begin" for message in messages)]
+            self.assertEqual(len(main_requests), 1)  # 主 Agent 仍在等本请求的两个 Bash 结果。
             (workspace / "release").touch()
             await _eventually(lambda: any("after-reply" in _results(messages) for messages, _ in model.requests))
             await asyncio.wait_for(runtime.wait_idle(), 3)
-        self.assertEqual((workspace / "shared").read_text(), "mainchild")
-        self.assertTrue((workspace / "child-ran").exists())
-        self.assertEqual(_results(model.requests[-1][0])["after-reply"]["stdout"], "mainchild")
+        self.assertTrue((workspace / "second-ran").exists())
+        self.assertEqual((workspace / "shared").read_text(), "mainsecond")
+        self.assertEqual(_results(model.requests[-1][0])["after-reply"]["stdout"], "mainsecond")
 
     async def test_timer_wakes_runtime_and_can_start_bash(self):
         def answer(messages, names):
@@ -680,12 +683,14 @@ class BashRuntimeTests(unittest.IsolatedAsyncioTestCase):
             async with running_agent(self.settings, self.history, model, _Channel(), session_id="stop-tree",
                                      roles={"main": AgentRole(None, (BASH_TOOL_NAME,))},
                                      user=self.user) as (runtime, tree):
+                request_locks = runtime._tools.request_locks()
+
                 async def execute(call_id, command):
                     call = _call(call_id, command=command, timeout=5).call
                     context = ToolContext(runtime.session_id, "run", call.id, True, workspace=runtime._workspace)
                     if call_id == "queued":
                         queued.set()
-                    return json.loads(await runtime._tools.execute(call, context))
+                    return json.loads(await runtime._tools.execute(call, context, request_locks=request_locks))
 
                 active = asyncio.create_task(execute("active", ": > started; until [[ -e release ]]; do "
                                                     "/bin/sleep 0.01; done; printf active"))
@@ -710,7 +715,8 @@ class BashRuntimeTests(unittest.IsolatedAsyncioTestCase):
                     await asyncio.gather(*tasks, return_exceptions=True)
 
     async def test_runtime_shutdown_cancels_and_reaps_active_bash(self):
-        model = _Model(lambda messages, names: (_call("run-long", command="touch started; exec /bin/sleep 20"),))
+        model = _Model(lambda messages, names: (_call("run-long", command="touch started; exec /bin/sleep 20"),
+                                                 _call("queued", command="touch queued-ran")))
         processes = []
         with _record_processes(processes), patch("os.killpg", wraps=os.killpg) as killpg:
             async with running_agent(self.settings, self.history, model, _Channel(), session_id="main", user=self.user,
@@ -721,4 +727,5 @@ class BashRuntimeTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(child.returncode, -signal.SIGKILL)
             self.assertEqual([call.args[1] for call in killpg.call_args_list if call.args[0] == child.pid and call.args[1]],
                              [signal.SIGKILL])
+        self.assertFalse((self._workspace(self.user) / "queued-ran").exists())
         self.assertEqual(len(model.requests), 1)

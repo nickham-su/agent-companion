@@ -22,7 +22,7 @@ from .compaction import Compactions
 from .context import Context
 from .model_deadline import ModelDeadline, model_deadline_at
 from .sqlite_access import SQLiteAccess
-from .tools import ToolContext, Tools
+from .tools import TOOL_CANCELLED, ToolContext, Tools
 
 
 _LOG = logging.getLogger(__name__)
@@ -383,6 +383,7 @@ class Runtime:
         text: list[str] = []
         reasoning: list[str] = []
         replay = None
+        request_locks = self._tools.request_locks()
         scheduled: dict[str, tuple[ToolCall, asyncio.Task[str]]] = {}
 
         def is_generated_prefix(prefix: str) -> bool:
@@ -414,6 +415,7 @@ class Runtime:
         has_user_channel = self._channel is not None
         model_complete = False
         reply_closed = False
+        voice_incomplete = False
         input_tokens: int | None = None
         accept_model_events = True
         reader_closing = False
@@ -434,6 +436,11 @@ class Runtime:
             receipt = self._read_receipt(reply, delivery)
             return (receipt is not None and receipt.status != DeliveryStatus.FULL
                     and is_generated_prefix(receipt.confirmed))
+
+        def can_start_serial_tool() -> bool:
+            # 工具拿锁可能先于 Runtime 汇合点恢复；直接检查投递任务的同步终态。
+            # 汇合后也尊重投递超时等不完整结算。
+            return not (self._closed or voice_incomplete or voice_interrupted())
 
         async def read_model() -> bool:
             nonlocal delivery, input_tokens, replay, read_deadline, reader_closing, model_complete
@@ -495,7 +502,10 @@ class Runtime:
                             context = ToolContext(self.session_id, run_id, call.id, has_user_input,
                                                   self.agent.agent_id if self.agent is not None else None,
                                                   has_agent_input, workspace=self._workspace)
-                            scheduled[call.id] = (call, loop.create_task(self._tools.execute(call, context)))
+                            scheduled[call.id] = (call, loop.create_task(
+                                self._tools.execute(call, context, request_locks=request_locks,
+                                                    can_start_serial=can_start_serial_tool),
+                            ))
             return True
 
         model_task: asyncio.Task[bool] | None = None
@@ -573,7 +583,7 @@ class Runtime:
             calls = tuple(call for call, _ in scheduled.values())
             if scheduled:
                 await asyncio.wait([task for _, task in scheduled.values()])
-            results = [Message("tool", '{"error":"tool_cancelled"}' if task.cancelled() else task.result(),
+            results = [Message("tool", TOOL_CANCELLED if task.cancelled() else task.result(),
                                  tool_call_id=call.id) for call, task in scheduled.values()]
             # 完整模型流的协议回放元数据可保留成套工具调用；适配器仍仅从确认正文回放文本。
             if model_status != "complete":

@@ -1,4 +1,4 @@
-"""在用户工作区中运行 Bash，按 Agent 树串行执行。"""
+"""在用户工作区中运行 Bash，同一次模型请求内串行执行。"""
 
 import asyncio
 from collections.abc import Coroutine
@@ -56,9 +56,8 @@ _SPEC = ToolSpec(
 
 class Bash:
     def __init__(self) -> None:
-        self._lock = asyncio.Lock()
         self._closed = False
-        self.tool = Tool(_SPEC, self._execute)
+        self.tool = Tool(_SPEC, self._execute, serial_per_request=True)
 
     def stop_accepting(self) -> None:
         """同步禁止新启动，不在此处取消已启动的工具。"""
@@ -77,14 +76,11 @@ class Bash:
         if context.workspace is None:
             return '{"error":"workspace_unavailable"}'
         if self._closed:
-            return _CLOSED_ERROR
-        async with self._lock:
-            if self._closed:
-                return _CLOSED_ERROR  # 等锁期间可能已经撤销路由。
-            workspace_key = context.workspace.directory
-            if workspace_key in _BLOCKED_WORKSPACES:
-                return _CLEANUP_ERROR
-            return await _run_command(command, workspace_key, timeout)
+            return _CLOSED_ERROR  # 等待本请求上一条调用期间可能已经撤销路由。
+        workspace_key = context.workspace.directory
+        if workspace_key in _BLOCKED_WORKSPACES:
+            return _CLEANUP_ERROR
+        return await _run_command(command, workspace_key, timeout)
 
 
 class _Child:

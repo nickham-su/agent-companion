@@ -66,7 +66,7 @@ class AgentTree:
         self._bindings: dict[str, _Binding] = {}
         self._closed = False
         self._workspace = workspace
-        self._bash = Bash()  # 每棵树仅一把锁，主 Agent 与所有子 Agent 共用。
+        self._bash = Bash()  # 主、子 Agent 共用关停状态，不共用执行锁。
         self._sqlite = SQLiteAccess(retry_locks=retry_sqlite_locks, stopped=lambda: self._closed)
         descriptions = {name: role.description for name, role in sorted(self._roles.items()) if name != "main"}
         # 没有可选角色时不展示工具，但仍为白名单内的显式复用返回准确错误。
