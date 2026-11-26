@@ -40,10 +40,14 @@ class ConfigError(ValueError):
 
 
 def normalize_openai_base_url(value: str | None) -> str:
-    """用于请求和回放范围的同一 HTTPS 基准地址。"""
-    if value is None:
-        return OPENAI_BASE_URL
-    error = "llm.base_url must be an HTTPS API base URL without credentials, query, or fragment"
+    """用于请求和回放范围的同一基准地址；默认使用 OpenAI 官方 HTTPS 端点。"""
+    return OPENAI_BASE_URL if value is None else _normalize_api_base_url(value, allow_http=True)
+
+
+def _normalize_api_base_url(value: str, *, allow_http: bool = False) -> str:
+    schemes = ("https", "http") if allow_http else ("https",)
+    scheme_label = "HTTP or HTTPS" if allow_http else "HTTPS"
+    error = f"llm.base_url must be a valid {scheme_label} API base URL without credentials, query, or fragment"
     if (not isinstance(value, str) or not 0 < len(value) <= 2048
             or any(char.isspace() or not char.isprintable() or char in "\\?#" for char in value)
             or re.search(r"%(?![0-9a-fA-F]{2})", value)):
@@ -51,14 +55,15 @@ def normalize_openai_base_url(value: str | None) -> str:
     try:
         split = urlsplit(value)
         hostname, port = split.hostname, split.port
-        if (split.scheme != "https" or not hostname or "@" in split.netloc
+        if (split.scheme not in schemes or not hostname or "@" in split.netloc
                 or split.netloc.endswith(":") or port == 0):
             raise ValueError
         url = httpx.URL(value)
         if split.netloc.startswith("["):
             # HTTPX 保留 IPv6 原拼写，规范化后等价地址使用同一指纹。
             url = url.copy_with(host=IPv6Address(hostname).compressed)
-        origin = url.copy_with(raw_path=b"/", port=None if port == 443 else port)
+        default_port = 443 if split.scheme == "https" else 80
+        origin = url.copy_with(raw_path=b"/", port=None if port == default_port else port)
         normalized = str(origin).removesuffix("/") + url.raw_path.decode("ascii").rstrip("/")
         if len(normalized) > 2048:
             raise ValueError
@@ -71,7 +76,7 @@ def normalize_minimax_base_url(value: str | None, region: str = "cn") -> str:
     if not isinstance(region, str) or region not in _MINIMAX_BASE_URLS:
         raise ConfigError("MiniMax Provider 的 region 必须是 cn 或 global")
     try:
-        return normalize_openai_base_url(_MINIMAX_BASE_URLS[region] if value is None else value)
+        return _normalize_api_base_url(_MINIMAX_BASE_URLS[region] if value is None else value)
     except ValueError:
         raise ConfigError("base_url 必须是无凭据、查询或片段的 HTTPS 地址") from None
 
@@ -136,7 +141,7 @@ class LLMProvider:
             try:
                 object.__setattr__(self, "base_url", normalize_openai_base_url(self.base_url))
             except ValueError:
-                raise ConfigError("base_url 必须是无凭据、查询或片段的 HTTPS 地址") from None
+                raise ConfigError("base_url 必须是无凭据、查询或片段的 HTTP 或 HTTPS 地址") from None
         elif self.base_url is not None:
             raise ConfigError("base_url 仅适用于 openai_responses 和 MiniMax LLM")
 

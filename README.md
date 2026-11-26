@@ -68,7 +68,7 @@ Bash 排查时看 `bash call finished`：记录结果类别、退出码和耗时
 
 升级旧配置时，删除 `[voice]` 的 `max_turn_seconds`，在 `asr_provider` 选中的 `[providers.<名称>.asr]` 中明确设置 `max_audio_seconds`（有限正数，单位为秒）。正式的 `text` 和 `voice` 模式都要填写；示例中的 `500` 是 `asr-1.0` 的参考值，使用其他模型时请按其接口限制填写。
 
-**只配置可信的 HTTPS 地址**：自定义服务会收到所选 Provider 的 API Key 和发送给模型的输入。地址不要包含凭据、查询参数或片段；客户端不跟随重定向。其他适配器不支持 `base_url`。
+`openai_responses` 可在可信内网或本机使用 HTTP，例如 `base_url = "http://127.0.0.1:8000/v1"`。服务必须支持 `POST /v1/responses` 的流式响应，仅支持 `/v1/chat/completions` 不行。**HTTP 不加密**，不要使用云端 API Key；仍须填写 `api_key`，服务无需认证时可以填写本地占位值。自定义服务会收到所选 Provider 的 Key 和模型输入；地址不能包含凭据、查询参数或片段，客户端不跟随重定向。MiniMax LLM 的 `base_url` 仍只允许 HTTPS。
 
 Responses 请求设置 `store: false` 并显式请求加密推理项，不使用 `previous_response_id`，也不主动请求可读推理摘要。请求正常完成后原样保存有效密文，之后只在原作用域（同一适配器、端点、模型、凭据与推理档位）按原生项顺序回传；压缩请求也遵守此规则。可读摘要若随协议返回，只作为私有回传字段，不是需要概括的内容。SQLite 中的私有回传记录与回复、工具结果和回执原子提交，客户端不主动把结构化私有协议字段写入正文、搜索、日志或会话摘要。不要共享历史数据库或提取并分享私有记录。
 

@@ -24,7 +24,8 @@ api_key = "your-deepseek-api-key"
 [providers.openai_default]
 adapter = "openai_responses"
 api_key = "your-openai-api-key"
-# base_url = "https://api.openai.com/v1"  # 可省略；仅设可信 HTTPS 地址，自定义服务会收到 Key 和模型输入
+# base_url = "https://api.openai.com/v1"  # 默认；不配置时使用官方地址
+# base_url = "http://127.0.0.1:8000/v1"  # 仅用于可信本机或内网的 Responses 服务；不要发送云端 Key
 
 [providers.minimax_llm]
 adapter = "minimax"

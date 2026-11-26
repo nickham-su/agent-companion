@@ -240,10 +240,11 @@ class OpenAIResponsesTests(unittest.IsolatedAsyncioTestCase):
     async def test_key_url_or_model_change_only_sends_common_history_without_decoding(self):
         base = "https://responses.example.invalid/gateway/v1"
         other_path = "https://responses.example.invalid/other/v1"
-        variants = ({"api_key": "synthetic-rotated"}, {"base_url": other_path},
-                    {"model": "other-model"})
-        for change in variants:
-            with self.subTest(field=next(iter(change))), closing(History(":memory:")) as history:
+        variants = (("key", {"api_key": "synthetic-rotated"}), ("path", {"base_url": other_path}),
+                    ("scheme", {"base_url": base.replace("https://", "http://", 1)}),
+                    ("model", {"model": "other-model"}))
+        for case, change in variants:
+            with self.subTest(case=case), closing(History(":memory:")) as history:
                 first = _Fixture(self, [_completed(_reason(), _answer("confirmed"))], endpoint=base + "/responses")
                 self.assertIsNone(await _complete(first, history, base_url=base))
                 settings = {"base_url": base, **change}
@@ -774,9 +775,11 @@ class OpenAIResponsesTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(all(value not in "".join(logs.output) for value in (_KEY, base, _CIPHER)))
 
     async def test_redirect_is_not_followed_even_with_client_defaults(self):
-        for destination in ("https://responses.example.invalid/elsewhere", "https://other.example.invalid/responses"):
-            with self.subTest(destination=destination):
-                base = "https://responses.example.invalid/v1"
+        for scheme, host in (("https", "responses.example.invalid"), ("https", "other.example.invalid"),
+                             ("http", "other.example.invalid")):
+            with self.subTest(scheme=scheme, host=host):
+                base = f"{scheme}://responses.example.invalid/v1"
+                destination = f"{scheme}://{host}/elsewhere"
                 fixture = _Fixture(self, httpx.Response(307, headers={"Location": destination}),
                                    endpoint=base + "/responses")
                 async with httpx.AsyncClient(transport=fixture.transport, follow_redirects=True,
@@ -859,7 +862,7 @@ class OpenAIResponsesTests(unittest.IsolatedAsyncioTestCase):
             "initial": default,
             "renamed": (_KEY, "https://responses.example.invalid/api", "fixture-model", "low"),
             "other_key": ("synthetic-rotation", *default[1:]),
-            "other_address": (_KEY, "https://other.example.invalid/api", *default[2:]),
+            "other_address": (_KEY, "HTTP://LOCALHOST:8000/v1///", *default[2:]),
             "other_model": (*default[:2], "other-model", "low"),
             "other_effort": (*default[:3], "future-value"),
         }
@@ -910,7 +913,7 @@ max_audio_seconds = 500
                     (agents / "main.md").write_bytes((header + role_body).encode("utf-8"))
                     settings = load_settings(config, for_run=True)
                     answer = (_reason(), _answer("old confirmed")) if name == "initial" else (_answer("follow-up"),)
-                    target = "https://other.example.invalid/api/responses" if name == "other_address" else endpoint
+                    target = "http://localhost:8000/v1/responses" if name == "other_address" else endpoint
                     fixture = _Fixture(self, [_completed(*answer)], api_key=key, endpoint=target)
                     with (patch("agent_companion.__main__.Path.cwd", return_value=config.parent),
                           patch("agent_companion.__main__.prepare_private_feishu", side_effect=prepare),
@@ -951,10 +954,20 @@ class LLMProviderTests(unittest.TestCase):
         llm = LLMProvider("openai_responses", "HTTPS://[2001:DB8::1]:8443/model/v1///", api_key=_KEY)
         self.assertEqual(llm.base_url, "https://[2001:db8::1]:8443/model/v1")
         self.assertNotIn("base_url", repr(llm))
-        for url in ("http://localhost/v1", "https://token@example.invalid/v1", "https://example.invalid/v1?",
+        for address, normalized in (("HTTP://LOCALHOST:80/v1///", "http://localhost/v1"),
+                                    ("http://127.0.0.1:8000/v1", "http://127.0.0.1:8000/v1"),
+                                    ("http://[0:0:0:0:0:0:0:1]:443/v1/", "http://[::1]:443/v1")):
+            with self.subTest(address=address):
+                self.assertEqual(LLMProvider("openai_responses", address).base_url, normalized)
+        for url in ("ftp://localhost/v1", "https://token@example.invalid/v1", "https://example.invalid/v1?",
                     "https://example.invalid/v1#", "https://example.invalid:65536/v1", "https://example.invalid:",
                     "https://example.invalid\\v1", "https://example.invalid/with space", "https:///v1",
-                    "https://example.invalid/" + "路" * 300):
+                    "https://example.invalid/" + "路" * 300, "http://user@localhost/v1",
+                    "http://localhost/v1?", "http://localhost/v1#"):
             with self.subTest(url=url), self.assertRaises(ValueError) as exc:
                 LLMProvider("openai_responses", url, api_key=_KEY)
             self.assertTrue(url not in str(exc.exception))
+
+    def test_minimax_base_url_still_requires_https(self):
+        with self.assertRaisesRegex(ValueError, "HTTPS"):
+            LLMProvider("minimax", "http://localhost/v1")
