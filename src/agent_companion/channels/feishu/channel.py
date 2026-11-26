@@ -1,7 +1,7 @@
 """飞书账号统一搜索私聊，文字回复、转写回显和通知独立发送。"""
 
 import asyncio
-from collections import defaultdict, deque
+from collections import Counter, defaultdict, deque
 from collections.abc import Callable
 from contextlib import nullcontext
 from dataclasses import dataclass, field
@@ -10,6 +10,7 @@ from hashlib import sha256
 import logging
 from sqlite3 import OperationalError
 from time import time
+from typing import Literal
 
 from ...protocol import ChannelUser, DeliveryStatus, Receipt, ReplyDelivery, ReplyInfo, ReplyStream
 from ...speech.asr import FileASR
@@ -191,23 +192,26 @@ def _chat_digest(chat_id: str) -> str:
     return sha256(chat_id.encode("ascii")).hexdigest()
 
 
-def _search_hit(row: object, account: ChannelUser) -> FeishuCandidate | None:
+_FilterReason = Literal["non_p2p", "unsupported_type", "bot_sender", "same_account", "out_of_window"]
+
+
+def _search_hit(row: object, account: ChannelUser) -> FeishuCandidate | _FilterReason:
     meta = row.get("meta_data") if isinstance(row, dict) else None
     if not isinstance(meta, dict) or type(meta.get("is_p2p_chat")) is not bool:
         raise CliError("cli_invalid_search_hit")
     if not meta["is_p2p_chat"]:
-        return None
+        return "non_p2p"
     kind = meta.get("type")
     if not isinstance(kind, str) or not kind:
         raise CliError("cli_invalid_search_hit")
     if kind not in SUPPORTED_TYPES:
-        return None
+        return "unsupported_type"
     sender = meta.get("from_id")
     if _valid_id(sender, "cli") or _valid_id(sender, "bot"):
-        return None
+        return "bot_sender"
     user = parse_open_id(sender)
     if user == account:
-        return None
+        return "same_account"
     mid, chat, stamp = meta.get("message_id"), meta.get("chat_id"), meta.get("create_time")
     if user is None or not _valid_id(mid, "om") or not _valid_id(chat, "oc") or not isinstance(stamp, str):
         raise CliError("cli_invalid_search_hit")
@@ -290,7 +294,7 @@ class _ScanWindow:
     oversized: int = 0
     pages: int = 0
     returned: int = 0
-    filtered: int = 0
+    filter_reasons: Counter[_FilterReason] = field(default_factory=Counter)
     duplicates: int = 0
     completed: bool = False
     failures: int = 0
@@ -347,11 +351,14 @@ class FeishuPoller:
                     self._window = window.restart()
                     raise CliError("cli_page_cycle")
                 page: dict[str, FeishuCandidate] = {}
-                filtered = 0
+                filter_reasons: Counter[_FilterReason] = Counter()
                 for row in items:
                     hit = _search_hit(row, self._account)
-                    if hit is None or not window.start <= hit.created_second < window.end:
-                        filtered += 1
+                    if isinstance(hit, str):
+                        filter_reasons[hit] += 1
+                        continue
+                    if not window.start <= hit.created_second < window.end:
+                        filter_reasons["out_of_window"] += 1
                         continue
                     mid = hit.message_id
                     previous = page.get(mid) or window.hits.get(mid)
@@ -377,8 +384,8 @@ class FeishuPoller:
             window.hits.update(page)
             window.pages += 1
             window.returned += len(items)
-            window.filtered += filtered
-            window.duplicates += len(items) - filtered - len(page)
+            window.filter_reasons.update(filter_reasons)
+            window.duplicates += len(items) - sum(filter_reasons.values()) - len(page)
             if token is None:
                 window.completed = True
                 return True
@@ -534,13 +541,17 @@ class FeishuPoller:
             raise
         finally:
             if debug:
+                filter_reasons = ",".join(f"{reason}:{count}" for reason, count in
+                                          sorted(window.filter_reasons.items())) or "none"
                 _LOG.debug("Feishu search window; outcome=%s stage=%s start_utc=%s end_utc=%s "
-                           "pages=%d returned=%d filtered=%d duplicates=%d elapsed_ms=%.0f category=%s api_code=%s",
+                           "pages=%d returned=%d filtered=%d duplicates=%d elapsed_ms=%.0f category=%s api_code=%s "
+                           "filter_reasons=%s",
                            outcome, stage, datetime.fromtimestamp(window.start, timezone.utc).isoformat(),
                            datetime.fromtimestamp(window.end, timezone.utc).isoformat(), window.pages,
-                           window.returned, window.filtered, window.duplicates,
+                           window.returned, sum(window.filter_reasons.values()), window.duplicates,
                            (asyncio.get_running_loop().time() - started) * 1000,
-                           cli_error.category if cli_error else None, cli_error.api_code if cli_error else None)
+                           cli_error.category if cli_error else None, cli_error.api_code if cli_error else None,
+                           filter_reasons)
 
     async def poll_once(self) -> None:
         async with self._poll_lock:
