@@ -743,6 +743,15 @@ class FeishuBackgroundDeliveryTests(unittest.IsolatedAsyncioTestCase):
 
 
 class FeishuPollingTests(unittest.IsolatedAsyncioTestCase):
+    async def test_search_window_diagnostics_are_off_by_default(self):
+        clock, runner = [110], _Runner()
+        cli = FeishuCLI("lark-cli", ChannelUser(_PEER), timeout=2, runner=runner)
+        with (closing(History(":memory:")) as history,
+              self.assertNoLogs("agent_companion.channels.feishu.channel", level="DEBUG")):
+            poller = _poller(history, lambda batch: None, cli, _ASR(), clock)
+            await poller.poll_once()
+        self.assertEqual([argv[3] for argv, _ in runner.calls], [_SEARCH])
+
     async def test_search_diagnostics_distinguish_empty_filtered_duplicate_and_recorded(self):
         clock, runner = [110], _Runner()
         cli = FeishuCLI("lark-cli", ChannelUser(_PEER), timeout=2, runner=runner)
@@ -754,6 +763,7 @@ class FeishuPollingTests(unittest.IsolatedAsyncioTestCase):
                           sender="cli_synthetic", sender_type="bot")),
                 _raw("om_unsupported", 115_000, "synthetic-private-kind", {"text": "unsupported"})]
         with (closing(History(":memory:")) as history,
+              patch("agent_companion.channels.feishu.channel._LOG_SEARCH_WINDOWS", True),
               self.assertLogs("agent_companion.channels.feishu.channel", level="DEBUG") as logs):
             poller = _poller(history, lambda batch: None, cli, _ASR(), clock)
             await poller.poll_once()
@@ -786,6 +796,7 @@ class FeishuPollingTests(unittest.IsolatedAsyncioTestCase):
 
         cli = FeishuCLI("lark-cli", ChannelUser(_PEER), timeout=2, runner=reject_details)
         with (closing(History(":memory:")) as history,
+              patch("agent_companion.channels.feishu.channel._LOG_SEARCH_WINDOWS", True),
               self.assertLogs("agent_companion.channels.feishu.channel", level="DEBUG") as logs):
             poller = _poller(history, lambda batch: None, cli, _ASR(), clock)
             with self.assertRaisesRegex(CliError, "^cli_rejected$"):
@@ -1017,6 +1028,8 @@ class FeishuPollingTests(unittest.IsolatedAsyncioTestCase):
     async def test_valid_id_with_wrong_sender_type_timestamp_or_body_is_not_routed(self):
         clock = [110]
         good = _raw("om_checked", 101_400, "text", {"text": "verified"})
+        hit = _hit(good)
+        hit["meta_data"]["type"] = "TEXT"  # 搜索返回大写，详情返回小写。
         variants = deque([
             {**good, "sender": {**good["sender"], "id": "ou_wrong"}},
             {**good, "sender": {**good["sender"], "sender_type": "app"}},
@@ -1028,7 +1041,7 @@ class FeishuPollingTests(unittest.IsolatedAsyncioTestCase):
 
         async def runner(argv, data, timeout):
             if argv[3] == _SEARCH:
-                return _success({"items": [_hit(good)], "has_more": False})
+                return _success({"items": [hit], "has_more": False})
             return _success({"items": [variants.popleft()]})
 
         cli = FeishuCLI("lark-cli", ChannelUser(_PEER), timeout=2, runner=runner)

@@ -113,7 +113,7 @@ python scripts/build_source_zip.py
 
 每个账号约每 10 秒执行一轮[全局搜索](https://open.feishu.cn/document/server-docs/im-v1/message/search)，用空关键词和一对一私聊、真人发送、固定时间窗口筛选。正常空闲时每轮只有一次搜索。水位回看 120 秒；消息若更晚才被搜索收录，仍可能漏收，没有旧轮询兜底。
 
-文字不回复时，设置 `log_level = "DEBUG"` 后重启，查找 `Feishu search window`：`outcome=ok` 且 `returned=0` 表示搜索成功但没有结果，`filtered`、`duplicates` 区分过滤与去重。若 `outcome=failed`，`stage` 指出失败阶段，有可用的 CLI 错误分类和错误码时也会记录。搜到新消息后，用 `Feishu inbox recorded` 的 `accepted`、`discarded`、`deferred` 看有多少条入库、跳过或等待重试。搜索时间范围用 UTC，不记录消息正文或飞书 ID。
+逐轮搜索摘要默认关闭，即使启用 `DEBUG` 也不输出。需要排查时，将 [`channel.py`](src/agent_companion/channels/feishu/channel.py) 的 `_LOG_SEARCH_WINDOWS` 改为 `True`，设置 `log_level = "DEBUG"` 并重启。`Feishu search window` 中，`outcome=ok` 且 `returned=0` 表示搜索成功但没有结果，`filtered`、`duplicates` 区分过滤与去重。若 `outcome=failed`，`stage` 指出失败阶段，有可用的 CLI 错误分类和错误码时也会记录。搜到新消息后，用 `Feishu inbox recorded` 的 `accepted`、`discarded`、`deferred` 看有多少条入库、跳过或等待重试。搜索时间范围用 UTC，不记录消息正文或飞书 ID。
 
 `filtered` 非零时，看同一行 `filter_reasons` 的原因计数：`non_p2p`（飞书未标记为一对一私聊）、`unsupported_type`（不支持的类型）、`bot_sender`（机器人发送）、`same_account`（登录账号自己发送）或 `out_of_window`（创建时间不在本轮范围内）。
 

@@ -22,6 +22,7 @@ from .messages import (MAX_BATCH_BYTES, NORMALIZE_ERRORS, SUPPORTED_TYPES, Batch
 
 
 _LOG = logging.getLogger(__name__)
+_LOG_SEARCH_WINDOWS = False  # 逐轮搜索摘要只在临时排查时启用。
 _POLL_SECONDS = 10
 _OVERLAP_SECONDS = 120
 _MAX_DETAIL_BATCHES = 10
@@ -204,6 +205,8 @@ def _search_hit(row: object, account: ChannelUser) -> FeishuCandidate | _FilterR
     kind = meta.get("type")
     if not isinstance(kind, str) or not kind:
         raise CliError("cli_invalid_search_hit")
+    # 搜索可能返回大写类型（TEXT），正文接口使用小写（text）。
+    kind = kind.lower()
     if kind not in SUPPORTED_TYPES:
         return "unsupported_type"
     sender = meta.get("from_id")
@@ -509,7 +512,7 @@ class FeishuPoller:
                     return
                 self._window = _ScanWindow(start, end)
         window = self._window
-        debug = _LOG.isEnabledFor(logging.DEBUG)
+        debug = _LOG_SEARCH_WINDOWS and _LOG.isEnabledFor(logging.DEBUG)
         started = asyncio.get_running_loop().time() if debug else 0.0
         stage, outcome = "search", "failed"
         cli_error = None
