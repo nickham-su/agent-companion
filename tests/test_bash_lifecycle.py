@@ -67,6 +67,46 @@ def _process(*, stdout=None):
 
 
 class BashChildLifecycleTests(unittest.IsolatedAsyncioTestCase):
+    async def test_rc_authorization_is_only_sent_before_deadline(self):
+        clock = asyncio.get_running_loop().time
+        for in_time in (True, False):
+            with self.subTest(in_time=in_time):
+                parent, child = bash._open_launch_status()
+                try:
+                    launch = bash._LaunchStatus(parent, clock() + (2 if in_time else 0))
+                    bash.os.write(child, bash.READY + bash.RC_PENDING + bash.RC_LOADED)
+                    launch.authorize()
+                    self.assertEqual(launch.authorized, in_time)
+                    bash.os.set_blocking(child, False)
+                    if in_time:
+                        self.assertEqual(bash.os.read(child, 1), bash.RC_RUN)
+                        launch.authorize()  # 不能发送第二份放行字节。
+                    with self.assertRaises(BlockingIOError):
+                        bash.os.read(child, 1)
+                finally:
+                    bash.os.close(child)
+                    bash.os.close(parent)
+
+    async def test_terminal_socket_reset_preserves_queued_status(self):
+        parent, child = bash._open_launch_status()
+        try:
+            deadline = asyncio.get_running_loop().time() + 1
+            pending = bash.READY + bash.RC_PENDING + bash.RC_LOADED
+            for finished in (False, True):
+                with self.subTest(finished=finished):
+                    launch = bash._LaunchStatus(parent, deadline)
+                    with patch.object(bash.os, "read", side_effect=[pending, ConnectionResetError()]):
+                        if finished:
+                            launch.read(finished=True)
+                            self.assertTrue(launch.eof)
+                        else:
+                            with self.assertRaises(ConnectionResetError):
+                                launch.read()
+                    self.assertEqual(launch.data, pending)
+        finally:
+            bash.os.close(child)
+            bash.os.close(parent)
+
     async def test_observation_and_reaping_failures_preserve_signal_order(self):
         for observations, wait_errno, error, order in (
             ([EIO, False], None, "bash_io_failed", ["observe", "observe", "kill", "reap", "confirm"]),

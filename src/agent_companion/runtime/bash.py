@@ -1,7 +1,7 @@
 """在用户工作区中运行 Bash，同一次模型请求内串行执行。"""
 
 import asyncio
-from collections.abc import Coroutine
+from collections.abc import Callable, Coroutine
 from errno import ECHILD, EPERM, ESRCH
 import fcntl
 import json
@@ -9,13 +9,15 @@ import logging
 import os
 from pathlib import Path
 import signal
+import socket
 import subprocess
 import sys
 from time import monotonic
 from typing import Any
 
 from ..protocol import ToolSpec
-from ._bash_launcher import READY, WORKSPACE_ERROR
+from ._bash_launcher import (RC_FAILED, RC_FDS_UNAVAILABLE, RC_HANDOFF, RC_LOADED, RC_PENDING, RC_RUN, RC_SYMLINK,
+                             RC_UNREADABLE, READY, WORKSPACE_ERROR)
 from ._child_exit import child_exited
 from .tools import Tool, ToolContext
 
@@ -25,7 +27,8 @@ _LOG = logging.getLogger(__name__)
 _DEFAULT_TIMEOUT = 30
 _MAX_TIMEOUT = 120
 _MAX_COMMAND_BYTES = 32 * 1024
-_MAX_OUTPUT_BYTES = 32 * 1024  # stdout / stderr 合计，按原始字节计算。
+_MAX_OUTPUT_BYTES = 10 * 1024 * 1024  # stdout / stderr 合计，按原始字节计算。
+_OUTPUT_READ_SIZE = 64 * 1024
 _PIPE_CLOSE_GRACE = 0.25
 _CHILD_POLL_INTERVAL = 0.01
 _GROUP_CLOSE_TIMEOUT = 1.0
@@ -74,7 +77,7 @@ class Bash:
             _log_result(context, started, {"error": "tool_failed"})
             raise
         _log_result(context, started, result)
-        return json.dumps(result, separators=(",", ":") if "error" in result else None)
+        return json.dumps(result, ensure_ascii=False, separators=(",", ":") if "error" in result else None)
 
     async def _execute_command(self, args: dict[str, Any], context: ToolContext) -> dict[str, Any]:
         command, timeout = args.get("command"), args.get("timeout", _DEFAULT_TIMEOUT)
@@ -184,7 +187,8 @@ class _Child:
                 self._lose_ownership()
             raise
 
-    async def collect(self, deadline: float) -> None:
+    async def collect(self, deadline: float, *, drain_excess: bool = False,
+                      authorize: Callable[[], None] | None = None) -> None:
         pipes = [(stream.fileno(), output) for stream, output in
                  ((self.process.stdout, self.stdout), (self.process.stderr, self.stderr)) if stream is not None]
         for fd, _ in pipes:
@@ -202,20 +206,27 @@ class _Child:
                 if exited:
                     self.stop(verified=True)  # 不回收组长，先终止仍持有管道的同组进程。
                     pipe_deadline = now + _PIPE_CLOSE_GRACE
+                elif authorize is not None:
+                    authorize()
             elif now >= pipe_deadline:
                 return
 
+            progress = False
             for fd, output in tuple(pipes):
                 room = self.output_limit - len(self.stdout) - len(self.stderr)
                 try:
-                    data = os.read(fd, room + 1)
+                    data = os.read(fd, _OUTPUT_READ_SIZE if drain_excess else room + 1)
                 except BlockingIOError:
                     continue
                 if not data:
                     pipes.remove((fd, output))
                     continue
+                progress = True
                 output.extend(data[:room])
                 if len(data) > room:
+                    if drain_excess:
+                        self.output_limit_exceeded = True
+                        continue
                     if pipe_deadline is None and clock() >= deadline:
                         self.timed_out = True
                     else:
@@ -225,7 +236,9 @@ class _Child:
             if pipe_deadline is not None and self.pipes_drained:
                 return
             wake = deadline if pipe_deadline is None else pipe_deadline
-            await asyncio.sleep(max(0, min(_CHILD_POLL_INTERVAL, wake - clock())))
+            # 两路每次各读一块，活跃时继续排空但让出事件循环；探测器仍按原节奏。
+            await asyncio.sleep(0 if drain_excess and progress
+                                else max(0, min(_CHILD_POLL_INTERVAL, wake - clock())))
 
     async def reap(self) -> bool:
         self.stop()
@@ -366,11 +379,12 @@ async def _finish_command(child: _Child, workspace_key: Path) -> bool:
 
 
 def _open_launch_status() -> tuple[int, int]:
-    status_read, status_write = os.pipe()
+    parent, child = socket.socketpair()
+    status_read, status_write = parent.detach(), child.detach()
     if status_write >= 3:
         return status_read, status_write
 
-    # 服务可能没有完整的标准描述符。只搬移要传给助手的写端，避免被 Popen 重定向覆盖。
+    # 服务可能没有完整的标准描述符。只搬移传给助手的一端，避免被 Popen 重定向覆盖。
     moved_write = None
     try:
         try:
@@ -387,24 +401,53 @@ def _open_launch_status() -> tuple[int, int]:
     return status_read, moved_write
 
 
-def _read_launch_status(fd: int) -> bytes | None:
-    # 助手至多写两个字节，正常 exec 或退出会关闭写端。没有 EOF 也视为异常。
-    os.set_blocking(fd, False)
-    status = b""
-    try:
-        while len(status) < 3:
-            data = os.read(fd, 3 - len(status))
+class _LaunchStatus:
+    """Bash 启动握手，与 stdout / stderr 无关；不等待脚本子进程关闭描述符。"""
+
+    def __init__(self, fd: int, deadline: float) -> None:
+        self.fd = fd
+        self.deadline = deadline
+        self.data = b""
+        self.eof = self.authorized = False
+        os.set_blocking(fd, False)
+
+    def read(self, *, finished: bool = False) -> None:
+        # 最多四个状态字节；额外的第五个字节只用于识别非法状态。
+        while not self.eof and len(self.data) < 5:
+            try:
+                data = os.read(self.fd, 5 - len(self.data))
+            except BlockingIOError:
+                break
+            except ConnectionResetError:
+                if not finished:
+                    raise
+                # 对端在收尾前没读完放行字节时，关闭套接字可能表现为 reset。
+                self.eof = True
+                break
             if not data:
-                return status
-            status += data
-    except BlockingIOError:
-        pass
-    return None
+                self.eof = True
+                break
+            self.data += data
+
+    def authorize(self) -> None:
+        if self.authorized or self.eof:
+            return
+        self.read()
+        if self.eof or self.data != READY + RC_PENDING + RC_LOADED:
+            return
+        if asyncio.get_running_loop().time() >= self.deadline:
+            return
+        # 只有在时限内完成 rc 握手才放行命令。超时清理前即使脚本刚好结束也不会运行命令。
+        try:
+            os.write(self.fd, RC_RUN)
+        except (BrokenPipeError, BlockingIOError, ConnectionResetError):
+            return
+        self.authorized = True
 
 
 async def _run_command(command: str, workspace_key: Path, timeout: int) -> dict[str, Any]:
     deadline = asyncio.get_running_loop().time() + timeout
-    # 私有管道区分准备失败和 Bash 自身的非零退出；不占用 stdout / stderr。
+    # 私有状态通道区分准备、bashrc 和命令阶段；不占用 stdout / stderr。
     try:
         status_read, status_write = _open_launch_status()
     except OSError:
@@ -419,7 +462,8 @@ async def _run_command(command: str, workspace_key: Path, timeout: int) -> dict[
                                pass_fds=(status_write,))
             finally:
                 os.close(status_write)
-            await child.collect(deadline)
+            launch = _LaunchStatus(status_read, deadline)
+            await child.collect(deadline, drain_excess=True, authorize=launch.authorize)
         except OSError:
             if child is None:
                 return {"error": "bash_start_failed"}
@@ -435,20 +479,39 @@ async def _run_command(command: str, workspace_key: Path, timeout: int) -> dict[
             return {"error": _CLEANUP_ERROR}
         if child.io_failed:
             return {"error": "bash_io_failed"}
-        status = _read_launch_status(status_read)
-        if not child.timed_out:
-            if status == WORKSPACE_ERROR:
-                return {"error": "workspace_unavailable"}
-            if status != READY:
-                return {"error": "bash_start_failed"}
+        launch.read(finished=True)
+        status = launch.data
+        rc_error = {RC_UNREADABLE: "unreadable", RC_SYMLINK: "symlink", RC_FDS_UNAVAILABLE: "descriptor_unavailable"}
+        if status in rc_error:
+            return {"error": "bash_rc_failed", "reason": rc_error[status], "exit_code": child.process.returncode}
+        rc_prefix = READY + RC_PENDING
+        rc_loaded = status == rc_prefix + RC_LOADED
+        handoff = launch.authorized and status == rc_prefix + RC_LOADED + RC_HANDOFF
+        rc_phase = status in (rc_prefix, rc_prefix + RC_FAILED) or rc_loaded
+        if not child.timed_out and not (rc_phase or handoff or (status == READY and launch.eof)):
+            return {"error": "workspace_unavailable" if status == WORKSPACE_ERROR else "bash_start_failed"}
+        show_output = rc_phase or handoff or (status == READY and launch.eof)
     except OSError:
         return {"error": "bash_io_failed"}
     finally:
         os.close(status_read)
-    return {
-        "exit_code": child.process.returncode,
-        "stdout": child.stdout.decode("utf-8", errors="replace") if status == READY else "",
-        "stderr": child.stderr.decode("utf-8", errors="replace") if status == READY else "",
-        "timed_out": child.timed_out,
-        "output_limit_exceeded": child.output_limit_exceeded,
-    }
+
+    result: dict[str, Any] = {}
+    if rc_phase:
+        if child.timed_out:
+            reason = "handoff_timeout" if rc_loaded else "timeout"
+        elif status.endswith(RC_FAILED):
+            reason = "source_failed"
+        else:
+            reason = "exited_before_command"
+        result.update(error="bash_rc_failed", reason=reason)
+        if rc_loaded:
+            result["command_authorized"] = launch.authorized
+    # 标志在正文之前，公共层截为预览时仍能区分两层截断。
+    result.update(exit_code=child.process.returncode, timed_out=child.timed_out,
+                  output_limit_exceeded=child.output_limit_exceeded,
+                  stdout=child.stdout.decode("utf-8", errors="replace") if show_output else "",
+                  stderr=child.stderr.decode("utf-8", errors="replace") if show_output else "")
+    if child.output_limit_exceeded:
+        result["output_limit_note"] = "Bash 已截断输出（两路合计仅保留 10 MiB 原始字节）。"
+    return result

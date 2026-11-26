@@ -253,6 +253,45 @@ class BashExecutionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((result["stdout"], result["stderr"]), ("short-stdout", "short-stderr"))
         self.assertFalse(result["timed_out"] or result["output_limit_exceeded"])
 
+    def _make_search_only(self, directory):
+        if sys.platform == "darwin" and not (hasattr(os, "O_SEARCH") or hasattr(os, "O_EXEC")):
+            self.skipTest("Python SDK does not expose Darwin directory search flags")
+        if sys.platform == "linux" and not hasattr(os, "O_PATH"):
+            self.skipTest("Python does not expose Linux O_PATH")
+        original = directory.stat().st_mode & 0o777
+        self.addCleanup(directory.chmod, original)
+        directory.chmod(0o111)
+        try:
+            fd = os.open(directory, os.O_RDONLY | os.O_DIRECTORY)
+        except PermissionError:
+            return
+        os.close(fd)
+        self.skipTest("effective permissions still allow directory reads")
+
+    async def test_no_rc_with_search_only_ancestor_creates_workspace_and_runs(self):
+        ancestor = self.root / "search-only"
+        parent = ancestor / "writable"
+        parent.mkdir(parents=True)
+        self.workspace = Workspace(parent / "workspace")
+        self._make_search_only(ancestor)
+        result = await self._execute(command='printf "%s|%s" "$PWD" "$HOME"')
+        directory = self.workspace.directory.resolve()
+        self.assertTrue(directory.is_dir())
+        self.assertEqual((result["exit_code"], result["stdout"]), (0, f"{directory}|{directory}"))
+        self.assertFalse((directory / ".agent").exists())
+        directory.chmod(0o600)
+        try:
+            self.assertEqual(await self._execute(command=":"), {"error": "workspace_unavailable"})
+        finally:
+            directory.chmod(0o700)
+
+    async def test_search_only_agent_checks_known_script_without_listing(self):
+        self._write_rc("rc_function() { printf rc; }")
+        agent = self.workspace.directory / ".agent"
+        self._make_search_only(agent)
+        result = await self._execute(command="rc_function; printf command")
+        self.assertEqual((result["exit_code"], result["stdout"]), (0, "rccommand"))
+
     async def test_bad_arguments_do_not_create_workspace_or_fall_back_to_service_cwd(self):
         invalid = ({}, {"command": None}, {"command": " \n"}, {"command": "x\x00y"}, {"command": "\ud800"},
                    {"command": "a" * (32 * 1024 + 1)}, {"command": ":", "workdir": "."},
@@ -278,13 +317,57 @@ class BashExecutionTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(await self._execute(command=":"), {"error": "workspace_unavailable"})
                 self.assertFalse(user_dir.parent.exists())
 
+    async def test_workspace_link_swapped_during_resolution_is_not_executed(self):
+        workspace = self.workspace.directory
+        workspace.mkdir()
+        outside = self.root / "outside"
+        (outside / ".agent").mkdir(parents=True)
+        (outside / ".agent" / "bashrc").write_text(": > rc-ran", encoding="utf-8")
+        launcher = self._fixture_launcher(
+            f"workspace = Path({str(workspace)!r})\n"
+            f"outside = Path({str(outside)!r})\n"
+            "resolve = Path.resolve\n"
+            "def replace_leaf(path, *args, **kwargs):\n"
+            "    if path in (workspace, workspace.parent) and not workspace.is_symlink():\n"
+            "        workspace.rename(workspace.with_name('moved'))\n"
+            "        workspace.symlink_to(outside, target_is_directory=True)\n"
+            "    return resolve(path, *args, **kwargs)\n"
+            "Path.resolve = replace_leaf\n",
+        )
+        with patch.object(bash_runtime, "_BASH_LAUNCHER", launcher):
+            self.assertEqual(await self._execute(command=": > model-ran"), {"error": "workspace_unavailable"})
+        self.assertTrue(workspace.is_symlink())
+        self.assertEqual(list(outside.iterdir()), [outside / ".agent"])
+
+    async def test_launcher_changes_directory_using_open_workspace_fd(self):
+        workspace = self.workspace.directory
+        workspace.mkdir()
+        outside = self.root / "outside"
+        outside.mkdir()
+        launcher = self._fixture_launcher(
+            f"workspace = Path({str(workspace)!r})\n"
+            f"outside = Path({str(outside)!r})\n"
+            "fchdir = os.fchdir\n"
+            "def replace_then_chdir(fd):\n"
+            "    workspace.rename(workspace.with_name('moved'))\n"
+            "    workspace.symlink_to(outside, target_is_directory=True)\n"
+            "    fchdir(fd)\n"
+            "os.fchdir = replace_then_chdir\n",
+        )
+        with patch.object(bash_runtime, "_BASH_LAUNCHER", launcher):
+            command = ': > model-ran; : > "$HOME/home-ran"'
+            self.assertEqual((await self._execute(command=command))["exit_code"], 0)
+        self.assertTrue((self.root / "moved" / "model-ran").is_file())
+        self.assertTrue((self.root / "moved" / "home-ran").is_file())
+        self.assertEqual(list(outside.iterdir()), [])
+
     async def test_chdir_failure_is_fixed_and_shell_exit_is_not_launcher_error(self):
         result = await self._execute(command="printf W >&2; exit 1")
         self.assertEqual((result["exit_code"], result["stderr"]), (1, "W"))
         launcher = self._fixture_launcher(
             "def fail_chdir(path):\n"
             "    raise OSError('synthetic workspace detail')\n"
-            "os.chdir = fail_chdir\n",
+            "os.fchdir = fail_chdir\n",
         )
         with patch.object(bash_runtime, "_BASH_LAUNCHER", launcher):
             self.assertEqual(await self._execute(command=":"), {"error": "workspace_unavailable"})
@@ -358,15 +441,15 @@ class BashExecutionTests(unittest.IsolatedAsyncioTestCase):
             "        started.with_suffix('.tmp').rename(started)\n"
             f"        with open({str(gate)!r}, 'rb') as stream:\n"
             "            stream.read(1)\n"
-            "ensure = Workspace.ensure_directory\n"
-            "chdir = os.chdir\n"
-            "def slow_ensure(workspace):\n"
+            "open_workspace = Workspace.open_directory\n"
+            "chdir = os.fchdir\n"
+            "def slow_open(workspace, *args, **kwargs):\n"
             "    gate(workspace.directory)\n"
-            "    return ensure(workspace)\n"
-            "def slow_chdir(path):\n"
-            "    gate(path)\n"
-            "    return chdir(path)\n"
-            + ("Workspace.ensure_directory = slow_ensure\n" if timeout_in_preparation else "os.chdir = slow_chdir\n"),
+            "    return open_workspace(workspace, *args, **kwargs)\n"
+            "def slow_chdir(fd):\n"
+            "    if os.path.samestat(os.fstat(fd), slow.stat()): gate(slow)\n"
+            "    return chdir(fd)\n"
+            + ("Workspace.open_directory = slow_open\n" if timeout_in_preparation else "os.fchdir = slow_chdir\n"),
         )
         processes = []
         with patch.object(bash_runtime, "_BASH_LAUNCHER", launcher), _record_processes(processes) as spawn:
@@ -404,22 +487,227 @@ class BashExecutionTests(unittest.IsolatedAsyncioTestCase):
                     task.cancel()
                 await asyncio.gather(task, return_exceptions=True)
 
-    async def test_timeout_and_combined_output_limit(self):
+    def _write_rc(self, script):
+        directory = self.workspace.directory / ".agent"
+        directory.mkdir(parents=True, exist_ok=True)
+        (directory / "bashrc").write_text(script, encoding="utf-8")
+
+    async def test_rc_loaded_once_per_call_in_same_shell(self):
+        self._write_rc("export PATH=\"$HOME/bin:$PATH\"\n"
+                       "helper() { from_path; }\n"
+                       "exec 3<rc-input\n"
+                       "printf x >> rc-runs\n")
+        (self.workspace.directory / "rc-input").write_text(" from-rc-fd\n", encoding="utf-8")
+        bin_dir = self.workspace.directory / "bin"
+        bin_dir.mkdir()
+        executable = bin_dir / "from_path"
+        executable.write_text("#!/bin/bash\nprintf from-path\n", encoding="utf-8")
+        executable.chmod(0o700)
+        command = 'helper; IFS= read -r line <&3; printf "%s " "$line"; '
+        command += " /bin/bash -c 'printf %s \"${BASH_ENV-unset}\"'; exit 31"
+        for _ in range(2):
+            result = await self._execute(command=command)
+            self.assertEqual((result["exit_code"], result["stdout"], result["stderr"]), (31, "from-path from-rc-fd unset", ""))
+            self.assertNotIn("error", result)
+        self.assertEqual((self.workspace.directory / "rc-runs").read_text(), "xx")
+
+    async def test_rc_failures_do_not_run_command(self):
+        for script, reason, code in (
+            ("return 23", "source_failed", 23),
+            ("if then", "source_failed", 2),
+            ("exit 0", "exited_before_command", 0),
+            ("exit 19", "exited_before_command", 19),
+            ("set -e; false; printf unexpected", "exited_before_command", 1),
+            ("printf starting >&2; /bin/sleep 20", "timeout", -signal.SIGKILL),
+        ):
+            with self.subTest(script=script):
+                self._write_rc(script)
+                result = await self._execute(command=": > command-ran", timeout=1 if reason == "timeout" else 3)
+                self.assertEqual((result["error"], result["reason"], result["exit_code"]),
+                                 ("bash_rc_failed", reason, code))
+                self.assertEqual(result["timed_out"], reason == "timeout")
+                self.assertFalse((self.workspace.directory / "command-ran").exists())
+                if reason == "timeout":
+                    self.assertEqual(result["stderr"], "starting")
+                if script == "if then":
+                    self.assertIn("syntax error", result["stderr"])
+
+    async def test_unreadable_or_unsafe_rc_does_not_run_command(self):
+        self._write_rc(": > rc-ran")
+        launcher = self._fixture_launcher(
+            "actual_open = os.open\n"
+            "def deny_rc(path, *args, **kwargs):\n"
+            "    if path == 'bashrc':\n"
+            "        raise PermissionError('synthetic permission detail')\n"
+            "    return actual_open(path, *args, **kwargs)\n"
+            "os.open = deny_rc\n",
+        )
+        expected = {"error": "bash_rc_failed", "reason": "unreadable", "exit_code": 1}
+        with patch.object(bash_runtime, "_BASH_LAUNCHER", launcher):
+            self.assertEqual(await self._execute(command=": > command-ran"), expected)
+        script = self.workspace.directory / ".agent" / "bashrc"
+        script.unlink()
+        os.mkfifo(script)
+        self.assertEqual(await self._execute(command=": > command-ran"), expected)
+        script.unlink()
+        target = self.root / "outside-rc"
+        target.write_text(": > rc-ran", encoding="utf-8")
+        script.symlink_to(target)
+        self.assertEqual(await self._execute(command=": > command-ran"), dict(expected, reason="symlink"))
+        for file in ("rc-ran", "command-ran"):
+            self.assertFalse((self.workspace.directory / file).exists())
+
+    async def test_regular_agent_file_means_rc_missing_but_agent_links_are_rejected(self):
+        self.workspace.directory.mkdir()
+        agent = self.workspace.directory / ".agent"
+        agent.touch()
+        result = await self._execute(command="printf normal")
+        self.assertEqual((result["exit_code"], result["stdout"]), (0, "normal"))
+        agent.unlink()
+        for is_directory in (False, True):
+            target = self.root / ("linked-dir" if is_directory else "linked-file")
+            if is_directory:
+                target.mkdir()
+                (target / "bashrc").write_text(": > rc-ran", encoding="utf-8")
+            else:
+                target.touch()
+            agent.symlink_to(target, target_is_directory=is_directory)
+            result = await self._execute(command=": > command-ran")
+            self.assertEqual((result["error"], result["reason"]), ("bash_rc_failed", "symlink"))
+            self.assertFalse((self.workspace.directory / "rc-ran").exists())
+            self.assertFalse((self.workspace.directory / "command-ran").exists())
+            agent.unlink()
+
+    async def test_fixed_rc_descriptors_survive_loading(self):
+        self._write_rc("exec 10>ten 11>eleven 19>nineteen\n")
+        result = await self._execute(command="printf x >&10 && printf y >&11 && printf z >&19")
+        self.assertNotIn("error", result)
+        self.assertEqual((result["exit_code"], result["stderr"]), (0, ""))
+        for name, expected in (("ten", "x"), ("eleven", "y"), ("nineteen", "z")):
+            self.assertEqual((self.workspace.directory / name).read_text(), expected)
+
+    async def test_rc_handoff_does_not_modify_ifs(self):
+        for script, ifs in (("readonly IFS=' :'; set -o posix", " :"), ("readonly IFS=G", "G")):
+            with self.subTest(script=script):
+                self._write_rc(script)
+                result = await self._execute(command='printf "model:%s" "$IFS"')
+                self.assertNotIn("error", result)
+                self.assertEqual((result["exit_code"], result["stdout"], result["stderr"]), (0, "model:" + ifs, ""))
+
+    async def test_low_fd_limit_preserves_direct_launch_and_reports_rc_setup_failure(self):
+        launcher = self._fixture_launcher(
+            "import resource\n"
+            "soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)\n"
+            "resource.setrlimit(resource.RLIMIT_NOFILE, (48 if soft < 0 else min(48, soft), hard))\n",
+        )
+        command = 'exec 10>direct; printf ok >&10; printf "%s|%s|%s" "$0" "$#" "$BASH_EXECUTION_STRING"'
+        with patch.object(bash_runtime, "_BASH_LAUNCHER", launcher):
+            result = await self._execute(command=command)
+            self.assertEqual((result["exit_code"], result["stdout"]), (0, "/bin/bash|0|" + command))
+            self.assertEqual((self.workspace.directory / "direct").read_text(), "ok")
+            self._write_rc(": > rc-ran")
+            result = await self._execute(command=": > model-ran")
+        self.assertEqual(result, {"error": "bash_rc_failed", "reason": "descriptor_unavailable", "exit_code": 1})
+        self.assertFalse((self.workspace.directory / "rc-ran").exists())
+        self.assertFalse((self.workspace.directory / "model-ran").exists())
+
+    async def test_dynamic_rc_fds_and_xtrace_survive_without_affecting_handoff(self):
+        supports = await self._execute(command="(( BASH_VERSINFO[0] * 10 + BASH_VERSINFO[1] >= 41 ))")
+        if supports["exit_code"] != 0:
+            self.skipTest("Bash 4.1+ is required for dynamic descriptors and BASH_XTRACEFD")
+        self._write_rc("for i in {1..64}; do exec {fd}>>dynamic; fds+=(\"$fd\"); done\n"
+                       "exec {trace_fd}>trace\nBASH_XTRACEFD=$trace_fd\nset -x\n")
+        result = await self._execute(command="for fd in \"${fds[@]}\"; do printf x >&$fd || exit 52; done; printf model-ran")
+        self.assertEqual((result["exit_code"], result["stdout"], result["stderr"]), (0, "model-ran", ""))
+        self.assertNotIn("error", result)
+        self.assertEqual((self.workspace.directory / "dynamic").read_text(), "x" * 64)
+        self.assertIn("printf model-ran", (self.workspace.directory / "trace").read_text())
+
+    async def test_completed_handoff_does_not_wait_for_other_copies_of_control_fd(self):
+        self._write_rc("printf rc;")
+        open_status = bash_runtime._open_launch_status
+
+        def keep_peer_open():
+            parent, child = open_status()
+            self.addCleanup(os.close, os.dup(child))
+            return parent, child
+
+        with patch.object(bash_runtime, "_open_launch_status", side_effect=keep_peer_open):
+            result = await self._execute(command="printf model; exit 17")
+        self.assertNotIn("error", result)
+        self.assertEqual((result["exit_code"], result["stdout"]), (17, "rcmodel"))
+
+    async def test_authorized_but_unread_handoff_preserves_timeout_and_exit(self):
+        launcher = self.root / "handoff_fixture.py"
+        launcher.write_text(
+            "import os, select, sys, time\n"
+            "fd = int(sys.argv[1])\n"
+            "os.write(fd, b'RBD')\n"
+            "if not select.select([fd], [], [], 5)[0]: os._exit(99)\n"
+            "os.write(1, b'authorization pending')\n"
+            "os.write(2, b'before handoff')\n"
+            "if sys.argv[3] == 'wait': time.sleep(10)\n"
+            "os._exit(19)  # 关闭套接字时故意不读取已排队的放行字节。\n",
+            encoding="utf-8",
+        )
+        for command, timed_out, code in (("wait", True, -signal.SIGKILL), ("end", False, 19)):
+            with self.subTest(command=command), patch.object(bash_runtime, "_BASH_LAUNCHER", launcher):
+                result = await self._execute(command=command, timeout=1 if timed_out else 3)
+                self.assertEqual(result["error"], "bash_rc_failed")
+                self.assertEqual(result["reason"], "handoff_timeout" if timed_out else "exited_before_command")
+                self.assertTrue(result["command_authorized"])
+                self.assertEqual((result["timed_out"], result["exit_code"]), (timed_out, code))
+                self.assertEqual((result["stdout"], result["stderr"]), ("authorization pending", "before handoff"))
+
+    async def test_timeout_after_handoff_is_not_rc_failure(self):
+        self._write_rc("printf rc;")
+        result = await self._execute(command="printf model; exec /bin/sleep 20", timeout=1)
+        self.assertNotIn("error", result)
+        self.assertTrue(result["timed_out"])
+        self.assertEqual((result["exit_code"], result["stdout"]), (-signal.SIGKILL, "rcmodel"))
+
+    async def test_timeout_and_utf8_serialization(self):
         with self.assertLogs("agent_companion.runtime.bash", level="DEBUG") as logs:
             result = await self._execute(command="printf ready; exec /bin/sleep 20", timeout=1)
         self.assertIn("status=timeout", logs.output[0])
         self.assertTrue(result["timed_out"])
         self.assertEqual(result["stdout"], "ready")
         self.assertEqual(result["exit_code"], -signal.SIGKILL)
-        with self.assertLogs("agent_companion.runtime.bash", level="DEBUG") as logs:
-            result = await self._execute(
-                command="printf '%0*d' 20000 0; printf '%0*d' 20000 0 >&2; exec /bin/sleep 20")
-        self.assertIn("status=output_limit", logs.output[0])
-        self.assertTrue(result["output_limit_exceeded"])
-        self.assertFalse(result["timed_out"])
-        self.assertEqual(len(result["stdout"]) + len(result["stderr"]), _MAX_OUTPUT_BYTES)
-        self.assertTrue(result["stdout"] and result["stderr"])
-        self.assertEqual((await self._execute(command="printf '\\377'"))["stdout"], "\ufffd")
+        context = ToolContext("test-session", "run", "call", False, workspace=self.workspace)
+        output = await self.tools.execute(_call("call", command=r'''printf '汉字\377\n"' ''').call, context)
+        self.assertIn("汉字", output)
+        self.assertEqual(json.loads(output)["stdout"], '汉字\ufffd\n"')
+
+    async def test_bash_combined_limit_and_public_archive(self):
+        context = ToolContext("test-session", "run", "call", False, workspace=self.workspace)
+        width = _MAX_OUTPUT_BYTES // 2
+        command = f"printf '%0*d' {width} 0; printf '%0*d' {width} 0 >&2; "
+        for extra_bytes in (0, 1, 512 * 1024):
+            with self.subTest(extra_bytes=extra_bytes):
+                extra = bool(extra_bytes)
+                more = f"printf '%0*d' {extra_bytes} 0 >&2; " if extra else ""
+                call = _call("call", command=command + more + ": > command-finished; exit 37").call
+                with self.assertLogs("agent_companion.runtime.bash", level="DEBUG") as logs:
+                    output = await self.tools.execute(call, context)
+                self.assertIn("status=output_limit" if extra else "status=nonzero_exit", logs.output[0])
+                self.assertIn('"output_limit_exceeded": ' + str(extra).lower(), output)
+                preview, _, archive_path = output.rpartition("截断前的工具结果：")
+                self.assertIn("公共工具层已截断", preview)
+                archive = self.workspace.directory / archive_path.removesuffix("]")
+                result = json.loads(archive.read_text(encoding="utf-8"))
+                self.assertEqual((len(result["stdout"]), len(result["stderr"])), (width, width))
+                self.assertEqual(result["output_limit_exceeded"], extra)
+                self.assertEqual("output_limit_note" in result, extra)
+                self.assertFalse(result["timed_out"])
+                self.assertEqual(result["exit_code"], 37)
+                (self.workspace.directory / "command-finished").unlink()
+
+    async def test_continuous_output_beyond_limit_still_times_out(self):
+        with patch.object(bash_runtime, "_MAX_OUTPUT_BYTES", 128):
+            result = await self._execute(command="while :; do printf '%08192d' 0; done", timeout=1)
+        self.assertEqual(len(result["stdout"]), 128)
+        self.assertTrue(result["output_limit_exceeded"] and result["timed_out"])
+        self.assertEqual(result["exit_code"], -signal.SIGKILL)
 
     async def test_success_stops_same_group_background_writer_even_without_output_pipes(self):
         for redirect in ("", " >/dev/null 2>&1"):

@@ -9,6 +9,7 @@ from typing import Any
 
 from ..protocol import ToolCall, ToolSpec
 from ..workspace import Workspace
+from ._tool_output import limit_tool_output
 
 
 TOOL_CANCELLED = '{"error":"tool_cancelled"}'
@@ -85,7 +86,7 @@ class Tools:
             result = await tool.handler(args, context)
             if not isinstance(result, str):
                 raise TypeError
-            return result
+            return await limit_tool_output(result, context.workspace)
         except Exception:
             # 工具错误本身作为终态结果，不把可能含有数据的异常正文投影给模型。
             return '{"error":"tool_failed"}'
