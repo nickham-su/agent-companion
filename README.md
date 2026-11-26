@@ -91,7 +91,14 @@ python scripts/build_source_zip.py
 
 ## 本机启动飞书文字模式
 
-1. 用专用飞书账号在本机完成 CLI **用户身份**登录。授权 `search:message`，并确认可查询当前登录用户（`GET /open-apis/authen/v1/user_info`）、[批量获取消息正文](https://open.feishu.cn/document/server-docs/im-v1/message/mget)、下载媒体和以用户身份发送私聊。原始 API 需要 CLI 支持 `--data -` 和将数组查询参数编码成重复参数（参考 `lark-cli` 1.0.99）。程序不会发起登录或读取凭据文件；运行中不要切换 CLI 登录账号或应用配置。
+1. 在飞书开放平台为 CLI 对应的应用开通下列**用户身份权限**并发布，再在运行 Agent 的同一环境里用专用飞书账号完成授权：
+
+   ```sh
+   lark-cli auth login --scope "search:message im:message.p2p_msg:get_as_user im:message:readonly im:message im:message.send_as_user offline_access"
+   ```
+
+   `offline_access` 用于刷新登录凭证。确认 CLI 可查询当前登录用户（`GET /open-apis/authen/v1/user_info`）、[批量获取消息正文](https://open.feishu.cn/document/server-docs/im-v1/message/mget)、下载媒体和以用户身份发送私聊。原始 API 需要 CLI 支持 `--data -` 和将数组查询参数编码成重复参数（参考 `lark-cli` 1.0.99）。程序不会发起登录或读取凭据文件；运行中不要切换 CLI 登录账号或应用配置。
+
 2. 复制 `config.example.toml` 为 `config.local.toml`，启用 `[feishu]`，使用默认的 `mode = "text"`。从旧版切换时，**把 `database` 指向尚不存在的新路径**，例如 `db-search.sqlite3`；旧库请原样保留，不会迁移或清空。首次启动会创建新库并绑定当前 CLI 登录账号。文字模式不加载音频设备或 TTS，也不监听来电、不查询会议；`cli_timeout` 限制单次飞书 CLI 调用（默认 20 秒）。
 3. 按[选择模型与 Provider](#选择模型与-provider)填好角色所选模型和 ASR 使用的 `api_key`；只在本机私有配置填写真实 Key，不要分享或提交该文件。MiniMax 区域按账号选择 `cn`（[国内 API](https://platform.minimax.cn/docs/api-reference/speech-to-text)）或 `global`（[国际 API](https://platform.minimax.io/docs/api-reference/speech-to-text)）。百炼另需配置同地域的 `workspace_id`。工作目录需要允许建立用于资源下载的短期目录。
 4. 在启动工作目录下复制 `agents/main.example.md` 为 `agents/main.md`，并按 [Agent 角色配置](#agent-角色配置)编辑。需要委派时，再从 `agents/sub.example.md` 创建实际子角色。
@@ -134,7 +141,7 @@ python scripts/build_source_zip.py
    ```
 
 3. 从 [Silero VAD 官方源码](https://github.com/snakers4/silero-vad/blob/master/src/silero_vad/data/silero_vad.onnx)单独取得 `silero_vad.onnx`（使用带 `input/state/sr` 接口的 v6 系列模型，不选只支持其他输入形状的变体），放在本机配置指定路径。程序只加载已有文件，不下载模型，不需要 PyTorch；相对路径以 TOML 文件所在目录为准。音频和 ONNX 依赖不在 `text` 或模拟模式下加载。
-4. 沿用[文字模式](#本机启动飞书文字模式)的 CLI 登录和私聊权限，另给同一 CLI 用户授权 `vc:meeting.meetingevent:read`（获取会议信息）；飞书桌面客户端与 CLI 必须登录同一用户，运行中不要切换。通过 `tts_model` 选择 TTS 配置，为它引用的 Provider 填写 `api_key`，并按示例填写 `[voice]` 的设备与 VAD 模型路径。
+4. 在应用中额外开通 `vc:meeting.meetingevent:read`（获取会议信息），并把它加到[文字模式](#本机启动飞书文字模式)登录命令的 `--scope` 引号内一并授权。飞书桌面客户端与 CLI 必须登录同一用户，运行中不要切换。通过 `tts_model` 选择 TTS 配置，为它引用的 Provider 填写 `api_key`，并按示例填写 `[voice]` 的设备与 VAD 模型路径。
 5. 在目标 Mac 的图形桌面中设置 `[feishu].mode = "voice"`，以同一 `--run --config config.local.toml` 命令启动。可沿用同一账号的库，也可以直接用新库，不需要先运行 `text`。为运行程序的终端或应用授予发送鼠标事件和收音的权限；如系统不提供通话窗口标题，也需授予屏幕录制权限并重启应用。自动接听会移动鼠标，测试时不要同时参加其他通话。
 
 程序为本次来电准备设备时检查两路是否支持所需流格式。输入为 16 kHz 单声道有符号 16-bit PCM（512 样本一帧），直接供 Silero 及流式/文件转写使用。输出为与 TTS 相同采样率的单声道 16-bit PCM，默认 44.1 kHz；MiniMax 可用 16/24/32/44.1 kHz，百炼可用 16/24/44.1 kHz。CoreAudio 在需要且支持时转换设备格式，程序不更改设备全局采样率、不再做第二次重采样。若报 `voice_input_pcm_16khz_mono_not_supported` 或 `voice_output_pcm_rate_or_channels_not_supported`，在「音频 MIDI 设置」和 `sounddevice` 列表核对两条线路；输出可选一个双方支持的采样率，输入需选择能提供 16 kHz 单声道流的设备或系统转换。若通话对端无声，核对虚拟设备首个单声道的路由、飞书麦克风/扬声器选项和设备权限。
