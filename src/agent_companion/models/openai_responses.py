@@ -406,7 +406,7 @@ class OpenAIResponses:
                 "Authorization": self._authorization,
                 "Accept": "text/event-stream", "Content-Type": "application/json", "Accept-Encoding": "identity",
             })
-            async with self._responses.open(request) as response:
+            async with self._responses.open(request) as (response, allow_tail):
                 if diagnostics is not None:
                     diagnostics.response_received(response.status_code)
                 if not response.is_success:
@@ -426,6 +426,7 @@ class OpenAIResponses:
                 if diagnostics is not None:
                     diagnostics.stage = "response_close"
                 yield ModelClosing(complete=False)
+                allow_tail()
         except httpx.RequestError as error:
             if diagnostics is not None:
                 diagnostics.transport_failure = failure_category(error)

@@ -235,7 +235,7 @@ class DeepSeek:
         try:
             request = self._client.stream("POST", CHAT_COMPLETIONS, content=body,
                                           headers={"Accept": "text/event-stream", "Content-Type": "application/json"})
-            async with self._responses.open(request) as response:
+            async with self._responses.open(request, background_tail=True) as (response, allow_tail):
                 if diagnostics is not None:
                     diagnostics.response_received(response.status_code)
                 if not response.is_success:
@@ -246,6 +246,7 @@ class DeepSeek:
                     async for event in events:
                         yield event
                 # 解析器只在完整的 [DONE] 后正常结束；此时数据和连接收尾是两个边界。
+                allow_tail()
                 if diagnostics is not None:
                     diagnostics.stage = "response_close"
                 yield ModelClosing(complete=True)

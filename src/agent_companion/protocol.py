@@ -196,7 +196,7 @@ class InputUsage:
 
 @dataclass(frozen=True, slots=True)
 class ModelClosing:
-    """适配器接下来由当前读流任务关闭连接，不再读取模型帧。"""
+    """适配器接下来收尾 HTTP 响应，不再解析模型帧。"""
 
     # False 表示关闭成功后仍有尚未交付的终态事件；True 表示已全部验证并交付。
     complete: bool

@@ -170,13 +170,19 @@ async def _serve(settings: Settings, *, discovery: FeishuDiscovery | None = None
     async with prepare_private_feishu(settings, discovery=discovery, roles=roles) as (history, run_private):
         # 独立客户端，避免任一平台收到另一平台的凭据。不接受网络重定向。
         async with _ServingExitStack() as stack:
-            async def client(key: str | None) -> httpx.AsyncClient:
+            async def client(key: str | None, *, limits: httpx.Limits | None = None) -> httpx.AsyncClient:
                 headers = {"Authorization": f"Bearer {key}"} if key is not None else None
+                pool_options = {"limits": limits} if limits is not None else {}
                 return await stack.enter_async_context(httpx.AsyncClient(
-                    headers=headers, follow_redirects=False, trust_env=False, timeout=None))
+                    headers=headers, follow_redirects=False, trust_env=False, timeout=None, **pool_options))
 
-            model_clients = {name: await client(key if settings.llm_providers[name].adapter == "deepseek" else None)
-                             for name, key in model_keys.items()}
+            # 播报和用户下一次输入之间，尽量保留已回池的模型连接。
+            model_limits = httpx.Limits(max_connections=100, max_keepalive_connections=20, keepalive_expiry=300.0)
+            model_clients = {
+                name: await client(key if settings.llm_providers[name].adapter == "deepseek" else None,
+                                   limits=model_limits)
+                for name, key in model_keys.items()
+            }
             speech = asr_settings.connection
             asr_client = None
             if isinstance(speech, BailianConnection):

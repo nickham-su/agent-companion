@@ -142,6 +142,7 @@ class ProfileRuntimeTests(_Files, unittest.IsolatedAsyncioTestCase):
     async def serve(self, handler, drive, *, expected_clients):
         actual_client = httpx.AsyncClient
         events = []
+        connection_limits = []
         deep_close, responses_close = DeepSeek.aclose, OpenAIResponses.aclose
 
         class Client(actual_client):
@@ -152,6 +153,7 @@ class ProfileRuntimeTests(_Files, unittest.IsolatedAsyncioTestCase):
         def client(**kwargs):
             self.assertFalse(kwargs["follow_redirects"])
             self.assertFalse(kwargs["trust_env"])
+            connection_limits.append(kwargs.get("limits"))
             return Client(transport=httpx.MockTransport(handler), **kwargs)
 
         async def close_deep(model):
@@ -175,6 +177,8 @@ class ProfileRuntimeTests(_Files, unittest.IsolatedAsyncioTestCase):
               patch("agent_companion.__main__.httpx.AsyncClient", side_effect=client),
               patch.object(DeepSeek, "aclose", close_deep), patch.object(OpenAIResponses, "aclose", close_responses)):
             await _serve(self.settings(), roles=load_roles(self.root))
+        model_limits = httpx.Limits(max_connections=100, max_keepalive_connections=20, keepalive_expiry=300.0)
+        self.assertEqual(connection_limits, [model_limits] * (expected_clients - 1) + [None])  # ASR 沿用默认
         self.assertEqual(events[:1], ["runtime"])
         self.assertEqual(events[-expected_clients:], ["client"] * expected_clients)
         return events[1:-expected_clients]
