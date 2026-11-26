@@ -30,37 +30,26 @@ class ToolCall:
     arguments: str = field(repr=False)
 
 
-@dataclass(frozen=True, slots=True)
-class ReplayScope:
-    protocol: str
-    fingerprint: bytes = field(repr=False)
-    reasoning_effort: str
-
-
-MAX_REPLAY_BYTES = 8 * 1024 * 1024
+REPLAY_KEY_BYTES = 16
 
 
 @dataclass(frozen=True, slots=True)
-class ReplayItem:
-    kind: Literal["reasoning", "message", "function_call"]
-    item_id: str
-    call_id: str | None = None
-    phase: str | None = None
-    # 文本内容只存于确认正文；原输出位置以类型和字符数表示。
-    parts: tuple[tuple[str, int], ...] = ()
-    encrypted_content: str | None = field(default=None, repr=False)
-    summary: tuple[str, ...] = field(default=(), repr=False)
+class Replay:
+    """完整响应的适配器私有数据。只有适配器可以比较 key 并解释 payload。"""
 
+    replay_key: bytes = field(repr=False)
+    payload: bytes = field(repr=False)
 
-@dataclass(frozen=True, slots=True)
-class ProviderReplay:
-    scope: ReplayScope
-    items: tuple[ReplayItem, ...] = field(repr=False)
+    def __post_init__(self) -> None:
+        if type(self.replay_key) is not bytes or len(self.replay_key) != REPLAY_KEY_BYTES:
+            raise ValueError("invalid replay key")
+        if type(self.payload) is not bytes:
+            raise ValueError("invalid replay payload")
 
 
 @dataclass(frozen=True, slots=True)
 class ReplayReady:
-    replay: ProviderReplay = field(repr=False)
+    replay: Replay = field(repr=False)
 
 
 @dataclass(frozen=True, slots=True)
@@ -69,8 +58,7 @@ class Message:
     content: str | tuple[Part, ...] = field(repr=False)
     tool_calls: tuple[ToolCall, ...] = ()
     tool_call_id: str | None = None
-    reasoning: str | None = field(default=None, repr=False)
-    replay: ProviderReplay | None = field(default=None, repr=False)
+    replay: Replay | None = field(default=None, repr=False)
 
 
 @dataclass(frozen=True, slots=True)
@@ -176,8 +164,7 @@ def validate_input_items(items: Sequence[InputItem]) -> None:
         if isinstance(item, InternalInput) and isinstance(message, (AgentReply, DelegationTask, TimerFired)):
             continue
         if (not isinstance(message, Message) or message.role != "user" or message.tool_calls
-                or message.tool_call_id is not None or message.reasoning is not None
-                or message.replay is not None):
+                or message.tool_call_id is not None or message.replay is not None):
             raise ValueError("runtime inputs must be plain user messages")
 
 
@@ -191,11 +178,6 @@ class ToolSpec:
 @dataclass(frozen=True, slots=True)
 class TextDelta:
     text: str
-
-
-@dataclass(frozen=True, slots=True)
-class ReasoningDelta:
-    text: str = field(repr=False)
 
 
 @dataclass(frozen=True, slots=True)
@@ -220,7 +202,7 @@ class ModelClosing:
     complete: bool
 
 
-ModelEvent = TextDelta | ReasoningDelta | ToolReady | ReplayReady | InputUsage | ModelClosing
+ModelEvent = TextDelta | ToolReady | ReplayReady | InputUsage | ModelClosing
 
 
 class ModelError(Exception):
@@ -241,7 +223,8 @@ _MODEL_DIAGNOSTICS = frozenset({
     "truncated_stream",
     "unsupported_tool_type", "responses_output_limit", "responses_event_limit",
     "responses_unsupported_encoding", "responses_unsupported_output", "responses_unexpected_response",
-    "summary_tool_call", "summary_private_echo", "agents_md_invalid_file",
+    "summary_tool_call", "incompatible_protected_history", "protected_history_already_compacted",
+    "agents_md_invalid_file",
     "agents_md_unreadable", "agents_md_too_large", "agents_md_invalid_utf8",
 })
 

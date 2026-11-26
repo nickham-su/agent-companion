@@ -16,7 +16,7 @@ from agent_companion.app import prepare_private_feishu, running_agent
 from agent_companion.config import FeishuSettings, RuntimeSettings, Settings
 from agent_companion.models import _http_stream
 from agent_companion.models.deepseek import DeepSeek
-from agent_companion.protocol import (ChannelUser, InputUsage, Message, ProviderReplay, ReplayItem, ReplayScope,
+from agent_companion.protocol import (ChannelUser, InputUsage, Message, Replay,
                                       TextDelta, ToolCall, ToolReady)
 from agent_companion.runtime.subtasks import demo_roles
 from agent_companion.runtime.compaction import Compactions, Prefix
@@ -605,10 +605,8 @@ class BackgroundCompactionTest(unittest.IsolatedAsyncioTestCase):
             with self.subTest(mode=mode), tempfile.TemporaryDirectory() as directory:
                 path = Path(directory) / "compaction.sqlite"
                 model = _GatedModel()
-                model.replay_scope = ReplayScope("fixture", b"a" * 32, "default")
-                compatible = ProviderReplay(model.replay_scope, (ReplayItem("reasoning", "fixture-reason"),))
-                other_scope = ReplayScope("fixture", b"b" * 32, "default")
-                incompatible = ProviderReplay(other_scope, (ReplayItem("reasoning", "different-reason"),))
+                compatible = Replay(b"a" * 16, b"fixture-reason")
+                incompatible = Replay(b"b" * 16, b"different-reason")
                 with closing(History(path)) as history, closing(History(path)) as other:
                     first_old = Message("user", "already summarized " + "b" * 500)
                     competing_id, target = history.append("main", [first_old, _OLD])
@@ -673,7 +671,7 @@ class BackgroundCompactionTest(unittest.IsolatedAsyncioTestCase):
                         else:
                             self.assertEqual(latest, (Message("system", "此前会话摘要：\n" + competing_text),
                                                       *common, concurrently_appended, matching_reply,
-                                                      replace(alternate_reply, replay=None)))
+                                                      alternate_reply))
                         self.assertNotIn(_SUMMARY, latest)
                     finally:
                         await runtime.close()

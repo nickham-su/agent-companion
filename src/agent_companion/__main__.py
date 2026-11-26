@@ -18,7 +18,7 @@ from .config import ConfigError, Settings, load_settings, valid_config_id
 from .logging_setup import stdout_logging
 from .models.deepseek import CHAT_COMPLETIONS, DeepSeek
 from .models.openai_responses import OpenAIResponses
-from .protocol import (AGENT_REPLY_PREFIX, DeliveryStatus, Message, ModelEvent, ReasoningDelta, Receipt, ReplyStream,
+from .protocol import (AGENT_REPLY_PREFIX, DeliveryStatus, Message, ModelEvent, Receipt, ReplyStream,
                        TextDelta, ToolCall, ToolReady, ToolSpec)
 from .runtime.instructions import load_roles
 from .runtime.subtasks import AgentRole, DELEGATE_TOOL_NAME, ModelBinding, demo_roles
@@ -41,8 +41,6 @@ class _DemoModel:
 
     async def stream(self, messages: Sequence[Message], tools: Sequence[ToolSpec], *,
                      thinking: bool) -> AsyncGenerator[ModelEvent, None]:
-        if thinking:
-            yield ReasoningDelta("模拟协议字段")
         last = messages[-1]
         if tools and last == Message("user", _DEMO_DELEGATION):
             yield ToolReady(ToolCall("demo-delegate", DELEGATE_TOOL_NAME,
@@ -218,7 +216,7 @@ async def _serve(settings: Settings, *, discovery: FeishuDiscovery | None = None
                 else:
                     assert provider.base_url is not None  # Responses Provider 在配置阶段已归一化。
                     model = OpenAIResponses(model_client, model=profile.model, api_key=key,
-                                            base_url=provider.base_url, reasoning_effort=effort, replay_salt=salt)
+                                            base_url=provider.base_url, reasoning_effort=effort)
                     endpoint, thinking = provider.base_url + "/responses", False
                 # Runtime/压缩先关停；所有模型流关闭后，才退出任一 HTTP 客户端。
                 stack.push_async_callback(model.aclose)

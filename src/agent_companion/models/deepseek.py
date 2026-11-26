@@ -10,14 +10,35 @@ from typing import Any
 import httpx
 
 from ..model_diagnostics import adapter_started, failure_category
-from ..protocol import (Image, InputUsage, Message, ModelClosing, ModelError, ModelEvent, ReasoningDelta, Text,
+from ..protocol import (Image, InputUsage, Message, ModelClosing, ModelError, ModelEvent, Replay, ReplayReady, Text,
                         TextDelta, ToolCall, ToolReady, ToolSpec)
 from ._http_stream import ResponseStreams
-from ._request import request_body
+from ._request import make_replay_key, request_body
 
 
 CHAT_COMPLETIONS = "https://api.deepseek.com/chat/completions"
 MODEL_NAME = "deepseek-flash"
+_ADAPTER_ID = "deepseek"
+# 明文回放只按协议和模型区分；此常量不是凭据。
+_REPLAY_NAMESPACE = b"agent-companion/deepseek-replay"
+
+
+def _replay_key(model: str) -> bytes:
+    return make_replay_key(_REPLAY_NAMESPACE, _ADAPTER_ID, model)
+
+
+def _decode_reasoning(payload: bytes) -> str | None:
+    try:
+        return payload.decode("utf-8")
+    except UnicodeError:
+        return None
+
+
+def _replay_text(message: Message, key: bytes) -> str | None:
+    replay = message.replay
+    if replay is None or replay.replay_key != key:
+        return None
+    return _decode_reasoning(replay.payload)
 
 
 def _content_part(part: Text | Image) -> dict[str, Any]:
@@ -28,8 +49,12 @@ def _content_part(part: Text | Image) -> dict[str, Any]:
 
 def build_request(messages: Sequence[Message], tools: Sequence[ToolSpec], *, thinking: bool,
                   model: str = MODEL_NAME, reasoning_effort: str | None = None) -> dict[str, Any]:
+    key = _replay_key(model) if thinking and tools else None
     result: list[dict[str, Any]] = []
     for message in messages:
+        reasoning = _replay_text(message, key) if key is not None and message.role == "assistant" else None
+        if message.role == "assistant" and not (message.content or message.tool_calls or reasoning):
+            continue  # 确认正文为空且无可回传数据，不能投影为空 assistant。
         content: Any = message.content
         if not isinstance(content, str):
             content = [_content_part(part) for part in content]
@@ -41,10 +66,10 @@ def build_request(messages: Sequence[Message], tools: Sequence[ToolSpec], *, thi
                                   for call in message.tool_calls]
         if message.tool_call_id is not None:
             item["tool_call_id"] = message.tool_call_id
-        if thinking and tools and message.role == "assistant":
-            if message.reasoning is None:
+        if key is not None and message.role == "assistant":
+            if reasoning is None:
                 raise ModelError("missing_reasoning")
-            item["reasoning_content"] = message.reasoning
+            item["reasoning_content"] = reasoning
         result.append(item)
     payload = {"model": model, "stream": True, "stream_options": {"include_usage": True}, "messages": result,
                "thinking": {"type": "enabled" if thinking else "disabled"}}
@@ -107,20 +132,30 @@ class _ToolParts:
         return ToolCall(self.id, name, arguments)
 
 
-async def parse_stream(lines: AsyncIterator[str]) -> AsyncIterator[ModelEvent]:
+async def parse_stream(lines: AsyncIterator[str], *, model: str = MODEL_NAME) -> AsyncIterator[ModelEvent]:
     fragments: dict[int, _ToolParts] = {}
     finish: str | None = None
     input_usage: InputUsage | None = None
+    reasoning_parts: list[str] = []
+    has_text = False
     async for event in _events(lines):
         if event == "[DONE]":
+            calls: list[ToolCall] = []
             if finish == "tool_calls" and fragments:
                 calls = [parts.complete() for _, parts in sorted(fragments.items())]
                 if len({call.id for call in calls}) != len(calls):
                     raise ModelError("duplicate_tool_id")
-                for call in calls:
-                    yield ToolReady(call)
             elif finish != "stop" or fragments:
                 raise ModelError("invalid_stream_finish")
+            # 有正文或工具时，明确给出的空字段也能用于后续带工具的请求。
+            if reasoning_parts and (has_text or calls or any(reasoning_parts)):
+                try:
+                    payload = "".join(reasoning_parts).encode("utf-8")
+                except UnicodeError:
+                    raise ModelError("invalid_sse_event") from None
+                yield ReplayReady(Replay(_replay_key(model), payload))
+            for call in calls:
+                yield ToolReady(call)
             if input_usage is not None:
                 yield input_usage
             return
@@ -161,8 +196,9 @@ async def parse_stream(lines: AsyncIterator[str]) -> AsyncIterator[ModelEvent]:
         except (ValueError, KeyError, TypeError, AttributeError):
             raise ModelError("invalid_sse_event") from None
         if reasoning is not None:
-            yield ReasoningDelta(reasoning)
+            reasoning_parts.append(reasoning)
         if content:
+            has_text = True
             yield TextDelta(content)
     raise ModelError("truncated_stream")
 
@@ -174,14 +210,25 @@ class DeepSeek:
         self._responses = ResponseStreams()
         self._model = model
         self._effort = reasoning_effort
+        self._replay_key = _replay_key(model)
 
     def _payload(self, messages: Sequence[Message], tools: Sequence[ToolSpec], thinking: bool) -> dict[str, Any]:
         return build_request(messages, tools, model=self._model,
                              thinking=thinking and self._effort != "disabled", reasoning_effort=self._effort)
 
+    def history_replay_bytes(self, message: Message, tools: Sequence[ToolSpec], *, thinking: bool) -> int | None:
+        """返回历史请求的额外回放字节数；None 表示不能按原角色投影。"""
+        if message.role != "assistant" or not (thinking and tools and self._effort != "disabled"):
+            return 0
+        reasoning = _replay_text(message, self._replay_key)
+        if reasoning is None:
+            return None if message.content or message.tool_calls else 0
+        assert message.replay is not None
+        return len(message.replay.payload)
+
     async def stream(self, messages: Sequence[Message], tools: Sequence[ToolSpec], *,
                      thinking: bool) -> AsyncGenerator[ModelEvent, None]:
-        diagnostics = adapter_started("deepseek")
+        diagnostics = adapter_started(_ADAPTER_ID)
         body = request_body(self._payload(messages, tools, thinking))
         if diagnostics is not None:
             diagnostics.request_ready(len(body))
@@ -195,7 +242,7 @@ class DeepSeek:
                     raise ModelError(f"http_{response.status_code}")
                 if diagnostics is not None:
                     diagnostics.stage = "sse_read"
-                async with aclosing(parse_stream(response.aiter_lines())) as events:
+                async with aclosing(parse_stream(response.aiter_lines(), model=self._model)) as events:
                     async for event in events:
                         yield event
                 # 解析器只在完整的 [DONE] 后正常结束；此时数据和连接收尾是两个边界。

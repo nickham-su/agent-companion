@@ -2,7 +2,7 @@
 
 import asyncio
 from collections import OrderedDict
-from collections.abc import Iterator, Sequence
+from collections.abc import Sequence
 from contextlib import aclosing
 from copy import deepcopy
 from dataclasses import dataclass
@@ -10,8 +10,7 @@ import logging
 from time import monotonic
 
 from ..model_diagnostics import ModelRequestDiagnostics
-from ..protocol import (Message, Model, ModelError, ProviderReplay, ReasoningDelta,
-                        ReplayReady, TextDelta, ToolReady, ToolSpec)
+from ..protocol import Message, Model, ModelError, TextDelta, ToolReady, ToolSpec
 from ..storage.sqlite import History, Summary
 from .model_deadline import model_deadline_at
 
@@ -20,7 +19,6 @@ _LOG = logging.getLogger(__name__)
 _SUMMARY_BACKOFF_SECONDS = 30
 _READY_SECONDS = 300
 _MAX_REMEMBERED_SESSIONS = 32
-_PRIVATE_ECHO_MIN_CHARS = 32
 
 
 @dataclass(frozen=True, slots=True)
@@ -160,41 +158,15 @@ class Compactions:
             self._active_model = None
 
 
-def _private_replay_fields(replay: ProviderReplay) -> Iterator[str]:
-    for item in replay.items:
-        if item.kind == "reasoning":
-            if item.encrypted_content:
-                yield item.encrypted_content
-            yield from item.summary
-
-
 async def _summarize(model: Model, messages: Sequence[Message], tools: Sequence[ToolSpec], thinking: bool) -> str:
     parts: list[str] = []
-    reasoning: list[str] = []
-    private: list[str] = []
-    for message in messages:
-        if message.reasoning:
-            private.append(message.reasoning)
-        if message.replay is not None:
-            private.extend(_private_replay_fields(message.replay))
     async with aclosing(model.stream(messages, tools, thinking=thinking)) as events:
         async for event in events:
             if isinstance(event, ToolReady):
                 raise ModelError("summary_tool_call")
             if isinstance(event, TextDelta):
                 parts.append(event.text)
-            elif isinstance(event, ReasoningDelta):
-                reasoning.append(event.text)
-            elif isinstance(event, ReplayReady):
-                private.extend(_private_replay_fields(event.replay))
     content = "".join(parts)
-    text = content.strip()
-    if not text:
+    if not content.strip():
         raise ModelError("empty_summary")
-    if reasoning:
-        private.append("".join(reasoning))
-    for value in private:
-        value = value.strip()
-        if value and (text == value or (len(value) >= _PRIVATE_ECHO_MIN_CHARS and value in text)):
-            raise ModelError("summary_private_echo")
     return content

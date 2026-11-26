@@ -26,7 +26,6 @@ from agent_companion.storage.sqlite import History, ReplyOutcome, Summary
 
 _RESPONSES = "https://api.openai.com/v1/responses"
 _KEY = "synthetic-model-test"
-_TEST_SALT = bytes(32)
 _CIPHER = "synthetic-opaque-block"
 _PRIVATE_SUMMARY = "synthetic-provider-summary"
 _IMAGE = "data:image/png;base64,YQ=="
@@ -125,15 +124,14 @@ class _Channel:
         return Receipt(reply.info.reply_id, DeliveryStatus.FULL, generated)
 
 
-def _model(client, *, history=None, api_key=_KEY, model="fixture-model", effort="custom-effort", **kwargs):
-    salt = _TEST_SALT if history is None else history.replay_salt()
-    return OpenAIResponses(client, model=model, api_key=api_key, replay_salt=salt, reasoning_effort=effort, **kwargs)
+def _model(client, *, api_key=_KEY, model="fixture-model", effort="custom-effort", **kwargs):
+    return OpenAIResponses(client, model=model, api_key=api_key, reasoning_effort=effort, **kwargs)
 
 
 async def _complete(fixture, history, *, prompt=None, channel=None, tools=None, settings=None, session_id="main",
                     instructions=None, followup=None, **model_settings):
     async with httpx.AsyncClient(transport=fixture.transport) as client:
-        runtime = Runtime(session_id, history, _model(client, history=history, **model_settings), channel or _Channel(),
+        runtime = Runtime(session_id, history, _model(client, **model_settings), channel or _Channel(),
                           tools=tools, settings=settings, instructions=instructions)
         try:
             runtime.submit_batch([prompt or Message("user", "synthetic prompt")])
@@ -171,7 +169,7 @@ class OpenAIResponsesTests(unittest.IsolatedAsyncioTestCase):
         prompt = Message("user", (Text("读图"), Image(_IMAGE), Text("使用工具")))
         with closing(History(":memory:")) as history:
             async with httpx.AsyncClient(transport=fixture.transport) as client:
-                runtime = Runtime("main", history, _model(client, history=history), channel, tools=tools)
+                runtime = Runtime("main", history, _model(client), channel, tools=tools)
                 try:
                     runtime.submit_batch([prompt])
                     await asyncio.wait_for(channel.first_text.wait(), 1)
@@ -186,8 +184,10 @@ class OpenAIResponsesTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(counts, [("call_1", {"value": 1}), ("call_2", {"value": 2})])
             self.assertEqual(channel.replies, ["读取中。准备完成。", "已完成。"])
             self.assertEqual([r.message.content for r in history.search("main", keyword="synthetic-provider-summary")], [])
-            self.assertTrue(all(row.message.replay is None for row in history.read_after("main")))
-            self.assertIsNone(history.read_after("main")[1].message.reasoning)
+            self.assertIsNotNone(history.read_after("main")[1].message.replay)
+            self.assertEqual(history._db.execute("SELECT count(*) FROM model_replays").fetchone()[0], 0)
+            self.assertIsNone(history._db.execute("SELECT reasoning FROM messages WHERE role = 'assistant'")
+                              .fetchone()[0])
             self.assertEqual(len(history.outcomes("main")), 2)
         initial, continued = fixture.requests
         self.assertTrue(initial["stream"])
@@ -220,7 +220,6 @@ class OpenAIResponsesTests(unittest.IsolatedAsyncioTestCase):
             first = _Fixture(self, [added, done, _completed(_reason(cipher=None, summary=(_PRIVATE_SUMMARY,)))])
             channel = _Channel()
             with closing(History(path)) as history:
-                salt = history.replay_salt()
                 self.assertIsNone(await _complete(first, history, channel=channel))
                 self.assertEqual(channel.replies, [])
                 records = history.read_after("main")
@@ -228,22 +227,21 @@ class OpenAIResponsesTests(unittest.IsolatedAsyncioTestCase):
                 outcome = history.outcomes("main")[0]
                 self.assertEqual(records[-1].message.content, "")
                 self.assertIsNone(outcome.delivery_status)
-                row = history._db.execute("SELECT fingerprint, items FROM model_replays").fetchone()
-                self.assertEqual(len(row["fingerprint"]), 32)
-                self.assertTrue(_KEY not in row["items"])
+                row = history._db.execute("SELECT replay_key, payload FROM model_replay_packets").fetchone()
+                self.assertEqual(len(row["replay_key"]), 16)
+                self.assertTrue(_KEY.encode() not in row["payload"])
             self.assertTrue(_KEY.encode() not in path.read_bytes())
             second = _Fixture(self, [_completed(_answer("完成"))])
             with closing(History(path)) as history:
-                self.assertTrue(history.replay_salt() == salt)
                 self.assertIsNone(await _complete(second, history, base_url="HTTPS://API.OpenAI.COM:443/v1///"))
             self.assertEqual(second.requests[0]["input"], [first.requests[0]["input"][0], native,
                                                            {"role": "user", "content": "synthetic prompt"}])
 
-    async def test_key_url_model_or_effort_change_only_sends_common_history(self):
+    async def test_key_url_or_model_change_only_sends_common_history_without_decoding(self):
         base = "https://responses.example.invalid/gateway/v1"
         other_path = "https://responses.example.invalid/other/v1"
         variants = ({"api_key": "synthetic-rotated"}, {"base_url": other_path},
-                    {"model": "other-model"}, {"effort": "another-valid-for-fixture"})
+                    {"model": "other-model"})
         for change in variants:
             with self.subTest(field=next(iter(change))), closing(History(":memory:")) as history:
                 first = _Fixture(self, [_completed(_reason(), _answer("confirmed"))], endpoint=base + "/responses")
@@ -251,7 +249,8 @@ class OpenAIResponsesTests(unittest.IsolatedAsyncioTestCase):
                 settings = {"base_url": base, **change}
                 second = _Fixture(self, [_completed(_answer("next"))], endpoint=settings["base_url"] + "/responses",
                                   api_key=settings.get("api_key", _KEY))
-                self.assertIsNone(await _complete(second, history, **settings))
+                with patch("agent_companion.models.openai_responses._decode_replay", side_effect=AssertionError):
+                    self.assertIsNone(await _complete(second, history, **settings))
                 payload = second.requests[0]
                 self.assertEqual(payload["reasoning"], {"effort": settings.get("effort", "custom-effort")})
                 self.assertEqual(payload["model"], settings.get("model", "fixture-model"))
@@ -259,7 +258,7 @@ class OpenAIResponsesTests(unittest.IsolatedAsyncioTestCase):
                     {"role": "assistant", "content": "confirmed"}, {"role": "user", "content": "synthetic prompt"},
                 ])
 
-    async def test_sidecar_copied_to_different_database_does_not_match(self):
+    async def test_replay_matches_across_databases_with_same_api_identity(self):
         with (TemporaryDirectory(dir=Path.cwd()) as folder,
               closing(History(Path(folder) / "first.sqlite")) as first,
               closing(History(Path(folder) / "second.sqlite")) as second):
@@ -267,13 +266,10 @@ class OpenAIResponsesTests(unittest.IsolatedAsyncioTestCase):
             source = _Fixture(self, [_completed(_reason(), _answer("confirmed"))])
             self.assertIsNone(await _complete(source, first))
             second.append("main", [row.message for row in first.read_after("main")])
-            with second._db:
-                row = first._db.execute("SELECT * FROM model_replays").fetchone()
-                second._db.execute("INSERT INTO model_replays VALUES (?, ?, ?, ?, ?)", tuple(row))
             dest = _Fixture(self, [_completed(_answer("next"))])
             self.assertIsNone(await _complete(dest, second))
             self.assertEqual(dest.requests[0]["input"], source.requests[0]["input"] + [
-                {"role": "assistant", "content": "confirmed"}, {"role": "user", "content": "synthetic prompt"},
+                _reason(), _answer("confirmed"), {"role": "user", "content": "synthetic prompt"},
             ])
 
     async def test_corrupt_replay_and_cross_provider_use_only_common_history(self):
@@ -285,7 +281,8 @@ class OpenAIResponsesTests(unittest.IsolatedAsyncioTestCase):
                     self.assertIsNone(await _complete(fixture, history))
                 if corrupt:
                     with closing(sqlite3.connect(path)) as conn, conn:
-                        conn.execute("UPDATE model_replays SET items = ?", ('{"malformed":"' + _CIPHER + '"}',))
+                        conn.execute("UPDATE model_replay_packets SET payload = ?",
+                                     (('{"malformed":"' + _CIPHER + '"}').encode(),))
                     second = _Fixture(self, [_completed(_answer("完成"))])
                     with closing(History(path)) as history:
                         self.assertIsNone(await _complete(second, history))
@@ -343,6 +340,20 @@ class OpenAIResponsesTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(later["input"][:len(inputs)], inputs)
                 self.assertNotIn("未播出", json.dumps(later, ensure_ascii=False))
 
+    async def test_zero_delivery_keeps_complete_replay_without_unconfirmed_text(self):
+        first = _Fixture(self, [_completed(_reason(), _answer("not confirmed", "msg_hidden"))])
+        second = _Fixture(self, [_completed(_answer("next"))])
+        with closing(History(":memory:")) as history:
+            self.assertIsNone(await _complete(first, history, channel=_Channel(first_confirmed="")))
+            reply = history.read_after("main")[-1].message
+            self.assertEqual((reply.role, reply.content), ("assistant", ""))
+            self.assertIsNotNone(reply.replay)
+            self.assertEqual(history.outcomes("main")[0].delivery_status, DeliveryStatus.ZERO)
+            self.assertIsNone(await _complete(second, history))
+        self.assertEqual(second.requests[0]["input"], first.requests[0]["input"] + [
+            _reason(), {"role": "user", "content": "synthetic prompt"},
+        ])
+
     async def test_partial_and_zero_delivery_keep_both_reasoning_items_and_tool_pairs(self):
         early, late = _reason(), _reason("rs_2", "synthetic-late-opaque")
         answer = _answer("ABCDEF")
@@ -389,7 +400,7 @@ class OpenAIResponsesTests(unittest.IsolatedAsyncioTestCase):
                 tool.assert_not_awaited()
                 self.assertEqual(history.outcomes("main")[0].model_error, error)
                 self.assertEqual(history.read_after("main")[1].message.content, "可见前缀")
-                self.assertEqual(history._db.execute("SELECT count(*) FROM model_replays").fetchone()[0], 0)
+                self.assertEqual(history._db.execute("SELECT count(*) FROM model_replay_packets").fetchone()[0], 0)
 
     async def test_voice_interrupt_while_closing_preserves_transport_but_not_withheld_terminal(self):
         closing_wire, release_close, closed_wire = (asyncio.Event() for _ in range(3))
@@ -427,6 +438,7 @@ class OpenAIResponsesTests(unittest.IsolatedAsyncioTestCase):
                     self.assertEqual((old.model_status, old.delivery_status),
                                      ("model_interrupted", DeliveryStatus.PARTIAL))
                     self.assertNotEqual(old.run_id, new.run_id)
+                    self.assertIsNone(history.read_after("main")[1].message.replay)
                     self.assertEqual(fixture.requests[1]["input"][-3:], [
                         {"role": "user", "content": "one"}, {"role": "assistant", "content": "confirmed"},
                         {"role": "user", "content": "two"},
@@ -475,7 +487,7 @@ class OpenAIResponsesTests(unittest.IsolatedAsyncioTestCase):
             tool = AsyncMock(side_effect=receive_at_tool_boundary)
             tools = Tools([Tool(_SPEC, tool)])
             async with httpx.AsyncClient(transport=fixture.transport) as client:
-                runtime = Runtime("main", history, _model(client, history=history), channel,
+                runtime = Runtime("main", history, _model(client), channel,
                                   settings=settings, tools=tools)
                 try:
                     runtime.submit_batch([Message("user", "prompt")])
@@ -555,7 +567,7 @@ class OpenAIResponsesTests(unittest.IsolatedAsyncioTestCase):
         tool = AsyncMock(side_effect=execute)
         with closing(History(":memory:")) as history:
             async with httpx.AsyncClient(transport=fixture.transport) as client:
-                runtime = Runtime("main", history, _model(client, history=history), channel,
+                runtime = Runtime("main", history, _model(client), channel,
                                   tools=Tools([Tool(_SPEC, tool)]))
                 try:
                     runtime.submit_batch([prompt])
@@ -605,17 +617,17 @@ class OpenAIResponsesTests(unittest.IsolatedAsyncioTestCase):
                     if rows and rows[0].tool_calls:
                         with history._db:
                             if damage == "missing":
-                                history._db.execute("DELETE FROM model_replays")
+                                history._db.execute("DELETE FROM model_replay_packets")
                             elif damage == "invalid-utf8":
-                                history._db.execute("UPDATE model_replays SET items = CAST(X'FF' AS TEXT)")
+                                history._db.execute("UPDATE model_replay_packets SET payload = X'FF'")
                             else:
-                                stored = history._db.execute("SELECT items FROM model_replays").fetchone()
+                                stored = history._db.execute("SELECT payload FROM model_replay_packets").fetchone()
                                 data = json.loads(stored[0])
                                 if damage == "call-id":
                                     data[-1]["call_id"] = "corrupt-call-id"
                                 else:
                                     data[0]["encrypted_content"] = "\udfff"
-                                history._db.execute("UPDATE model_replays SET items = ?", (json.dumps(data),))
+                                history._db.execute("UPDATE model_replay_packets SET payload = ?", (json.dumps(data).encode(),))
 
                 with patch.object(history, "finalize_reply", side_effect=damage_after_commit):
                     self.assertIsNone(await _complete(fixture, history, tools=Tools([Tool(_SPEC, tool)])))
@@ -659,7 +671,7 @@ class OpenAIResponsesTests(unittest.IsolatedAsyncioTestCase):
             current = "current " + "y" * 1400
             settings = RuntimeSettings(context_budget=2500, tail_budget=510)
             async with httpx.AsyncClient(transport=fixture.transport) as client:
-                runtime = Runtime("main", history, _model(client, history=history), channel, tools=registry,
+                runtime = Runtime("main", history, _model(client), channel, tools=registry,
                                   settings=settings, instructions="fixed synthetic instructions")
                 try:
                     for prompt in (image, Message("user", current)):
@@ -709,16 +721,15 @@ class OpenAIResponsesTests(unittest.IsolatedAsyncioTestCase):
                 _ = [event async for event in _model(client).stream([Message("user", (image,))], (), thinking=False)]
         self.assertEqual(seen, [True])
 
-    async def test_summary_rejects_obvious_private_replay_echo_but_allows_short_common_text(self):
+    async def test_summary_uses_only_formal_text_and_can_keep_original_reasoning_facts(self):
         long_text = "synthetic long private reasoning token " * 2
         long_cipher = "synthetic-opaque-" + "q" * 42
         cases = (
-            ("summary part", "prefix " + long_text, (), True),
-            ("ciphertext", "prefix " + long_cipher, (), True),
-            ("response's short field", "status", (_reason("rs_2", summary=("status",)),), True),
-            ("ordinary prose", "updated status for the case", (), False),
+            ("prior reasoning text", "prefix " + long_text, ()),
+            ("output reasoning text", "status", (_reason("rs_2", summary=("status", "not part of summary")),)),
+            ("ordinary prose", "updated status for the case", ()),
         )
-        for case, generated, output_reasoning, rejected in cases:
+        for case, generated, output_reasoning in cases:
             with self.subTest(case=case), closing(History(":memory:")) as history:
                 def generation_or_reply(payload):
                     if payload["input"][-1].get("content") == _SUMMARIZE.content:
@@ -736,15 +747,8 @@ class OpenAIResponsesTests(unittest.IsolatedAsyncioTestCase):
                 old_end = history.read_after("main")[-1].message_id
                 options = dict(settings=RuntimeSettings(context_budget=252, tail_budget=125),
                                prompt=Message("user", "y" * 420), followup=Message("user", "use candidate"))
-                if rejected:
-                    with self.assertLogs("agent_companion.runtime.compaction", level="WARNING") as logs:
-                        self.assertIsNone(await _complete(fixture, history, **options))
-                    self.assertIn("summary_private_echo", logs.output[0])
-                    self.assertNotIn(generated, logs.output[0])
-                    self.assertEqual(history.summary("main"), saved)
-                else:
-                    self.assertIsNone(await _complete(fixture, history, **options))
-                    self.assertEqual(history.summary("main"), Summary(old_end, generated))
+                self.assertIsNone(await _complete(fixture, history, **options))
+                self.assertEqual(history.summary("main"), Summary(old_end, generated))
                 self.assertEqual(len(fixture.requests), 4)
                 summary = next(payload for payload in fixture.requests[1:3]
                                if payload["input"][-1].get("content") == _SUMMARIZE.content)
@@ -778,7 +782,7 @@ class OpenAIResponsesTests(unittest.IsolatedAsyncioTestCase):
                 async with httpx.AsyncClient(transport=fixture.transport, follow_redirects=True,
                                              auth=("fixture", "unused"), headers={"Authorization": "unused"}) as client:
                     adapter = _model(client, base_url=base)
-                    self.assertNotIn("fingerprint", repr(adapter.replay_scope))
+                    self.assertNotIn(_KEY, repr(adapter))
                     with self.assertRaisesRegex(ModelError, "^http_307$"):
                         _ = [event async for event in adapter.stream([Message("user", "x")], (), thinking=False)]
                 self.assertEqual(len(fixture.requests), 1)
@@ -790,6 +794,8 @@ class OpenAIResponsesTests(unittest.IsolatedAsyncioTestCase):
             with closing(History(path)) as history:
                 assistant_id, = history.append("main", [Message("assistant", "confirmed")])
                 with history._db:
+                    history._db.execute("INSERT INTO model_replays VALUES (?, ?, ?, ?, ?)",
+                                        (assistant_id, "openai_responses", bytes(32), "low", _CIPHER))
                     history._db.execute("CREATE TABLE provider_replays (assistant_message_id INTEGER PRIMARY KEY, items TEXT)")
                     history._db.execute("INSERT INTO provider_replays VALUES (?, ?)", (assistant_id, _CIPHER))
             with closing(History(path)) as history:
@@ -798,7 +804,8 @@ class OpenAIResponsesTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(fixture.requests[0]["input"], [
                     {"role": "assistant", "content": "confirmed"}, {"role": "user", "content": "synthetic prompt"},
                 ])
-                self.assertTrue(history._db.execute("SELECT items FROM provider_replays").fetchone()[0] == _CIPHER)
+                for table in ("provider_replays", "model_replays"):
+                    self.assertTrue(history._db.execute(f"SELECT items FROM {table}").fetchone()[0] == _CIPHER)
 
     async def test_no_reasoning_is_valid_and_input_usage_is_optional(self):
         fixture = _Fixture(self, [_completed(_answer("文本"), input_tokens=17)],
@@ -808,8 +815,9 @@ class OpenAIResponsesTests(unittest.IsolatedAsyncioTestCase):
             adapter = _model(client)
             events = [item async for item in adapter.stream(messages, (), thinking=False)]
             invalid = [item async for item in adapter.stream(messages, (), thinking=False)]
-        replay = next(event.replay for event in events if isinstance(event, ReplayReady))
-        self.assertEqual([item.kind for item in replay.items], ["message"])
+        replay_event, = (event for event in events if isinstance(event, ReplayReady))
+        records = adapter._payload([Message("assistant", "文本", replay=replay_event.replay)], ())["input"]
+        self.assertEqual(records, [_answer("文本")])
         self.assertEqual([event for event in events if isinstance(event, InputUsage)], [InputUsage(17)])
         self.assertFalse(any(isinstance(event, InputUsage) for event in invalid))
 
@@ -835,16 +843,14 @@ class OpenAIResponsesTests(unittest.IsolatedAsyncioTestCase):
             self.assertIsNone(await _complete(fixture, history))
             self.assertIsNone(await _complete(fixture, history, session_id="other"))
             self.assertNotIn(_CIPHER, json.dumps(fixture.requests[1]))
-            async with httpx.AsyncClient(transport=fixture.transport) as client:
-                scope = _model(client, history=history).replay_scope
-            entries = history.read_after("main", replay_scope=scope)
-            before_count = history._db.execute("SELECT count(*) FROM model_replays").fetchone()[0]
+            entries = history.read_after("main")
+            before_count = history._db.execute("SELECT count(*) FROM model_replay_packets").fetchone()[0]
             outcome = history.outcomes("main")[0]
             duplicate = ReplyOutcome(outcome.reply_id, "main", outcome.run_id, "complete")
             with self.assertRaises(sqlite3.IntegrityError):
                 history.finalize_reply(duplicate, [entries[-1].message])
-            self.assertEqual(history.read_after("main", replay_scope=scope), entries)
-            self.assertEqual(history._db.execute("SELECT count(*) FROM model_replays").fetchone()[0], before_count)
+            self.assertEqual(history.read_after("main"), entries)
+            self.assertEqual(history._db.execute("SELECT count(*) FROM model_replay_packets").fetchone()[0], before_count)
 
     async def test_production_switches_named_providers_without_changing_replay_identity_rules(self):
         endpoint = "https://responses.example.invalid/api/responses"
@@ -917,7 +923,7 @@ max_audio_seconds = 500
                     self.assertEqual(request["model"], model)
                     self.assertEqual(request["reasoning"]["effort"], effort)
                     body = json.dumps(request["input"])
-                    self.assertEqual(_CIPHER in body, name == "renamed")
+                    self.assertEqual(_CIPHER in body, name in ("renamed", "other_effort"))
                     self.assertEqual("old confirmed" in body, name != "initial")
 
     async def test_deepseek_explicit_effort_and_disabled_use_existing_wire(self):

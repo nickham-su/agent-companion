@@ -2,7 +2,7 @@
 
 from collections.abc import Iterable, Iterator, Sequence
 from contextlib import contextmanager
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 import json
 from pathlib import Path
 from secrets import token_bytes
@@ -10,8 +10,7 @@ import sqlite3
 from time import time
 from uuid import uuid4
 
-from ..protocol import (MAX_REPLAY_BYTES, DeliveryStatus, Image, Message, ProviderReplay, ReplayItem,
-                        ReplayScope, Text, ToolCall)
+from ..protocol import REPLAY_KEY_BYTES, DeliveryStatus, Image, Message, Replay, Text, ToolCall
 
 
 _SCHEMA_VERSION = 3
@@ -26,6 +25,15 @@ CREATE TABLE IF NOT EXISTS reply_model_origins (
     fingerprint BLOB NOT NULL CHECK (length(fingerprint) = 32)
 )
 """
+# 追加式扩展：不迁移没有新兼容标识的旧 reasoning 和 model_replays。
+_REPLAY_PACKETS = f"""
+CREATE TABLE IF NOT EXISTS model_replay_packets (
+    assistant_message_id INTEGER PRIMARY KEY REFERENCES messages(message_id) ON DELETE CASCADE,
+    replay_key BLOB NOT NULL CHECK (typeof(replay_key) = 'blob' AND length(replay_key) = {REPLAY_KEY_BYTES}),
+    payload BLOB NOT NULL CHECK (typeof(payload) = 'blob')
+)
+"""
+_MESSAGE_COLUMNS = "m.message_id, m.session_id, m.created_at, m.role, m.content, m.tool_calls, m.tool_call_id"
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS messages (
     message_id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -246,41 +254,19 @@ def _decode_content(encoded: str) -> str | tuple[Text | Image, ...]:
     )
 
 
-def _decode_replay(row: sqlite3.Row, scope: ReplayScope) -> ProviderReplay | None:
-    if row["replay_items"] is None:
-        return None
-    try:
-        items = json.loads(row["replay_items"].decode("utf-8"))
-        if not isinstance(items, list):
-            raise ValueError
-        parsed = []
-        for item in items:
-            if (type(item) is not dict or type(item["parts"]) is not list or type(item["summary"]) is not list
-                    or any(type(part) is not list for part in item["parts"])):
-                raise ValueError
-            cipher, summary = item["encrypted_content"], tuple(item["summary"])
-            # JSON 转义可以藏有孤立代理码点；此类记录不能被写入 UTF-8 请求。
-            for text in ((cipher,) if cipher is not None else ()) + summary:
-                if not isinstance(text, str):
-                    raise ValueError
-                text.encode("utf-8")
-            parsed.append(ReplayItem(
-                kind=item["kind"], item_id=item["item_id"], call_id=item["call_id"], phase=item["phase"],
-                parts=tuple(tuple(part) for part in item["parts"]), encrypted_content=cipher, summary=summary,
-            ))
-        return ProviderReplay(scope, tuple(parsed))
-    except (ValueError, TypeError, KeyError, RecursionError):
-        return None  # 私有记录损坏时，仍可正常读取通用会话历史。
+def _read_packet(row: sqlite3.Row) -> Replay | None:
+    key, payload = row["replay_key"], row["replay_payload"]
+    if type(key) is bytes and len(key) == REPLAY_KEY_BYTES and type(payload) is bytes:
+        return Replay(key, payload)
+    return None
 
 
-def _decode(row: sqlite3.Row, replay: ProviderReplay | None = None, *, include_reasoning: bool = True) -> HistoryEntry:
+def _decode(row: sqlite3.Row, replay: Replay | None = None) -> HistoryEntry:
     return HistoryEntry(
         row["message_id"], row["session_id"], row["created_at"],
         Message(row["role"], _decode_content(row["content"]),
-                tuple(ToolCall(**item) for item in json.loads(row["tool_calls"])), row["tool_call_id"],
-                row["reasoning"] if include_reasoning else None, replay=replay),
+                tuple(ToolCall(**item) for item in json.loads(row["tool_calls"])), row["tool_call_id"], replay=replay),
     )
-
 
 class FeishuBindingError(ValueError):
     """飞书账号或会话的数据库归属无法确认。"""
@@ -349,6 +335,7 @@ class History:
                     # 打开时只预检已有归属；空库由绑定事务认领。
                     self.check_feishu_private(feishu_private_owner)
                 self._db.execute(_MODEL_ORIGINS)
+                self._db.execute(_REPLAY_PACKETS)
         except BaseException:
             self.close()
             raise
@@ -486,13 +473,18 @@ class History:
         for message in messages:
             content, searchable = _encode(message)
             cursor = self._db.execute(
-                "INSERT INTO messages (session_id, created_at, role, content, tool_calls, tool_call_id, reasoning)"
-                " VALUES (?, ?, ?, ?, ?, ?, ?)",
+                "INSERT INTO messages (session_id, created_at, role, content, tool_calls, tool_call_id)"
+                " VALUES (?, ?, ?, ?, ?, ?)",
                 (session_id, created_at, message.role, content,
                  json.dumps([asdict(call) for call in message.tool_calls], ensure_ascii=False),
-                 message.tool_call_id, message.reasoning),
+                 message.tool_call_id),
             )
             message_id = cursor.lastrowid
+            if message.replay is not None:
+                if message.role != "assistant":
+                    raise ValueError("only assistant messages may carry model replay")
+                self._db.execute("INSERT INTO model_replay_packets VALUES (?, ?, ?)",
+                                 (message_id, message.replay.replay_key, message.replay.payload))
             if searchable:
                 self._db.execute("INSERT INTO message_search (rowid, body) VALUES (?, ?)",
                                  (message_id, searchable))
@@ -581,7 +573,7 @@ class History:
         contents = []
         for message in messages:
             if (message.role != "user" or message.tool_calls or message.tool_call_id is not None
-                    or message.reasoning is not None or message.replay is not None):
+                    or message.replay is not None):
                 raise ValueError("inbound batches require plain user messages")
             contents.append(_encode(message)[0])
         if contents:
@@ -780,25 +772,17 @@ class History:
         # 原子提交响应及对应结果，不在崩溃后暴露只有调用、没有结果的组。
         if messages and messages[0].role != "assistant":
             raise ValueError("reply history must start with an assistant message")
+        if outcome.model_status != "complete" and any(message.replay is not None for message in messages):
+            messages = [replace(message, replay=None) for message in messages]
         with self._input_transaction(retryable_io=False):
             ids = self._append(outcome.session_id, messages)
-            replay = messages[0].replay if messages else None
-            if replay is not None and outcome.model_status == "complete":
-                items = json.dumps([asdict(item) for item in replay.items], ensure_ascii=False, separators=(",", ":"))
-                if len(items.encode("utf-8")) > MAX_REPLAY_BYTES:
-                    raise ValueError("provider replay exceeds storage limit")
-                scope = replay.scope
-                self._db.execute("INSERT INTO model_replays VALUES (?, ?, ?, ?, ?)", (
-                    ids[0], scope.protocol, scope.fingerprint, scope.reasoning_effort, items,
-                ))
             self._db.execute("INSERT INTO reply_outcomes"
                              " (reply_id, session_id, run_id, model_status, delivery_status,"
                              " assistant_message_id, model_error, input_tokens) VALUES (?, ?, ?, ?, ?, ?, ?, ?)", (
                 outcome.reply_id, outcome.session_id, outcome.run_id, outcome.model_status,
                 outcome.delivery_status, ids[0] if ids else None, outcome.model_error, outcome.input_tokens,
             ))
-            if model_origin is not None and outcome.model_status == "complete" and (
-                    outcome.input_tokens is not None or bool(messages and messages[0].reasoning is not None)):
+            if model_origin is not None and outcome.model_status == "complete" and outcome.input_tokens is not None:
                 self._db.execute("INSERT INTO reply_model_origins VALUES (?, ?, ?)", (
                     outcome.reply_id, ids[0] if ids else None, model_origin,
                 ))
@@ -870,45 +854,26 @@ class History:
         return (row["input_tokens"] if row is not None and
                 (model_origin is None or row["fingerprint"] == model_origin) else None)
 
-    def read_after(self, session_id: str, after: int = 0, *,
-                   replay_scope: ReplayScope | None = None, model_origin: bytes | None = None) -> list[HistoryEntry]:
-        columns, joins, select_args, join_args = ["m.*"], [], [], []
-        if replay_scope is not None:
-            columns.append("CASE WHEN length(CAST(r.items AS BLOB)) <= ? THEN CAST(r.items AS BLOB) END AS replay_items")
-            select_args.append(MAX_REPLAY_BYTES)
-            joins.append("LEFT JOIN model_replays r ON r.assistant_message_id = m.message_id"
-                         " AND r.protocol = ? AND r.fingerprint = ? AND r.reasoning_effort = ?")
-            join_args.extend((replay_scope.protocol, replay_scope.fingerprint, replay_scope.reasoning_effort))
-        if model_origin is not None:
-            columns.append("p.fingerprint IS NOT NULL AS matching_origin")
-            joins.append("LEFT JOIN reply_model_origins p ON p.assistant_message_id = m.message_id AND p.fingerprint = ?")
-            join_args.append(model_origin)
-        sql = (f"SELECT {', '.join(columns)} FROM messages m {' '.join(joins)}"
-               " WHERE m.session_id = ? AND m.message_id > ? ORDER BY m.message_id")
-        return [_decode(row, _decode_replay(row, replay_scope) if replay_scope is not None else None,
-                        include_reasoning=model_origin is None or bool(row["matching_origin"]))
-                for row in self._db.execute(sql, (*select_args, *join_args, session_id, after))]
+    def read_after(self, session_id: str, after: int = 0) -> list[HistoryEntry]:
+        rows = self._db.execute(
+            f"SELECT {_MESSAGE_COLUMNS}, r.replay_key, r.payload AS replay_payload FROM messages m"
+            " LEFT JOIN model_replay_packets r ON r.assistant_message_id = m.message_id"
+            " WHERE m.session_id = ? AND m.message_id > ? ORDER BY m.message_id", (session_id, after))
+        return [_decode(row, _read_packet(row)) for row in rows]
 
-    def context_snapshot(
-        self, session_id: str, *, replay_scope: ReplayScope | None = None, model_origin: bytes | None = None,
-    ) -> tuple[Summary | None, list[HistoryEntry]]:
-        """摘要、续尾及私有回放来自同一个 SQLite 读事务。"""
+    def context_snapshot(self, session_id: str) -> tuple[Summary | None, list[HistoryEntry]]:
+        """摘要、续尾及不透明回放包来自同一个 SQLite 读事务。"""
         self._db.execute("BEGIN")
         with self._db:
             summary = self.summary(session_id)
-            options = {"model_origin": model_origin} if model_origin is not None else {}
-            entries = self.read_after(session_id, summary.covers_through if summary else 0,
-                                      replay_scope=replay_scope, **options)
+            entries = self.read_after(session_id, summary.covers_through if summary else 0)
         return summary, entries
 
-    def try_context_snapshot(
-        self, session_id: str, *, replay_scope: ReplayScope | None = None, model_origin: bytes | None = None,
-    ) -> tuple[Summary | None, list[HistoryEntry]] | None:
+    def try_context_snapshot(self, session_id: str) -> tuple[Summary | None, list[HistoryEntry]] | None:
         """压缩 CAS 失利后的单次刷新；遇锁时调用方保留原快照。"""
         with self._without_busy_wait():
             try:
-                options = {"model_origin": model_origin} if model_origin is not None else {}
-                return self.context_snapshot(session_id, replay_scope=replay_scope, **options)
+                return self.context_snapshot(session_id)
             except sqlite3.OperationalError as exc:
                 if not is_sqlite_lock_error(exc):
                     raise
@@ -918,7 +883,7 @@ class History:
         if limit < 1:
             raise ValueError("limit must be positive")
         recent = self._db.execute(
-            "SELECT * FROM messages WHERE session_id = ? ORDER BY message_id DESC LIMIT ?",
+            f"SELECT {_MESSAGE_COLUMNS} FROM messages m WHERE session_id = ? ORDER BY message_id DESC LIMIT ?",
             (session_id, limit),
         ).fetchall()
         return [_decode(row) for row in reversed(recent)]
@@ -997,5 +962,5 @@ class History:
             clauses.append("m.created_at < ?")
             args.append(until)
         args.append(limit)
-        sql = "SELECT m.* FROM messages AS m" + join + " WHERE " + " AND ".join(clauses)
+        sql = f"SELECT {_MESSAGE_COLUMNS} FROM messages AS m" + join + " WHERE " + " AND ".join(clauses)
         return [_decode(row) for row in self._db.execute(sql + " ORDER BY m.message_id DESC LIMIT ?", args)]

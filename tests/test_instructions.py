@@ -218,7 +218,7 @@ class RoleRuntimeTests(_RoleFiles, unittest.IsolatedAsyncioTestCase):
 
         async with httpx.AsyncClient(transport=httpx.MockTransport(receive)) as client:
             adapters = (DeepSeek(client), OpenAIResponses(client, model="fixture", api_key="fixture",
-                                                          replay_salt=bytes(32), reasoning_effort="low"))
+                                                          reasoning_effort="low"))
             for adapter in adapters:
                 try:
                     with self.assertRaises(ModelError):

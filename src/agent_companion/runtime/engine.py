@@ -13,8 +13,8 @@ from uuid import uuid4
 from ..config import RuntimeSettings
 from ..model_diagnostics import ModelRequestDiagnostics, failure_category
 from ..protocol import (AgentReply, Channel, DelegationTask, DeliveryStatus, InputItem, InputUsage, InternalInput,
-                         Message, Model, ModelClosing, ModelError, PersistedInput, ReasoningDelta, Receipt, ReplayReady,
-                         ReplayScope, ReplyDelivery, ReplyInfo, ReplyStream, SelectableChannel, TextDelta, ToolCall,
+                         Message, Model, ModelClosing, ModelError, PersistedInput, Receipt, ReplayReady,
+                         ReplyDelivery, ReplyInfo, ReplyStream, SelectableChannel, TextDelta, ToolCall,
                          ToolReady, validate_input_items)
 from ..storage.sqlite import (Agent, AgentReplyInput, DelegatedInput, History, ReplyOutcome, RetryableInputWrite,
                               is_sqlite_lock_error)
@@ -71,8 +71,6 @@ class Runtime:
         self._settings = settings if settings is not None else RuntimeSettings()
         self._thinking = thinking
         self._instructions = instructions
-        replay_scope = getattr(model, "replay_scope", None)
-        self._replay_scope = replay_scope if isinstance(replay_scope, ReplayScope) else None
         self._origin_options = {"model_origin": model_origin} if model_origin is not None else {}
         self._pending: deque[_InputBatch] = deque()
         self._queued_inbound: set[int] = set()
@@ -87,8 +85,7 @@ class Runtime:
         self._owns_compactions = compactions is None
         self._compactions = compactions if compactions is not None else Compactions(history)
         self._compactions.check_owner(history)
-        self._context = Context(history, self._settings, self._compactions, model=model, sqlite=self._sqlite,
-                                replay_scope=self._replay_scope, **self._origin_options)
+        self._context = Context(history, self._settings, self._compactions, model=model, sqlite=self._sqlite)
         self._idle = asyncio.Event()
         self._idle.set()
         self.last_failure: str | None = None
@@ -385,7 +382,6 @@ class Runtime:
         info = ReplyInfo(uuid4().hex, self.session_id, run_id, loop.time())
         diagnostics = ModelRequestDiagnostics("reply", self._settings.model_timeout, run_id, info.reply_id)
         text: list[str] = []
-        reasoning: list[str] = []
         replay = None
         request_locks = self._tools.request_locks()
         scheduled: dict[str, tuple[ToolCall, asyncio.Task[str]]] = {}
@@ -464,10 +460,12 @@ class Runtime:
                             raise TimeoutError
                         if isinstance(event, ModelClosing):
                             reader_closing = True
-                            if event.complete and has_user_channel:
+                            if event.complete:
                                 deadline.disarm()
                                 model_complete = True
-                                finish_reply_stream()  # 回执可先于连接关闭结算；完整投递仍等连接收尾。
+                                if has_user_channel:
+                                    # 回执可先于连接关闭结算；完整投递仍等连接收尾。
+                                    finish_reply_stream()
                                 return True
                         elif isinstance(event, TextDelta) and event.text:
                             if not text:
@@ -491,12 +489,10 @@ class Runtime:
                                 if first_handoff and reply.voice_delivery:
                                     # 先让语音投递进入同一回执接口，以便拒收先于相邻工具帧。
                                     await delivery_started
-                        elif isinstance(event, ReasoningDelta) and self._thinking:
-                            reasoning.append(event.text)
                         elif isinstance(event, InputUsage):
                             input_tokens = event.input_tokens
                         elif isinstance(event, ReplayReady):
-                            if replay is not None or event.replay.scope != self._replay_scope:
+                            if replay is not None:
                                 raise ModelError("invalid_sse_event")
                             replay = event.replay
                         elif isinstance(event, ToolReady):
@@ -596,12 +592,10 @@ class Runtime:
             # 完整模型流的协议回放元数据可保留成套工具调用；适配器仍仅从确认正文回放文本。
             if model_status != "complete":
                 replay = None
-            # 零投递的纯文本只留投递结果，不创建模型可见的助理消息。
-            keep_reply = (receipt.status != DeliveryStatus.ZERO if receipt is not None else
-                          bool(generated_text or replay is not None))
-            rows = ([Message("assistant", confirmed_text if receipt else generated_text, calls,
-                              reasoning="".join(reasoning) if model_status == "complete" and reasoning else None,
-                              replay=replay),
+            # 零投递不保留未送达正文；仍可随空正文保存完整的协议回放。
+            keep_reply = (replay is not None or
+                          (receipt.status != DeliveryStatus.ZERO if receipt is not None else bool(generated_text)))
+            rows = ([Message("assistant", confirmed_text if receipt else generated_text, calls, replay=replay),
                        *results]
                       if keep_reply or calls else [])
             outcome = ReplyOutcome(info.reply_id, info.session_id, run_id, model_status,

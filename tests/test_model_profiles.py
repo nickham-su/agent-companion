@@ -266,6 +266,8 @@ class ProfileRuntimeTests(_Files, unittest.IsolatedAsyncioTestCase):
         phase = "first"
 
         async def respond(request):
+            credential = "fixture-deep-rotated" if phase in ("rotated", "changed") else "fixture-deep"
+            self.assertTrue(request.headers.get("authorization") == f"Bearer {credential}")
             body = json.loads(request.content)
             messages = body["messages"]
             requests.append((body["model"], messages))
@@ -282,7 +284,9 @@ class ProfileRuntimeTests(_Files, unittest.IsolatedAsyncioTestCase):
                 if phase == "same":
                     # 摘要是后台请求，等其发出再退出当前启动。
                     await asyncio.wait_for(summary_started.wait(), 2)
-                self.assertEqual(history.read_after("root")[0].message.reasoning, "prior unknown reasoning")
+                self.assertIsNone(history.read_after("root")[0].message.replay)
+                legacy = history._db.execute("SELECT reasoning FROM messages WHERE message_id = 1").fetchone()[0]
+                self.assertTrue(legacy == "prior unknown reasoning")
 
         self.assertEqual(await self.serve(respond, drive, expected_clients=2), ["deep"])
         self.assertEqual(len(requests), 1)
@@ -303,18 +307,28 @@ class ProfileRuntimeTests(_Files, unittest.IsolatedAsyncioTestCase):
             self.assertIn("first private", wire)
             self.assertNotIn("prior unknown reasoning", wire)
 
+        phase = "rotated"
+        requests.clear()
+        rotated = (_CONFIG.replace("[models.chat]", "[models.renamed]")
+                   .replace('api_key = "fixture-deep"', 'api_key = "fixture-deep-rotated"'))
+        self.config.write_text(rotated, encoding="utf-8")
+        self.assertEqual(await self.serve(respond, drive, expected_clients=2), ["deep"])
+        self.assertEqual(len(requests), 1)  # 用量来源仍按现有规则隔离；明文推理不依赖凭据。
+        wire = json.dumps(requests[0][1])
+        self.assertIn("first private", wire)
+        self.assertIn("same private", wire)
+
         phase = "changed"
         requests.clear()
-        self.config.write_text(_CONFIG.replace("[models.chat]", "[models.renamed]")
-                               .replace('model = "main-model"', 'model = "different-model"'), encoding="utf-8")
+        self.config.write_text(rotated.replace('model = "main-model"', 'model = "different-model"'), encoding="utf-8")
         self.assertEqual(await self.serve(respond, drive, expected_clients=2), ["deep"])
         self.assertEqual(len(requests), 1)  # 同 ID 指向新模型，旧的 500 token 不触发摘要。
         model, messages = requests[0]
         self.assertEqual(model, "different-model")
         wire = json.dumps(messages)
-        for old in ("legacy answer", "first answer", "same answer", "changed prompt"):
+        for old in ("legacy answer", "first answer", "same answer", "rotated answer", "changed prompt"):
             self.assertIn(old, wire)
-        for private in ("prior unknown reasoning", "first private", "same private"):
+        for private in ("prior unknown reasoning", "first private", "same private", "rotated private"):
             self.assertNotIn(private, wire)
 
     async def test_unused_profile_credentials_are_not_required(self):

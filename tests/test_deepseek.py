@@ -7,9 +7,9 @@ from unittest.mock import patch
 import httpx
 
 from agent_companion.config import RuntimeSettings
-from agent_companion.models.deepseek import DeepSeek, build_request, parse_stream
+from agent_companion.models.deepseek import MODEL_NAME, DeepSeek, _replay_key, build_request, parse_stream
 from agent_companion.protocol import (DeliveryStatus, Image, InputUsage, Message, ModelClosing, ModelError,
-                                      ReasoningDelta, Receipt, Text, TextDelta, ToolCall, ToolReady, ToolSpec)
+                                      Receipt, Replay, ReplayReady, Text, TextDelta, ToolCall, ToolReady, ToolSpec)
 from agent_companion.runtime.context import _SUMMARIZE
 from agent_companion.runtime.engine import Runtime
 from agent_companion.runtime.tools import Tool, Tools
@@ -122,7 +122,7 @@ class DeepSeekTest(unittest.IsolatedAsyncioTestCase):
                     await asyncio.wait_for(closing_wire.wait(), 2)
                     await asyncio.wait_for(runtime.wait_idle(), 2)
                     self.assertEqual(history.outcomes("main")[0].model_status, "model_interrupted")
-                    self.assertEqual(history.tail("main", 1)[0].message, Message("assistant", "confirmed"))
+                    self.assertEqual(history.read_after("main")[-1].message, Message("assistant", "confirmed"))
                     self.assertTrue(deadline.cancelled())  # 已撤销旧计时 handle，而不是只清引用。
                     shutdown = asyncio.create_task(runtime.close())
                     await asyncio.sleep(max(0, cutoff - asyncio.get_running_loop().time()) + .01)
@@ -217,6 +217,105 @@ class DeepSeekTest(unittest.IsolatedAsyncioTestCase):
                     release_next.set()
                     await runtime.close()
                 self.assertTrue(closed_wire.is_set())
+
+    async def test_internal_done_preserves_reply_and_tool_continuation_on_close_failure(self):
+        for blocked in (False, True):
+            with self.subTest(blocked=blocked), closing(History(":memory:")) as history:
+                close_started, close_cancelled, release_close, closed = (asyncio.Event() for _ in range(4))
+                requests, ran = [], []
+
+                class FailingClose(Bytes):
+                    async def aclose(self):
+                        close_started.set()
+                        if not blocked:
+                            raise httpx.ReadError("synthetic response close error")
+                        try:
+                            await asyncio.Future()
+                        except asyncio.CancelledError:
+                            close_cancelled.set()
+                            await release_close.wait()
+                        closed.set()
+
+                def endpoint(request):
+                    requests.append(json.loads(request.content))
+                    if len(requests) == 1:
+                        frames = [chunk({"content": "tool reply", "reasoning_content": "tool reasoning"}),
+                                  chunk(call(id="internal-call", function={"name": "test", "arguments": "{}"})),
+                                  chunk(finish="tool_calls"), "[DONE]"]
+                        wire = FailingClose
+                    else:
+                        frames = [chunk({"content": "final answer", "reasoning_content": "final reasoning"}),
+                                  chunk(finish="stop"), "[DONE]"]
+                        wire = Bytes
+                    return httpx.Response(200, stream=wire("".join(f"data: {frame}\n\n" for frame in frames).encode()))
+
+                async def tool(_arguments, context):
+                    ran.append(context.call_id)
+                    return "tool result"
+
+                with (patch("agent_companion.models._http_stream._RESPONSE_CLOSE_TIMEOUT", .25),
+                      _record_model_timers() as deadlines):
+                    async with httpx.AsyncClient(transport=httpx.MockTransport(endpoint)) as client:
+                        runtime = Runtime("main", history, DeepSeek(client), None, thinking=True,
+                                          tools=Tools([Tool(SPEC, tool)]), settings=RuntimeSettings(model_timeout=.15))
+                        try:
+                            with self.assertLogs("agent_companion.runtime.engine", level="WARNING") as logs:
+                                runtime.submit_batch([Message("user", "internal request")])
+                                await asyncio.wait_for(close_started.wait(), 2)
+                                self.assertTrue(deadlines[0].cancelled())
+                                await asyncio.wait_for(runtime.wait_idle(), 2)
+                            expected = "transport_close_timeout" if blocked else "transport_error"
+                            self.assertIn(f"model cleanup failed ({expected})", "\n".join(logs.output))
+                            self.assertIsNone(runtime.last_failure)
+                            if blocked:
+                                self.assertTrue(close_cancelled.is_set())
+                                self.assertFalse(closed.is_set())  # 续轮不必等待底层关闭任务恢复。
+                        finally:
+                            release_close.set()
+                            await runtime.close()
+                        if blocked:
+                            await asyncio.wait_for(closed.wait(), 2)
+
+                self.assertEqual(ran, ["internal-call"])
+                self.assertEqual(len(requests), 2)
+                assistant, result = requests[-1]["messages"][-2:]
+                self.assertEqual((assistant["content"], assistant["reasoning_content"]),
+                                 ("tool reply", "tool reasoning"))
+                self.assertEqual(assistant["tool_calls"][0]["id"], "internal-call")
+                self.assertEqual(result, {"role": "tool", "content": "tool result", "tool_call_id": "internal-call"})
+                self.assertEqual([row.model_status for row in history.outcomes("main")], ["complete", "complete"])
+                first, _, final = [row.message for row in history.read_after("main")][1:]
+                self.assertEqual(first.replay, Replay(_replay_key(MODEL_NAME), b"tool reasoning"))
+                self.assertEqual((final.content, final.replay),
+                                 ("final answer", Replay(_replay_key(MODEL_NAME), b"final reasoning")))
+
+    async def test_internal_missing_done_never_saves_body_or_replay(self):
+        for cancelled in (False, True):
+            with self.subTest(cancelled=cancelled), closing(History(":memory:")) as history:
+                frames = [chunk({"content": "incomplete text", "reasoning_content": "incomplete reasoning"}),
+                          chunk(finish="stop")]
+                data = "".join(f"data: {frame}\n\n" for frame in frames).encode()
+
+                class MissingDone(Bytes):
+                    async def __aiter__(self):
+                        async for block in super().__aiter__():
+                            yield block
+                        if cancelled:
+                            raise asyncio.CancelledError
+
+                transport = httpx.MockTransport(lambda _: httpx.Response(200, stream=MissingDone(data)))
+                async with httpx.AsyncClient(transport=transport) as client:
+                    runtime = Runtime("main", history, DeepSeek(client), None, thinking=True)
+                    try:
+                        runtime.submit_batch([Message("user", "internal request")])
+                        await asyncio.wait_for(runtime.wait_idle(), 2)
+                        status = "model_cancelled" if cancelled else "model_failed"
+                        self.assertEqual(runtime.last_failure, status)
+                    finally:
+                        await runtime.close()
+                outcome, = history.outcomes("main")
+                self.assertEqual((outcome.model_status, outcome.assistant_message_id), (status, None))
+                self.assertEqual([row.message for row in history.read_after("main")], [Message("user", "internal request")])
 
     async def test_two_complete_tool_rounds_finish_after_response_closes_without_new_input(self):
         requests, tool_ids = [], []
@@ -490,7 +589,7 @@ class DeepSeekTest(unittest.IsolatedAsyncioTestCase):
         assistant, result = pending[1]["messages"][-2:]
         self.assertEqual(assistant["reasoning_content"], "原始推理")
         self.assertEqual(result, {"role": "tool", "content": "尺寸为 2", "tool_call_id": "call-a"})
-        self.assertEqual(history.read_after("main")[1].message.reasoning, "原始推理")
+        self.assertEqual(history.read_after("main")[1].message.replay, Replay(_replay_key(MODEL_NAME), "原始推理".encode()))
         self.assertEqual(history.search("main", keyword="原始推理"), [])
 
     async def test_json_looking_complete_before_finish_is_not_ready(self):
@@ -521,7 +620,8 @@ class DeepSeekTest(unittest.IsolatedAsyncioTestCase):
             with self.subTest(ending=ending):
                 result = []
                 with self.assertRaises(ModelError):
-                    async for event in parse_stream(lines(chunk({"content": "prefix"}), partial, *ending)):
+                    async for event in parse_stream(lines(chunk({"content": "prefix", "reasoning_content": "unfinished"}),
+                                                          partial, *ending)):
                         result.append(event)
                 self.assertEqual(result, [TextDelta("prefix")])
 
@@ -539,7 +639,7 @@ class DeepSeekTest(unittest.IsolatedAsyncioTestCase):
                 _ = [event async for event in DeepSeek(client).stream([Message("user", "one")], (), thinking=False)]
 
     async def test_tool_blocks_have_no_reasoning_when_disabled(self):
-        args = [Message("assistant", "", (ToolCall("a", "test", "{}"),), reasoning="internal"),
+        args = [Message("assistant", "", (ToolCall("a", "test", "{}"),), replay=Replay(_replay_key(MODEL_NAME), b"internal")),
                 Message("tool", "ok", tool_call_id="a")]
         request = build_request(args, [SPEC], thinking=False)
         self.assertEqual(request["thinking"], {"type": "disabled"})
@@ -548,7 +648,95 @@ class DeepSeekTest(unittest.IsolatedAsyncioTestCase):
         with self.assertRaisesRegex(ModelError, "missing_reasoning"):
             build_request([Message("assistant", "history without protocol field")], [SPEC], thinking=True)
 
-    async def test_reasoning_and_text_are_separate_events(self):
-        self.assertEqual([e async for e in parse_stream(lines(chunk({"reasoning_content": "r", "content": "t"}),
-                                                                  chunk(finish="stop"), "[DONE]"))],
-                         [ReasoningDelta("r"), TextDelta("t")])
+    async def test_text_is_immediate_and_complete_reasoning_is_delivered_once(self):
+        stream = parse_stream(lines(chunk({"reasoning_content": "r", "content": "t"}),
+                                    chunk({"reasoning_content": "续"}), chunk(finish="stop"), "[DONE]"))
+        self.assertEqual(await anext(stream), TextDelta("t"))
+        self.assertEqual([event async for event in stream], [ReplayReady(Replay(_replay_key(MODEL_NAME), "r续".encode()))])
+
+    async def test_explicit_empty_reasoning_survives_until_followup_with_tools(self):
+        for reasoning in ({"reasoning_content": ""}, {}, {"reasoning_content": None}):
+            with self.subTest(reasoning=reasoning), closing(History(":memory:")) as history:
+                requests = []
+
+                def endpoint(request):
+                    requests.append(json.loads(request.content))
+                    delta = {"content": "first answer", **reasoning} if len(requests) == 1 else {"content": "next answer"}
+                    frames = [chunk(delta), chunk(finish="stop"), "[DONE]"]
+                    return httpx.Response(200, text="".join(f"data: {frame}\n\n" for frame in frames))
+
+                async def unused_tool(_arguments, _context):
+                    self.fail("fixture does not request tool execution")
+
+                async with httpx.AsyncClient(transport=httpx.MockTransport(endpoint)) as client:
+                    model = DeepSeek(client)
+                    for tools in (None, Tools([Tool(SPEC, unused_tool)])):
+                        runtime = Runtime("main", history, model, None, tools=tools, thinking=True)
+                        try:
+                            runtime.submit_batch([Message("user", "next prompt" if tools else "first prompt")])
+                            await asyncio.wait_for(runtime.wait_idle(), 2)
+                            self.assertIsNone(runtime.last_failure)
+                        finally:
+                            await runtime.close()
+                self.assertNotIn("tools", requests[0])
+                self.assertIn("tools", requests[1])
+                saved = history.read_after("main")[1].message
+                previous = requests[1]["messages"][1]
+                if reasoning.get("reasoning_content") == "":
+                    self.assertEqual(saved.replay, Replay(_replay_key(MODEL_NAME), b""))
+                    self.assertEqual(previous, {"role": "assistant", "content": "first answer", "reasoning_content": ""})
+                else:
+                    self.assertIsNone(saved.replay)
+                    self.assertEqual(previous["role"], "user")
+                    self.assertIn("first answer", repr(previous))
+                    self.assertNotIn("reasoning_content", previous)
+
+    async def test_empty_reasoning_alone_has_no_replay(self):
+        events = [event async for event in parse_stream(lines(chunk({"reasoning_content": ""}),
+                                                              chunk(finish="stop"), "[DONE]"))]
+        self.assertEqual(events, [])
+
+    async def test_protected_tool_round_with_incompatible_replay_does_not_send_history(self):
+        calls = []
+        requests = []
+
+        async def tool(_arguments, context):
+            calls.append(context.call_id)
+            return "finished tool"
+
+        def response(request):
+            requests.append(json.loads(request.content))
+            frames = [chunk(call(id="protected", function={"name": "test", "arguments": "{}"})),
+                      chunk(finish="tool_calls"), "[DONE]"]
+            return httpx.Response(200, text="".join(f"data: {frame}\n\n" for frame in frames))
+
+        with closing(History(":memory:")) as history:
+            async with httpx.AsyncClient(transport=httpx.MockTransport(response)) as client:
+                runtime = Runtime("main", history, DeepSeek(client), None, thinking=True,
+                                  tools=Tools([Tool(SPEC, tool)]))
+                try:
+                    runtime.submit_batch([Message("user", "current input")])
+                    await asyncio.wait_for(runtime.wait_idle(), 2)
+                    self.assertEqual(runtime.last_failure, "context_failed")
+                finally:
+                    await runtime.close()
+            self.assertEqual(len(requests), 1)
+            self.assertEqual(calls, ["protected"])
+            self.assertEqual([row.message for row in history.read_after("main")][1:], [
+                Message("assistant", "", (ToolCall("protected", "test", "{}"),)),
+                Message("tool", "finished tool", tool_call_id="protected"),
+            ])
+
+    async def test_nonmatching_deepseek_replay_is_never_decoded(self):
+        bad = Replay(_replay_key(MODEL_NAME), b"\xff")
+        entry = Message("assistant", "confirmed", replay=bad)
+        async with httpx.AsyncClient(transport=httpx.MockTransport(lambda _: httpx.Response(200))) as client:
+            with patch("agent_companion.models.deepseek._decode_reasoning", side_effect=AssertionError):
+                other = DeepSeek(client, model="other-model")
+                self.assertIsNone(other.history_replay_bytes(entry, [SPEC], thinking=True))
+                with self.assertRaisesRegex(ModelError, "missing_reasoning"):
+                    other._payload([entry], [SPEC], thinking=True)
+            same = DeepSeek(client)
+            self.assertIsNone(same.history_replay_bytes(entry, [SPEC], thinking=True))
+            with self.assertRaisesRegex(ModelError, "missing_reasoning"):
+                same._payload([entry], [SPEC], thinking=True)

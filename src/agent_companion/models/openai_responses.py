@@ -3,8 +3,7 @@
 import asyncio
 from collections.abc import AsyncGenerator, AsyncIterator, Sequence
 from contextlib import aclosing
-from dataclasses import asdict
-import hmac
+from dataclasses import asdict, dataclass, field
 import json
 import re
 from typing import Any
@@ -13,13 +12,15 @@ import httpx
 
 from ..config import normalize_openai_base_url
 from ..model_diagnostics import adapter_started, failure_category
-from ..protocol import (MAX_REPLAY_BYTES, Image, InputUsage, Message, ModelClosing, ModelError, ModelEvent,
-                        ProviderReplay, ReplayItem, ReplayReady, ReplayScope, Text, TextDelta, ToolCall,
+from ..protocol import (Image, InputUsage, Message, ModelClosing, ModelError, ModelEvent,
+                        Replay, ReplayReady, Text, TextDelta, ToolCall,
                         ToolReady, ToolSpec)
 from ._http_stream import ResponseStreams
-from ._request import JSON_ENCODER, request_body
+from ._request import JSON_ENCODER, make_replay_key, request_body
 
 
+_ADAPTER_ID = "openai_responses"
+_MAX_REPLAY_BYTES = 8 * 1024 * 1024
 _MAX_EVENT = 16 * 1024 * 1024
 _MAX_STREAM = 64 * 1024 * 1024
 _MAX_TEXT = 2 * 1024 * 1024
@@ -61,14 +62,52 @@ def _reject_constant(_: str) -> None:
     raise ValueError
 
 
-def _replay_items(message: Message, replay: ProviderReplay) -> list[dict[str, Any]] | None:
-    if not isinstance(message.content, str) or not replay.items or len(replay.items) > _MAX_ITEMS:
+@dataclass(frozen=True, slots=True)
+class _ReplayItem:
+    kind: str
+    item_id: str
+    call_id: str | None = None
+    phase: str | None = None
+    # 正文只来自确认历史；这里只保存输出位置和字符数。
+    parts: tuple[tuple[str, int], ...] = ()
+    encrypted_content: str | None = field(default=None, repr=False)
+    summary: tuple[str, ...] = field(default=(), repr=False)
+
+
+def _decode_replay(payload: bytes) -> list[_ReplayItem] | None:
+    if len(payload) > _MAX_REPLAY_BYTES:
+        return None
+    try:
+        items = json.loads(payload.decode("utf-8"))
+        if not isinstance(items, list) or not 0 < len(items) <= _MAX_ITEMS:
+            return None
+        parsed = []
+        for item in items:
+            if (not isinstance(item, dict) or not isinstance(item["parts"], list)
+                    or not isinstance(item["summary"], list)
+                    or any(not isinstance(part, list) for part in item["parts"])):
+                return None
+            cipher, summary = item["encrypted_content"], tuple(item["summary"])
+            # 拒绝 JSON 转义隐藏的孤立代理码点，避免坏包污染新请求。
+            for text in ((cipher,) if cipher is not None else ()) + summary:
+                if not isinstance(text, str):
+                    return None
+                text.encode("utf-8")
+            parsed.append(_ReplayItem(item["kind"], item["item_id"], item["call_id"], item["phase"],
+                                      tuple(tuple(part) for part in item["parts"]), cipher, summary))
+        return parsed
+    except (ValueError, KeyError, RecursionError):
+        return None
+
+
+def _replay_items(message: Message, replay: Sequence[_ReplayItem]) -> list[dict[str, Any]] | None:
+    if not isinstance(message.content, str):
         return None
     items: list[dict[str, Any]] = []
     calls = iter(message.tool_calls)
     used_ids: set[str] = set()
     position = 0
-    for item in replay.items:
+    for item in replay:
         if not _identifier(item.item_id) or item.item_id in used_ids:
             return None
         used_ids.add(item.item_id)
@@ -123,12 +162,12 @@ def _tools(tools: Sequence[ToolSpec]) -> list[dict[str, Any]]:
              "parameters": tool.parameters, "strict": False} for tool in tools]
 
 
-def _read_output(raw: Any, scope: ReplayScope, done_reasoning: dict[int, tuple[str, str]]) -> tuple[
-    list[tuple[tuple[int, int], str]], tuple[ToolCall, ...], ProviderReplay | None,
+def _read_output(raw: Any, replay_key: bytes, done_reasoning: dict[int, tuple[str, str]]) -> tuple[
+    list[tuple[tuple[int, int], str]], tuple[ToolCall, ...], Replay | None,
 ]:
     if not isinstance(raw, list) or len(raw) > _MAX_ITEMS:
         raise ModelError("invalid_sse_event")
-    replay: list[ReplayItem] = []
+    replay: list[_ReplayItem] = []
     text_parts: list[tuple[tuple[int, int], str]] = []
     calls = []
     used_ids: set[str] = set()
@@ -154,7 +193,7 @@ def _read_output(raw: Any, scope: ReplayScope, done_reasoning: dict[int, tuple[s
                 for part in summary
             )):
                 raise ModelError("invalid_sse_event")
-            replay.append(ReplayItem(kind, identity, encrypted_content=cipher,
+            replay.append(_ReplayItem(kind, identity, encrypted_content=cipher,
                                      summary=tuple(part["text"] for part in summary)))
         elif kind == "function_call":
             name, call_id, arguments = item.get("name"), item.get("call_id"), item.get("arguments")
@@ -168,7 +207,7 @@ def _read_output(raw: Any, scope: ReplayScope, done_reasoning: dict[int, tuple[s
             except (ValueError, RecursionError):
                 raise ModelError("invalid_tool_arguments") from None
             call_ids.add(call_id)
-            replay.append(ReplayItem(kind, identity, call_id=call_id))
+            replay.append(_ReplayItem(kind, identity, call_id=call_id))
             calls.append(ToolCall(call_id, name, arguments))
         elif kind == "message":
             content, phase = item.get("content"), item.get("phase")
@@ -187,19 +226,20 @@ def _read_output(raw: Any, scope: ReplayScope, done_reasoning: dict[int, tuple[s
                 text_parts.append(((index, content_index), text))
                 parts.append((part_type, len(text)))
             if any(length for _, length in parts):
-                replay.append(ReplayItem(kind, identity, phase=phase, parts=tuple(parts)))
+                replay.append(_ReplayItem(kind, identity, phase=phase, parts=tuple(parts)))
         else:
             # 不接受可产生外部副作用的内建工具或尚未定义的 item。
             raise ModelError("responses_unsupported_output")
-    size = 0
+    payload = bytearray()
     try:
-        for chunk in JSON_ENCODER.iterencode([asdict(item) for item in replay]):
-            size += len(chunk.encode("utf-8"))
-            if size > MAX_REPLAY_BYTES:
-                raise ModelError("responses_output_limit")
+        if replay:
+            for chunk in JSON_ENCODER.iterencode([asdict(item) for item in replay]):
+                payload.extend(chunk.encode("utf-8"))
+                if len(payload) > _MAX_REPLAY_BYTES:
+                    raise ModelError("responses_output_limit")
     except UnicodeError:
         raise ModelError("invalid_sse_event") from None
-    return text_parts, tuple(calls), ProviderReplay(scope, tuple(replay)) if replay else None
+    return text_parts, tuple(calls), Replay(replay_key, bytes(payload)) if replay else None
 
 
 async def _sse_data(chunks: AsyncIterator[bytes]) -> AsyncIterator[str]:
@@ -239,7 +279,7 @@ async def _sse_data(chunks: AsyncIterator[bytes]) -> AsyncIterator[str]:
                 event.append(payload)
 
 
-async def _events(chunks: AsyncIterator[bytes], scope: ReplayScope) -> AsyncIterator[ModelEvent]:
+async def _events(chunks: AsyncIterator[bytes], replay_key: bytes) -> AsyncIterator[ModelEvent]:
     segments: dict[tuple[int, int], list[str]] = {}
     done_reasoning: dict[int, tuple[str, str]] = {}
     done_size = 0
@@ -268,7 +308,7 @@ async def _events(chunks: AsyncIterator[bytes], scope: ReplayScope) -> AsyncIter
                                 or index in done_reasoning or item.get("status") not in (None, "completed")):
                             raise ModelError("invalid_sse_event")
                         done_size += len(cipher)
-                        if done_size > MAX_REPLAY_BYTES:
+                        if done_size > _MAX_REPLAY_BYTES:
                             raise ModelError("responses_output_limit")
                         done_reasoning[index] = (identity, cipher)
             if kind in ("response.output_text.delta", "response.refusal.delta"):
@@ -294,7 +334,7 @@ async def _events(chunks: AsyncIterator[bytes], scope: ReplayScope) -> AsyncIter
                 response = event.get("response")
                 if not isinstance(response, dict) or response.get("status") not in (None, "completed"):
                     raise ModelError("invalid_stream_finish")
-                parts, calls, replay = _read_output(response.get("output"), scope, done_reasoning)
+                parts, calls, replay = _read_output(response.get("output"), replay_key, done_reasoning)
                 if sum(len(text) for _, text in parts) > _MAX_TEXT:
                     raise ModelError("responses_output_limit")
                 visible = "".join(text for _, text in parts)
@@ -324,34 +364,30 @@ async def _events(chunks: AsyncIterator[bytes], scope: ReplayScope) -> AsyncIter
 
 
 class OpenAIResponses:
-    def __init__(self, client: httpx.AsyncClient, *, model: str, api_key: str, replay_salt: bytes,
+    def __init__(self, client: httpx.AsyncClient, *, model: str, api_key: str,
                  reasoning_effort: str, base_url: str | None = None) -> None:
         if not api_key or not api_key.isascii() or any(not 33 <= ord(char) <= 126 for char in api_key):
             raise ValueError("invalid OpenAI Responses API credential")
-        if not isinstance(replay_salt, bytes) or len(replay_salt) != 32:
-            raise ValueError("invalid OpenAI Responses replay salt")
         base_url = normalize_openai_base_url(base_url)
-        # 固定用途标签及盐长度，URL 与模型用 JSON 分隔，避免拼接歧义。
-        target = JSON_ENCODER.encode([base_url, model]).encode("utf-8")
-        fingerprint = hmac.digest(api_key.encode("ascii"),
-                                  b"agent-companion/openai-responses-replay\0" + replay_salt + target, "sha256")
         self._client = client
         self._responses = ResponseStreams()
         self._endpoint = base_url + "/responses"
         self._authorization = f"Bearer {api_key}"
         self._model = model
-        self.replay_scope = ReplayScope("openai_responses", fingerprint, reasoning_effort)
+        self._effort = reasoning_effort
+        self._replay_key = make_replay_key(api_key.encode("ascii"), _ADAPTER_ID, model, base_url)
 
     def _payload(self, messages: Sequence[Message], tools: Sequence[ToolSpec]) -> dict[str, Any]:
         items: list[dict[str, Any]] = []
         tools_data = _tools(tools)
         for message in messages:
             replay = message.replay
-            projected = (_replay_items(message, replay) if message.role == "assistant" and replay is not None
-                         and replay.scope == self.replay_scope else None)
+            decoded = (_decode_replay(replay.payload) if message.role == "assistant" and replay is not None
+                       and replay.replay_key == self._replay_key else None)
+            projected = _replay_items(message, decoded) if decoded is not None else None
             items.extend(projected if projected is not None else _common_items(message))
         payload = {"model": self._model, "input": items, "stream": True, "store": False,
-                   "include": ["reasoning.encrypted_content"], "reasoning": {"effort": self.replay_scope.reasoning_effort}}
+                   "include": ["reasoning.encrypted_content"], "reasoning": {"effort": self._effort}}
         if tools_data:
             payload["tools"] = tools_data
         return payload
@@ -359,7 +395,7 @@ class OpenAIResponses:
     async def stream(self, messages: Sequence[Message], tools: Sequence[ToolSpec], *,
                      thinking: bool) -> AsyncGenerator[ModelEvent, None]:
         # thinking 是 DeepSeek 内部协议参数；Responses 只采用用户选定的 effort。
-        diagnostics = adapter_started("openai_responses")
+        diagnostics = adapter_started(_ADAPTER_ID)
         body = request_body(self._payload(messages, tools))
         if diagnostics is not None:
             diagnostics.request_ready(len(body))
@@ -381,7 +417,7 @@ class OpenAIResponses:
                     raise ModelError("responses_unexpected_response")
                 if diagnostics is not None:
                     diagnostics.stage = "sse_read"
-                async with aclosing(_events(response.aiter_raw(), self.replay_scope)) as events:
+                async with aclosing(_events(response.aiter_raw(), self._replay_key)) as events:
                     async for event in events:
                         if isinstance(event, TextDelta):
                             yield event

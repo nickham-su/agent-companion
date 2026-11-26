@@ -3,9 +3,9 @@ import unittest
 from unittest.mock import patch
 
 from agent_companion.config import RuntimeSettings
-from agent_companion.models.deepseek import build_request
-from agent_companion.protocol import (DeliveryStatus, Message, ModelError, ProviderReplay, ReasoningDelta, Receipt,
-                                      ReplayItem, ReplayReady, ReplayScope, ReplyDelivery, TextDelta, ToolCall,
+from agent_companion.models.deepseek import MODEL_NAME, DeepSeek, _replay_key, build_request
+from agent_companion.protocol import (DeliveryStatus, Message, ModelError, Receipt, Replay, ReplayReady,
+                                      ReplyDelivery, TextDelta, ToolCall,
                                       ToolReady, ToolSpec)
 from agent_companion.runtime.engine import Runtime
 from agent_companion.runtime.tools import Tool, Tools
@@ -523,8 +523,7 @@ class RuntimeTest(unittest.IsolatedAsyncioTestCase):
 
     async def test_voice_receipt_after_model_completion_still_blocks_tool_continuation(self):
         model_finished, release_receipt = asyncio.Event(), asyncio.Event()
-        replay = ProviderReplay(ReplayScope("test", bytes(32), ""),
-                                (ReplayItem("function_call", "item", call_id=CALL.id),))
+        replay = Replay(bytes(16), b"opaque tool replay")
 
         async def script():
             yield TextDelta("first unconfirmed")
@@ -546,7 +545,6 @@ class RuntimeTest(unittest.IsolatedAsyncioTestCase):
             return "tool result"
 
         model = ScriptModel(script, events(TextDelta("next")))
-        model.replay_scope = replay.scope
         runtime, history = self.setup_runtime(model, Voice(), tools=Tools([Tool(SPEC, tool)]))
         runtime.submit_batch([Message("user", "one")])
         await asyncio.wait_for(model_finished.wait(), 2)
@@ -952,6 +950,8 @@ class RuntimeTest(unittest.IsolatedAsyncioTestCase):
             with self.subTest(timeout=timeout):
                 async def incomplete():
                     yield TextDelta("already sent")
+                    # 即使替身提前交付了包，也不能在流失败或超时后保存。
+                    yield ReplayReady(Replay(bytes(16), b"discard on failure"))
                     if timeout:
                         await asyncio.Event().wait()
                     raise ModelError("truncated_stream")
@@ -965,6 +965,7 @@ class RuntimeTest(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(outcomes[0].model_status, "model_timeout" if timeout else "model_failed")
                 self.assertNotEqual(outcomes[0].run_id, outcomes[1].run_id)
                 self.assertEqual([m.content for m in model.requests[1][0]], ["one", "already sent", "two"])
+                self.assertIsNone(history.read_after("main")[1].message.replay)
 
     async def test_model_failure_still_finishes_started_tool_in_same_group(self):
         async def failed():
@@ -984,8 +985,11 @@ class RuntimeTest(unittest.IsolatedAsyncioTestCase):
                                                      Message("tool", "done despite model failure", tool_call_id=CALL.id)])
 
     async def test_failed_reasoning_is_never_reused_as_a_complete_protocol_field(self):
+        unfinished = Replay(_replay_key(MODEL_NAME), b"unfinished reasoning")
+        complete = Replay(_replay_key(MODEL_NAME), b"complete reasoning")
+
         async def failed():
-            yield ReasoningDelta("unfinished reasoning")
+            yield ReplayReady(unfinished)
             yield TextDelta("confirmed prefix")
             yield ToolReady(CALL)
             raise ModelError("truncated_stream")
@@ -993,7 +997,8 @@ class RuntimeTest(unittest.IsolatedAsyncioTestCase):
         async def tool(args, context):
             return "completed tool result"
 
-        model = ScriptModel(failed, events(ReasoningDelta("complete reasoning"), TextDelta("new answer")))
+        model = ScriptModel(failed, events(TextDelta("new answer"), ReplayReady(complete)))
+        model.history_replay_bytes = DeepSeek(None).history_replay_bytes
         runtime, history = self.setup_runtime(model, Channel(), tools=Tools([Tool(SPEC, tool)]), thinking=True)
         runtime.submit_batch([Message("user", "one")])
         runtime.submit_batch([Message("user", "two")])
@@ -1001,7 +1006,7 @@ class RuntimeTest(unittest.IsolatedAsyncioTestCase):
         raw = [item.message for item in history.read_after("main")]
         self.assertEqual(raw[1], Message("assistant", "confirmed prefix", (CALL,)))
         self.assertEqual(raw[2], Message("tool", "completed tool result", tool_call_id=CALL.id))
-        self.assertEqual(raw[-1].reasoning, "complete reasoning")
+        self.assertEqual(raw[-1].replay, complete)
         self.assertIsNone(history.summary("main"))
         self.assertEqual(len(model.requests), 2)
         projected, tools, thinking = model.requests[1]

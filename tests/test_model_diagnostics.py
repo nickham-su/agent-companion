@@ -57,7 +57,7 @@ class ModelDiagnosticTests(unittest.IsolatedAsyncioTestCase):
     def model(adapter, client):
         if adapter == "deepseek":
             return DeepSeek(client, model=_MODEL)
-        return OpenAIResponses(client, model=_MODEL, api_key=_SECRET, replay_salt=b"0" * 32,
+        return OpenAIResponses(client, model=_MODEL, api_key=_SECRET,
                                reasoning_effort="low", base_url=f"https://{_URL_HOST}/v1")
 
     async def submit(self, runtime, history, session=_SESSION):
