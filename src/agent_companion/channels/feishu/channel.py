@@ -5,7 +5,7 @@ from collections import defaultdict, deque
 from collections.abc import Callable
 from contextlib import nullcontext
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timezone
 from hashlib import sha256
 import logging
 from sqlite3 import OperationalError
@@ -288,6 +288,10 @@ class _ScanWindow:
     detail_batch_size: int = MAX_MGET_SIZE
     raw_bytes: int = 0
     oversized: int = 0
+    pages: int = 0
+    returned: int = 0
+    filtered: int = 0
+    duplicates: int = 0
     completed: bool = False
     failures: int = 0
 
@@ -343,9 +347,11 @@ class FeishuPoller:
                     self._window = window.restart()
                     raise CliError("cli_page_cycle")
                 page: dict[str, FeishuCandidate] = {}
+                filtered = 0
                 for row in items:
                     hit = _search_hit(row, self._account)
                     if hit is None or not window.start <= hit.created_second < window.end:
+                        filtered += 1
                         continue
                     mid = hit.message_id
                     previous = page.get(mid) or window.hits.get(mid)
@@ -369,6 +375,10 @@ class FeishuPoller:
             if len(window.hits) + len(page) > _MAX_WINDOW_MESSAGES:
                 self._narrow_window(window)
             window.hits.update(page)
+            window.pages += 1
+            window.returned += len(items)
+            window.filtered += filtered
+            window.duplicates += len(items) - filtered - len(page)
             if token is None:
                 window.completed = True
                 return True
@@ -443,6 +453,10 @@ class FeishuPoller:
                 verified[hits[mid].peer_open_id].append((mid, raw.created_ms, raw.kind, raw.content))
         retry = [hit for mid, hit in hits.items() if mid not in details]
         self._history.record_feishu_window(through, now=now, verified=verified, discarded=discarded, retry=retry)
+        if hits and _LOG.isEnabledFor(logging.DEBUG):
+            _LOG.debug("Feishu inbox recorded; source=%s accepted=%d discarded=%d deferred=%d users=%d",
+                       "recovery" if through is None else "search", sum(map(len, verified.values())),
+                       len(discarded), len(retry), len(verified))
         if retry:
             _LOG.warning("Feishu details unavailable or mismatched; deferred=%d", len(retry))
         if verified:
@@ -474,6 +488,7 @@ class FeishuPoller:
 
     async def _scan(self, now: int) -> None:
         if now < self._scan_retry_at:
+            _LOG.debug("Feishu search waiting; reason=backoff retry_in_s=%d", self._scan_retry_at - now)
             return
         if self._window is None:
             if self._right_segments:
@@ -483,21 +498,49 @@ class FeishuPoller:
                 start = max(floor, through - _OVERLAP_SECONDS)
                 end = min(now, through + _MAX_SCAN_SECONDS)
                 if end <= start:
+                    _LOG.debug("Feishu search waiting; reason=no_time_window")
                     return
                 self._window = _ScanWindow(start, end)
         window = self._window
-        if not await self._collect(window):
-            return
-        if window.remaining is None:
-            # 只信任完整且无冲突的搜索段。刷新不推进水位，恢复总是使用最新已提交的核验依据。
-            fresh = self._history.reconcile_feishu_search(window.hits.values(), now=now)
-            window.hits = {hit.message_id: hit for hit in fresh}
-            window.remaining = deque(fresh)
-        if await self._fetch_details(window, window.remaining):
+        debug = _LOG.isEnabledFor(logging.DEBUG)
+        started = asyncio.get_running_loop().time() if debug else 0.0
+        stage, outcome = "search", "failed"
+        cli_error = None
+        try:
+            if not await self._collect(window):
+                outcome = "pending"
+                return
+            stage = "reconcile"
+            if window.remaining is None:
+                # 只信任完整且无冲突的搜索段。刷新不推进水位，恢复总是使用最新已提交的核验依据。
+                fresh = self._history.reconcile_feishu_search(window.hits.values(), now=now)
+                window.hits = {hit.message_id: hit for hit in fresh}
+                window.remaining = deque(fresh)
+            stage = "details"
+            if not await self._fetch_details(window, window.remaining):
+                outcome = "pending"
+                return
+            stage = "record"
             self._record(window.end, now, window.hits, window.details)
             if window.oversized:
                 _LOG.warning("Feishu single-message detail output limit; deferred=%d", window.oversized)
             self._window = None
+            outcome = "ok"
+        except CliError as exc:
+            cli_error = exc
+            raise
+        except asyncio.CancelledError:
+            outcome = "cancelled"
+            raise
+        finally:
+            if debug:
+                _LOG.debug("Feishu search window; outcome=%s stage=%s start_utc=%s end_utc=%s "
+                           "pages=%d returned=%d filtered=%d duplicates=%d elapsed_ms=%.0f category=%s api_code=%s",
+                           outcome, stage, datetime.fromtimestamp(window.start, timezone.utc).isoformat(),
+                           datetime.fromtimestamp(window.end, timezone.utc).isoformat(), window.pages,
+                           window.returned, window.filtered, window.duplicates,
+                           (asyncio.get_running_loop().time() - started) * 1000,
+                           cli_error.category if cli_error else None, cli_error.api_code if cli_error else None)
 
     async def poll_once(self) -> None:
         async with self._poll_lock:
@@ -514,6 +557,7 @@ class FeishuPoller:
         """不重叠轮询，长批次完成后跳过错过的时钟刻度。"""
         loop = asyncio.get_running_loop()
         next_tick = loop.time()
+        _LOG.info("Feishu global search started; interval_s=%d overlap_s=%d", _POLL_SECONDS, _OVERLAP_SECONDS)
         try:
             while True:
                 try:

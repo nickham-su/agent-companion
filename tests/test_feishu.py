@@ -743,6 +743,57 @@ class FeishuBackgroundDeliveryTests(unittest.IsolatedAsyncioTestCase):
 
 
 class FeishuPollingTests(unittest.IsolatedAsyncioTestCase):
+    async def test_search_diagnostics_distinguish_empty_filtered_duplicate_and_recorded(self):
+        clock, runner = [110], _Runner()
+        cli = FeishuCLI("lark-cli", ChannelUser(_PEER), timeout=2, runner=runner)
+        peer = _raw("om_diagnostic", 111_000, "text", {"text": "synthetic diagnostic body"})
+        rows = [peer, peer, _raw("om_own", 112_000, "text", {"text": "own"}, sender=_SELF),
+                _raw("om_group", 113_000, "text", {"text": "group"}, chat="oc_group"),
+                _raw("om_outside", 120_000, "text", {"text": "outside"})]
+        with (closing(History(":memory:")) as history,
+              self.assertLogs("agent_companion.channels.feishu.channel", level="DEBUG") as logs):
+            poller = _poller(history, lambda batch: None, cli, _ASR(), clock)
+            await poller.poll_once()
+            clock[0] = 120
+            runner.pages[None] = {"items": rows[:2], "has_more": True, "page_token": "synthetic-private-cursor"}
+            runner.pages["synthetic-private-cursor"] = {"items": rows[2:], "has_more": False}
+            await poller.poll_once()
+        summaries = [record.getMessage() for record in logs.records if record.msg.startswith("Feishu search window")]
+        self.assertEqual(len(summaries), 2)
+        self.assertIn("outcome=ok stage=record start_utc=1970-01-01T00:01:40+00:00", summaries[0])
+        self.assertIn("end_utc=1970-01-01T00:01:50+00:00 pages=1 returned=0 filtered=0 duplicates=0", summaries[0])
+        self.assertIn("pages=2 returned=5 filtered=3 duplicates=1", summaries[1])
+        diagnostics = "\n".join(logs.output)
+        self.assertIn("Feishu inbox recorded; source=search accepted=1 discarded=0 deferred=0 users=1", diagnostics)
+        for private in (_SELF, _PEER, _CHAT, "om_diagnostic", "synthetic-private-cursor", "synthetic diagnostic body"):
+            self.assertNotIn(private, diagnostics)
+
+    async def test_search_diagnostics_report_failed_stage_and_safe_cli_classification(self):
+        clock, runner = [110], _Runner()
+        runner.pages[None] = _failure("authorization", 99991672)
+
+        async def reject_details(argv, data, timeout):
+            if argv[3] == _MGET:
+                return _failure("api", "synthetic private error code")
+            return await runner(argv, data, timeout)
+
+        cli = FeishuCLI("lark-cli", ChannelUser(_PEER), timeout=2, runner=reject_details)
+        with (closing(History(":memory:")) as history,
+              self.assertLogs("agent_companion.channels.feishu.channel", level="DEBUG") as logs):
+            poller = _poller(history, lambda batch: None, cli, _ASR(), clock)
+            with self.assertRaisesRegex(CliError, "^cli_rejected$"):
+                await poller.poll_once()
+            runner.pages[None] = {"items": [_raw("om_found", 101_000, "text", {"text": "synthetic body"})],
+                                  "has_more": False}
+            with self.assertRaisesRegex(CliError, "^cli_result_unknown$"):
+                await poller.poll_once()
+            self.assertEqual(history.feishu_inbound_window(0), (100, 100))
+        self.assertIn("outcome=failed stage=search", logs.output[0])
+        self.assertIn("category=authorization api_code=99991672", logs.output[0])
+        self.assertIn("outcome=failed stage=details", logs.output[1])
+        self.assertIn("category=api api_code=None", logs.output[1])
+        self.assertNotIn("synthetic private", "\n".join(logs.output))
+
     async def test_idle_single_query_and_overlap_recovers_a_late_hit(self):
         clock, runner = [100], _Runner()
         cli = FeishuCLI("lark-cli", ChannelUser(_PEER), timeout=2, runner=runner)

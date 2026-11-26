@@ -33,14 +33,18 @@ _CLI_ENV = ("PATH", "HOME", "LANG", "LC_ALL", "LC_CTYPE", "TMPDIR", "XDG_CONFIG_
             "XDG_DATA_HOME", "XDG_STATE_HOME", "XDG_CACHE_HOME")
 # Generic API errors and policy checks that may run after the request cannot prove non-delivery.
 _DEFINITE_ERRORS = {"validation", "config", "authentication", "authorization", "confirmation"}
+_DIAGNOSTIC_ERRORS = _DEFINITE_ERRORS | {"api", "network", "internal", "rate_limit"}
 
 
 class CliError(Exception):
-    """只带由本模块定义的诊断码；不得附带子进程输入、输出或原始异常。"""
+    """只带诊断码和经过筛选的错误分类；不得附带子进程输入、输出或原始异常。"""
 
-    def __init__(self, reason: str, *, definite: bool = False) -> None:
+    def __init__(self, reason: str, *, definite: bool = False, category: str | None = None,
+                 api_code: int | None = None) -> None:
         super().__init__(reason)
         self.definite = definite
+        self.category = category
+        self.api_code = api_code
 
 
 class CliStdoutLimit(CliError):
@@ -145,11 +149,18 @@ def _check_exit(result: CommandResult) -> None:
         return
     envelope = as_object(result.stderr)
     error = envelope.get("error")
-    definite = False
+    category = None
+    api_code = None
     if envelope.get("ok") is False and isinstance(error, dict):
-        category = error.get("type")
-        definite = isinstance(category, str) and category in _DEFINITE_ERRORS
-    raise CliError("cli_rejected" if definite else "cli_result_unknown", definite=definite)
+        kind = error.get("type")
+        if isinstance(kind, str) and kind in _DIAGNOSTIC_ERRORS:
+            category = kind
+            code = error.get("code")
+            if type(code) is int and 0 < code <= 99_999_999:
+                api_code = code
+    definite = category in _DEFINITE_ERRORS
+    raise CliError("cli_rejected" if definite else "cli_result_unknown", definite=definite,
+                   category=category, api_code=api_code)
 
 
 def _success_data(result: CommandResult) -> dict[str, Any]:
