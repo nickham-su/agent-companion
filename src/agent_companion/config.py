@@ -1,7 +1,7 @@
 """启动配置；语言模型档案与 Provider 连接分别定义。"""
 
 from collections.abc import Mapping
-from dataclasses import MISSING, dataclass, field, fields
+from dataclasses import MISSING, InitVar, dataclass, field, fields
 from ipaddress import IPv6Address
 import math
 from pathlib import Path
@@ -17,6 +17,7 @@ from .speech.vad import silence_frames
 
 
 OPENAI_BASE_URL = "https://api.openai.com/v1"
+_MINIMAX_BASE_URLS = {"cn": "https://api.minimax.cn/v1", "global": "https://api.minimax.io/v1"}
 MINIMAX_ASR_MODEL = "asr-1.0"
 BAILIAN_TTS_MODEL = "qwen-audio-3.1-tts-flash"
 BAILIAN_TTS_VOICE = "longanhuan_v3.1"
@@ -29,7 +30,9 @@ _DEFAULT_LOG_LEVEL = "WARNING"
 _LOG_LEVELS = ("DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL")
 _LEGACY_CONFIG_ERROR = "旧配置格式不再支持，请按 config.example.toml 迁移到命名 Provider"
 _MODEL_MIGRATION = "请迁到 [models.<ID>]，并在每个 Agent 角色文件中设置 model_id，参考 config.example.toml"
-_LLM_ADAPTERS = ("deepseek", "openai_responses")
+_CHAT_ADAPTERS = ("minimax", "bailian")
+_LLM_ADAPTERS = ("deepseek", "openai_responses", *_CHAT_ADAPTERS)
+_DNS_LABEL = re.compile(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?")
 
 
 class ConfigError(ValueError):
@@ -62,6 +65,21 @@ def normalize_openai_base_url(value: str | None) -> str:
         return normalized
     except (ValueError, httpx.InvalidURL):
         raise ValueError(error) from None
+
+
+def normalize_minimax_base_url(value: str | None, region: str = "cn") -> str:
+    if not isinstance(region, str) or region not in _MINIMAX_BASE_URLS:
+        raise ConfigError("MiniMax Provider 的 region 必须是 cn 或 global")
+    try:
+        return normalize_openai_base_url(_MINIMAX_BASE_URLS[region] if value is None else value)
+    except ValueError:
+        raise ConfigError("base_url 必须是无凭据、查询或片段的 HTTPS 地址") from None
+
+
+def bailian_llm_base_url(region: str, workspace_id: str | None) -> str:
+    if not all(isinstance(value, str) and _DNS_LABEL.fullmatch(value) for value in (region, workspace_id)):
+        raise ConfigError("百炼 LLM Provider 须设置有效的 region 和 workspace_id")
+    return f"https://{workspace_id}.{region}.maas.aliyuncs.com/compatible-mode/v1"
 
 
 def require_seconds(value: float, name: str) -> None:
@@ -100,17 +118,27 @@ class LLMProvider:
     adapter: str
     base_url: str | None = field(default=None, repr=False)
     api_key: object = field(default=None, kw_only=True, repr=False)
+    region: str | None = field(default=None, kw_only=True)
+    workspace_id: str | None = field(default=None, kw_only=True, repr=False)
 
     def __post_init__(self) -> None:
         if self.adapter not in _LLM_ADAPTERS:
-            raise ConfigError("adapter 须为 deepseek 或 openai_responses")
-        if self.adapter == "openai_responses":
+            raise ConfigError(f"adapter 须为 {' 或 '.join(_LLM_ADAPTERS)}")
+        if self.adapter == "bailian":
+            if self.base_url is not None:
+                raise ConfigError("百炼 Provider 请设置 region 和 workspace_id，不支持 base_url")
+            region = "cn-beijing" if self.region is None else self.region
+            object.__setattr__(self, "base_url", bailian_llm_base_url(region, self.workspace_id))
+        elif self.adapter == "minimax":
+            region = "cn" if self.region is None else self.region
+            object.__setattr__(self, "base_url", normalize_minimax_base_url(self.base_url, region))
+        elif self.adapter == "openai_responses":
             try:
                 object.__setattr__(self, "base_url", normalize_openai_base_url(self.base_url))
             except ValueError:
                 raise ConfigError("base_url 必须是无凭据、查询或片段的 HTTPS 地址") from None
         elif self.base_url is not None:
-            raise ConfigError("base_url 仅适用于 openai_responses")
+            raise ConfigError("base_url 仅适用于 openai_responses 和 MiniMax LLM")
 
     def require_api_key(self, location: str) -> str:
         return _require_api_key(self.api_key, location)
@@ -126,14 +154,22 @@ class ModelProfile:
     model: str
     reasoning_effort: str
     runtime: RuntimeSettings
+    preserve_thinking: bool | None = None
+    adapter: InitVar[str | None] = field(default=None, kw_only=True)
 
-    def __post_init__(self) -> None:
+    def __post_init__(self, adapter: str | None) -> None:
         if not valid_config_id(self.provider):
             raise ConfigError("provider 必须是非空 Provider ID")
-        if not isinstance(self.model, str) or not re.fullmatch(r"[A-Za-z0-9_.:-]{1,128}", self.model):
+        if not isinstance(self.model, str) or not 0 < len(self.model) <= 128:
+            raise ConfigError("model 格式无效")
+        parts = self.model.split("/") if adapter == "bailian" else (self.model,)
+        if any(not re.fullmatch(r"[A-Za-z0-9_.:-]+", part) or (adapter == "bailian" and part in (".", ".."))
+               for part in parts):
             raise ConfigError("model 格式无效")
         if not valid_config_id(self.reasoning_effort) or len(self.reasoning_effort) > 64:
             raise ConfigError("reasoning_effort 必须是非空字符串（至多 64 字符）")
+        if self.preserve_thinking is not None and type(self.preserve_thinking) is not bool:
+            raise ConfigError("preserve_thinking 必须是布尔值")
 
 
 @dataclass(frozen=True, slots=True)
@@ -331,9 +367,9 @@ def _require_api_key(key: object, selector: str) -> str:
     return key
 
 
-def _speech_connection(provider: dict[str, Any], selector: str) -> SpeechConnection:
-    if "base_url" in provider:
-        raise ConfigError("base_url 仅适用于 openai_responses；语音 Provider 请设置 region")
+def _speech_connection(provider: dict[str, Any], selector: str, llm: LLMProvider | None) -> SpeechConnection:
+    if "base_url" in provider and (llm is None or llm.adapter != "minimax"):
+        raise ConfigError("base_url 仅适用于 LLM；语音 Provider 请设置 region")
     key = _api_key(provider, selector)
     if provider["adapter"] == "minimax":
         return MiniMaxConnection(api_key=key, region=provider.get("region", "cn"))
@@ -359,14 +395,24 @@ def _load_model_profiles(data: Any, providers: dict[str, Any], model_timeout: fl
                          ) -> tuple[dict[str, ModelProfile], dict[str, LLMProvider]]:
     if not isinstance(data, dict):
         raise ConfigError("models 必须是命名模型配置表")
+    references = {options["provider"] for options in data.values()
+                  if isinstance(options, dict) and isinstance(options.get("provider"), str)}
     llm_providers = {}
     for index, (name, provider) in enumerate(providers.items(), 1):
         if not isinstance(provider, dict) or provider.get("adapter") not in _LLM_ADAPTERS:
             continue  # 非 LLM Provider 仍按语音能力的选用规则解析。
         location = f"providers 第 {index} 项"
-        _table(provider, {"adapter", "api_key", "base_url"}, location)
+        adapter = provider["adapter"]
+        keys = {"adapter", "api_key", "base_url"}
+        if adapter in _CHAT_ADAPTERS:
+            if name not in references:
+                continue  # 既有纯语音表不因新增同名 LLM 适配器而被解析为 LLM。
+            keys.add("region")
+            if adapter == "bailian":
+                keys.add("workspace_id")
+        _table(provider, keys | ({"asr", "tts"} if adapter in _CHAT_ADAPTERS else set()), location)
         try:
-            llm_providers[name] = LLMProvider(**provider)
+            llm_providers[name] = LLMProvider(**{key: provider[key] for key in keys if key in provider})
         except ConfigError as exc:
             raise ConfigError(f"{location}：{exc}") from None
 
@@ -376,7 +422,7 @@ def _load_model_profiles(data: Any, providers: dict[str, Any], model_timeout: fl
         location = f"models 第 {index} 项"
         if not valid_config_id(name):
             raise ConfigError(f"{location} 的 ID 必须是非空字符串且不能有首尾空白")
-        options = _table(options, set(required) | {"max_tool_rounds"}, location)
+        options = _table(options, set(required) | {"max_tool_rounds", "preserve_thinking"}, location)
         for key in required:
             if key not in options:
                 raise ConfigError(f"{location} 的 {key} 必须显式设置")
@@ -384,21 +430,26 @@ def _load_model_profiles(data: Any, providers: dict[str, Any], model_timeout: fl
             runtime = RuntimeSettings(model_timeout=model_timeout, context_budget=options["context_budget"],
                                       tail_budget=options["tail_budget"],
                                       max_tool_rounds=options.get("max_tool_rounds", DEFAULT_MAX_TOOL_ROUNDS))
-            profile = ModelProfile(options["provider"], options["model"], options["reasoning_effort"], runtime)
+            provider_id = options["provider"]
+            llm = llm_providers.get(provider_id) if isinstance(provider_id, str) else None
+            profile = ModelProfile(provider_id, options["model"], options["reasoning_effort"], runtime,
+                                   options.get("preserve_thinking"), adapter=None if llm is None else llm.adapter)
         except ConfigError as exc:
             raise ConfigError(f"{location}：{str(exc).replace('runtime.', '')}") from None
         if profile.provider not in providers:
             raise ConfigError(f"{location} 的 provider 引用的 Provider 不存在")
         if profile.provider not in llm_providers:
-            raise ConfigError(f"{location} 的 provider 需要显式设置支持 llm 的 adapter（deepseek 或 openai_responses）")
+            raise ConfigError(f"{location} 的 provider 需要显式设置支持 llm 的 adapter（{' 或 '.join(_LLM_ADAPTERS)}）")
+        if profile.preserve_thinking is not None and llm_providers[profile.provider].adapter != "bailian":
+            raise ConfigError(f"{location} 的 preserve_thinking 仅适用于百炼模型")
         models[name] = profile
     return models, llm_providers
 
 
-def _load_speech(data: dict[str, Any], providers: dict[str, Any], *, voice: bool
+def _load_speech(data: dict[str, Any], providers: dict[str, Any], llm_providers: dict[str, LLMProvider], *, voice: bool
                  ) -> tuple[ASRSettings, TTSSettings | None]:
     asr_name, provider, asr_data = _selected_provider(data, providers, "asr", ("minimax", "bailian"))
-    connection = _speech_connection(provider, "asr_provider")
+    connection = _speech_connection(provider, "asr_provider", llm_providers.get(asr_name))
     asr_options = _section(asr_data, ASRSettings, "asr", exclude=("connection",)).copy()
     if isinstance(connection, BailianConnection):
         asr_options.setdefault("model", BAILIAN_ASR_MODEL)
@@ -406,7 +457,8 @@ def _load_speech(data: dict[str, Any], providers: dict[str, Any], *, voice: bool
     tts = None
     if voice:
         tts_name, provider, tts_data = _selected_provider(data, providers, "tts", ("minimax", "bailian"))
-        tts_connection = connection if tts_name == asr_name else _speech_connection(provider, "tts_provider")
+        tts_connection = connection if tts_name == asr_name else _speech_connection(
+            provider, "tts_provider", llm_providers.get(tts_name))
         tts_options = _section(tts_data, TTSSettings, "tts", exclude=("connection",)).copy()
         if isinstance(tts_connection, BailianConnection):
             tts_model = tts_options.setdefault("model", BAILIAN_TTS_MODEL)
@@ -489,7 +541,7 @@ def _parse_settings(data: dict[str, Any], path: Path, *, for_run: bool) -> Setti
             raise ConfigError("正式启动需要 [feishu] 配置，请参考 config.example.toml")
         providers = _provider_tables(data)
         models, llm_providers = _load_model_profiles(data.get("models", {}), providers, runtime.model_timeout)
-        asr, tts = _load_speech(data, providers, voice=use_voice)
+        asr, tts = _load_speech(data, providers, llm_providers, voice=use_voice)
     return Settings(
         database=Path(database),
         runtime=runtime,

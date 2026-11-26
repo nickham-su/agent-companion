@@ -220,7 +220,7 @@ _MODEL_DIAGNOSTICS = frozenset({
     "abnormal_stream_finish", "duplicate_tool_id", "empty_summary", "incomplete_tool_call",
     "internal_tool_call", "invalid_sse_event", "invalid_stream_finish", "invalid_tool_arguments",
     "invalid_tool_delta", "invalid_tool_id", "missing_reasoning", "transport_error", "transport_close_timeout",
-    "truncated_stream",
+    "truncated_stream", "vendor_error",
     "unsupported_tool_type", "responses_output_limit", "responses_event_limit",
     "responses_unsupported_encoding", "responses_unsupported_output", "responses_unexpected_response",
     "summary_tool_call", "incompatible_protected_history", "protected_history_already_compacted",

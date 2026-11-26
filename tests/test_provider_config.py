@@ -96,7 +96,8 @@ class ProviderConfigTests(unittest.TestCase):
         getenv.assert_not_called()
         settings, = serve.await_args.args
         self.assertEqual({name: settings.llm_providers[model.provider].adapter for name, model in settings.models.items()},
-                         {"chat": "deepseek", "review": "openai_responses"})
+                         {"chat": "deepseek", "review": "openai_responses",
+                          "minimax_chat": "minimax", "bailian_chat": "bailian"})
         self.assertEqual(settings.models["chat"].runtime.model_timeout, 12.5)
         self.assertEqual(settings.models["review"].runtime.max_tool_rounds, 8)
         self.assertEqual(settings.asr_timeout, 30)
@@ -113,7 +114,7 @@ class ProviderConfigTests(unittest.TestCase):
             ('provider = "chat"', f'provider = "{_KEY}_absent"', 'provider 引用的 Provider 不存在'),
             ('asr_provider = "speech"', 'asr_provider = "absent"', 'asr_provider 引用的 Provider 不存在'),
             ('asr_provider = "speech"', 'asr_provider = "chat"', '支持 asr 的 adapter'),
-            ('provider = "chat"', 'provider = "speech"', '支持 llm 的 adapter'),
+            ('adapter = "deepseek"', 'adapter = "unsupported"', '支持 llm 的 adapter'),
             ('[providers.speech.asr]\nmax_audio_seconds = 500\n', '', '缺少 asr 能力配置表'),
         ):
             with self.subTest(error=error):

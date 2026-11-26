@@ -189,6 +189,11 @@ class ResponseStreams:
                 found = True
         return found
 
+    def stopping(self) -> bool:
+        """防止吞掉取消的底层读取把迟到的帧交给当前请求。"""
+        reader = asyncio.current_task()
+        return any(owner.task is reader and owner.stopping for owner in self._requests)
+
     @asynccontextmanager
     async def open(
         self, context: AbstractAsyncContextManager[httpx.Response], *, background_tail: bool = False,

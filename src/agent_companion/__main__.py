@@ -16,7 +16,9 @@ from .app import feishu_settings, prepare_private_feishu, running_agent
 from .channels.feishu.cli import CliError, FeishuDiscovery
 from .config import ConfigError, Settings, load_settings, valid_config_id
 from .logging_setup import stdout_logging
+from .models.bailian import Bailian
 from .models.deepseek import CHAT_COMPLETIONS, DeepSeek
+from .models.minimax import MiniMax
 from .models.openai_responses import OpenAIResponses
 from .protocol import (AGENT_REPLY_PREFIX, DeliveryStatus, Message, ModelEvent, Receipt, ReplyStream,
                        TextDelta, ToolCall, ToolReady, ToolSpec)
@@ -219,11 +221,23 @@ async def _serve(settings: Settings, *, discovery: FeishuDiscovery | None = None
                 if provider.adapter == "deepseek":
                     model = DeepSeek(model_client, model=profile.model, reasoning_effort=effort)
                     endpoint, thinking = CHAT_COMPLETIONS, effort != "disabled"
-                else:
+                elif provider.adapter == "minimax":
+                    assert provider.base_url is not None
+                    model = MiniMax(model_client, model=profile.model, api_key=key, base_url=provider.base_url,
+                                    reasoning_effort=effort)
+                    endpoint, thinking = model.endpoint, effort != "disabled"
+                elif provider.adapter == "bailian":
+                    assert provider.base_url is not None
+                    model = Bailian(model_client, model=profile.model, api_key=key, base_url=provider.base_url,
+                                    preserve_thinking=profile.preserve_thinking)
+                    endpoint, thinking = model.endpoint, effort != "disabled"
+                elif provider.adapter == "openai_responses":
                     assert provider.base_url is not None  # Responses Provider 在配置阶段已归一化。
                     model = OpenAIResponses(model_client, model=profile.model, api_key=key,
                                             base_url=provider.base_url, reasoning_effort=effort)
                     endpoint, thinking = provider.base_url + "/responses", False
+                else:
+                    raise ConfigError("不支持的模型适配器")
                 # Runtime/压缩先关停；所有模型流关闭后，才退出任一 HTTP 客户端。
                 stack.push_async_callback(model.aclose)
                 origin = _model_origin(salt, key, provider.adapter, endpoint, profile.model, effort)

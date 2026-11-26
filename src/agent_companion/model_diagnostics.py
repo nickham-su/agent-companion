@@ -1,4 +1,4 @@
-"""模型请求的安全诊断；只保留固定类别和不含内容的计数。"""
+"""模型请求诊断；厂商报错与固定的失败分类分开。"""
 
 from collections.abc import Iterator
 from contextlib import contextmanager
@@ -13,6 +13,7 @@ from .protocol import ModelError
 
 
 _LOG = logging.getLogger(__name__)
+AdapterID = Literal["deepseek", "openai_responses", "minimax", "bailian"]
 _HTTP_ERRORS = (
     (httpx.ConnectTimeout, "connect_timeout"),
     (httpx.ReadTimeout, "read_timeout"),
@@ -54,13 +55,37 @@ def failure_category(error: BaseException) -> str:
     return "unexpected_error"
 
 
+class VendorResponseError(ModelError):
+    """只有适配器验证过的厂商字段进日志，异常本身仍只含固定分类。"""
+
+    def __init__(self, reason: str, *, adapter: AdapterID, http_status: int, request_id: str | None,
+                 code: int | str | None, message: str | None) -> None:
+        super().__init__(reason)
+        self._adapter = adapter
+        self._status = http_status
+        self._request_id = request_id
+        self._code = code
+        self._message = message
+
+    def log_response(self) -> None:
+        details = []
+        if self._request_id is not None:
+            details.append(f" request_id={self._request_id}")
+        if self._code is not None:
+            details.append(f" code={self._code}")
+        if self._message is not None:
+            details.append(f" message={self._message!r}")
+        _LOG.warning("vendor model response failed; adapter=%s http_status=%s%s",
+                     self._adapter, self._status, "".join(details))
+
+
 @dataclass(slots=True, repr=False)
 class ModelRequestDiagnostics:
     purpose: Literal["reply", "summary"]
     timeout: float
     run_id: str | None = None
     reply_id: str | None = None
-    adapter: Literal["unknown", "deepseek", "openai_responses"] = "unknown"
+    adapter: AdapterID | Literal["unknown"] = "unknown"
     stage: Literal["unknown", "request_build", "http_wait", "http_response", "sse_read", "response_close"] = "unknown"
     body_bytes: int | None = None
     http_status: int | None = None
@@ -84,6 +109,9 @@ class ModelRequestDiagnostics:
         self.stage = "http_response"
 
     def failed(self, error: Exception) -> None:
+        # Runtime 接受失败后才打印厂商报错；退役读流不报告迟到的厂商内容。
+        if isinstance(error, VendorResponseError):
+            error.log_response()
         if isinstance(error, ModelError):
             reason = error.diagnostic
             category = self.transport_failure if reason == "transport_error" else None
@@ -104,7 +132,7 @@ def current_request() -> ModelRequestDiagnostics | None:
     return _CURRENT.get()
 
 
-def adapter_started(adapter: Literal["deepseek", "openai_responses"]) -> ModelRequestDiagnostics | None:
+def adapter_started(adapter: AdapterID) -> ModelRequestDiagnostics | None:
     diagnostics = current_request()
     if diagnostics is not None:
         diagnostics.adapter = adapter
