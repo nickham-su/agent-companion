@@ -20,8 +20,9 @@ from agent_companion.runtime.compaction import Compactions
 from agent_companion.runtime.context import _SUMMARIZE
 from agent_companion.runtime.engine import Runtime
 from agent_companion.runtime.instructions import load_roles
-from agent_companion.storage.sqlite import History, ReplyOutcome, _SCHEMA, _SCHEMA_VERSION
+from agent_companion.storage.sqlite import History, ReplyOutcome
 from test_openai_responses import _Wire, _answer, _call, _completed
+from test_message_support import tool_calls
 
 
 _CONFIG = '''asr_model = "speech"
@@ -220,14 +221,13 @@ class ProfileRuntimeTests(_Files, unittest.IsolatedAsyncioTestCase):
                 root.submit_batch([Message("user", "reuse" if restarting else "delegate")])
                 await asyncio.wait_for(tree.wait_idle(), 3)
                 self.assertIsNone(root.last_failure)
-                accepts = [json.loads(row.message.content) for row in history.read_after("root")
-                           if row.message.role == "tool"]
+                accepts = [json.loads(call.result) for call in tool_calls(row.message for row in history.read_after("root"))]
                 if not restarting:
                     child_id = accepts[0]["agent_id"]
                     child_session = history.agent(child_id).session_id
                     self.assertEqual(len(history.outcomes(child_session)), 2)
-                    self.assertTrue(any("tool_round_limit" in str(row.message.content)
-                                        for row in history.read_after("root") if row.message.role == "user"))
+                    self.assertTrue(any(row.message.async_result.payload.get("error") == "tool_round_limit"
+                                        for row in history.read_after("root") if row.message.async_result is not None))
                 else:
                     self.assertEqual([item["agent_id"] for item in accepts], [child_id, child_id])
                     await asyncio.wait_for(child_summary.wait(), 2)
@@ -244,15 +244,10 @@ class ProfileRuntimeTests(_Files, unittest.IsolatedAsyncioTestCase):
     async def test_existing_database_and_same_id_model_switch_isolate_usage_and_deepseek_reasoning(self):
         self.role("unused_child", 'model_id="chat"')
         database = self.settings().database
-        # 模拟当前格式中无来源表的库，以及升级前的普通用量和私有推理记录。
-        with closing(sqlite3.connect(database)) as raw:
-            raw.executescript(_SCHEMA + f"\nPRAGMA user_version = {_SCHEMA_VERSION};")
-            raw.execute("INSERT INTO messages (session_id, created_at, role, content, tool_calls, reasoning)"
-                        " VALUES ('root', 1, 'assistant', ?, '[]', ?)",
-                        (json.dumps("legacy answer"), "prior unknown reasoning"))
-            raw.execute("INSERT INTO reply_outcomes (reply_id, session_id, run_id, model_status,"
-                        " assistant_message_id, input_tokens) VALUES ('legacy', 'root', 'legacy', 'complete', 1, 500)")
-            raw.commit()
+        # 模拟新库中一条没有兼容回放和用量来源的历史回应。
+        with closing(History(database)) as history:
+            history.finalize_reply(ReplyOutcome("past", "root", "past", "complete", input_tokens=500),
+                                   [Message("assistant", "past answer")])
         requests = []
         summary_started = asyncio.Event()
         phase = "first"
@@ -276,14 +271,12 @@ class ProfileRuntimeTests(_Files, unittest.IsolatedAsyncioTestCase):
                 if phase == "same":
                     # 摘要是后台请求，等其发出再退出当前启动。
                     await asyncio.wait_for(summary_started.wait(), 2)
-                self.assertIsNone(history.read_after("root")[0].message.replay)
-                legacy = history._db.execute("SELECT reasoning FROM messages WHERE message_id = 1").fetchone()[0]
-                self.assertTrue(legacy == "prior unknown reasoning")
+                self.assertEqual(history.read_after("root")[0].message, Message("assistant", "past answer"))
 
         self.assertEqual(await self.serve(respond, drive, expected_clients=2), ["deep"])
         self.assertEqual(len(requests), 1)
         original = json.dumps(requests[0][1])
-        self.assertIn("legacy answer", original)
+        self.assertIn("past answer", original)
         self.assertNotIn("prior unknown reasoning", original)
 
         phase = "same"
@@ -318,7 +311,7 @@ class ProfileRuntimeTests(_Files, unittest.IsolatedAsyncioTestCase):
         model, messages = requests[0]
         self.assertEqual(model, "different-model")
         wire = json.dumps(messages)
-        for old in ("legacy answer", "first answer", "same answer", "rotated answer", "changed prompt"):
+        for old in ("past answer", "first answer", "same answer", "rotated answer", "changed prompt"):
             self.assertIn(old, wire)
         for private in ("prior unknown reasoning", "first private", "same private", "rotated private"):
             self.assertNotIn(private, wire)
@@ -351,7 +344,7 @@ class SharedSummarySlotTests(unittest.IsolatedAsyncioTestCase):
                 self.summaries = 0
                 self.cancels = 0
 
-            async def stream(self, messages, tools, *, thinking):
+            async def stream(self, messages, tools, *, thinking, instructions=None):
                 if messages[-1] == _SUMMARIZE:
                     self.summaries += 1
                     if self.block:

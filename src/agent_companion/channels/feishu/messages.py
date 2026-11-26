@@ -137,7 +137,7 @@ class BatchMediaBudget:
                         else:
                             remaining -= cost
                     parts.append(part)
-                message = replace(message, content=tuple(parts))
+                message = replace(message, parts=tuple(parts))
             final.append((external_id, message))
         return final
 

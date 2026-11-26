@@ -1,5 +1,6 @@
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import closing
+import json
 from pathlib import Path
 import sqlite3
 from tempfile import TemporaryDirectory
@@ -8,7 +9,8 @@ import unittest
 from unittest.mock import patch
 from uuid import UUID
 
-from agent_companion.protocol import Message
+from agent_companion.models.deepseek import build_request
+from agent_companion.protocol import AgentReply, Message
 from agent_companion.storage.sqlite import AgentReplyInput, DatabaseFormatError, DelegatedInput, FeishuCandidate, History, is_sqlite_lock_error
 
 
@@ -231,7 +233,8 @@ class AgentStorageTests(unittest.TestCase):
             _start(history, parent.agent_id, "parent-run")
             child, _ = history.accept_delegation(parent.agent_id, "parent-run", "a", role_id="review")
             _start(history, child.agent_id, "child-run")
-            reply = AgentReplyInput(child.agent_id, "child-run", _user("reply"))
+            notice = AgentReply(child.agent_id, "child-run", error="model_failed").to_history_message()
+            reply = AgentReplyInput(child.agent_id, "child-run", notice)
 
             def append(target: str, run_id: str, item: AgentReplyInput):
                 return history.append_agent_inputs(target, run_id, (item,), start=True)
@@ -243,6 +246,13 @@ class AgentStorageTests(unittest.TestCase):
             spoofed = AgentReplyInput(other.agent_id, "child-run", _user("spoofed"))
             self.assertEqual(append(parent.agent_id, "wrong-child", spoofed), ([], False, False))
 
+            for forged in (AgentReply(child.agent_id, "child-run", error="different error"),
+                           AgentReply(child.agent_id, "child-run", result="forged success")):
+                fake = AgentReplyInput(child.agent_id, "child-run", forged.to_history_message())
+                self.assertEqual(append(parent.agent_id, "forged-run", fake), ([], False, False))
+                self.assertIsNone(history.agent_run("forged-run"))
+                self.assertIsNone(history.agent_run("child-run").reply_consumed_run_id)
+
             history._db.execute("CREATE TRIGGER reject_reply BEFORE INSERT ON messages"
                                 " BEGIN SELECT RAISE(ABORT, 'injected'); END")
             with self.assertRaises(sqlite3.IntegrityError):
@@ -252,7 +262,16 @@ class AgentStorageTests(unittest.TestCase):
             history._db.execute("DROP TRIGGER reject_reply")
 
             # 先消费再记录已入队，也是允许的时序。
-            _, inbound, agent_input = append(parent.agent_id, "reply-run", reply)
+            (message_id,), inbound, agent_input = append(parent.agent_id, "reply-run", reply)
+            stored = history.read_after(parent.session_id)[-1]
+            self.assertEqual((stored.message_id, stored.message), (message_id, notice))
+            outgoing, = build_request([stored.message], (), thinking=False)["messages"]
+            self.assertEqual(outgoing["role"], "user")
+            prefix, payload = outgoing["content"].split("\n", 1)
+            self.assertEqual(prefix, "[异步工具通知]")
+            self.assertEqual(json.loads(payload), {"kind": "agent_reply", "payload": {
+                "agent_id": child.agent_id, "status": "failed", "error": "model_failed"}})
+            self.assertNotIn("child-run", payload)
             history.mark_agent_reply_enqueued("child-run")
             self.assertEqual((inbound, agent_input), (False, True))
             self.assertEqual(append(parent.agent_id, "duplicate", reply), ([], False, False))
@@ -281,7 +300,8 @@ class AgentStorageTests(unittest.TestCase):
                     self.assertEqual(history.agent_run("child-run"), running)
             self.assertFalse(history._db.in_transaction)
 
-            reply = AgentReplyInput(child.agent_id, "child-run", _user("reply"))
+            notice = AgentReply(child.agent_id, "child-run", result="reply").to_history_message()
+            reply = AgentReplyInput(child.agent_id, "child-run", notice)
             self.assertEqual(history.append_agent_inputs(parent.agent_id, "premature", (reply,), start=True),
                              ([], False, False))
             self.assertIsNone(history.agent_run("premature"))
@@ -297,7 +317,8 @@ class AgentStorageTests(unittest.TestCase):
             _start(history, child.agent_id, "child-run")
             history.finish_agent_run("parent-run")
             history.finish_agent_run("child-run", result="reply")
-            reply = AgentReplyInput(child.agent_id, "child-run", _user("reply"))
+            notice = AgentReply(child.agent_id, "child-run", result="reply").to_history_message()
+            reply = AgentReplyInput(child.agent_id, "child-run", notice)
             for status, result, error in (("completed", None, None), ("completed", "\t\u3000", None),
                                           ("completed", None, "wrong status"), ("failed", None, None),
                                           ("failed", None, "\n"), ("failed", "wrong status", None)):
@@ -321,7 +342,7 @@ class AgentStorageTests(unittest.TestCase):
             batch_id, = history.pending_inbound(child.session_id, "offline")
             items = (DelegatedInput(task.delegation_id, _user("delegate")), batch_id, _user("reject"))
             history._db.execute("CREATE TRIGGER reject_input BEFORE INSERT ON messages"
-                                " WHEN NEW.content = '\"reject\"' BEGIN SELECT RAISE(ABORT, 'injected'); END")
+                                " WHEN json_extract(NEW.parts, '$[0].text') = 'reject' BEGIN SELECT RAISE(ABORT, 'injected'); END")
             with self.assertRaises(sqlite3.IntegrityError):
                 history.append_agent_inputs(child.agent_id, "run", items, start=True)
             self.assertIsNone(history.agent_run("run"))

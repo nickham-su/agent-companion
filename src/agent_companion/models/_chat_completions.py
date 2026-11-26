@@ -2,9 +2,10 @@
 
 from abc import ABC, abstractmethod
 import asyncio
-from collections.abc import AsyncGenerator, AsyncIterator, Iterator, Sequence
+from collections.abc import AsyncGenerator, AsyncIterator, Callable, Iterator, Sequence
 from contextlib import aclosing
 from dataclasses import dataclass, field
+from itertools import groupby
 import json
 import re
 from typing import Any
@@ -12,10 +13,10 @@ from typing import Any
 import httpx
 
 from ..model_diagnostics import AdapterID, VendorResponseError, adapter_started, failure_category
-from ..protocol import (Image, InputUsage, Message, ModelClosing, ModelError, ModelEvent, Replay, ReplayReady,
-                        TextDelta, ToolCall, ToolReady, ToolSpec)
+from ..protocol import (AssistantPartsReady, Image, InputUsage, Message, ModelClosing, ModelError, ModelEvent,
+                        Part, PrivateData, Reasoning, Text, TextDelta, ToolCall, ToolReady, ToolSpec)
 from ._http_stream import ResponseStreams
-from ._request import request_body
+from ._request import input_content, request_body
 
 
 _ERROR_BODY_LIMIT = 64 * 1024
@@ -60,7 +61,7 @@ class _ToolParts:
                         raise ModelError("invalid_tool_delta")
                     values.append(piece)
 
-    def complete(self) -> ToolCall:
+    def complete(self, index: int, key: bytes) -> ToolCall:
         name = "".join(self.name)
         if not self.id or not name:
             raise ModelError("incomplete_tool_call")
@@ -69,7 +70,7 @@ class _ToolParts:
             json.loads(arguments)
         except (ValueError, RecursionError):
             raise ModelError("invalid_tool_arguments") from None
-        return ToolCall(self.id, name, arguments)
+        return ToolCall(self.id, name, arguments, private=PrivateData(key, str(index).encode("ascii")))
 
 
 async def _sse(lines: AsyncIterator[str]) -> AsyncIterator[tuple[str, str]]:
@@ -270,8 +271,135 @@ def _without_echo(value: object, api_key: str, sources: list[str] | None, *, tok
     return value
 
 
+class ChatOutput:
+    """保留首段原始顺序，不把每个 SSE 增量保存为独立 Part。"""
+
+    def __init__(self) -> None:
+        self._parts: list[tuple[str, list[str]] | int] = []
+        self._calls: set[int] = set()
+
+    def text(self, kind: str, text: str) -> None:
+        last = self._parts[-1] if self._parts else None
+        if isinstance(last, tuple) and last[0] == kind:
+            last[1].append(text)
+        else:
+            self._parts.append((kind, [text]))
+
+    def call(self, index: int) -> None:
+        if index not in self._calls:
+            self._calls.add(index)
+            self._parts.append(index)
+
+    def complete(self, key: bytes, calls: dict[int, ToolCall]) -> AssistantPartsReady | None:
+        has_reasoning = any(isinstance(part, tuple) and part[0] == "reasoning" for part in self._parts)
+        if not has_reasoning and not calls:
+            return None
+        parts: list[Part] = []
+        try:
+            for is_call, run in groupby(self._parts, key=lambda part: isinstance(part, int)):
+                if is_call:
+                    # 同一次工具列表按协议 index 排序，不按流中各调用最先收到片段的顺序。
+                    parts.extend(calls[index] for index in sorted(part for part in run if isinstance(part, int)))
+                else:
+                    for part in run:
+                        assert isinstance(part, tuple)
+                        kind, fragments = part
+                        text = "".join(fragments)
+                        if kind == "reasoning":
+                            parts.append(Reasoning(PrivateData(key, text.encode("utf-8"))))
+                        elif text:
+                            parts.append(Text(text))
+        except UnicodeError:
+            raise ModelError("invalid_sse_event") from None
+        if not calls and not any(isinstance(part, Text) or part.private.payload for part in parts):
+            return None
+        return AssistantPartsReady(tuple(parts))
+
+
+def chat_reasoning(message: Message, key: bytes) -> str | None:
+    payloads = [part.private.payload for part in message.parts
+                if isinstance(part, Reasoning) and part.private.compatibility_key == key]
+    if not payloads:
+        return None
+    try:
+        return b"".join(payloads).decode("utf-8")
+    except UnicodeError:
+        return None
+
+
+def _native_calls(calls: tuple[ToolCall, ...], key: bytes) -> dict[int, ToolCall] | None:
+    native: dict[int, ToolCall] = {}
+    for call in calls:
+        data = call.private
+        if data is None or data.compatibility_key != key or not data.payload.isdigit():
+            return None
+        try:
+            index = int(data.payload)
+        except ValueError:
+            return None
+        if index in native:
+            return None
+        native[index] = call
+    return native
+
+
+def _ordered_calls(calls: tuple[ToolCall, ...], key: bytes) -> list[tuple[int, ToolCall]]:
+    if native := _native_calls(calls, key):
+        return sorted(native.items())
+    # 任一 index 缺失、无效或冲突时，不混排原生 index 和推测位置。
+    return list(enumerate(calls))
+
+
+def chat_messages(messages: Sequence[Message], reasoning_for: Callable[[Message], str | None], *,
+                  key: bytes, include_tool_index: bool = False, instructions: str | None = None) -> list[dict[str, Any]]:
+    projected: list[dict[str, Any]] = []
+    if instructions is not None:
+        projected.append({"role": "system", "content": instructions})
+    for message in messages:
+        assistant = message.kind == "assistant"
+        calls = _ordered_calls(message.tool_calls, key)
+        reasoning = reasoning_for(message) if assistant else None
+        content: Any = input_content(message)
+        if assistant and not (content or calls or reasoning):
+            continue
+        if not isinstance(content, str):
+            content = [{"type": "image_url", "image_url": {"url": part.url}} if isinstance(part, Image)
+                       else {"type": "text", "text": part.text} for part in content]
+        item = {"role": "assistant" if assistant else "user", "content": content}
+        if calls:
+            item["content"] = content or None
+            item["tool_calls"] = [{"type": "function", "id": call.id,
+                                   **({"index": index} if include_tool_index else {}),
+                                   "function": {"name": call.name, "arguments": call.arguments}}
+                                  for index, call in calls]
+        if reasoning is not None:
+            item["reasoning_content"] = reasoning
+        projected.append(item)
+        projected.extend({"role": "tool", "content": call.result, "tool_call_id": call.id}
+                         for _, call in calls if call.result is not None)
+    return projected
+
+
+def _has_private_fields(item: object) -> bool:
+    if not isinstance(item, dict):
+        return False
+    calls = item.get("tool_calls")
+    return "reasoning_content" in item or (isinstance(calls, list) and any(
+        isinstance(call, dict) and "index" in call for call in calls))
+
+
+def _has_private_response_fields(item: dict[str, Any]) -> bool:
+    if _has_private_fields(item):
+        return True
+    choices = item.get("choices")
+    return isinstance(choices, list) and any(
+        _has_private_fields(choice.get(field)) for choice in choices if isinstance(choice, dict)
+        for field in ("delta", "message"))
+
+
 class ChatCompletions(ABC):
     adapter: AdapterID
+    include_tool_index = False
 
     def __init__(self, client: httpx.AsyncClient, *, model: str, api_key: str, endpoint: str,
                  replay_key: bytes) -> None:
@@ -287,41 +415,16 @@ class ChatCompletions(ABC):
         return self._endpoint
 
     def _reasoning(self, message: Message) -> str | None:
-        replay = message.replay
-        if message.role != "assistant" or replay is None or replay.replay_key != self._replay_key:
-            return None
-        try:
-            return replay.payload.decode("utf-8")
-        except UnicodeError:
-            return None
+        return chat_reasoning(message, self._replay_key)
 
     def history_replay_bytes(self, message: Message, tools: Sequence[ToolSpec], *, thinking: bool) -> int:
-        if self._reasoning(message) is None:
-            return 0
-        assert message.replay is not None
-        return len(message.replay.payload)
+        reasoning = self._reasoning(message)
+        return len(reasoning.encode("utf-8")) if reasoning is not None else 0
 
-    def _request(self, messages: Sequence[Message], tools: Sequence[ToolSpec]) -> dict[str, Any]:
-        projected: list[dict[str, Any]] = []
-        for message in messages:
-            reasoning = self._reasoning(message)
-            content: Any = message.content
-            if message.role == "assistant" and not (content or message.tool_calls or reasoning):
-                continue
-            if not isinstance(content, str):
-                content = [{"type": "image_url", "image_url": {"url": part.url}} if isinstance(part, Image)
-                           else {"type": "text", "text": part.text} for part in content]
-            item = {"role": message.role, "content": content}
-            if message.tool_calls:
-                item["content"] = content or None
-                item["tool_calls"] = [{"type": "function", "id": call.id,
-                                       "function": {"name": call.name, "arguments": call.arguments}}
-                                      for call in message.tool_calls]
-            if message.tool_call_id is not None:
-                item["tool_call_id"] = message.tool_call_id
-            if reasoning is not None:
-                item["reasoning_content"] = reasoning
-            projected.append(item)
+    def _request(self, messages: Sequence[Message], tools: Sequence[ToolSpec], *,
+                 instructions: str | None = None) -> dict[str, Any]:
+        projected = chat_messages(messages, self._reasoning, key=self._replay_key,
+                                  include_tool_index=self.include_tool_index, instructions=instructions)
         result = {"model": self._model, "stream": True, "stream_options": {"include_usage": True},
                   "messages": projected}
         if tools:
@@ -330,7 +433,8 @@ class ChatCompletions(ABC):
         return result
 
     @abstractmethod
-    def _payload(self, messages: Sequence[Message], tools: Sequence[ToolSpec], thinking: bool) -> dict[str, Any]: ...
+    def _payload(self, messages: Sequence[Message], tools: Sequence[ToolSpec], thinking: bool, *,
+                 instructions: str | None = None) -> dict[str, Any]: ...
 
     @abstractmethod
     def _validate_finish(self, finish: str | None, *, has_tools: bool) -> None: ...
@@ -346,7 +450,11 @@ class ChatCompletions(ABC):
             raise asyncio.CancelledError
 
     def _failure(self, response: httpx.Response, item: dict[str, Any], messages: list[dict[str, Any]],
-                 reason: str) -> VendorResponseError:
+                 reason: str, *, private: bool) -> VendorResponseError:
+        if private:
+            # 请求回放或本轮已收到的私有字段可被变形回显，不尝试猜测远端字段是否安全。
+            return VendorResponseError(reason, adapter=self.adapter, http_status=response.status_code,
+                                       request_id=None, code=None, message=None)
         code, message = self._error_fields(item) or (None, None)
         sources = _bounded_sources(messages)
         request_id = None
@@ -365,37 +473,35 @@ class ChatCompletions(ABC):
         return VendorResponseError(reason, adapter=self.adapter, http_status=response.status_code,
                                    request_id=request_id, code=code, message=message)
 
-    async def _parse_stream(self, response: httpx.Response, messages: list[dict[str, Any]]) -> AsyncIterator[ModelEvent]:
+    async def _parse_stream(self, response: httpx.Response, messages: list[dict[str, Any]], *,
+                            private: bool) -> AsyncIterator[ModelEvent]:
         fragments: dict[int, _ToolParts] = {}
-        reasoning: list[str] = []
+        output = ChatOutput()
         finish: str | None = None
         usage: InputUsage | None = None
-        has_text = False
         async for kind, data in _sse(response.aiter_lines()):
             self._check_stopping()
             if kind != "error" and data == "[DONE]":
                 self._validate_finish(finish, has_tools=bool(fragments))
-                calls = [part.complete() for _, part in sorted(fragments.items())]
-                if len({call.id for call in calls}) != len(calls):
+                calls = {index: part.complete(index, self._replay_key) for index, part in sorted(fragments.items())}
+                if len({call.id for call in calls.values()}) != len(calls):
                     raise ModelError("duplicate_tool_id")
-                if reasoning and (has_text or calls or any(reasoning)):
-                    try:
-                        payload = "".join(reasoning).encode("utf-8")
-                    except UnicodeError:
-                        raise ModelError("invalid_sse_event") from None
-                    yield ReplayReady(Replay(self._replay_key, payload))
-                for call in calls:
+                if ready := output.complete(self._replay_key, calls):
+                    yield ready
+                for call in calls.values():
                     yield ToolReady(call)
                 if usage is not None:
                     yield usage
                 return
 
             item = _json_object(data) or {}
+            # 同一帧也可能同时携带错误和私有增量；先收紧诊断边界。
+            private = private or _has_private_response_fields(item)
             if self._error_fields(item) is not None or kind == "error" or "error" in item:
-                raise self._failure(response, item, messages, "vendor_error")
+                raise self._failure(response, item, messages, "vendor_error", private=private)
             choices = item.get("choices")
             if not isinstance(choices, list) or len(choices) > 1:
-                raise self._failure(response, item, messages, "invalid_sse_event")
+                raise self._failure(response, item, messages, "invalid_sse_event", private=private)
             count = item.get("usage")
             if isinstance(count, dict):
                 tokens = count.get("prompt_tokens")
@@ -415,6 +521,10 @@ class ChatCompletions(ABC):
             if ((thought is not None and not isinstance(thought, str)) or
                     (text is not None and not isinstance(text, str))):
                 raise ModelError("invalid_sse_event")
+            if thought is not None:
+                output.text("reasoning", thought)
+            if text:
+                output.text("text", text)
             calls_delta = delta.get("tool_calls")
             if calls_delta is not None:
                 if not isinstance(calls_delta, list):
@@ -424,22 +534,25 @@ class ChatCompletions(ABC):
                     if type(index) is not int or index < 0:
                         raise ModelError("invalid_tool_delta")
                     fragments.setdefault(index, _ToolParts()).append(call)
+                    output.call(index)
             reason = choice.get("finish_reason")
             if reason is not None:
                 self._validate_finish(reason, has_tools=bool(fragments))
                 finish = reason
-            if thought is not None:
-                reasoning.append(thought)
             if text:
-                has_text = True
                 yield TextDelta(text)
         self._check_stopping()
         raise ModelError("truncated_stream")
 
     async def stream(self, messages: Sequence[Message], tools: Sequence[ToolSpec], *,
-                     thinking: bool) -> AsyncGenerator[ModelEvent, None]:
+                     thinking: bool, instructions: str | None = None) -> AsyncGenerator[ModelEvent, None]:
         diagnostics = adapter_started(self.adapter)
-        payload = self._payload(messages, tools, thinking)
+        payload = self._payload(messages, tools, thinking, instructions=instructions)
+        projected = payload["messages"]
+        private = any("reasoning_content" in item for item in projected)
+        if not private and self.include_tool_index:
+            # 与出站排序共用兼容性检查；仅回传原生 index 才携带私有数据，本地重新编号不算。
+            private = any(_native_calls(message.tool_calls, self._replay_key) for message in messages)
         body = request_body(payload)
         if diagnostics is not None:
             diagnostics.request_ready(len(body))
@@ -464,10 +577,11 @@ class ChatCompletions(ABC):
                         reason = f"http_{response.status_code}"
                     else:
                         reason = "vendor_error" if self._error_fields(item) is not None else "invalid_sse_event"
-                    raise self._failure(response, item, payload["messages"], reason)
+                    raise self._failure(response, item, projected, reason,
+                                        private=private or _has_private_response_fields(item))
                 if diagnostics is not None:
                     diagnostics.stage = "sse_read"
-                async with aclosing(self._parse_stream(response, payload["messages"])) as events:
+                async with aclosing(self._parse_stream(response, projected, private=private)) as events:
                     async for event in events:
                         yield event
                 allow_tail()

@@ -18,7 +18,7 @@ from unittest.mock import AsyncMock, patch
 from agent_companion import workspace as workspace_module
 from agent_companion.app import running_agent
 from agent_companion.config import ConfigError, Settings, load_settings
-from agent_companion.protocol import (AGENT_REPLY_PREFIX, TIMER_EVENT_PREFIX, ChannelUser, DeliveryStatus, Message,
+from agent_companion.protocol import (ChannelUser, DeliveryStatus, Message,
                                       Receipt, TextDelta, ToolCall, ToolReady)
 from agent_companion.runtime import _proc_group_probe
 from agent_companion.runtime import bash as bash_runtime
@@ -29,6 +29,7 @@ from agent_companion.runtime.timers import SET_TIMER_TOOL_NAME
 from agent_companion.runtime.tools import ToolContext, Tools
 from agent_companion.storage.sqlite import History
 from agent_companion.workspace import Workspace
+from test_message_support import tool_calls
 
 
 async def _eventually(condition):
@@ -42,7 +43,7 @@ def _call(call_id, *, name=BASH_TOOL_NAME, **arguments):
 
 
 def _results(messages):
-    return {message.tool_call_id: json.loads(message.content) for message in messages if message.role == "tool"}
+    return {call.id: json.loads(call.result) for call in tool_calls(messages)}
 
 
 def _record_processes(processes):
@@ -67,7 +68,7 @@ class _Model:
         self.answer = answer
         self.requests = []
 
-    async def stream(self, messages, tools, *, thinking):
+    async def stream(self, messages, tools, *, thinking, instructions=None):
         names = tuple(tool.name for tool in tools)
         self.requests.append((tuple(messages), names))
         for event in self.answer(messages, names):
@@ -981,7 +982,7 @@ class BashRuntimeTests(unittest.IsolatedAsyncioTestCase):
                                      (None, AgentRole(None, (BASH_TOOL_NAME,)), "workspace_unavailable")):
             with self.subTest(expected=expected):
                 model = _Model(lambda messages, names: (_call("last", command=":"),)
-                               if messages[-1].role == "user" else (TextDelta("done"),))
+                               if messages[-1].kind == "user" else (TextDelta("done"),))
                 session_id = f"test-{expected}"
                 async with running_agent(self.settings, self.history, model, _Channel(), session_id=session_id,
                                          roles={"main": role}, user=user) as (runtime, _):
@@ -995,7 +996,7 @@ class BashRuntimeTests(unittest.IsolatedAsyncioTestCase):
         for session_id, command, output in (("new-agent-a", "printf marker > fixture", ""),
                                             ("new-agent-b", "cat fixture", "marker")):
             model = _Model(lambda messages, names: (_call("last", command=command),)
-                           if messages[-1].role == "user" else (TextDelta("done"),))
+                           if messages[-1].kind == "user" else (TextDelta("done"),))
             async with running_agent(self.settings, self.history, model, _Channel(), session_id=session_id,
                                      roles={"main": AgentRole(None, (BASH_TOOL_NAME,))},
                                      user=self.user) as (runtime, _):
@@ -1023,7 +1024,7 @@ class BashRuntimeTests(unittest.IsolatedAsyncioTestCase):
                                                     "test ! -e release && printf child > child-ran"),)
             if last.content == "other user":
                 return (_call("other-bash", command="printf other > shared"),)
-            if last.role == "user" and last.content.startswith(AGENT_REPLY_PREFIX):
+            if last.async_result is not None and last.async_result.kind == "agent_reply":
                 return (_call("after-reply", command="cat shared"),)
             return (TextDelta("done"),)
 
@@ -1043,7 +1044,7 @@ class BashRuntimeTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual((other_workspace / "shared").read_text(), "other")
             self.assertFalse((workspace / "second-ran").exists())
             main_requests = [messages for messages, _ in model.requests
-                             if any(message.role == "user" and message.content == "begin" for message in messages)]
+                             if any(message.kind == "user" and message.content == "begin" for message in messages)]
             self.assertEqual(len(main_requests), 1)  # 主 Agent 仍在等本请求的两个 Bash 结果。
             (workspace / "release").touch()
             await _eventually(lambda: any("after-reply" in _results(messages) for messages, _ in model.requests))
@@ -1056,7 +1057,7 @@ class BashRuntimeTests(unittest.IsolatedAsyncioTestCase):
         def answer(messages, names):
             if messages[-1].content == "schedule":
                 return (_call("register", name=SET_TIMER_TOOL_NAME, interval_seconds=0.03),)
-            if messages[-1].role == "user" and messages[-1].content.startswith(TIMER_EVENT_PREFIX):
+            if messages[-1].async_result is not None and messages[-1].async_result.kind == "timer_fired":
                 return (_call("timer-bash", command="printf fired"),)
             return (TextDelta("done"),)
 

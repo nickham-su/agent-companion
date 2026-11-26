@@ -21,6 +21,7 @@ from agent_companion.runtime.context import _SUMMARIZE
 from agent_companion.runtime.instructions import MAX_ROLE_BYTES, load_roles
 from agent_companion.runtime.subtasks import DELEGATE_TOOL_NAME
 from agent_companion.storage.sqlite import History
+from test_message_support import tool_calls
 
 
 class Model:
@@ -28,8 +29,8 @@ class Model:
         self.requests = []
         self.respond = respond or (lambda messages: [TextDelta("answer")])
 
-    async def stream(self, messages, tools, *, thinking):
-        self.requests.append((tuple(messages), tuple(tools)))
+    async def stream(self, messages, tools, *, thinking, instructions=None):
+        self.requests.append((tuple(messages), tuple(tools), instructions))
         for event in self.respond(messages):
             yield event
 
@@ -192,22 +193,22 @@ class RoleRuntimeTests(_RoleFiles, unittest.IsolatedAsyncioTestCase):
             async with running_agent(Settings(), history, model, Sink(), session_id="main",
                                      roles=load_roles(self.workdir)) as (runtime, tree):
                 await self.turn(runtime, tree, "开始")
-        for messages, tools in model.requests:
-            self.assertEqual(messages[0].role, "system")
-            self.assertIn(messages[0].content, {main_body, "调研提示\n", "审阅提示\r\n"})
-            if messages[0].content == "审阅提示\r\n":
+        for messages, tools, instructions in model.requests:
+            self.assertEqual(messages[0].kind, "user")
+            self.assertIn(instructions, {main_body, "调研提示\n", "审阅提示\r\n"})
+            if instructions == "审阅提示\r\n":
                 self.assertEqual(tools, ())
             else:
                 delegate, = tools
                 self.assertEqual(delegate.parameters["properties"]["agent"]["enum"], ["research", "review"])
                 self.assertIn("收集证据", delegate.description)
                 self.assertIn("检查缺遗漏", delegate.description)
-        self.assertEqual({messages[0].content for messages, _ in model.requests},
+        self.assertEqual({instructions for _, _, instructions in model.requests},
                          {main_body, "调研提示\n", "审阅提示\r\n"})
-        review_tools = [message for messages, _ in model.requests if messages[0].content == "审阅提示\r\n"
-                        for message in messages if message.role == "tool"]
-        self.assertEqual(json.loads(review_tools[-1].content), {"error": "unknown_tool"})
-        await self.check_wire_payloads(*model.requests[0], main_body)
+        review_tools = [call for messages, _, instructions in model.requests if instructions == "审阅提示\r\n"
+                        for call in tool_calls(messages)]
+        self.assertEqual(json.loads(review_tools[-1].result), {"error": "unknown_tool"})
+        await self.check_wire_payloads(*model.requests[0])
 
     async def check_wire_payloads(self, messages, tools, main_body):
         requests = []
@@ -222,12 +223,12 @@ class RoleRuntimeTests(_RoleFiles, unittest.IsolatedAsyncioTestCase):
             for adapter in adapters:
                 try:
                     with self.assertRaises(ModelError):
-                        _ = [part async for part in adapter.stream(messages, tools, thinking=False)]
+                        _ = [part async for part in adapter.stream(messages, tools, thinking=False, instructions=main_body)]
                 finally:
                     await adapter.aclose()
         deepseek, openai = requests
         self.assertEqual(deepseek["messages"][0], {"role": "system", "content": main_body})
-        self.assertEqual(openai["input"][0], {"role": "system", "content": main_body})
+        self.assertEqual(openai["instructions"], main_body)
         for spec in (deepseek["tools"][0]["function"], openai["tools"][0]):
             self.assertEqual(spec["parameters"]["properties"]["agent"]["enum"], ["research", "review"])
             self.assertIn("research：收集证据", spec["description"])
@@ -240,7 +241,7 @@ class RoleRuntimeTests(_RoleFiles, unittest.IsolatedAsyncioTestCase):
             async with running_agent(Settings(), history, model, Sink(), session_id="main",
                                      roles=load_roles(self.workdir)) as (runtime, tree):
                 await self.turn(runtime, tree, "运行")
-        self.assertEqual(model.requests, [((Message("system", ""), Message("user", "运行")), ())])
+        self.assertEqual(model.requests, [((Message("user", "运行"),), (), "")])
 
     async def test_role_changes_and_missing_file_take_effect_after_restart(self):
         self.write_role("main", "主提示", tools=(DELEGATE_TOOL_NAME,))
@@ -258,8 +259,8 @@ class RoleRuntimeTests(_RoleFiles, unittest.IsolatedAsyncioTestCase):
             return [TextDelta("完成")]
 
         def assert_hidden(model):
-            self.assertTrue(all(messages[0].content == "主提示" and not tools
-                                for messages, tools in model.requests))
+            self.assertTrue(all(instructions == "主提示" and not tools
+                                for _, tools, instructions in model.requests))
 
         for phase in ("create", "change", "remove", "without_permission", "restore"):
             with self.subTest(phase=phase):
@@ -278,8 +279,7 @@ class RoleRuntimeTests(_RoleFiles, unittest.IsolatedAsyncioTestCase):
                     async with running_agent(Settings(), history, model, Sink(), session_id="main",
                                              roles=load_roles(self.workdir)) as (runtime, tree):
                         await self.turn(runtime, tree, "创建" if phase == "create" else "继续")
-                    tool_result = [entry.message.content for entry in history.tail("main", 30)
-                                   if entry.message.role == "tool"][-1]
+                    tool_result = tool_calls(entry.message for entry in history.tail("main", 30))[-1].result
                     body = json.loads(tool_result)
                     if phase == "create":
                         agent_id = body["agent_id"]
@@ -293,11 +293,15 @@ class RoleRuntimeTests(_RoleFiles, unittest.IsolatedAsyncioTestCase):
                     else:
                         self.assertEqual(body["agent_id"], agent_id)
                         expected = "修改后的提示" if phase == "change" else "恢复后的提示"
-                        (messages, tools), = [request for request in model.requests if request[0][0].content == expected]
-                        self.assertIn(Message("user", "历史输入"), messages)
+                        (messages, tools, _), = [request for request in model.requests if request[2] == expected]
+                        self.assertIn("历史输入", [message.text for message in messages])
                         self.assertEqual([tool.name for tool in tools], ["cancel_timer"] if phase == "change" else [])
-                    self.assertTrue(any(entry.message == Message("user", "历史输入")
-                                        for entry in history.tail(child_session_id, 30)))
+                    stored = next(entry.message for entry in history.tail(child_session_id, 30)
+                                  if entry.message.text == "历史输入")
+                    self.assertEqual(stored.source.kind, "delegation")
+                    delegation = history.delegation(stored.source.delegation_id)
+                    self.assertEqual((stored.source.agent_id, delegation.agent_id),
+                                     (delegation.parent_agent_id, agent_id))
 
     async def test_normal_and_compaction_requests_use_same_config_snapshot(self):
         def respond(messages):
@@ -321,5 +325,5 @@ class RoleRuntimeTests(_RoleFiles, unittest.IsolatedAsyncioTestCase):
                 self.assertIsNone(history.summary("main"))
                 await self.turn(runtime, tree, "应用摘要")
                 self.assertEqual(history.summary("main").text, "摘要")
-        self.assertTrue(any(messages[-1] == _SUMMARIZE for messages, _ in model.requests))
-        self.assertTrue(all(messages[0] == Message("system", "固定指令") for messages, _ in model.requests))
+        self.assertTrue(any(messages[-1] == _SUMMARIZE for messages, _, _ in model.requests))
+        self.assertTrue(all(instructions == "固定指令" for _, _, instructions in model.requests))

@@ -18,9 +18,10 @@ from agent_companion.app import private_feishu_identity, run_feishu, running_age
 from agent_companion.channels.feishu.cli import CliError, CommandResult, FeishuDiscovery
 from agent_companion.config import (ASRSettings, FeishuSettings, LLMProvider, MiniMaxConnection, ModelProfile, RuntimeSettings, Settings,
                                     load_settings)
-from agent_companion.protocol import AGENT_REPLY_PREFIX, ChannelUser, Message, TextDelta, ToolCall, ToolReady
+from agent_companion.protocol import ChannelUser, Message, TextDelta, ToolCall, ToolReady
 from agent_companion.runtime.subtasks import AgentTree, DELEGATE_TOOL_NAME, demo_roles
 from agent_companion.storage.sqlite import AgentReplyInput, DelegatedInput, FeishuBindingError, History, is_sqlite_lock_error
+from test_message_support import tool_calls
 
 
 _OWN = "ou_private_service"
@@ -118,17 +119,17 @@ class _Model:
         self.release_a = asyncio.Event()
         self.calls = []
 
-    async def stream(self, messages, tools, *, thinking):
+    async def stream(self, messages, tools, *, thinking, instructions=None):
         last = messages[-1]
-        self.calls.append((bool(tools), tuple(m.content for m in messages if m.role == "user")))
+        self.calls.append((bool(tools), tuple(m.content for m in messages if m.kind == "user")))
         if last.content == "first A":
             self.a_waiting.set()
             await self.release_a.wait()
         if last.content == "first B" and tools:
             yield ToolReady(ToolCall("delegate_b", DELEGATE_TOOL_NAME, '{"agent":"general","prompt":"child B"}'))
-        elif last.role == "tool":
+        elif last.tool_calls:
             yield TextDelta("delegated B")
-        elif isinstance(last.content, str) and last.content.startswith(AGENT_REPLY_PREFIX):
+        elif last.async_result is not None and last.async_result.kind == "agent_reply":
             yield TextDelta("returned B")
         else:
             yield TextDelta("reply: " + last.content)
@@ -356,12 +357,12 @@ class FeishuPrivateTests(unittest.IsolatedAsyncioTestCase):
                 await _eventually(lambda: runner.sent[sb] == ["reply: B 第一条", "reply: B 后续文字"])
                 self.assertIn((100.0, 104.0), runner.queries)
                 self.assertEqual(history.feishu_inbound_window(0), (100, 104))
-                self.assertEqual([row.message.content for row in history.tail(session_b, 10) if row.message.role == "user"],
+                self.assertEqual([row.message.content for row in history.tail(session_b, 10) if row.message.kind == "user"],
                                  ["B 第一条", "B 后续文字"])
                 self.assertEqual(history.tail(session_a, 10), [])
                 release.set()
                 await _eventually(lambda: "reply: A 后续文字" in runner.sent[sa])
-                self.assertEqual([row.message.content for row in history.tail(session_a, 10) if row.message.role == "user"],
+                self.assertEqual([row.message.content for row in history.tail(session_a, 10) if row.message.kind == "user"],
                                  ["A 同批文字", "A 后续文字"])
                 media.assert_awaited_once()
 
@@ -445,7 +446,7 @@ class FeishuPrivateTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_runtime_retries_reply_and_subtask_transactions_without_repeating_work(self):
         class Model(_Model):
-            async def stream(self, messages, tools, *, thinking):
+            async def stream(self, messages, tools, *, thinking, instructions=None):
                 if messages[-1].content == "first B":
                     yield TextDelta("tool-stage B")
                 async for event in super().stream(messages, tools, thinking=thinking):
@@ -497,7 +498,11 @@ class FeishuPrivateTests(unittest.IsolatedAsyncioTestCase):
                 await _eventually(lambda: len(attempts["accept"]) >= 2)
                 blocked.remove("accept")
                 await _eventually(lambda: len(attempts["tool_reply"]) >= 2 and len(attempts["start"]) >= 2)
-                self.assertEqual([e.message.role for e in history.read_after(session_b)], ["user"])
+                _, snapshot = history.context_snapshot(session_b)
+                self.assertEqual([e.message.kind for e in snapshot], ["user", "assistant"])
+                self.assertTrue(snapshot[-1].active_reply)
+                self.assertEqual(snapshot[-1].message.content, "")
+                self.assertIsNotNone(snapshot[-1].message.tool_calls[0].result)
                 self.assertEqual(runner.sent[sb], [])
                 self.assertEqual(model.calls, [(True, ("first B",))])
                 # 工具轮次之间吸收排队的用户输入时也只等当前事务。
@@ -509,9 +514,9 @@ class FeishuPrivateTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(model.calls, [(True, ("first B",))])
                 blocked.remove("tool_input")
                 await _eventually(lambda: len(runner.sent[sb]) >= 2)
-                tool = next(e.message for e in history.read_after(session_b) if e.message.role == "tool")
-                accepted = json.loads(tool.content)
-                delegation_id = stored_delegation(history, session_b, tool.tool_call_id).delegation_id
+                tool = tool_calls(e.message for e in history.read_after(session_b))[0]
+                accepted = json.loads(tool.result)
+                delegation_id = stored_delegation(history, session_b, tool.id).delegation_id
                 child = history.agent(accepted["agent_id"]).session_id
                 self.assertEqual(history.delegation(delegation_id).status, "queued")
                 self.assertIsNone(history.delegation(delegation_id).run_id)
@@ -536,8 +541,8 @@ class FeishuPrivateTests(unittest.IsolatedAsyncioTestCase):
                 delegate.assert_awaited_once()
                 self.assertEqual(len(model.calls), 4)  # 主会话三轮、子会话一轮
                 self.assertEqual(runner.sent[sb], ["tool-stage B", "reply: during tool B", "returned B"])
-                self.assertEqual([e.message.role for e in history.read_after(session_b)],
-                                 ["user", "assistant", "tool", "user", "assistant", "user", "assistant"])
+                self.assertEqual([e.message.kind for e in history.read_after(session_b)],
+                                 ["user", "assistant", "user", "assistant", "async_tool_result", "assistant"])
                 self.assertEqual([e.message.content for e in history.read_after(child)], ["child B", "reply: child B"])
                 for stage in attempts:
                     self.assertEqual(committed[stage], [attempts[stage][0]], stage)
@@ -549,7 +554,7 @@ class FeishuPrivateTests(unittest.IsolatedAsyncioTestCase):
         release_child = asyncio.Event()
 
         class PausedChild(_Model):
-            async def stream(self, messages, tools, *, thinking):
+            async def stream(self, messages, tools, *, thinking, instructions=None):
                 if not tools:
                     await release_child.wait()
                 async for event in super().stream(messages, tools, thinking=thinking):
@@ -585,10 +590,10 @@ class FeishuPrivateTests(unittest.IsolatedAsyncioTestCase):
                         runner.messages[b] = [_message("delegate", b, sb, "first B")]
                         clock[0] = 101.0
                         await _eventually(lambda: runner.sent[sb] == ["delegated B"])
-                        tool = next(e.message for e in history.read_after(session) if e.message.role == "tool")
-                        accepted = json.loads(tool.content)
+                        tool = tool_calls(e.message for e in history.read_after(session))[0]
+                        accepted = json.loads(tool.result)
                         child = history.agent(accepted["agent_id"]).session_id
-                        run_id = stored_delegation(history, session, tool.tool_call_id).run_id
+                        run_id = stored_delegation(history, session, tool.id).run_id
                         try:
                             release_child.set()
                             await _eventually(lambda: len(failures) >= 2)
@@ -601,8 +606,8 @@ class FeishuPrivateTests(unittest.IsolatedAsyncioTestCase):
                         self.assertEqual(len(model.calls), 4)
                         self.assertEqual(sum(not tools for tools, _ in model.calls), 1)
                         self.assertEqual([outcome.run_id for outcome in history.outcomes(child)], [run_id])
-                        payloads = [json.loads(e.message.content.removeprefix(AGENT_REPLY_PREFIX))
-                                    for e in history.read_after(session) if e.message.content.startswith(AGENT_REPLY_PREFIX)]
+                        payloads = [e.message.async_result.payload for e in history.read_after(session)
+                                    if e.message.async_result is not None and e.message.async_result.kind == "agent_reply"]
                         run = history.agent_run(run_id)
                         self.assertEqual(payloads, [{"agent_id": accepted["agent_id"],
                                                      "status": "completed", "result": "reply: child B"}])

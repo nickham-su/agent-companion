@@ -1,16 +1,18 @@
 import asyncio
+from dataclasses import replace
 import sqlite3
 import unittest
 from unittest.mock import patch
 
 from agent_companion.config import RuntimeSettings
 from agent_companion.models.deepseek import MODEL_NAME, DeepSeek, _replay_key, build_request
-from agent_companion.protocol import (DeliveryStatus, Message, ModelError, Receipt, Replay, ReplayReady,
+from agent_companion.protocol import (DeliveryStatus, Message, ModelError, Receipt, PrivateData, Reasoning, AssistantPartsReady,
                                       ReplyDelivery, TextDelta, ToolCall,
                                       ToolReady, ToolSpec)
 from agent_companion.runtime.engine import Runtime
 from agent_companion.runtime.tools import Tool, Tools
 from agent_companion.storage.sqlite import History, Summary
+from test_message_support import assistant_message, reasoning_parts
 
 
 SPEC = ToolSpec("test", "模拟工具", {"type": "object", "properties": {}})
@@ -22,7 +24,7 @@ class ScriptModel:
         self.scripts = iter(scripts)
         self.requests = []
 
-    async def stream(self, messages, tools, *, thinking):
+    async def stream(self, messages, tools, *, thinking, instructions=None):
         self.requests.append((list(messages), tools, thinking))
         async for event in next(self.scripts)():
             yield event
@@ -78,10 +80,10 @@ class RuntimeTest(unittest.IsolatedAsyncioTestCase):
         await self.idle(runtime)
         self.assertEqual(usage, [(False, False)])
         (first, _, _), (second, _, _) = model.requests
-        self.assertEqual(first, [Message("system", "此前会话摘要：\n合成摘要")])
-        self.assertEqual([message.role for message in second], ["system", "assistant", "tool"])
-        self.assertEqual([row.message.role for row in history.tail("main", 10)],
-                         ["user", "assistant", "tool", "assistant"])
+        self.assertEqual(first, [Message("compaction_summary", "合成摘要")])
+        self.assertEqual([message.kind for message in second], ["compaction_summary", "assistant"])
+        self.assertEqual([row.message.kind for row in history.tail("main", 10)],
+                         ["user", "assistant", "assistant"])
 
     async def test_real_pending_input_replaces_or_prevents_trigger(self):
         for before_trigger in (False, True):
@@ -176,7 +178,7 @@ class RuntimeTest(unittest.IsolatedAsyncioTestCase):
         lock = asyncio.Lock()
 
         class Model:
-            async def stream(self, messages, tools, *, thinking):
+            async def stream(self, messages, tools, *, thinking, instructions=None):
                 try:
                     yield ToolReady(CALL)
                     yield ToolReady(ToolCall("queued", SPEC.name, "{}"))
@@ -281,15 +283,21 @@ class RuntimeTest(unittest.IsolatedAsyncioTestCase):
                     self.assertFalse(tool_sent.is_set())
                     model_release.set()
                 self.assertEqual(len(model.requests), 1)
-                self.assertEqual([row.message.content for row in history.read_after("main")], ["one"])
+                _, snapshot = history.context_snapshot("main")
+                self.assertEqual([row.message.content for row in snapshot], ["one", ""])
+                self.assertTrue(snapshot[-1].active_reply)
+                staged_id = snapshot[-1].message_id
+                self.assertEqual(snapshot[-1].message.tool_calls[0].result,
+                                 "tool says done" if first == "tool" else None)
                 if first == "tool":
                     receipt_release.set()
                 else:
                     tool_release.set()
                 await self.idle(runtime)
                 self.assertEqual(len(model.requests), 2)
+                self.assertEqual(history.read_after("main")[1].message_id, staged_id)
                 self.assertEqual([item.content for item in model.requests[1][0]],
-                                 ["one", "first", "tool says done", "two", "three"])
+                                 ["one", "first", "two", "three"])
                 self.assertEqual(channel.replies[0][0].run_id, channel.replies[1][0].run_id)
                 self.assertNotEqual(channel.replies[0][0].reply_id, channel.replies[1][0].reply_id)
 
@@ -332,7 +340,7 @@ class RuntimeTest(unittest.IsolatedAsyncioTestCase):
                 late_call = ToolCall("late", SPEC.name, "{}")
 
                 class Model:
-                    async def stream(self, messages, tools, *, thinking):
+                    async def stream(self, messages, tools, *, thinking, instructions=None):
                         requests.append(list(messages))
                         if len(requests) > 1:
                             yield TextDelta("next")
@@ -377,8 +385,7 @@ class RuntimeTest(unittest.IsolatedAsyncioTestCase):
                     release_tool.set()
                     await self.idle(runtime)
                     self.assertFalse(model_closed.is_set())
-                    self.assertEqual(requests[1], [Message("user", "one"), Message("assistant", confirmed, (CALL,)),
-                                                  Message("tool", "tool result", tool_call_id=CALL.id),
+                    self.assertEqual(requests[1], [Message("user", "one"), assistant_message(confirmed, (replace(CALL, result="tool result"),)),
                                                   Message("user", "two")])
                     first, second = history.outcomes("main")
                     self.assertEqual((first.model_status, first.delivery_status), ("model_interrupted", status))
@@ -448,8 +455,7 @@ class RuntimeTest(unittest.IsolatedAsyncioTestCase):
                     self.assertEqual((first.model_status, first.delivery_status),
                                      ("model_interrupted", DeliveryStatus.PARTIAL))
                     prefix = "confirmed"
-                self.assertEqual(model.requests[1][0], [Message("user", "one"), Message("assistant", prefix, (CALL,)),
-                                                      Message("tool", "result", tool_call_id=CALL.id),
+                self.assertEqual(model.requests[1][0], [Message("user", "one"), assistant_message(prefix, (replace(CALL, result="result"),)),
                                                       Message("user", "two")])
 
     async def test_stuck_model_cleanup_pauses_at_limit_and_shutdown_does_not_cancel_again(self):
@@ -569,7 +575,7 @@ class RuntimeTest(unittest.IsolatedAsyncioTestCase):
                 self.assertTrue(any("capacity reached; pending=1" in row for row in blocked.output))
                 self.assertEqual(len(model.requests), 2)
                 rows = [row.message for row in history.read_after("main")]
-                self.assertEqual(rows[-1], Message("tool", "result", tool_call_id=CALL.id))
+                self.assertEqual(rows[-1].tool_calls, (replace(CALL, result="result"),))
                 if shutdown:
                     worker = runtime._worker
                     with (patch("agent_companion.runtime.engine._MODEL_CLOSE_GRACE", .01),
@@ -633,12 +639,12 @@ class RuntimeTest(unittest.IsolatedAsyncioTestCase):
 
     async def test_voice_receipt_after_model_completion_still_blocks_tool_continuation(self):
         model_finished, release_receipt = asyncio.Event(), asyncio.Event()
-        replay = Replay(bytes(16), b"opaque tool replay")
+        replay = PrivateData(bytes(16), b"opaque tool replay")
 
         async def script():
             yield TextDelta("first unconfirmed")
             yield ToolReady(CALL)
-            yield ReplayReady(replay)
+            yield AssistantPartsReady((Reasoning(replay),))
             model_finished.set()
 
         class Voice(Channel):
@@ -664,8 +670,7 @@ class RuntimeTest(unittest.IsolatedAsyncioTestCase):
         first, second = history.outcomes("main")
         self.assertEqual((first.model_status, first.delivery_status), ("complete", DeliveryStatus.PARTIAL))
         self.assertNotEqual(first.run_id, second.run_id)
-        self.assertEqual(model.requests[1][0], [Message("user", "one"), Message("assistant", "first", (CALL,), replay=replay),
-                                                Message("tool", "tool result", tool_call_id=CALL.id),
+        self.assertEqual(model.requests[1][0], [Message("user", "one"), assistant_message("first", (replace(CALL, result="tool result"),), reasoning=replay),
                                                 Message("user", "two")])
 
     async def test_voice_interruption_blocks_queued_serial_tool(self):
@@ -704,10 +709,9 @@ class RuntimeTest(unittest.IsolatedAsyncioTestCase):
                 await self.idle(runtime)
                 self.assertEqual(invocations, [CALL.id])
                 self.assertEqual(len(model.requests), 1)
-                self.assertEqual([row.message for row in history.read_after("main")][-2:], [
-                    Message("tool", "tool result", tool_call_id=CALL.id),
-                    Message("tool", '{"error":"tool_cancelled"}', tool_call_id=queued.id),
-                ])
+                self.assertEqual(history.read_after("main")[-1].message.tool_calls, (
+                    replace(CALL, result="tool result"), replace(queued, result='{"error":"tool_cancelled"}'),
+                ))
                 outcome, = history.outcomes("main")
                 self.assertEqual(outcome.model_status, "complete" if model_complete else "model_interrupted")
 
@@ -763,8 +767,7 @@ class RuntimeTest(unittest.IsolatedAsyncioTestCase):
         await self.idle(runtime)
         self.assertEqual(len(channel.replies), 1)
         self.assertEqual([outcome.delivery_status for outcome in history.outcomes("main")], [None, DeliveryStatus.FULL])
-        self.assertEqual(model.requests[1][0][-2:], [Message("assistant", "", (CALL,)),
-                                                    Message("tool", '{"error":"tool_failed"}', tool_call_id=CALL.id)])
+        self.assertEqual(model.requests[1][0][-1:], [assistant_message("", (replace(CALL, result='{"error":"tool_failed"}'),))])
 
     async def test_delivery_statuses_persist_only_prefix_and_allow_next_turn(self):
         cases = [(DeliveryStatus.FULL, "abcdef"), (DeliveryStatus.PARTIAL, "abc"),
@@ -780,7 +783,7 @@ class RuntimeTest(unittest.IsolatedAsyncioTestCase):
                 runtime.submit_batch([Message("user", "two")])
                 await self.idle(runtime)
                 prefix = "" if confirmed == "bad prefix" else confirmed
-                saved = [row.message for row in history.read_after("main") if row.message.role == "assistant"]
+                saved = [row.message for row in history.read_after("main") if row.message.kind == "assistant"]
                 self.assertEqual(saved, [] if status == DeliveryStatus.ZERO else [Message("assistant", prefix)])
                 self.assertEqual(history.outcomes("main")[0].delivery_status,
                                  DeliveryStatus.UNKNOWN if confirmed == "bad prefix" else status)
@@ -797,8 +800,7 @@ class RuntimeTest(unittest.IsolatedAsyncioTestCase):
         runtime, _ = self.setup_runtime(model, channel, tools=Tools([Tool(SPEC, tool)]))
         runtime.submit_batch([Message("user", "one")])
         await self.idle(runtime)
-        self.assertEqual(model.requests[1][0][-2:], [Message("assistant", "", (CALL,)),
-                                                    Message("tool", "ok", tool_call_id=CALL.id)])
+        self.assertEqual(model.requests[1][0][-1:], [assistant_message("", (replace(CALL, result="ok"),))])
 
     async def test_delivery_timeout_does_not_retry_and_does_not_hold_the_queue(self):
         release = asyncio.Event()
@@ -869,8 +871,7 @@ class RuntimeTest(unittest.IsolatedAsyncioTestCase):
         runtime.submit_batch([Message("user", "two")])
         await self.idle(runtime)
         self.assertEqual(history.outcomes("main")[0].delivery_status, DeliveryStatus.UNKNOWN)
-        self.assertEqual(model.requests[-1][0][1:], [Message("assistant", "", (CALL,)),
-                                                    Message("tool", '{"error":"tool_cancelled"}', tool_call_id=CALL.id),
+        self.assertEqual(model.requests[-1][0][1:], [assistant_message("", (replace(CALL, result='{"error":"tool_cancelled"}'),)),
                                                     Message("user", "two")])
 
     async def test_watchdog_ignores_late_receipts_and_cleanup_errors(self):
@@ -963,7 +964,7 @@ class RuntimeTest(unittest.IsolatedAsyncioTestCase):
         tool_released.set()
         await self.idle(runtime)
         self.assertEqual([item[1] for item in channel.replies], ["start", "end"])
-        self.assertEqual([row.message.role for row in channel.replies[0][2]], ["user", "assistant", "tool"])
+        self.assertEqual([row.message.kind for row in channel.replies[0][2]], ["user", "assistant"])
         self.assertEqual([item.delivery_status for item in history.outcomes("main")],
                          [DeliveryStatus.FULL, DeliveryStatus.FULL])
 
@@ -1000,7 +1001,7 @@ class RuntimeTest(unittest.IsolatedAsyncioTestCase):
         late_calls = []
 
         class Model:
-            async def stream(self, messages, tools, *, thinking):
+            async def stream(self, messages, tools, *, thinking, instructions=None):
                 yield TextDelta("waiting")
                 yield ToolReady(CALL)
                 try:
@@ -1024,7 +1025,10 @@ class RuntimeTest(unittest.IsolatedAsyncioTestCase):
         await asyncio.wait_for(asyncio.gather(delivery_cancelled.wait(), tool_cancelled.wait(), model_closed.wait()), 2)
         self.assertEqual(late_calls, [])
         self.assertEqual(history.outcomes("main"), [])
-        self.assertEqual([row.message.content for row in history.read_after("main")], ["started"])
+        _, snapshot = history.context_snapshot("main")
+        self.assertEqual([row.message.content for row in snapshot], ["started", ""])
+        self.assertFalse(snapshot[-1].active_reply)
+        self.assertEqual(snapshot[-1].message.tool_calls, (CALL,))
 
     async def test_reply_identity_precedes_first_output(self):
         loop = asyncio.get_running_loop()
@@ -1061,7 +1065,7 @@ class RuntimeTest(unittest.IsolatedAsyncioTestCase):
                 async def incomplete():
                     yield TextDelta("already sent")
                     # 即使替身提前交付了包，也不能在流失败或超时后保存。
-                    yield ReplayReady(Replay(bytes(16), b"discard on failure"))
+                    yield AssistantPartsReady((Reasoning(PrivateData(bytes(16), b"discard on failure")),))
                     if timeout:
                         await asyncio.Event().wait()
                     raise ModelError("truncated_stream")
@@ -1075,7 +1079,7 @@ class RuntimeTest(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(outcomes[0].model_status, "model_timeout" if timeout else "model_failed")
                 self.assertNotEqual(outcomes[0].run_id, outcomes[1].run_id)
                 self.assertEqual([m.content for m in model.requests[1][0]], ["one", "already sent", "two"])
-                self.assertIsNone(history.read_after("main")[1].message.replay)
+                self.assertFalse(reasoning_parts(history.read_after("main")[1].message))
 
     async def test_model_failure_still_finishes_started_tool_in_same_group(self):
         async def failed():
@@ -1091,15 +1095,14 @@ class RuntimeTest(unittest.IsolatedAsyncioTestCase):
         runtime.submit_batch([Message("user", "two")])
         await self.idle(runtime)
         self.assertEqual(history.outcomes("main")[0].model_status, "model_failed")
-        self.assertEqual(model.requests[1][0][1:3], [Message("assistant", "", (CALL,)),
-                                                     Message("tool", "done despite model failure", tool_call_id=CALL.id)])
+        self.assertEqual(model.requests[1][0][1:2], [assistant_message("", (replace(CALL, result="done despite model failure"),))])
 
     async def test_failed_reasoning_is_never_reused_as_a_complete_protocol_field(self):
-        unfinished = Replay(_replay_key(MODEL_NAME), b"unfinished reasoning")
-        complete = Replay(_replay_key(MODEL_NAME), b"complete reasoning")
+        unfinished = PrivateData(_replay_key(MODEL_NAME), b"unfinished reasoning")
+        complete = PrivateData(_replay_key(MODEL_NAME), b"complete reasoning")
 
         async def failed():
-            yield ReplayReady(unfinished)
+            yield AssistantPartsReady((Reasoning(unfinished),))
             yield TextDelta("confirmed prefix")
             yield ToolReady(CALL)
             raise ModelError("truncated_stream")
@@ -1107,23 +1110,22 @@ class RuntimeTest(unittest.IsolatedAsyncioTestCase):
         async def tool(args, context):
             return "completed tool result"
 
-        model = ScriptModel(failed, events(TextDelta("new answer"), ReplayReady(complete)))
+        model = ScriptModel(failed, events(TextDelta("new answer"), AssistantPartsReady((Reasoning(complete),))))
         model.history_replay_bytes = DeepSeek(None).history_replay_bytes
         runtime, history = self.setup_runtime(model, Channel(), tools=Tools([Tool(SPEC, tool)]), thinking=True)
         runtime.submit_batch([Message("user", "one")])
         runtime.submit_batch([Message("user", "two")])
         await self.idle(runtime)
         raw = [item.message for item in history.read_after("main")]
-        self.assertEqual(raw[1], Message("assistant", "confirmed prefix", (CALL,)))
-        self.assertEqual(raw[2], Message("tool", "completed tool result", tool_call_id=CALL.id))
-        self.assertEqual(raw[-1].replay, complete)
+        self.assertEqual(raw[1], assistant_message("confirmed prefix", (replace(CALL, result="completed tool result"),)))
+        self.assertEqual(reasoning_parts(raw[-1]), (complete,))
         self.assertIsNone(history.summary("main"))
         self.assertEqual(len(model.requests), 2)
         projected, tools, thinking = model.requests[1]
         self.assertTrue(thinking)
         self.assertEqual(tools, (SPEC,))
         request = build_request(projected, tools, thinking=thinking)
-        self.assertEqual(request["messages"][1]["role"], "user")
+        self.assertEqual(request["messages"][1]["role"], "assistant")
         prompt = repr(request)
         self.assertIn("confirmed prefix", prompt)
         self.assertIn("completed tool result", prompt)
@@ -1142,4 +1144,4 @@ class RuntimeTest(unittest.IsolatedAsyncioTestCase):
         runtime.submit_batch([Message("user", "one")])
         await self.idle(runtime)
         self.assertEqual(invoked, [])
-        self.assertEqual(model.requests[1][0][-1].content, '{"error":"invalid_arguments"}')
+        self.assertEqual(model.requests[1][0][-1].tool_calls[0].result, '{"error":"invalid_arguments"}')

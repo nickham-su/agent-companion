@@ -17,7 +17,7 @@ from agent_companion.channels.feishu.macos_calls import DesktopCallError, MacCal
 from agent_companion.config import ASRSettings, FeishuSettings, MiniMaxConnection, Settings
 from agent_companion.feishu_calls import IncomingCalls
 from agent_companion.feishu_private import _Route
-from agent_companion.protocol import (AGENT_REPLY_PREFIX, ChannelUser, DeliveryStatus, InternalInput, Message,
+from agent_companion.protocol import (ChannelUser, DeliveryStatus, InternalInput, Message,
                                       TextDelta, ToolCall, ToolReady)
 from agent_companion.runtime.subtasks import DELEGATE_TOOL_NAME, demo_roles
 from agent_companion.speech.asr import AsrError
@@ -27,6 +27,7 @@ from agent_companion.storage.sqlite import History
 
 from test_feishu_private import _CHATS, _OWN, _SENDERS, _Runner, _eventually, _message
 from test_voice import _A, _ASR, _Device, _SETTINGS, _TTS, _Vad
+from test_message_support import tool_calls
 
 
 def _ok(data, *, identity="user"):
@@ -276,8 +277,8 @@ class _Echo:
     def __init__(self):
         self.calls = []
 
-    async def stream(self, messages, tools, *, thinking):
-        self.calls.append(tuple(m.content for m in messages if m.role == "user"))
+    async def stream(self, messages, tools, *, thinking, instructions=None):
+        self.calls.append(tuple(m.content for m in messages if m.kind == "user"))
         yield TextDelta(messages[-1].content + "。")
 
 
@@ -735,7 +736,7 @@ class IncomingCallTests(unittest.IsolatedAsyncioTestCase):
         tts_late, asr_late = asyncio.Event(), asyncio.Event()
 
         class Model(_Echo):
-            async def stream(self, messages, tools, *, thinking):
+            async def stream(self, messages, tools, *, thinking, instructions=None):
                 if messages[-1].content == "测试语音1":
                     yield TextDelta("旧合成。")
                     model_wait.set()
@@ -825,7 +826,7 @@ class IncomingCallTests(unittest.IsolatedAsyncioTestCase):
         new_model_inputs = []
 
         class Model(_Echo):
-            async def stream(self, messages, tools, *, thinking):
+            async def stream(self, messages, tools, *, thinking, instructions=None):
                 if messages[-1].content == "测试语音1":
                     yield TextDelta("已播放的旧句。")
                     model_blocked.set()
@@ -860,7 +861,7 @@ class IncomingCallTests(unittest.IsolatedAsyncioTestCase):
         started, resume, finished = asyncio.Event(), asyncio.Event(), asyncio.Event()
 
         class Model(_Echo):
-            async def stream(self, messages, tools, *, thinking):
+            async def stream(self, messages, tools, *, thinking, instructions=None):
                 started.set()
                 try:
                     await resume.wait()
@@ -890,7 +891,7 @@ class IncomingCallTests(unittest.IsolatedAsyncioTestCase):
                 queued.set()
 
         class Model(_Echo):
-            async def stream(self, messages, tools, *, thinking):
+            async def stream(self, messages, tools, *, thinking, instructions=None):
                 last = messages[-1]
                 if not tools:
                     child_wait.set()
@@ -900,8 +901,8 @@ class IncomingCallTests(unittest.IsolatedAsyncioTestCase):
                     yield ToolReady(ToolCall("voice-child", DELEGATE_TOOL_NAME, '{"agent":"general","prompt":"后台任务"}'))
                     parent_wait.set()
                     await parent_release.wait()
-                elif isinstance(last.content, str) and last.content.startswith(AGENT_REPLY_PREFIX):
-                    notices.append(json.loads(last.content.removeprefix(AGENT_REPLY_PREFIX)))
+                elif last.async_result is not None and last.async_result.kind == "agent_reply":
+                    notices.append(last.async_result.payload)
                     yield TextDelta("收到任务结果。")
                 else:
                     async for event in super().stream(messages, tools, thinking=thinking):
@@ -927,9 +928,9 @@ class IncomingCallTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(tts.calls, [])
                 self.assertEqual(agents.call_count, 1)
                 rows = history.tail(_session(sender), 20)
-                tool, = (row.message for row in rows if row.message.role == "tool")
-                delegation = stored_delegation(history, _session(sender), tool.tool_call_id)
-                self.assertEqual(json.loads(tool.content), {"status": "accepted", "agent_id": delegation.agent_id})
+                tool, = tool_calls(row.message for row in rows)
+                delegation = stored_delegation(history, _session(sender), tool.id)
+                self.assertEqual(json.loads(tool.result), {"status": "accepted", "agent_id": delegation.agent_id})
                 child = history.agent_run(delegation.run_id)
                 self.assertEqual(child.status, "completed")
                 self.assertIsNotNone(child.reply_enqueued_at)
@@ -948,7 +949,7 @@ class IncomingCallTests(unittest.IsolatedAsyncioTestCase):
                 idle_reported.set()
 
         class Model(_Echo):
-            async def stream(self, messages, tools, *, thinking):
+            async def stream(self, messages, tools, *, thinking, instructions=None):
                 if messages[-1].content == "先开始的文字请求":
                     started.set()
                     await release_model.wait()
@@ -981,7 +982,7 @@ class IncomingCallTests(unittest.IsolatedAsyncioTestCase):
                 await _eventually(lambda: any(self.devices[0].pull(32)))
                 await _eventually(lambda: self.runner.sent[_SENDERS[0]] == ["新话轮。"])
                 self.assertEqual(tts.calls, [("新话轮。", 16000)])
-                self.assertEqual([row.message.role for row in history.tail(session, 10)],
+                self.assertEqual([row.message.kind for row in history.tail(session, 10)],
                                  ["user", "user", "assistant"])
                 first, second = history.outcomes(session)
                 self.assertNotEqual(first.run_id, second.run_id)
@@ -1005,8 +1006,8 @@ class IncomingCallTests(unittest.IsolatedAsyncioTestCase):
                 requests = []
 
                 class Model:
-                    async def stream(self, messages, tools, *, thinking):
-                        requests.append(tuple(message for message in messages if message.role != "system"))
+                    async def stream(self, messages, tools, *, thinking, instructions=None):
+                        requests.append(tuple(messages))
                         if len(requests) == 1:
                             yield TextDelta("确认的首句。")
                             yield TextDelta("未确认的尾句。")
@@ -1255,7 +1256,7 @@ class IncomingCallTests(unittest.IsolatedAsyncioTestCase):
         started, release_model = asyncio.Event(), asyncio.Event()
 
         class Model(_Echo):
-            async def stream(self, messages, tools, *, thinking):
+            async def stream(self, messages, tools, *, thinking, instructions=None):
                 if messages[-1].content == "文字请求":
                     started.set()
                     await release_model.wait()

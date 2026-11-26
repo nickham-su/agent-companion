@@ -16,7 +16,7 @@ from agent_companion.app import prepare_private_feishu, running_agent
 from agent_companion.config import FeishuSettings, RuntimeSettings, Settings
 from agent_companion.models import _http_stream
 from agent_companion.models.deepseek import DeepSeek
-from agent_companion.protocol import (ChannelUser, InputUsage, Message, Replay,
+from agent_companion.protocol import (ChannelUser, InputUsage, Message, PrivateData,
                                       TextDelta, ToolCall, ToolReady)
 from agent_companion.runtime.subtasks import demo_roles
 from agent_companion.runtime.compaction import Compactions, Prefix
@@ -26,10 +26,11 @@ from agent_companion.runtime.tools import Tool, ToolContext, Tools
 from agent_companion.speech.asr import ASRCapabilities, FileASR
 from agent_companion.storage.sqlite import History, ReplyOutcome, Summary
 from test_history_context import Sink, SPEC
+from test_message_support import assistant_message
 
 
 _SETTINGS = RuntimeSettings(context_budget=240, tail_budget=60)
-_SUMMARY = Message("system", "此前会话摘要：\nbackground result")
+_SUMMARY = Message("compaction_summary", "background result")
 _OLD = Message("user", "old history " + "a" * 500)
 
 
@@ -55,7 +56,7 @@ class _GatedModel:
         self.release = asyncio.Event()
         self.cancelled = asyncio.Event()
 
-    async def stream(self, messages, tools, *, thinking):
+    async def stream(self, messages, tools, *, thinking, instructions=None):
         if messages[-1] == _SUMMARIZE:
             self.summary_requests.append(tuple(messages))
             self.generating.set()
@@ -185,11 +186,10 @@ class BackgroundCompactionTest(unittest.IsolatedAsyncioTestCase):
                 self.assertIsNone(runtime.last_failure)
                 self.assertEqual(history.summary("main"), Summary(old_id, "background result"))
                 self.assertEqual(model.requests[2], (
-                    _SUMMARY, Message("user", "first"), Message("assistant", "", (calls[0],)),
-                    Message("tool", "result0", tool_call_id=calls[0].id),
-                    Message("user", "queued during first batch"), Message("assistant", "", tuple(calls[1:])),
-                    Message("tool", "result1", tool_call_id=calls[1].id),
-                    Message("tool", "result2", tool_call_id=calls[2].id),
+                    _SUMMARY, Message("user", "first"), assistant_message("", (replace(calls[0], result="result0"),)),
+                    Message("user", "queued during first batch"),
+                    assistant_message(calls=(replace(calls[1], result="result1"),
+                                             replace(calls[2], result="result2"))),
                     Message("user", "queued during second batch"),
                 ))
                 self.assertCountEqual(tools_run, [call.id for call in calls])
@@ -256,11 +256,11 @@ class BackgroundCompactionTest(unittest.IsolatedAsyncioTestCase):
                 await _idle(main)
                 applied = [request for request in model.requests if _SUMMARY in request]
                 self.assertEqual(len(applied), 1)
-                self.assertIn(Message("user", "child while generating"), applied[0])
-                self.assertEqual(applied[0][-1], Message("user", "reuse original child"))
+                self.assertIn("child while generating", [msg.text for msg in applied[0]])
+                self.assertEqual(applied[0][-1].text, "reuse original child")
                 self.assertIsNotNone(history.summary(child))
                 self.assertEqual(len(model.summary_requests), 1)
-                self.assertIn(Message("user", first_child_text), model.summary_requests[0])
+                self.assertIn(first_child_text, [msg.text for msg in model.summary_requests[0]])
                 self.assertNotIn(Message("user", "child while generating"), model.summary_requests[0])
 
     async def test_private_application_shares_one_generation_slot_across_groups(self):
@@ -605,8 +605,8 @@ class BackgroundCompactionTest(unittest.IsolatedAsyncioTestCase):
             with self.subTest(mode=mode), tempfile.TemporaryDirectory() as directory:
                 path = Path(directory) / "compaction.sqlite"
                 model = _GatedModel()
-                compatible = Replay(b"a" * 16, b"fixture-reason")
-                incompatible = Replay(b"b" * 16, b"different-reason")
+                compatible = PrivateData(b"a" * 16, b"fixture-reason")
+                incompatible = PrivateData(b"b" * 16, b"different-reason")
                 with closing(History(path)) as history, closing(History(path)) as other:
                     first_old = Message("user", "already summarized " + "b" * 500)
                     competing_id, target = history.append("main", [first_old, _OLD])
@@ -620,8 +620,8 @@ class BackgroundCompactionTest(unittest.IsolatedAsyncioTestCase):
                         competing_text = "other connection summary"
                         concurrently_appended = Message("user", "new input from the other connection")
                         racing_input = Message("user", "racing summary")
-                        matching_reply = Message("assistant", "matching provider replay", replay=compatible)
-                        alternate_reply = Message("assistant", "other provider replay", replay=incompatible)
+                        matching_reply = assistant_message("matching provider replay", reasoning=compatible)
+                        alternate_reply = assistant_message("other provider replay", reasoning=incompatible)
                         reads = []
                         original_timeout = history._db.execute("PRAGMA busy_timeout").fetchone()[0]
 
@@ -669,7 +669,7 @@ class BackgroundCompactionTest(unittest.IsolatedAsyncioTestCase):
                             self.assertLess(reads[0][0], 1)
                             self.assertEqual(latest, (first_old, *common))
                         else:
-                            self.assertEqual(latest, (Message("system", "此前会话摘要：\n" + competing_text),
+                            self.assertEqual(latest, (Message("compaction_summary", competing_text),
                                                       *common, concurrently_appended, matching_reply,
                                                       alternate_reply))
                         self.assertNotIn(_SUMMARY, latest)

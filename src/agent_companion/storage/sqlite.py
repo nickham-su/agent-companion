@@ -1,24 +1,27 @@
 """SQLite 中的 Agent、会话历史、摘要和投递记录。"""
 
-from collections.abc import Callable, Iterable, Iterator, Sequence
+from base64 import b64decode, b64encode
+from collections.abc import Callable, Iterable, Iterator, Sequence, Set
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass, field, replace
 import json
+from os import fspath
 from pathlib import Path
 from secrets import token_bytes, token_hex
 import sqlite3
 from time import time
 from uuid import uuid4
 
-from ..protocol import REPLAY_KEY_BYTES, DeliveryStatus, Image, Message, Replay, Text, ToolCall
+from ..protocol import (AgentReply, AsyncToolResult, DeliveryStatus, Image, Message, Part, PrivateData, Reasoning,
+                        Text, ToolCall, UserSource, is_human_message)
+from ._reply_writers import ReplyWriters
 
 
-_SCHEMA_VERSION = 3
+_SCHEMA_VERSION = 4
 _AGENT_ID_ATTEMPTS = 8
 _FEISHU_INBOX = ("feishu-inbox", "feishu-private")
 _FEISHU_INITIAL_RETRY_SECONDS = 10
 _FEISHU_MAX_RETRY_SECONDS = 900
-# v1 的可选扩展；旧库不需要回填，旧程序也可继续写入没有来源的记录。
 _MODEL_ORIGINS = """
 CREATE TABLE IF NOT EXISTS reply_model_origins (
     reply_id TEXT PRIMARY KEY REFERENCES reply_outcomes(reply_id) ON DELETE CASCADE,
@@ -26,25 +29,30 @@ CREATE TABLE IF NOT EXISTS reply_model_origins (
     fingerprint BLOB NOT NULL CHECK (length(fingerprint) = 32)
 )
 """
-# 追加式扩展：不迁移没有新兼容标识的旧 reasoning 和 model_replays。
-_REPLAY_PACKETS = f"""
-CREATE TABLE IF NOT EXISTS model_replay_packets (
-    assistant_message_id INTEGER PRIMARY KEY REFERENCES messages(message_id) ON DELETE CASCADE,
-    replay_key BLOB NOT NULL CHECK (typeof(replay_key) = 'blob' AND length(replay_key) = {REPLAY_KEY_BYTES}),
-    payload BLOB NOT NULL CHECK (typeof(payload) = 'blob')
+_MESSAGE_COLUMNS = (
+    "m.message_id, m.session_id, m.created_at, m.kind, m.parts, m.source, m.async_result, "
+    "(SELECT json_group_object(call_id, output) FROM tool_results "
+    "WHERE assistant_message_id = m.message_id) AS tool_results"
 )
-"""
-_MESSAGE_COLUMNS = "m.message_id, m.session_id, m.created_at, m.role, m.content, m.tool_calls, m.tool_call_id"
+_UNSETTLED_REPLY = (
+    "m.reply_id IS NOT NULL AND NOT EXISTS (SELECT 1 FROM reply_outcomes o WHERE o.reply_id = m.reply_id)"
+)
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS messages (
     message_id INTEGER PRIMARY KEY AUTOINCREMENT,
     session_id TEXT NOT NULL,
     created_at REAL NOT NULL,
-    role TEXT NOT NULL,
-    content TEXT NOT NULL,
-    tool_calls TEXT NOT NULL,
-    tool_call_id TEXT,
-    reasoning TEXT
+    kind TEXT NOT NULL CHECK (kind IN ('user', 'assistant', 'state_event', 'async_tool_result')),
+    parts TEXT NOT NULL,
+    source TEXT,
+    async_result TEXT,
+    reply_id TEXT UNIQUE
+);
+CREATE TABLE IF NOT EXISTS tool_results (
+    assistant_message_id INTEGER NOT NULL REFERENCES messages(message_id) ON DELETE CASCADE,
+    call_id TEXT NOT NULL,
+    output TEXT NOT NULL,
+    PRIMARY KEY (assistant_message_id, call_id)
 );
 CREATE INDEX IF NOT EXISTS messages_session ON messages(session_id, message_id);
 CREATE VIRTUAL TABLE IF NOT EXISTS message_search USING fts5(body);
@@ -67,13 +75,6 @@ CREATE INDEX IF NOT EXISTS reply_outcomes_session_status ON reply_outcomes(sessi
 CREATE TABLE IF NOT EXISTS model_replay_salt (
     singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
     salt BLOB NOT NULL CHECK (length(salt) = 32)
-);
-CREATE TABLE IF NOT EXISTS model_replays (
-    assistant_message_id INTEGER PRIMARY KEY REFERENCES messages(message_id) ON DELETE CASCADE,
-    protocol TEXT NOT NULL,
-    fingerprint BLOB NOT NULL CHECK (length(fingerprint) = 32),
-    reasoning_effort TEXT NOT NULL,
-    items TEXT NOT NULL
 );
 CREATE TABLE IF NOT EXISTS inbound_windows (
     session_id TEXT NOT NULL,
@@ -164,6 +165,7 @@ class HistoryEntry:
     session_id: str
     created_at: float
     message: Message
+    active_reply: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -235,39 +237,71 @@ def _has_reply_text(value: str | None) -> bool:
     return isinstance(value, str) and bool(value.strip())
 
 
-def _encode(message: Message) -> tuple[str, str]:
-    if isinstance(message.content, str):
-        return json.dumps(message.content, ensure_ascii=False), message.content
-    parts, searchable = [], []
-    for part in message.content:
+def _dump(value: object) -> str:
+    return json.dumps(value, ensure_ascii=True, separators=(",", ":"))
+
+
+def _encode_parts(parts: Sequence[Part]) -> str:
+    encoded = []
+    for part in parts:
         if isinstance(part, Text):
-            parts.append({"text": part.text})
-            searchable.append(part.text)
+            item = {"type": "text", "text": part.text}
+        elif isinstance(part, Image):
+            item = {"type": "image", "url": part.url}
+        elif isinstance(part, ToolCall):
+            item = {"type": "tool_call", "id": part.id, "name": part.name, "arguments": part.arguments}
         else:
-            parts.append({"image": part.url})
-    return json.dumps(parts, ensure_ascii=False), "\n".join(searchable)
+            item = {"type": "reasoning"}
+        if not isinstance(part, Image) and part.private is not None:
+            item["private"] = [part.private.compatibility_key.hex(), b64encode(part.private.payload).decode("ascii")]
+        encoded.append(item)
+    return _dump(encoded)
 
 
-def _decode_content(encoded: str) -> str | tuple[Text | Image, ...]:
-    value = json.loads(encoded)
-    return value if isinstance(value, str) else tuple(
-        Text(item["text"]) if "text" in item else Image(item["image"]) for item in value
-    )
+def _decode_private(data: object) -> PrivateData | None:
+    if not isinstance(data, list) or len(data) != 2 or not all(isinstance(value, str) for value in data):
+        return None
+    try:
+        return PrivateData(bytes.fromhex(data[0]), b64decode(data[1], validate=True))
+    except ValueError:
+        # 私有数据损坏不影响同一消息中可独立使用的正文和调用结果。
+        return None
 
 
-def _read_packet(row: sqlite3.Row) -> Replay | None:
-    key, payload = row["replay_key"], row["replay_payload"]
-    if type(key) is bytes and len(key) == REPLAY_KEY_BYTES and type(payload) is bytes:
-        return Replay(key, payload)
-    return None
+def _decode_parts(encoded: str, *, private: bool = False, results: dict[str, str] | None = None) -> tuple[Part, ...]:
+    parts: list[Part] = []
+    for item in json.loads(encoded):
+        metadata = _decode_private(item.get("private")) if private else None
+        match item["type"]:
+            case "text":
+                parts.append(Text(item["text"], metadata))
+            case "image":
+                parts.append(Image(item["url"]))
+            case "tool_call":
+                result = results.get(item["id"]) if results is not None else None
+                parts.append(ToolCall(item["id"], item["name"], item["arguments"], result, metadata))
+            case "reasoning":
+                if metadata is not None:
+                    parts.append(Reasoning(metadata))
+            case _:
+                raise ValueError("unknown stored part type")
+    return tuple(parts)
 
 
-def _decode(row: sqlite3.Row, replay: Replay | None = None) -> HistoryEntry:
+def _call_identity(message: Message) -> dict[str, tuple[str, str]]:
+    return {call.id: (call.name, call.arguments) for call in message.tool_calls}
+
+
+def _decode(row: sqlite3.Row, *, private: bool = False) -> HistoryEntry:
+    source = json.loads(row["source"]) if row["source"] is not None else None
+    result = json.loads(row["async_result"]) if row["async_result"] is not None else None
     return HistoryEntry(
         row["message_id"], row["session_id"], row["created_at"],
-        Message(row["role"], _decode_content(row["content"]),
-                tuple(ToolCall(**item) for item in json.loads(row["tool_calls"])), row["tool_call_id"], replay=replay),
+        Message(row["kind"], _decode_parts(row["parts"], private=private, results=json.loads(row["tool_results"])),
+                source=UserSource(**source) if source is not None else None,
+                async_result=AsyncToolResult(**result) if result is not None else None),
     )
+
 
 class FeishuBindingError(ValueError):
     """飞书账号或会话的数据库归属无法确认。"""
@@ -315,6 +349,11 @@ class History:
         self._connection: sqlite3.Connection | None = sqlite3.connect(path)
         self._db.row_factory = sqlite3.Row
         try:
+            database_file = self._db.execute("PRAGMA database_list").fetchone()[2]
+            if not database_file and fspath(path) not in ("", ":memory:"):
+                # SQLite 可把文件 URI 打开为共享内存库，但不给出可用的主库身份。
+                # 在建表前拒绝；普通 :memory: 和匿名临时库都只对当前连接可见。
+                raise DatabaseFormatError("不支持 URI 内存数据库；请使用普通 :memory: 或 SQLite 文件路径。")
             # 旧格式直接拒绝，无需争用写锁。初始化仍会在写事务内复查，防止并发建表。
             version = self._db.execute("PRAGMA user_version").fetchone()[0]
             if version not in (0, _SCHEMA_VERSION):
@@ -336,7 +375,7 @@ class History:
                     # 打开时只预检已有归属；空库由绑定事务认领。
                     self.check_feishu_private(feishu_private_owner)
                 self._db.execute(_MODEL_ORIGINS)
-                self._db.execute(_REPLAY_PACKETS)
+            self._reply_writers = ReplyWriters(database_file)
         except BaseException:
             self.close()
             raise
@@ -482,29 +521,50 @@ class History:
         row = self._db.execute("SELECT * FROM agent_runs WHERE run_id = ?", (run_id,)).fetchone()
         return AgentRun(**dict(row)) if row is not None else None
 
-    def _append(self, session_id: str, messages: Iterable[Message]) -> list[int]:
+    def _append(self, session_id: str, messages: Iterable[Message], *, reply_id: str | None = None,
+                staged: bool = False) -> list[int]:
         created_at = time()
         ids = []
         for message in messages:
-            content, searchable = _encode(message)
+            if message.kind != "assistant" and any(isinstance(part, (Reasoning, ToolCall)) or
+                    isinstance(part, Text) and part.private is not None for part in message.parts):
+                raise ValueError("only assistant messages may carry calls or private data")
             cursor = self._db.execute(
-                "INSERT INTO messages (session_id, created_at, role, content, tool_calls, tool_call_id)"
-                " VALUES (?, ?, ?, ?, ?, ?)",
-                (session_id, created_at, message.role, content,
-                 json.dumps([asdict(call) for call in message.tool_calls], ensure_ascii=False),
-                 message.tool_call_id),
+                "INSERT INTO messages (session_id, created_at, kind, parts, source, async_result, reply_id)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (session_id, created_at, message.kind, _encode_parts(message.parts),
+                 _dump(asdict(message.source)) if message.source is not None else None,
+                 _dump(asdict(message.async_result)) if message.async_result is not None else None, reply_id),
             )
             message_id = cursor.lastrowid
-            if message.replay is not None:
-                if message.role != "assistant":
-                    raise ValueError("only assistant messages may carry model replay")
-                self._db.execute("INSERT INTO model_replay_packets VALUES (?, ?, ?)",
-                                 (message_id, message.replay.replay_key, message.replay.payload))
-            if searchable:
-                self._db.execute("INSERT INTO message_search (rowid, body) VALUES (?, ?)",
-                                 (message_id, searchable))
+            for call in message.tool_calls:
+                if call.result is None:
+                    if staged:
+                        continue
+                    raise ValueError("settled tool calls require a result")
+                self._insert_tool_result(message_id, call.id, call.result)
+            self._index_message(message_id, message)
             ids.append(message_id)
         return ids
+
+    def _insert_tool_result(self, assistant_message_id: int, call_id: str, output: str) -> None:
+        self._db.execute("INSERT INTO tool_results VALUES (?, ?, ?)", (assistant_message_id, call_id, output))
+
+    def _reindex_message(self, message_id: int, message: Message) -> None:
+        self._db.execute("DELETE FROM message_search WHERE rowid = ?", (message_id,))
+        self._index_message(message_id, message)
+
+    def _index_message(self, message_id: int, message: Message) -> None:
+        if message.async_result is not None:
+            searchable = json.dumps(asdict(message.async_result), ensure_ascii=False).encode(
+                "utf-8", "backslashreplace").decode("utf-8")
+        else:
+            content = message.content
+            text = content if isinstance(content, str) else "\n".join(
+                part.text for part in content if isinstance(part, Text))
+            searchable = "\n".join(filter(None, (text, *(call.result for call in message.tool_calls))))
+        if searchable:
+            self._db.execute("INSERT INTO message_search (rowid, body) VALUES (?, ?)", (message_id, searchable))
 
     @contextmanager
     def _input_transaction(self, *, retryable_io: bool) -> Iterator[None]:
@@ -587,10 +647,9 @@ class History:
                               peer_open_id: str | None = None) -> None:
         contents = []
         for message in messages:
-            if (message.role != "user" or message.tool_calls or message.tool_call_id is not None
-                    or message.replay is not None):
+            if not is_human_message(message):
                 raise ValueError("inbound batches require plain user messages")
-            contents.append(_encode(message)[0])
+            contents.append(_encode_parts(message.parts))
         if contents:
             self._db.execute("INSERT INTO inbound_batches (session_id, source, contents, peer_open_id)"
                              " VALUES (?, ?, ?, ?)", (session_id, source, json.dumps(contents, ensure_ascii=False), peer_open_id))
@@ -755,7 +814,11 @@ class History:
                     consumed_inbound = consumed_inbound or bool(inbound_ids)
                 elif isinstance(item, (DelegatedInput, AgentReplyInput)):
                     if self._consume_agent_input(agent_id, run_id, item):
-                        ids.extend(self._append(agent.session_id, (item.message,)))
+                        message = item.message
+                        if isinstance(item, DelegatedInput):
+                            message = replace(message, source=UserSource("delegation", agent.parent_agent_id,
+                                                                         item.delegation_id))
+                        ids.extend(self._append(agent.session_id, (message,)))
                         consumed_agent = True
                 else:
                     ids.extend(self._append(agent.session_id, (item,)))
@@ -785,6 +848,9 @@ class History:
                 valid = result is None and _has_reply_text(error)
             if not valid:
                 return False
+            expected = AgentReply(item.source_agent_id, item.source_run_id, result=result, error=error)
+            if item.message != expected.to_history_message():
+                return False
             # 调用方已持有写事务；校验、去重标记与消息写入不会被拆开。
             cursor = self._db.execute("UPDATE agent_runs SET reply_consumed_run_id = ? WHERE run_id = ?",
                                       (run_id, item.source_run_id))
@@ -798,18 +864,89 @@ class History:
             return []
         if self._db.execute("DELETE FROM inbound_batches WHERE session_id = ? AND batch_id = ?", key).rowcount != 1:
             return []
-        return self._append(session_id, (Message("user", _decode_content(content))
+        return self._append(session_id, (Message("user", _decode_parts(content))
                                          for content in json.loads(row["contents"])))
+
+    @contextmanager
+    def own_reply(self, reply_id: str) -> Iterator[None]:
+        """持有到工具和回复均不再写入；此所有权不是工具执行状态。"""
+        with self._reply_writers.own(reply_id):
+            yield
+
+    def _unsettled_reply(self, session_id: str, reply_id: str) -> HistoryEntry | None:
+        row = self._db.execute(f"SELECT {_MESSAGE_COLUMNS} FROM messages m WHERE m.reply_id = ?"
+                               f" AND {_UNSETTLED_REPLY}", (reply_id,)).fetchone()
+        if row is None:
+            return None
+        if row["session_id"] != session_id or row["kind"] != "assistant" or not self._reply_writers.owns(reply_id):
+            raise ValueError("reply is not owned by this writer")
+        return _decode(row)
+
+    def stage_tool_calls(self, session_id: str, reply_id: str, message: Message) -> None:
+        """在任何工具开始前记下接受的调用，不写未经确认的正文。"""
+        calls = _call_identity(message)
+        if (not self._reply_writers.owns(reply_id) or message.kind != "assistant" or not calls
+                or len(calls) != len(message.tool_calls) or any(
+                    not isinstance(part, (ToolCall, Reasoning)) or isinstance(part, ToolCall) and part.result is not None
+                    for part in message.parts)):
+            raise ValueError("invalid staged tool calls")
+        # 交给 Runtime 在锁冲突时异步重试，不能卡住同事件循环上的语音回执。
+        with self._without_busy_wait(), self._input_transaction(retryable_io=False):
+            self._db.execute("BEGIN IMMEDIATE")
+            existing = self._unsettled_reply(session_id, reply_id)
+            if existing is None:
+                self._append(session_id, (message,), reply_id=reply_id, staged=True)
+            else:
+                if not _call_identity(existing.message).items() <= calls.items():
+                    raise ValueError("cannot replace a staged tool call")
+                self._db.execute("UPDATE messages SET parts = ? WHERE message_id = ?",
+                                 (_encode_parts(message.parts), existing.message_id))
+
+    def record_tool_result(self, session_id: str, reply_id: str, call_id: str, output: str) -> None:
+        """只补写对应调用的真实文本，包括空字符串。"""
+        with self._without_busy_wait(), self._input_transaction(retryable_io=False):
+            self._db.execute("BEGIN IMMEDIATE")
+            existing = self._unsettled_reply(session_id, reply_id)
+            if existing is None or not any(call.id == call_id for call in existing.message.tool_calls):
+                raise ValueError("result has no staged tool call")
+            self._insert_tool_result(existing.message_id, call_id, output)
+            parts = tuple(replace(part, result=output) if isinstance(part, ToolCall) and part.id == call_id else part
+                          for part in existing.message.parts)
+            self._reindex_message(existing.message_id, Message("assistant", parts))
 
     def finalize_reply(self, outcome: ReplyOutcome, messages: Sequence[Message], *,
                        model_origin: bytes | None = None) -> list[int]:
-        # 原子提交响应及对应结果，不在崩溃后暴露只有调用、没有结果的组。
-        if messages and messages[0].role != "assistant":
-            raise ValueError("reply history must start with an assistant message")
-        if outcome.model_status != "complete" and any(message.replay is not None for message in messages):
-            messages = [replace(message, replay=None) for message in messages]
-        with self._input_transaction(retryable_io=False):
-            ids = self._append(outcome.session_id, messages)
+        # 已预写调用的回复保留其消息 ID；确认正文与投递结算仍一次提交。
+        if len(messages) > 1 or (messages and messages[0].kind != "assistant"):
+            raise ValueError("reply history must contain at most one assistant message")
+        with self._without_busy_wait(), self._input_transaction(retryable_io=False):
+            self._db.execute("BEGIN IMMEDIATE")
+            existing = self._unsettled_reply(outcome.session_id, outcome.reply_id)
+            if existing is None:
+                ids = self._append(outcome.session_id, messages, reply_id=outcome.reply_id)
+            else:
+                if not messages:
+                    raise ValueError("cannot discard staged tool calls")
+                message = messages[0]
+                stored = {call.id: call.result for call in existing.message.tool_calls}
+                if len(stored) != len(message.tool_calls) or _call_identity(message) != _call_identity(existing.message):
+                    raise ValueError("cannot change the staged tool calls when settling a reply")
+                for call in message.tool_calls:
+                    result = stored[call.id]
+                    if call.result is None:
+                        continue  # 仅结算正文；保留库内结果，包括提交成功但调用方未获确认的结果。
+                    if result is None:
+                        self._insert_tool_result(existing.message_id, call.id, call.result)
+                        stored[call.id] = call.result
+                    elif result != call.result:
+                        raise ValueError("cannot replace a recorded result")
+                message = replace(message, parts=tuple(
+                    replace(part, result=stored[part.id]) if isinstance(part, ToolCall) else part
+                    for part in message.parts))
+                ids = [existing.message_id]
+                self._db.execute("UPDATE messages SET parts = ? WHERE message_id = ?",
+                                 (_encode_parts(message.parts), existing.message_id))
+                self._reindex_message(existing.message_id, message)
             self._db.execute("INSERT INTO reply_outcomes"
                              " (reply_id, session_id, run_id, model_status, delivery_status,"
                              " assistant_message_id, model_error, input_tokens) VALUES (?, ?, ?, ?, ?, ?, ?, ?)", (
@@ -888,19 +1025,28 @@ class History:
         return (row["input_tokens"] if row is not None and
                 (model_origin is None or row["fingerprint"] == model_origin) else None)
 
-    def read_after(self, session_id: str, after: int = 0) -> list[HistoryEntry]:
+    def read_after(self, session_id: str, after: int = 0, *,
+                   active_replies: Set[str] | None = frozenset()) -> list[HistoryEntry]:
+        # 只有 context_snapshot 会判定所有权；普通历史读取返回已经记录的事实。
         rows = self._db.execute(
-            f"SELECT {_MESSAGE_COLUMNS}, r.replay_key, r.payload AS replay_payload FROM messages m"
-            " LEFT JOIN model_replay_packets r ON r.assistant_message_id = m.message_id"
+            f"SELECT {_MESSAGE_COLUMNS}, CASE WHEN {_UNSETTLED_REPLY} THEN m.reply_id END AS pending_id FROM messages m"
             " WHERE m.session_id = ? AND m.message_id > ? ORDER BY m.message_id", (session_id, after))
-        return [_decode(row, _read_packet(row)) for row in rows]
+        entries = []
+        for row in rows:
+            pending = row["pending_id"]
+            entry = _decode(row, private=True)
+            entries.append(replace(entry, active_reply=True) if pending is not None and (
+                active_replies is None or pending in active_replies) else entry)
+        return entries
 
     def context_snapshot(self, session_id: str) -> tuple[Summary | None, list[HistoryEntry]]:
-        """摘要、续尾及不透明回放包来自同一个 SQLite 读事务。"""
-        self._db.execute("BEGIN")
-        with self._db:
-            summary = self.summary(session_id)
-            entries = self.read_after(session_id, summary.covers_through if summary else 0)
+        """摘要、续尾及不透明协议数据来自同一个 SQLite 读事务。"""
+        with self._reply_writers.observe() as active_replies:
+            self._db.execute("BEGIN")
+            with self._db:
+                summary = self.summary(session_id)
+                entries = self.read_after(session_id, summary.covers_through if summary else 0,
+                                          active_replies=active_replies)
         return summary, entries
 
     def try_context_snapshot(self, session_id: str) -> tuple[Summary | None, list[HistoryEntry]] | None:
@@ -937,8 +1083,9 @@ class History:
             " covers_through = excluded.covers_through, text = excluded.text"
             " WHERE excluded.covers_through > summaries.covers_through",
             (session_id, summary.covers_through, summary.text),
+            session_id, summary.covers_through,
         ):
-            raise ValueError("summary coverage must advance")
+            raise ValueError("summary coverage must advance without crossing an active reply")
 
     def try_save_summary(self, session_id: str, summary: Summary, *, covered: int, protected_from: int) -> bool:
         """在发包前单次尝试；锁冲突不等待，也不改变连接的常规锁策略。"""
@@ -952,20 +1099,35 @@ class History:
                 " ON CONFLICT(session_id) DO UPDATE SET covers_through = excluded.covers_through, text = excluded.text",
                 (session_id, summary.covers_through, summary.text, session_id, covered,
                  session_id, summary.covers_through),
+                session_id, summary.covers_through,
             )
 
     @contextmanager
     def _without_busy_wait(self) -> Iterator[None]:
-        timeout = self._db.execute("PRAGMA busy_timeout").fetchone()[0]
-        self._db.execute("PRAGMA busy_timeout = 0")
+        connection = self._db
+        timeout = connection.execute("PRAGMA busy_timeout").fetchone()[0]
+        connection.execute("PRAGMA busy_timeout = 0")
         try:
             yield
         finally:
-            self._db.execute(f"PRAGMA busy_timeout = {timeout:d}")
+            if self._connection is connection:
+                connection.execute(f"PRAGMA busy_timeout = {timeout:d}")
 
-    def _write_summary(self, sql: str, params: tuple[str | int, ...]) -> bool:
+    def _write_summary(self, sql: str, params: tuple[str | int, ...], session_id: str, covers_through: int) -> bool:
         try:
-            with self._db:
+            with self._reply_writers.observe() as active, self._db:
+                # 与 CAS 同一个写事务；不能使用候选生成时的在途快照替代此检查。
+                self._db.execute("BEGIN IMMEDIATE")
+                if active is None or active:
+                    encoded = None if active is None else _dump(sorted(active))
+                    blocked = self._db.execute(
+                        "SELECT 1 FROM messages m WHERE m.session_id = ? AND m.message_id <= ?"
+                        f" AND {_UNSETTLED_REPLY}"
+                        " AND (? IS NULL OR m.reply_id IN (SELECT value FROM json_each(?))) LIMIT 1",
+                        (session_id, covers_through, encoded, encoded),
+                    ).fetchone()
+                    if blocked:
+                        return False
                 rowcount = self._db.execute(sql, params).rowcount
             return rowcount == 1
         except sqlite3.DatabaseError as exc:

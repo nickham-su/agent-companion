@@ -1,5 +1,6 @@
 import asyncio
 from contextlib import aclosing, closing
+from dataclasses import replace
 import json
 import traceback
 import unittest
@@ -7,17 +8,20 @@ from unittest.mock import patch
 
 import httpx
 
-from agent_companion.config import bailian_llm_base_url
+from agent_companion.config import RuntimeSettings, bailian_llm_base_url
 from agent_companion.model_diagnostics import ModelRequestDiagnostics
 from agent_companion.models import _http_stream
 from agent_companion.models.bailian import Bailian
+from agent_companion.models.deepseek import DeepSeek
 from agent_companion.models.minimax import MiniMax
 from agent_companion.protocol import (DeliveryStatus, Image, InputUsage, Message, ModelClosing, ModelError, Receipt,
-                                      Replay, Text, TextDelta, ToolCall, ToolSpec)
+                                      PrivateData, Reasoning, Text, TextDelta, ToolCall, ToolSpec)
+from agent_companion.runtime.context import _SUMMARIZE
 from agent_companion.runtime.engine import Runtime
 from agent_companion.runtime.tools import Tool, Tools
-from agent_companion.storage.sqlite import History
+from agent_companion.storage.sqlite import History, ReplyOutcome, Summary
 from test_model_http_reuse import _HTTP11, _sse
+from test_message_support import assistant_message, reasoning_parts
 
 
 _SPEC = ToolSpec("lookup", "Look up a fixture", {"type": "object"})
@@ -131,11 +135,49 @@ class ChatModelTests(unittest.IsolatedAsyncioTestCase):
                                               "content": "fixture tool result"})
                     self.assertEqual([row.input_tokens for row in history.outcomes("main")], [7, 13])
                     self.assertEqual([row.model_status for row in history.outcomes("main")], ["complete", "complete"])
-                    stored = [row.message for row in history.read_after("main") if row.message.role == "assistant"]
-                    self.assertEqual(stored[0].replay.payload if stored[0].replay else None,
+                    stored = [row.message for row in history.read_after("main") if row.message.kind == "assistant"]
+                    self.assertEqual(reasoning_parts(stored[0])[0].payload if reasoning_parts(stored[0]) else None,
                                      b"fixture plan" if thought else None)
                     self.assertEqual(stored[1].content, "fixture answer")
-                    self.assertEqual(stored[1].replay.payload, b"fixture final reasoning")
+                    self.assertEqual(reasoning_parts(stored[1])[0].payload, b"fixture final reasoning")
+
+    async def test_compaction_and_reply_keep_compatible_reasoning_with_bailian_opt_out(self):
+        for adapter, preserve in (("minimax", None), ("bailian", True), ("bailian", False)):
+            with self.subTest(adapter=adapter, preserve=preserve), closing(History(":memory:")) as history:
+                requests = []
+
+                def wire(request):
+                    requests.append(json.loads(request.content))
+                    summary = requests[-1]["messages"][-1]["content"] == _SUMMARIZE.text
+                    return httpx.Response(200, content=_answer("compressed context" if summary else "next answer"))
+
+                async with httpx.AsyncClient(transport=httpx.MockTransport(wire)) as client:
+                    model = _model(client, adapter, preserve_thinking=preserve)
+                    _seed, = history.append("main", [Message("user", "old question " + "x" * 500)])
+                    end, = history.finalize_reply(ReplyOutcome("old", "main", "old", "complete", input_tokens=500), [
+                        assistant_message("old answer", reasoning=PrivateData(model._replay_key, b"prior private reasoning")),
+                    ])
+                    runtime = Runtime("main", history, model, None,
+                                      settings=RuntimeSettings(context_budget=500, tail_budget=75),
+                                      instructions="role instruction", thinking=True)
+                    try:
+                        runtime.submit_batch([Message("user", "next question " + "y" * 300)])
+                        await asyncio.wait_for(runtime.wait_idle(), 2)
+                        if task := runtime._compactions._generating:
+                            await asyncio.wait_for(asyncio.shield(task), 2)
+                        self.assertEqual(len(requests), 2)
+                        for request in requests:
+                            self.assertEqual(request["messages"][0], {"role": "system", "content": "role instruction"})
+                            projected = next(entry for entry in request["messages"] if entry["content"] == "old answer")
+                            self.assertEqual(projected.get("reasoning_content"),
+                                             None if preserve is False else "prior private reasoning")
+                        runtime.submit_batch([Message("user", "apply summary")])
+                        await asyncio.wait_for(runtime.wait_idle(), 2)
+                        self.assertEqual(history.summary("main"), Summary(end, "compressed context"))
+                        self.assertEqual(requests[-1]["messages"][1]["role"], "user")
+                        self.assertIn("compressed context", requests[-1]["messages"][1]["content"])
+                    finally:
+                        await runtime.close()
 
     async def test_bailian_namespaced_model_resumes_interleaved_tool_deltas_with_ordered_indexes(self):
         requests, calls = [], []
@@ -183,6 +225,66 @@ class ChatModelTests(unittest.IsolatedAsyncioTestCase):
                              [("call-first", "Oslo"), ("call-second", "Tokyo")])
             self.assertEqual(history.read_after("main")[-1].message.content, "fixture answer")
 
+    async def test_interleaved_parts_keep_positions_but_replay_calls_and_results_in_native_index_order(self):
+        def delta(index, identity, city):
+            return {"index": index, "id": identity, "function": {
+                "name": "lookup", "arguments": json.dumps({"city": city}),
+            }}
+
+        async def lookup(arguments, context):
+            return arguments["city"]
+
+        for adapter in ("minimax", "bailian", "deepseek"):
+            with self.subTest(adapter=adapter), closing(History(":memory:")) as history:
+                requests = []
+
+                def wire(request):
+                    requests.append(json.loads(request.content))
+                    if len(requests) == 1:
+                        return _response(_choice({"tool_calls": [delta(3, "call-later", "Tokyo")]}),
+                                         _choice({"content": "in between"}),
+                                         _choice({"reasoning_content": "synthetic reasoning"}),
+                                         _choice({"tool_calls": [delta(1, "call-earlier", "Oslo")]},
+                                                 finish="tool_calls"), b"[DONE]")
+                    return httpx.Response(200, content=_answer())
+
+                async with httpx.AsyncClient(transport=httpx.MockTransport(wire)) as client:
+                    model = DeepSeek(client) if adapter == "deepseek" else _model(client, adapter)
+                    runtime = Runtime("main", history, model, None, tools=Tools([Tool(_SPEC, lookup)]), thinking=True)
+                    try:
+                        runtime.submit_batch([_INPUT])
+                        await asyncio.wait_for(runtime.wait_idle(), 2)
+                    finally:
+                        await runtime.close()
+                        await model.aclose()
+
+                stored = history.read_after("main")[1].message
+                self.assertEqual(tuple(type(part) for part in stored.parts), (ToolCall, Text, Reasoning, ToolCall))
+                self.assertEqual([call.id for call in stored.tool_calls], ["call-later", "call-earlier"])
+                assistant, *results = requests[1]["messages"][-3:]
+                self.assertEqual(assistant["content"], "in between")
+                self.assertEqual(assistant["reasoning_content"], "synthetic reasoning")
+                self.assertEqual([(call["id"], call.get("index")) for call in assistant["tool_calls"]],
+                                 [("call-earlier", 1 if adapter == "bailian" else None),
+                                  ("call-later", 3 if adapter == "bailian" else None)])
+                self.assertEqual([(item["tool_call_id"], item["content"]) for item in results],
+                                 [("call-earlier", "Oslo"), ("call-later", "Tokyo")])
+
+    async def test_conflicting_missing_or_incompatible_indexes_fall_back_to_part_order(self):
+        async with httpx.AsyncClient() as client:
+            model = _model(client, "bailian")
+            key = model._replay_key
+            first = ToolCall("first", "lookup", "{}", "one", PrivateData(key, b"3"))
+            for data in (None, PrivateData(key, b"3"), PrivateData(key, b"-1"), PrivateData(b"x" * len(key), b"1")):
+                with self.subTest(data=data):
+                    second = ToolCall("second", "lookup", "{}", "two", data)
+                    assistant, *results = model._payload([Message("assistant", (first, Text("gap"), second))],
+                                                          (), False)["messages"]
+                    self.assertEqual([(call["id"], call["index"]) for call in assistant["tool_calls"]],
+                                     [("first", 0), ("second", 1)])
+                    self.assertEqual([item["tool_call_id"] for item in results], ["first", "second"])
+            await model.aclose()
+
     async def test_replay_handles_key_change_invalid_payload_explicit_empty_and_multipart_input(self):
         requests = []
 
@@ -196,15 +298,14 @@ class ChatModelTests(unittest.IsolatedAsyncioTestCase):
             for adapter, model in (("minimax", mini), ("bailian", bai)):
                 events = await _collect(model, thinking=False)
                 self.assertEqual((events[0], events[-1]), (TextDelta("ok"), ModelClosing(complete=True)))
-                self.assertEqual(len(events[1].replay.replay_key), 16)
-                self.assertEqual(events[1].replay.payload, b"")
-                source_key = events[1].replay.replay_key
-                good = Replay(source_key, "思考".encode())
+                self.assertEqual(len(events[1].parts[0].private.compatibility_key), 16)
+                self.assertEqual(events[1].parts[0].private.payload, b"")
+                source_key = events[1].parts[0].private.compatibility_key
+                good = PrivateData(source_key, "思考".encode())
                 messages = (Message("user", (Text("fixture text"), Image("https://example.invalid/photo"))),
-                            Message("assistant", "history", (ToolCall("a", "lookup", "{}"),), replay=good),
-                            Message("tool", "fixture result", tool_call_id="a"),
-                            Message("assistant", "bad payload", replay=Replay(source_key, b"\xff")),
-                            Message("assistant", "explicit empty", replay=events[1].replay))
+                            assistant_message("history", (replace(ToolCall("a", "lookup", "{}"), result="fixture result"),), reasoning=good),
+                            assistant_message("bad payload", reasoning=PrivateData(source_key, b"\xff")),
+                            assistant_message("explicit empty", reasoning=events[1].parts[0].private))
                 case_args = ([({"base_url": "https://API.MINIMAX.CN:443/v1", "api_key": "fixture-new"}, True),
                               ({"base_url": "https://api.minimax.io/v1"}, False)] if adapter == "minimax" else
                              [({"base_url": bailian_llm_base_url("ap-southeast-1", "other-space"),
@@ -411,6 +512,139 @@ class ChatModelErrorTests(unittest.IsolatedAsyncioTestCase):
                         finally:
                             await model.aclose()
 
+    async def test_runtime_logs_only_local_failure_details_for_requests_with_private_reasoning(self):
+        thought = "synthetic reasoning containing 427 and x7q"
+        remote_id, remote_code, remote_text = "remote-x7q", "code-x7q", "reflected: X7Q"
+        headers = {"x-request-id": remote_id}
+
+        async def lookup(arguments, context):
+            return "synthetic tool result"
+
+        for adapter in ("minimax", "bailian"):
+            vendor = ({"base_resp": {"status_code": 427, "status_msg": remote_text}} if adapter == "minimax" else
+                      {"error": {"code": remote_code, "message": remote_text}, "request_id": remote_id})
+            for mode, status, reason in (("http", 400, "http_400"), ("json", 200, "vendor_error"),
+                                         ("sse", 200, "vendor_error"), ("transport", None, "transport_error")):
+                with self.subTest(adapter=adapter, mode=mode), closing(History(":memory:")) as history:
+                    requests = []
+
+                    def wire(request):
+                        requests.append(json.loads(request.content))
+                        if len(requests) == 1:
+                            return _response(_choice({"reasoning_content": thought}), _tool_start(), _tool_end(),
+                                             b"[DONE]")
+                        if mode == "transport":
+                            try:
+                                raise ValueError(remote_text)
+                            except ValueError as exc:
+                                raise httpx.ReadError(remote_id) from exc
+                        if mode == "sse":
+                            return httpx.Response(200, content=b"event: error\n" + _sse(vendor), headers=headers)
+                        return httpx.Response(status, json=vendor, headers=headers)
+
+                    async with httpx.AsyncClient(transport=httpx.MockTransport(wire)) as client:
+                        model = _model(client, adapter)
+                        runtime = Runtime("main", history, model, None, tools=Tools([Tool(_SPEC, lookup)]),
+                                          thinking=True)
+                        try:
+                            with self.assertLogs("agent_companion", "DEBUG") as logs:
+                                runtime.submit_batch([_INPUT])
+                                await asyncio.wait_for(runtime.wait_idle(), 2)
+                        finally:
+                            await runtime.close()
+                            await model.aclose()
+                    self.assertEqual(len(requests), 2)
+                    self.assertEqual(requests[1]["messages"][-2]["reasoning_content"], thought)
+                    output = "\n".join(logs.output)
+                    self.assertIn(f"reason={reason}", output)
+                    if status is not None:
+                        self.assertIn(f"http_status={status}", output)
+                    for forbidden in (thought, remote_id, remote_code, remote_text, "request_id=", " code=", " message="):
+                        self.assertNotIn(forbidden, output)
+                    self.assertTrue(all(record.exc_info is None for record in logs.records))
+
+    async def test_first_stream_private_deltas_suppress_error_echo_without_history(self):
+        request_id, code, message = "rcv-x7q", "err-x7q", "echo: X7Q"
+        for adapter in ("minimax", "bailian"):
+            vendor = ({"base_resp": {"status_code": 7319, "status_msg": message}} if adapter == "minimax" else
+                      {"error": {"code": code, "message": message}, "request_id": request_id})
+            for delta in ({"reasoning_content": "synthetic reasoning x7q"}, {"tool_calls": [{"index": 7319}]}):
+                for same_frame in (False, True):
+                    with self.subTest(adapter=adapter, field=next(iter(delta)), same_frame=same_frame):
+                        frame = _choice(delta)
+                        frames = ({**frame, **vendor},) if same_frame else (frame, vendor)
+
+                        def wire(request):
+                            assistant_history = [item for item in json.loads(request.content)["messages"]
+                                                 if item["role"] == "assistant"]
+                            self.assertEqual(assistant_history, [])
+                            return httpx.Response(200, content=_sse(*frames),
+                                                  headers={"x-request-id": request_id})
+
+                        with closing(History(":memory:")) as history:
+                            async with httpx.AsyncClient(transport=httpx.MockTransport(wire)) as client:
+                                model = _model(client, adapter)
+                                runtime = Runtime("main", history, model, None, thinking=True)
+                                try:
+                                    with self.assertLogs("agent_companion", "DEBUG") as logs:
+                                        runtime.submit_batch([_INPUT])
+                                        await asyncio.wait_for(runtime.wait_idle(), 2)
+                                finally:
+                                    await runtime.close()
+                                    await model.aclose()
+                            self.assertEqual([row.model_error for row in history.outcomes("main")], ["vendor_error"])
+                            self.assertEqual([row.message for row in history.read_after("main")], [_INPUT])
+                        self._assert_only_local_failure(logs, "vendor_error", 200, request_id, code, message)
+
+    async def test_bailian_native_tool_index_suppresses_error_echo_without_reasoning(self):
+        index = 7319
+        request_id, code, message = f"rcv-{index}", f"err-{index}", f"echo: {index}"
+        vendor = {"error": {"code": code, "message": message}, "request_id": request_id}
+        headers = {"x-request-id": request_id}
+
+        async def lookup(arguments, context):
+            return "synthetic tool result"
+
+        for mode, status, reason in (("http", 400, "http_400"), ("json", 200, "vendor_error"),
+                                     ("sse", 200, "vendor_error")):
+            with self.subTest(mode=mode), closing(History(":memory:")) as history:
+                requests = []
+
+                def wire(request):
+                    requests.append(json.loads(request.content))
+                    if len(requests) == 1:
+                        return _response(_choice({"tool_calls": [{"index": index, "id": "call-lookup",
+                                                                 "function": {"name": "lookup", "arguments": "{}"}}]},
+                                                 finish="tool_calls"), b"[DONE]")
+                    if mode == "sse":
+                        return httpx.Response(status, content=b"event: error\n" + _sse(vendor), headers=headers)
+                    return httpx.Response(status, json=vendor, headers=headers)
+
+                async with httpx.AsyncClient(transport=httpx.MockTransport(wire)) as client:
+                    model = _model(client, "bailian", preserve_thinking=False)
+                    runtime = Runtime("main", history, model, None, tools=Tools([Tool(_SPEC, lookup)]), thinking=False)
+                    try:
+                        with self.assertLogs("agent_companion", "DEBUG") as logs:
+                            runtime.submit_batch([_INPUT])
+                            await asyncio.wait_for(runtime.wait_idle(), 2)
+                    finally:
+                        await runtime.close()
+                        await model.aclose()
+                self.assertEqual(len(requests), 2)
+                assistant = requests[1]["messages"][-2]
+                self.assertEqual(assistant["tool_calls"][0]["index"], index)
+                self.assertFalse(any("reasoning_content" in item for item in requests[1]["messages"]))
+                self.assertEqual(history.outcomes("main")[-1].model_error, reason)
+                self._assert_only_local_failure(logs, reason, status, request_id, code, message)
+
+    def _assert_only_local_failure(self, logs, reason, status, *remote_fields):
+        output = "\n".join(logs.output)
+        self.assertIn(f"reason={reason}", output)
+        self.assertIn(f"http_status={status}", output)
+        for forbidden in (*remote_fields, "request_id=", " code=", " message="):
+            self.assertNotIn(forbidden, output)
+        self.assertTrue(all(record.exc_info is None for record in logs.records))
+
     async def test_unknown_shapes_fall_back_to_status_and_request_id(self):
         for adapter in ("minimax", "bailian"):
             for status, sse in ((502, False), (200, False), (200, True)):
@@ -456,7 +690,7 @@ class ChatModelErrorTests(unittest.IsolatedAsyncioTestCase):
     async def test_confirmed_credential_and_input_echo_are_not_logged(self):
         for adapter in ("minimax", "bailian"):
             tool_input = "fixture-private-tool-value"
-            messages = (_INPUT, Message("assistant", "", (ToolCall("a", "lookup",
+            messages = (_INPUT, assistant_message("", (ToolCall("a", "lookup",
                                                                     json.dumps({"input": tool_input})),)))
             for secret in (_KEY, _INPUT.content, tool_input):
                 with self.subTest(adapter=adapter):
@@ -483,7 +717,7 @@ class ChatModelErrorTests(unittest.IsolatedAsyncioTestCase):
                                           "contact": "box-743819@example.invalid",
                                           "雪域编号密钥条目": "fixture"}]}, ensure_ascii=True)
         self.assertNotIn("雪域编号密钥条目", arguments)
-        tool = Message("assistant", "", (ToolCall("a", "lookup", arguments),))
+        tool = assistant_message("", (ToolCall("a", "lookup", arguments),))
         cases = (
             ("synthetic-unique-pr", "Rejected input: 'synthetic-unique-pr…'"),
             ("synt", "Rejected input: 'synt...'"),
@@ -549,7 +783,7 @@ class ChatModelErrorTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_structured_strings_apply_same_partial_echo_check_as_message(self):
         arguments = json.dumps({"nested": {"values": ["prefix-segmentmarker-suffix"]}})
-        messages = (_INPUT, Message("assistant", "", (ToolCall("a", "lookup", arguments),)))
+        messages = (_INPUT, assistant_message("", (ToolCall("a", "lookup", arguments),)))
         credential_fragment = _KEY[9:19]
         self.assertEqual(len(credential_fragment), 10)
         for fragment in ("segmentmarker", credential_fragment):
@@ -602,13 +836,13 @@ class ChatModelErrorTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_minimax_common_phrase_and_short_numeric_tool_argument_do_not_hide_error(self):
         messages = (Message("user", "The website says access is not allowed; can you explain?"),
-                    Message("assistant", "", (ToolCall("a", "lookup", '{"limit":1}'),)),
-                    Message("assistant", "", (ToolCall("b", "lookup", '{"limit":12}'),)))
+                    assistant_message("", (ToolCall("a", "lookup", '{"limit":1}'),)),
+                    assistant_message("", (ToolCall("b", "lookup", '{"limit":12}'),)))
         for text in ('thinking.type="disabled" is not allowed',
                      'Model MiniMax-M3.1-Flash: thinking.type="disabled" is not allowed',
                      'Model MiniMax-M3.12-Flash: thinking.type="disabled" is not allowed'):
             for history in (*((message,) for message in messages), messages):
-                with self.subTest(text=text, roles=[message.role for message in history]):
+                with self.subTest(text=text, roles=[message.kind for message in history]):
                     item = {"base_resp": {"status_code": 2013, "status_msg": text}}
                     response = httpx.Response(400, json=item, headers={"x-request-id": "fixture-request"})
                     async with httpx.AsyncClient(transport=httpx.MockTransport(lambda _: response)) as client:
@@ -628,11 +862,11 @@ class ChatModelErrorTests(unittest.IsolatedAsyncioTestCase):
         recipient = "Kavil Zorven Mondralix"
         self.assertEqual(len(recipient), 22)
         arguments = json.dumps({"delivery": [{"recipient": recipient}]})
-        sources = (Message("user", recipient), Message("assistant", "", (ToolCall("a", "lookup", arguments),)))
+        sources = (Message("user", recipient), assistant_message("", (ToolCall("a", "lookup", arguments),)))
         text = f"Invalid recipient {recipient} in the request"
         for adapter in ("minimax", "bailian"):
             for source in sources:
-                with self.subTest(adapter=adapter, source=source.role):
+                with self.subTest(adapter=adapter, source=source.kind):
                     item = ({"base_resp": {"status_code": 2013, "status_msg": text}} if adapter == "minimax"
                             else {"error": {"code": "invalid_parameter", "message": text}})
                     response = httpx.Response(400, json=item, headers={"x-request-id": "fixture-request"})

@@ -7,13 +7,14 @@ from unittest.mock import patch
 
 from agent_companion.app import running_agent
 from agent_companion.config import Settings
-from agent_companion.protocol import (DeliveryStatus, InternalInput, Message, Receipt, TIMER_EVENT_PREFIX,
+from agent_companion.protocol import (DeliveryStatus, InternalInput, Message, Receipt,
                                       TextDelta, ToolCall, ToolReady)
 from agent_companion.runtime.subtasks import demo_roles
 from agent_companion.runtime.timers import CANCEL_TIMER_TOOL_NAME, SET_TIMER_TOOL_NAME, Timers
 from agent_companion.runtime.tools import ToolContext, Tools
 from agent_companion.session_scheduler import SessionScheduler, SessionSchedulers
 from agent_companion.storage.sqlite import History
+from test_message_support import tool_calls
 
 
 @dataclass
@@ -48,9 +49,9 @@ class _Clock:
 
 def _event(item):
     if isinstance(item, InternalInput):
-        item = item.to_model_message()
-    assert item.role == "user" and item.content.startswith(TIMER_EVENT_PREFIX)
-    return json.loads(item.content.removeprefix(TIMER_EVENT_PREFIX))
+        item = item.to_history_message()
+    assert item.kind == "async_tool_result" and item.async_result.kind == "timer_fired"
+    return {"event": item.async_result.kind, **item.async_result.payload}
 
 
 async def _execute(tools, name, args, *, session="main", has_user_input=True):
@@ -63,7 +64,7 @@ class _Model:
         self.answer = answer
         self.requests = []
 
-    async def stream(self, messages, tools, *, thinking):
+    async def stream(self, messages, tools, *, thinking, instructions=None):
         self.requests.append(tuple(messages))
         for event in self.answer(len(self.requests), messages):
             yield event
@@ -312,7 +313,7 @@ class TimerTest(unittest.IsolatedAsyncioTestCase):
                 await asyncio.wait_for(runtime.wait_idle(), 2)
                 self.assertIsNone(runtime.last_failure)
                 self.assertEqual(len(model.requests), 4)
-                tool_results = {m.tool_call_id: json.loads(m.content) for m in model.requests[-1] if m.role == "tool"}
+                tool_results = {call.id: json.loads(call.result) for call in tool_calls(model.requests[-1])}
                 self.assertEqual(tool_results["auto-register"], {"error": "timer_requires_user_input"})
                 self.assertEqual(tool_results["stop"], {"status": "cancelled"})
                 self.assertEqual(_event(model.requests[2][-1])["timer_id"], tool_results["register"]["timer_id"])
@@ -336,7 +337,7 @@ class TimerTest(unittest.IsolatedAsyncioTestCase):
                                      schedulers=schedulers, roles=demo_roles()) as (runtime, _):
                 scheduler.session_input((Message("user", "synthetic registration"),))
                 await asyncio.wait_for(runtime.wait_idle(), 2)
-                timer_id = json.loads(model.requests[-1][-1].content)["timer_id"]
+                timer_id = json.loads(model.requests[-1][-1].tool_calls[-1].result)["timer_id"]
                 scheduler.session_input((Message("user", "synthetic follow-up"),))
                 await asyncio.wait_for(runtime.wait_idle(), 2)
                 self.assertIsNone(runtime.last_failure)

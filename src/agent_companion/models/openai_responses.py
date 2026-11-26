@@ -3,7 +3,6 @@
 import asyncio
 from collections.abc import AsyncGenerator, AsyncIterator, Sequence
 from contextlib import aclosing
-from dataclasses import asdict, dataclass, field
 import json
 import re
 from typing import Any
@@ -12,11 +11,10 @@ import httpx
 
 from ..config import normalize_openai_base_url
 from ..model_diagnostics import adapter_started, failure_category
-from ..protocol import (Image, InputUsage, Message, ModelClosing, ModelError, ModelEvent,
-                        Replay, ReplayReady, Text, TextDelta, ToolCall,
-                        ToolReady, ToolSpec)
+from ..protocol import (AssistantPartsReady, Image, InputUsage, Message, ModelClosing, ModelError, ModelEvent,
+                        Part, PrivateData, Reasoning, Text, TextDelta, ToolCall, ToolReady, ToolSpec)
 from ._http_stream import ResponseStreams
-from ._request import JSON_ENCODER, make_replay_key, request_body
+from ._request import JSON_ENCODER, input_content, make_replay_key, request_body
 
 
 _ADAPTER_ID = "openai_responses"
@@ -41,19 +39,6 @@ def _function(call: ToolCall, item_id: str | None = None) -> dict[str, Any]:
     return item
 
 
-def _common_items(message: Message) -> list[dict[str, Any]]:
-    if message.role == "tool":
-        return [{"type": "function_call_output", "call_id": message.tool_call_id, "output": message.content}]
-    items = []
-    if message.content or message.role != "assistant":
-        content = message.content
-        if not isinstance(content, str):
-            content = [_input_part(part) for part in content]
-        items.append({"role": message.role, "content": content})
-    items.extend(_function(call) for call in message.tool_calls)
-    return items
-
-
 def _identifier(value: object) -> bool:
     return isinstance(value, str) and 0 < len(value) <= 256 and value.isascii() and all(32 < ord(c) < 127 for c in value)
 
@@ -62,99 +47,99 @@ def _reject_constant(_: str) -> None:
     raise ValueError
 
 
-@dataclass(frozen=True, slots=True)
-class _ReplayItem:
-    kind: str
-    item_id: str
-    call_id: str | None = None
-    phase: str | None = None
-    # 正文只来自确认历史；这里只保存输出位置和字符数。
-    parts: tuple[tuple[str, int], ...] = ()
-    encrypted_content: str | None = field(default=None, repr=False)
-    summary: tuple[str, ...] = field(default=(), repr=False)
+def _private(key: bytes, **data: Any) -> PrivateData:
+    try:
+        payload = JSON_ENCODER.encode(data).encode("utf-8")
+    except UnicodeError:
+        raise ModelError("invalid_sse_event") from None
+    return PrivateData(key, payload)
 
 
-def _decode_replay(payload: bytes) -> list[_ReplayItem] | None:
-    if len(payload) > _MAX_REPLAY_BYTES:
+def _metadata(part: Text | ToolCall | Reasoning, key: bytes) -> dict[str, Any] | None:
+    data = part.private
+    if data is None or data.compatibility_key != key or len(data.payload) > _MAX_REPLAY_BYTES:
         return None
     try:
-        items = json.loads(payload.decode("utf-8"))
-        if not isinstance(items, list) or not 0 < len(items) <= _MAX_ITEMS:
+        item = json.loads(data.payload.decode("utf-8"))
+    except (ValueError, RecursionError):
+        return None
+    if not isinstance(item, dict) or not _identifier(item.get("id")):
+        return None
+    return item
+
+
+def _native_text(text: str, item: dict[str, Any]) -> dict[str, Any] | None:
+    phase, shape = item.get("phase"), item.get("parts")
+    if phase not in _PHASES or not isinstance(shape, list) or not shape:
+        return None
+    content = []
+    offset = 0
+    for entry in shape:
+        if (not isinstance(entry, list) or len(entry) != 2 or entry[0] not in ("output_text", "refusal")
+                or type(entry[1]) is not int or not 0 <= entry[1] <= len(text) - offset):
             return None
-        parsed = []
-        for item in items:
-            if (not isinstance(item, dict) or not isinstance(item["parts"], list)
-                    or not isinstance(item["summary"], list)
-                    or any(not isinstance(part, list) for part in item["parts"])):
+        kind, length = entry
+        part = text[offset:offset + length]
+        offset += length
+        # 展示引用不在原生回放白名单内，不保存或回传响应中的 annotations。
+        content.append({"type": kind, "text": part, "annotations": []} if kind == "output_text"
+                       else {"type": kind, "refusal": part})
+    if offset != len(text):
+        return None
+    native = {"type": "message", "id": item["id"], "role": "assistant", "status": "completed", "content": content}
+    if phase is not None:
+        native["phase"] = phase
+    return native
+
+
+def _native_reasoning(item: dict[str, Any]) -> dict[str, Any] | None:
+    cipher, summary = item.get("encrypted_content"), item.get("summary")
+    if not isinstance(cipher, str) or not cipher or not isinstance(summary, list):
+        return None
+    try:
+        for text in (cipher, *summary):
+            if not isinstance(text, str):
                 return None
-            cipher, summary = item["encrypted_content"], tuple(item["summary"])
-            # 拒绝 JSON 转义隐藏的孤立代理码点，避免坏包污染新请求。
-            for text in ((cipher,) if cipher is not None else ()) + summary:
-                if not isinstance(text, str):
-                    return None
-                text.encode("utf-8")
-            parsed.append(_ReplayItem(item["kind"], item["item_id"], item["call_id"], item["phase"],
-                                      tuple(tuple(part) for part in item["parts"]), cipher, summary))
-        return parsed
-    except (ValueError, KeyError, RecursionError):
+            text.encode("utf-8")
+    except UnicodeError:
         return None
+    return {"type": "reasoning", "id": item["id"], "encrypted_content": cipher,
+            "summary": [{"type": "summary_text", "text": text} for text in summary]}
 
 
-def _replay_items(message: Message, replay: Sequence[_ReplayItem]) -> list[dict[str, Any]] | None:
-    if not isinstance(message.content, str):
-        return None
+def _response_items(message: Message, key: bytes | None) -> list[dict[str, Any]]:
+    if message.kind != "assistant":
+        body = input_content(message)
+        return [{"role": "user", "content": body if isinstance(body, str) else [_input_part(p) for p in body]}]
     items: list[dict[str, Any]] = []
-    calls = iter(message.tool_calls)
-    used_ids: set[str] = set()
-    position = 0
-    for item in replay:
-        if not _identifier(item.item_id) or item.item_id in used_ids:
-            return None
-        used_ids.add(item.item_id)
-        if item.kind == "reasoning":
-            if (not isinstance(item.encrypted_content, str) or not item.encrypted_content
-                    or item.call_id is not None or item.parts or item.phase is not None
-                    or not all(isinstance(text, str) for text in item.summary)):
-                return None
-            items.append({"type": "reasoning", "id": item.item_id, "encrypted_content": item.encrypted_content,
-                          "summary": [{"type": "summary_text", "text": text} for text in item.summary]})
-        elif item.kind == "function_call":
-            call = next(calls, None)
-            if (call is None or not _identifier(item.call_id) or call.id != item.call_id or item.parts
-                    or item.phase is not None or item.encrypted_content is not None or item.summary):
-                return None
-            items.append(_function(call, item.item_id))
-        elif item.kind == "message":
-            if (item.phase not in _PHASES or not item.parts or item.call_id is not None
-                    or item.encrypted_content is not None or item.summary):
-                return None
-            start = position
-            content: list[dict[str, Any]] = []
-            for part in item.parts:
-                if (len(part) != 2 or part[0] not in ("output_text", "refusal")
-                        or type(part[1]) is not int or not 0 <= part[1] <= _MAX_TEXT):
-                    return None
-                kind, amount = part
-                text = message.content[position:position + amount]
-                position += amount
-                content.append({"type": kind, "text": text, "annotations": []} if kind == "output_text"
-                               else {"type": kind, "refusal": text})
-            if position > _MAX_TEXT or position == start:
-                return None
-            if position <= len(message.content):
-                native = {"type": "message", "id": item.item_id, "role": "assistant",
-                          "status": "completed", "content": content}
-                if item.phase is not None:
-                    native["phase"] = item.phase
-                items.append(native)
-            elif start < len(message.content):
-                # 仅确认前缀可见，不能用原 item ID 引用未交付的正文。
-                items.append({"role": "assistant", "content": message.content[start:]})
+    outputs: list[dict[str, Any]] = []
+    ids: set[str] = set()
+    for part in message.parts:
+        if isinstance(part, Image):
+            continue  # 模型响应目前不产生图像历史。
+        native = _metadata(part, key) if key is not None else None
+        if native is not None and native["id"] in ids:
+            native = None
+        projected: dict[str, Any] | None = None
+        if isinstance(part, Reasoning):
+            if native is not None:
+                projected = _native_reasoning(native)
+        elif isinstance(part, Text):
+            if native is not None:
+                projected = _native_text(part.text, native)
+            if projected is None and part.text:
+                projected = {"role": "assistant", "content": part.text}
         else:
-            return None
-    if next(calls, None) is not None or position < len(message.content):
-        return None
-    return items
+            if native is not None and native.get("call_id") != part.id:
+                native = None
+            projected = _function(part, native["id"] if native is not None else None)
+            if part.result is not None:
+                outputs.append({"type": "function_call_output", "call_id": part.id, "output": part.result})
+        if projected is not None:
+            if "id" in projected:
+                ids.add(projected["id"])
+            items.append(projected)
+    return items + outputs
 
 
 def _tools(tools: Sequence[ToolSpec]) -> list[dict[str, Any]]:
@@ -163,11 +148,11 @@ def _tools(tools: Sequence[ToolSpec]) -> list[dict[str, Any]]:
 
 
 def _read_output(raw: Any, replay_key: bytes, done_reasoning: dict[int, tuple[str, str]]) -> tuple[
-    list[tuple[tuple[int, int], str]], tuple[ToolCall, ...], Replay | None,
+    list[tuple[tuple[int, int], str]], tuple[ToolCall, ...], tuple[Part, ...],
 ]:
     if not isinstance(raw, list) or len(raw) > _MAX_ITEMS:
         raise ModelError("invalid_sse_event")
-    replay: list[_ReplayItem] = []
+    ordered: list[Part] = []
     text_parts: list[tuple[tuple[int, int], str]] = []
     calls = []
     used_ids: set[str] = set()
@@ -193,8 +178,8 @@ def _read_output(raw: Any, replay_key: bytes, done_reasoning: dict[int, tuple[st
                 for part in summary
             )):
                 raise ModelError("invalid_sse_event")
-            replay.append(_ReplayItem(kind, identity, encrypted_content=cipher,
-                                     summary=tuple(part["text"] for part in summary)))
+            ordered.append(Reasoning(_private(replay_key, id=identity, encrypted_content=cipher,
+                                              summary=[part["text"] for part in summary])))
         elif kind == "function_call":
             name, call_id, arguments = item.get("name"), item.get("call_id"), item.get("arguments")
             if not isinstance(name, str) or not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", name) or not _identifier(call_id):
@@ -207,13 +192,15 @@ def _read_output(raw: Any, replay_key: bytes, done_reasoning: dict[int, tuple[st
             except (ValueError, RecursionError):
                 raise ModelError("invalid_tool_arguments") from None
             call_ids.add(call_id)
-            replay.append(_ReplayItem(kind, identity, call_id=call_id))
-            calls.append(ToolCall(call_id, name, arguments))
+            call = ToolCall(call_id, name, arguments, private=_private(replay_key, id=identity, call_id=call_id))
+            ordered.append(call)
+            calls.append(call)
         elif kind == "message":
             content, phase = item.get("content"), item.get("phase")
             if item.get("role") != "assistant" or not isinstance(content, list) or phase not in _PHASES:
                 raise ModelError("invalid_sse_event")
             parts = []
+            visible = []
             for content_index, part in enumerate(content):
                 if not isinstance(part, dict):
                     raise ModelError("invalid_sse_event")
@@ -225,21 +212,17 @@ def _read_output(raw: Any, replay_key: bytes, done_reasoning: dict[int, tuple[st
                     raise ModelError("invalid_sse_event")
                 text_parts.append(((index, content_index), text))
                 parts.append((part_type, len(text)))
-            if any(length for _, length in parts):
-                replay.append(_ReplayItem(kind, identity, phase=phase, parts=tuple(parts)))
+                visible.append(text)
+            if any(visible):
+                # 一个原生输出条目内的正文，共用其 ID 和 content 片段形状，不记录正文副本。
+                ordered.append(Text("".join(visible), _private(replay_key, id=identity, phase=phase, parts=parts)))
         else:
             # 不接受可产生外部副作用的内建工具或尚未定义的 item。
             raise ModelError("responses_unsupported_output")
-    payload = bytearray()
-    try:
-        if replay:
-            for chunk in JSON_ENCODER.iterencode([asdict(item) for item in replay]):
-                payload.extend(chunk.encode("utf-8"))
-                if len(payload) > _MAX_REPLAY_BYTES:
-                    raise ModelError("responses_output_limit")
-    except UnicodeError:
-        raise ModelError("invalid_sse_event") from None
-    return text_parts, tuple(calls), Replay(replay_key, bytes(payload)) if replay else None
+    if sum(len(part.private.payload) for part in ordered if not isinstance(part, Image)
+           and part.private is not None) > _MAX_REPLAY_BYTES:
+        raise ModelError("responses_output_limit")
+    return text_parts, tuple(calls), tuple(ordered)
 
 
 async def _sse_data(chunks: AsyncIterator[bytes]) -> AsyncIterator[str]:
@@ -334,7 +317,7 @@ async def _events(chunks: AsyncIterator[bytes], replay_key: bytes) -> AsyncItera
                 response = event.get("response")
                 if not isinstance(response, dict) or response.get("status") not in (None, "completed"):
                     raise ModelError("invalid_stream_finish")
-                parts, calls, replay = _read_output(response.get("output"), replay_key, done_reasoning)
+                parts, calls, ordered = _read_output(response.get("output"), replay_key, done_reasoning)
                 if sum(len(text) for _, text in parts) > _MAX_TEXT:
                     raise ModelError("responses_output_limit")
                 visible = "".join(text for _, text in parts)
@@ -349,8 +332,8 @@ async def _events(chunks: AsyncIterator[bytes], replay_key: bytes) -> AsyncItera
                     raise ModelError("invalid_stream_finish")
                 if len(visible) > emitted:
                     yield TextDelta(visible[emitted:])
-                if replay is not None:
-                    yield ReplayReady(replay)
+                if ordered:
+                    yield AssistantPartsReady(ordered)
                 # 先完整校验本响应所有 item，再派发任何工具。
                 for call in calls:
                     yield ToolReady(call)
@@ -377,26 +360,35 @@ class OpenAIResponses:
         self._effort = reasoning_effort
         self._replay_key = make_replay_key(api_key.encode("ascii"), _ADAPTER_ID, model, base_url)
 
-    def _payload(self, messages: Sequence[Message], tools: Sequence[ToolSpec]) -> dict[str, Any]:
-        items: list[dict[str, Any]] = []
+    def history_replay_bytes(self, message: Message, tools: Sequence[ToolSpec], *, thinking: bool) -> int:
+        if message.kind != "assistant" or not any(
+                isinstance(part, (Text, ToolCall, Reasoning)) and part.private is not None
+                and part.private.compatibility_key == self._replay_key for part in message.parts):
+            return 0
+        native = _response_items(message, self._replay_key)
+        common = _response_items(message, None)
+        if native == common:
+            return 0
+        # 正文和工具调用/结果已在基础预算中，只补计实际出站的原生增量。
+        return len(request_body({"input": native})) - len(request_body({"input": common}))
+
+    def _payload(self, messages: Sequence[Message], tools: Sequence[ToolSpec], *,
+                 instructions: str | None = None) -> dict[str, Any]:
+        items = [item for message in messages for item in _response_items(message, self._replay_key)]
         tools_data = _tools(tools)
-        for message in messages:
-            replay = message.replay
-            decoded = (_decode_replay(replay.payload) if message.role == "assistant" and replay is not None
-                       and replay.replay_key == self._replay_key else None)
-            projected = _replay_items(message, decoded) if decoded is not None else None
-            items.extend(projected if projected is not None else _common_items(message))
         payload = {"model": self._model, "input": items, "stream": True, "store": False,
                    "include": ["reasoning.encrypted_content"], "reasoning": {"effort": self._effort}}
+        if instructions is not None:
+            payload["instructions"] = instructions
         if tools_data:
             payload["tools"] = tools_data
         return payload
 
     async def stream(self, messages: Sequence[Message], tools: Sequence[ToolSpec], *,
-                     thinking: bool) -> AsyncGenerator[ModelEvent, None]:
+                     thinking: bool, instructions: str | None = None) -> AsyncGenerator[ModelEvent, None]:
         # thinking 是 DeepSeek 内部协议参数；Responses 只采用用户选定的 effort。
         diagnostics = adapter_started(_ADAPTER_ID)
-        body = request_body(self._payload(messages, tools))
+        body = request_body(self._payload(messages, tools, instructions=instructions))
         if diagnostics is not None:
             diagnostics.request_ready(len(body))
         terminal: list[ModelEvent] = []

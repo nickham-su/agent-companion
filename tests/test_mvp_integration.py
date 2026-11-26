@@ -20,13 +20,14 @@ from agent_companion.channels.feishu.cli import CommandResult, FeishuDiscovery
 from agent_companion.channels.feishu.macos_calls import RingingWindow, WindowIdentity
 from agent_companion.config import (ASRSettings, FeishuSettings, MiniMaxConnection, RuntimeSettings, Settings,
                                     VoiceSettings)
-from agent_companion.protocol import AGENT_REPLY_PREFIX, DeliveryStatus, TextDelta, ToolCall, ToolReady
+from agent_companion.protocol import DeliveryStatus, TextDelta, ToolCall, ToolReady
 from agent_companion.runtime.subtasks import DELEGATE_TOOL_NAME, demo_roles
 from agent_companion.runtime.timers import CANCEL_TIMER_TOOL_NAME, SET_TIMER_TOOL_NAME
 from agent_companion.speech.audio import AudioFormat
 from agent_companion.speech.vad import INPUT_FRAMES, INPUT_RATE
 from agent_companion.speech.voice import VoiceChannel
 from agent_companion.storage.sqlite import History
+from test_message_support import tool_calls
 
 
 _CHAT, _PEER, _OWN = "oc_mvp", "ou_synthetic", "ou_companion"
@@ -128,19 +129,19 @@ class _ScriptedModel:
         self.finish_child = asyncio.Event()
         self.restart_request = None
 
-    async def stream(self, messages, tools, *, thinking):
+    async def stream(self, messages, tools, *, thinking, instructions=None):
         last = messages[-1]
         if not tools:
-            assert last.role == "user" and last.content == _PROMPT
+            assert last.kind == "user" and last.content == _PROMPT
             self.child_started.set()
             await self.finish_child.wait()
             yield TextDelta(_RESULT)
-        elif last.role == "tool":
+        elif last.tool_calls:
             yield TextDelta(_ACCEPTED)
         elif last.content == _USER:
             assert {tool.name for tool in tools} == {DELEGATE_TOOL_NAME, SET_TIMER_TOOL_NAME, CANCEL_TIMER_TOOL_NAME}
             yield ToolReady(ToolCall("synthetic-call", DELEGATE_TOOL_NAME, json.dumps({"agent": "general", "prompt": _PROMPT})))
-        elif last.content.startswith(AGENT_REPLY_PREFIX):
+        elif last.async_result is not None and last.async_result.kind == "agent_reply":
             yield TextDelta(_RETURNED)
         elif last.content == "明确失败测试":
             yield TextDelta(_FAILED)
@@ -325,10 +326,10 @@ class MVPIntegrationTest(unittest.IsolatedAsyncioTestCase):
                 transport.push(_USER)
                 await model.child_started.wait()
                 self.assertEqual(await _outcome(history, session, 2), (DeliveryStatus.FULL, _ACCEPTED))
-                tool_result = next(row.message for row in history.read_after(session) if row.message.role == "tool")
-                accepted = json.loads(tool_result.content)
-                self.assertEqual(tool_result.tool_call_id, "synthetic-call")
-                delegation = stored_delegation(history, session, tool_result.tool_call_id)
+                tool_result = tool_calls(row.message for row in history.read_after(session))[0]
+                accepted = json.loads(tool_result.result)
+                self.assertEqual(tool_result.id, "synthetic-call")
+                delegation = stored_delegation(history, session, tool_result.id)
                 child = delegation.agent_id
                 self.assertEqual(accepted, {"status": "accepted", "agent_id": child})
                 run = delegation.run_id
@@ -337,11 +338,11 @@ class MVPIntegrationTest(unittest.IsolatedAsyncioTestCase):
                 # The main session has settled. Completion alone must wake it; no new CLI message.
                 model.finish_child.set()
                 self.assertEqual(await _outcome(history, session, 3), (DeliveryStatus.FULL, _RETURNED))
-                returned = next(row.message.content for row in history.read_after(session)
-                                if isinstance(row.message.content, str) and row.message.content.startswith(AGENT_REPLY_PREFIX))
-                self.assertEqual(json.loads(returned.removeprefix(AGENT_REPLY_PREFIX)), {
-                    "agent_id": child, "status": "completed", "result": _RESULT,
-                })
+                returned = next(row.message.async_result for row in history.read_after(session)
+                                if row.message.async_result is not None)
+                self.assertEqual(returned.kind, "agent_reply")
+                self.assertEqual(returned.payload, {"agent_id": child,
+                                                    "status": "completed", "result": _RESULT})
                 self.assertIsNotNone(history.agent_run(run).reply_enqueued_at)
                 self.assertEqual([row.message.content for row in history.read_after(history.agent(child).session_id)], [_PROMPT, _RESULT])
                 self.assertNotIn(_PROMPT, [row.message.content for row in history.read_after(session)])

@@ -19,7 +19,7 @@ class _Model:
         self.responses = iter(responses)
         self.requests = []
 
-    async def stream(self, messages, tools, *, thinking):
+    async def stream(self, messages, tools, *, thinking, instructions=None):
         self.requests.append(tuple(messages))
         for item in next(self.responses):
             yield item
@@ -134,9 +134,9 @@ class SessionSchedulerTest(unittest.IsolatedAsyncioTestCase):
         append = history._append
         rolled_back = asyncio.Event()
 
-        def fail_after_final_insert(session_id, messages):
+        def fail_after_final_insert(session_id, messages, **kwargs):
             messages = tuple(messages)
-            result = append(session_id, messages)
+            result = append(session_id, messages, **kwargs)
             if messages == (transcript,) and not rolled_back.is_set():
                 rolled_back.set()
                 raise sqlite3.OperationalError("database is locked")
@@ -157,7 +157,7 @@ class SessionSchedulerTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(history.pending_inbound("main", "test"), [])
         expected = ["feishu 1", "feishu 2", "background result", "feishu 3", "transcript"]
         self.assertEqual([row.message.content for row in history.read_after("main")], [*expected, "done"])
-        self.assertEqual([[m.content for m in request if m.role == "user"] for request in model.requests],
+        self.assertEqual([[m.content for m in request if m.kind == "user"] for request in model.requests],
                          [expected])
         scheduler.session_input((first, second))
         await asyncio.wait_for(runtime.wait_idle(), 2)
@@ -196,12 +196,12 @@ class SessionSchedulerTest(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(authorizations, [False, has_new_user])
                 self.assertEqual(len(set(run_ids)), 1)
                 self.assertEqual(history.pending_inbound("main", "test"), [])
-                self.assertEqual([m.content for m in model.requests[0] if m.role == "user"],
+                self.assertEqual([m.content for m in model.requests[0] if m.kind == "user"],
                                  ["already consumed", "internal start"])
                 expected = ["already consumed", "internal start", "internal continuation"]
                 if has_new_user:
                     expected.append("new persisted user input")
-                self.assertEqual([m.content for m in model.requests[1] if m.role == "user"], expected)
+                self.assertEqual([m.content for m in model.requests[1] if m.kind == "user"], expected)
 
     async def test_invalid_event_cannot_change_fifo_or_input_state(self):
         runtime, history = self.make_runtime(_Model((TextDelta("done"),)))
@@ -261,10 +261,10 @@ class SessionSchedulerTest(unittest.IsolatedAsyncioTestCase):
                 interrupted = asyncio.Event()
                 append = history._append
 
-                def fail_after_statement(session_id, messages):
+                def fail_after_statement(session_id, messages, **kwargs):
                     nonlocal attempts
                     messages = tuple(messages)
-                    ids = append(session_id, messages)
+                    ids = append(session_id, messages, **kwargs)
                     if messages == (speech,):
                         attempts += 1
                         if attempts == 1:
@@ -285,14 +285,14 @@ class SessionSchedulerTest(unittest.IsolatedAsyncioTestCase):
                     self.assertFalse(history._db.in_transaction)
                     self.assertEqual(history.pending_inbound("main", "test"), [ref.batch_id])
                     self.assertEqual([row.message.content for row in history.read_after("main")
-                                      if row.message.role == "user"], expected_prior)
+                                      if row.message.kind == "user"], expected_prior)
                     runtime.submit_persisted_batch(ref.batch_id)
                     await asyncio.wait_for(runtime.wait_idle(), 2)
 
                 expected_a = ["A persistent", "A internal", "A speech"]
                 self.assertEqual([row.message.content for row in history.read_after("main")
-                                  if row.message.role == "user"], [*expected_prior, *expected_a, "B"])
-                self.assertEqual([[m.content for m in request if m.role == "user"] for request in model.requests],
+                                  if row.message.kind == "user"], [*expected_prior, *expected_a, "B"])
+                self.assertEqual([[m.content for m in request if m.kind == "user"] for request in model.requests],
                                  [expected_prior if continuation else expected_a,
                                   [*expected_prior, *expected_a, "B"]])
                 self.assertEqual(attempts, 2)
@@ -314,10 +314,10 @@ class SessionSchedulerTest(unittest.IsolatedAsyncioTestCase):
                 attempts = 0
                 failed = True
 
-                def fail_statement(session_id, messages):
+                def fail_statement(session_id, messages, **kwargs):
                     nonlocal attempts
                     messages = tuple(messages)
-                    ids = append(session_id, messages)
+                    ids = append(session_id, messages, **kwargs)
                     if messages == (speech,):
                         attempts += 1
                         if failed:
@@ -353,7 +353,7 @@ class SessionSchedulerTest(unittest.IsolatedAsyncioTestCase):
                 if recovers:
                     self.assertEqual(attempts, expected_attempts + 1)
                     expected = ["A persistent", "A speech", "later B", "new C"]
-                    self.assertEqual([[m.content for m in request if m.role == "user"] for request in model.requests],
+                    self.assertEqual([[m.content for m in request if m.kind == "user"] for request in model.requests],
                                      [expected[:2], expected[:3], expected])
                     self.assertIsNone(runtime.last_failure)
                 else:
@@ -414,9 +414,9 @@ class SessionSchedulerTest(unittest.IsolatedAsyncioTestCase):
                     speech = Message("user", "A speech")
                     snapshots = []
 
-                    def fail_after_write(session_id, messages):
+                    def fail_after_write(session_id, messages, **kwargs):
                         messages = tuple(messages)
-                        ids = append(session_id, messages)
+                        ids = append(session_id, messages, **kwargs)
                         if session_id == "main" and messages == (speech,):
                             snapshots.append((connection.in_transaction,
                                               [row.message.content for row in history.read_after("main")],
@@ -466,10 +466,10 @@ class SessionSchedulerTest(unittest.IsolatedAsyncioTestCase):
                 append = history._append
                 attempts = 0
 
-                def fail_once(session_id, messages):
+                def fail_once(session_id, messages, **kwargs):
                     nonlocal attempts
                     messages = tuple(messages)
-                    ids = append(session_id, messages)
+                    ids = append(session_id, messages, **kwargs)
                     if messages == (Message("user", "prompt"),):
                         attempts += 1
                         if attempts == 1:
@@ -496,8 +496,8 @@ class SessionSchedulerTest(unittest.IsolatedAsyncioTestCase):
             wrapped.rollback.side_effect = sqlite3.OperationalError("synthetic rollback failure")
             append = history._append
 
-            def cancelled_after_write(session_id, messages):
-                append(session_id, messages)
+            def cancelled_after_write(session_id, messages, **kwargs):
+                append(session_id, messages, **kwargs)
                 raise asyncio.CancelledError
 
             try:

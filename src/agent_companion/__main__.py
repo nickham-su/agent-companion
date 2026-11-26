@@ -20,7 +20,7 @@ from .models.bailian import Bailian
 from .models.deepseek import CHAT_COMPLETIONS, DeepSeek
 from .models.minimax import MiniMax
 from .models.openai_responses import OpenAIResponses
-from .protocol import (AGENT_REPLY_PREFIX, DeliveryStatus, Message, ModelEvent, Receipt, ReplyStream,
+from .protocol import (DeliveryStatus, Message, ModelEvent, Receipt, ReplyStream,
                        TextDelta, ToolCall, ToolReady, ToolSpec)
 from .runtime.instructions import load_roles
 from .runtime.subtasks import AgentRole, DELEGATE_TOOL_NAME, ModelBinding, demo_roles
@@ -42,15 +42,15 @@ class _DemoModel:
         self.child_agent_id: str | None = None
 
     async def stream(self, messages: Sequence[Message], tools: Sequence[ToolSpec], *,
-                     thinking: bool) -> AsyncGenerator[ModelEvent, None]:
+                     thinking: bool, instructions: str | None = None) -> AsyncGenerator[ModelEvent, None]:
         last = messages[-1]
         if tools and last == Message("user", _DEMO_DELEGATION):
             yield ToolReady(ToolCall("demo-delegate", DELEGATE_TOOL_NAME,
                                      json.dumps({"agent": "general", "prompt": "给出一个模拟子任务结果"})))
-        elif last.role == "tool":
+        elif last.tool_calls:
             yield TextDelta("离线模拟：委派已受理。")
-        elif isinstance(last.content, str) and last.content.startswith(AGENT_REPLY_PREFIX):
-            payload = json.loads(last.content.removeprefix(AGENT_REPLY_PREFIX))
+        elif last.async_result is not None and last.async_result.kind == "agent_reply":
+            payload = last.async_result.payload
             if self.child_agent_id is None and payload.get("result") == "模拟子任务已完成。":
                 self.child_agent_id = payload["agent_id"]
                 yield ToolReady(ToolCall("demo-reuse", DELEGATE_TOOL_NAME, json.dumps({
@@ -63,7 +63,7 @@ class _DemoModel:
                                 else "离线模拟：子任务失败。")
         elif not tools:
             if last.content == "基于同一个子 Agent 继续任务":
-                continued = any(item.role == "assistant" and item.content == "模拟子任务已完成。"
+                continued = any(item.kind == "assistant" and item.content == "模拟子任务已完成。"
                                 for item in messages)
                 yield TextDelta("已续接原子任务历史。" if continued else "未找到原子任务历史。")
             else:

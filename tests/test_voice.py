@@ -20,6 +20,7 @@ from agent_companion.speech.tts import TtsError
 from agent_companion.speech.vad import INPUT_FRAMES, VoiceSetupError
 from agent_companion.speech.voice import VoiceChannel
 from agent_companion.storage.sqlite import History
+from test_message_support import tool_calls
 
 
 _RATE = 16000
@@ -172,7 +173,7 @@ class VoiceOutputTest(unittest.IsolatedAsyncioTestCase):
         output = VoiceOutput(tts, _SETTINGS)
 
         class Model:
-            async def stream(self, messages, tools, *, thinking):
+            async def stream(self, messages, tools, *, thinking, instructions=None):
                 yield TextDelta("合成测试正文")
                 await finish_sentence.wait()
                 yield TextDelta("。")
@@ -493,7 +494,7 @@ class VoiceDeliveryWatchdogTest(unittest.IsolatedAsyncioTestCase):
         ordering = []
 
         class Model:
-            async def stream(self, messages, tools, *, thinking):
+            async def stream(self, messages, tools, *, thinking, instructions=None):
                 requests.append(messages)
                 if len(requests) == 1:
                     yield ToolReady(ToolCall("one", "lookup", "{}"))
@@ -537,13 +538,13 @@ class VoiceDeliveryWatchdogTest(unittest.IsolatedAsyncioTestCase):
             await runtime.wait_idle()
         self.assertEqual(ordering, ["production_complete", "hangup", "receipt"])
         self.assertEqual(history.outcomes("main")[0].delivery_status, DeliveryStatus.FULL)
-        self.assertEqual([m.content for m in requests[1] if m.role == "tool"], ["工具结果"])
+        self.assertEqual([call.result for call in tool_calls(requests[1])], ["工具结果"])
 
     async def test_no_pcm_starts_idle_timer_only_after_model_closes(self):
         model_close, tts_started = asyncio.Event(), asyncio.Event()
 
         class Model:
-            async def stream(self, messages, tools, *, thinking):
+            async def stream(self, messages, tools, *, thinking, instructions=None):
                 yield TextDelta("未开始。")
                 await model_close.wait()
 
@@ -571,7 +572,7 @@ class VoiceDeliveryWatchdogTest(unittest.IsolatedAsyncioTestCase):
         requests = []
 
         class Model:
-            async def stream(self, messages, tools, *, thinking):
+            async def stream(self, messages, tools, *, thinking, instructions=None):
                 requests.append(list(messages))
                 if len(requests) == 1:
                     yield TextDelta("已交给设备。只播了一点。")
@@ -594,7 +595,7 @@ class VoiceDeliveryWatchdogTest(unittest.IsolatedAsyncioTestCase):
         second = "甲乙丙丁戊己庚辛壬癸" * 3 + "。"
 
         class Model:
-            async def stream(self, messages, tools, *, thinking):
+            async def stream(self, messages, tools, *, thinking, instructions=None):
                 yield TextDelta(f"第一句。{second}迟到句。")
 
         class TTS:
@@ -629,7 +630,7 @@ class VoiceDeliveryWatchdogTest(unittest.IsolatedAsyncioTestCase):
                 produced = asyncio.Event()
 
                 class Model:
-                    async def stream(self, messages, tools, *, thinking):
+                    async def stream(self, messages, tools, *, thinking, instructions=None):
                         yield TextDelta("持续播放。不会播完。" if continuous else "持续播放。")
 
                 class TTS:
@@ -984,7 +985,7 @@ class VoiceInputTest(unittest.IsolatedAsyncioTestCase):
         events, prompts = [], []
 
         class Model:
-            async def stream(self, messages, tools, *, thinking):
+            async def stream(self, messages, tools, *, thinking, instructions=None):
                 prompts.append(messages[-1])
                 yield TextDelta("正在回复。")
 
@@ -1236,7 +1237,7 @@ class VoiceInputTest(unittest.IsolatedAsyncioTestCase):
         calls = []
 
         class Model:
-            async def stream(self, messages, tools, *, thinking):
+            async def stream(self, messages, tools, *, thinking, instructions=None):
                 calls.append(messages)
                 if len(calls) == 1:
                     yield ToolReady(ToolCall("a", "wait", "{}"))
@@ -1270,7 +1271,7 @@ class VoiceInputTest(unittest.IsolatedAsyncioTestCase):
                     self.assertEqual(device.pull(4), _A * 4)
                     await runtime.wait_idle()
                     self.assertTrue(tool_done.is_set())
-                    self.assertEqual([msg.content for msg in calls[-1] if msg.role == "tool"], ["工具结果"])
+                    self.assertEqual([call.result for call in tool_calls(calls[-1])], ["工具结果"])
                     self.assertEqual(calls[-1][-1].content, "转写结果")
             finally:
                 await runtime.close()
@@ -1290,7 +1291,7 @@ class VoiceInputTest(unittest.IsolatedAsyncioTestCase):
                 await asyncio.Event().wait()
 
         class Model:
-            async def stream(self, messages, tools, *, thinking):
+            async def stream(self, messages, tools, *, thinking, instructions=None):
                 prompts.append(messages)
                 if len(prompts) == 1:
                     yield TextDelta("已交付。" + "甲乙丙丁戊己庚辛壬癸" * 3 + "。")

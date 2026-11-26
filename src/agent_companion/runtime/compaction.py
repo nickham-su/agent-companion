@@ -112,7 +112,8 @@ class Compactions:
         )
 
     def start(self, session_id: str, prefix: Prefix, prompt: list[Message], tools: Sequence[ToolSpec], *,
-               model: Model, thinking: bool, timeout: float, run_id: str | None = None) -> None:
+               model: Model, thinking: bool, timeout: float, run_id: str | None = None,
+               instructions: str | None = None) -> None:
         # 与 can_start 之间无 await；冻结工具定义中可变的 schema。
         if self._closed or self._generating is not None:
             return
@@ -123,7 +124,7 @@ class Compactions:
             return
         self._active_model = model
         self._generating = asyncio.create_task(self._generate(
-            session_id, prefix, tuple(prompt), frozen_tools, model, thinking, timeout, run_id))
+            session_id, prefix, tuple(prompt), frozen_tools, model, thinking, timeout, run_id, instructions))
 
     def failed(self, session_id: str, prefix: Prefix, reason: str) -> None:
         if not self._closed:
@@ -131,7 +132,8 @@ class Compactions:
             _LOG.warning("model summary unavailable (%s); preserving original context", reason)
 
     async def _generate(self, session_id: str, prefix: Prefix, prompt: tuple[Message, ...],
-                         tools: tuple[ToolSpec, ...], model: Model, thinking: bool, timeout: float, run_id: str | None) -> None:
+                         tools: tuple[ToolSpec, ...], model: Model, thinking: bool, timeout: float, run_id: str | None,
+                         instructions: str | None) -> None:
         diagnostics = ModelRequestDiagnostics("summary", timeout, run_id=run_id)
         try:
             loop = asyncio.get_running_loop()
@@ -139,7 +141,7 @@ class Compactions:
             stop_stream = getattr(model, "stop_stream", None)
             with diagnostics.activate():
                 async with model_deadline_at(expires, stop_stream) as deadline:
-                    content = await _summarize(model, prompt, tools, thinking)
+                    content = await _summarize(model, prompt, tools, thinking, instructions)
             if deadline.expired() or loop.time() >= expires:
                 raise TimeoutError
             self._remember(session_id, _Remembered(
@@ -158,9 +160,10 @@ class Compactions:
             self._active_model = None
 
 
-async def _summarize(model: Model, messages: Sequence[Message], tools: Sequence[ToolSpec], thinking: bool) -> str:
+async def _summarize(model: Model, messages: Sequence[Message], tools: Sequence[ToolSpec], thinking: bool,
+                     instructions: str | None = None) -> str:
     parts: list[str] = []
-    async with aclosing(model.stream(messages, tools, thinking=thinking)) as events:
+    async with aclosing(model.stream(messages, tools, thinking=thinking, instructions=instructions)) as events:
         async for event in events:
             if isinstance(event, ToolReady):
                 raise ModelError("summary_tool_call")

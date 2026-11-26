@@ -25,8 +25,9 @@ class MiniMax(ChatCompletions):
                          replay_key=make_replay_key(_REPLAY_NAMESPACE, _ADAPTER_ID, model, base_url))
         self._effort = reasoning_effort
 
-    def _payload(self, messages: Sequence[Message], tools: Sequence[ToolSpec], thinking: bool) -> dict[str, Any]:
-        payload = self._request(messages, tools)
+    def _payload(self, messages: Sequence[Message], tools: Sequence[ToolSpec], thinking: bool, *,
+                 instructions: str | None = None) -> dict[str, Any]:
+        payload = self._request(messages, tools, instructions=instructions)
         payload["thinking"] = {"type": "adaptive" if thinking else "disabled"}
         payload["reasoning_split"] = True  # 不把 <think> 混进用户可见正文。
         if thinking and self._effort is not None:

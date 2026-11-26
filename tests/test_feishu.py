@@ -143,7 +143,7 @@ class _Model:
     def __init__(self):
         self.calls = []
 
-    async def stream(self, messages, tools, *, thinking):
+    async def stream(self, messages, tools, *, thinking, instructions=None):
         self.calls.append(tuple(messages))
         yield TextDelta("模拟回复")
 
@@ -406,7 +406,7 @@ class FeishuBackgroundDeliveryTests(unittest.IsolatedAsyncioTestCase):
                     await asyncio.wait_for(reply_sent.wait(), 1)
                     self.assertEqual(attempts, ["转写 0"])
                     self.assertEqual(model.calls[0][-1], Message("user", "文字纠正"))
-                    self.assertEqual([(row.message.role, row.message.content) for row in history.read_after("main")],
+                    self.assertEqual([(row.message.kind, row.message.content) for row in history.read_after("main")],
                                      [("user", "文字纠正"), ("assistant", "模拟回复")])
                     release_first.set()
                     await asyncio.wait_for(last_started.wait(), 1)
@@ -459,7 +459,7 @@ class FeishuBackgroundDeliveryTests(unittest.IsolatedAsyncioTestCase):
             return _success({"message_id": "om_reply"})
 
         class Echo:
-            async def stream(self, messages, tools, *, thinking):
+            async def stream(self, messages, tools, *, thinking, instructions=None):
                 yield TextDelta(f"回复 {messages[-1].content}")
 
         channel = FeishuChannel(FeishuCLI("lark-cli", ChannelUser(_PEER), timeout=2, runner=runner))
@@ -475,7 +475,7 @@ class FeishuBackgroundDeliveryTests(unittest.IsolatedAsyncioTestCase):
                     await asyncio.wait_for(main.wait_idle(), 1)
                     self.assertEqual(sent, ["回复 0"])
                     self.assertEqual([row.message.content for row in history.read_after("main") if
-                                      row.message.role == "assistant"], [f"回复 {i}" for i in range(10)])
+                                      row.message.kind == "assistant"], [f"回复 {i}" for i in range(10)])
                     self.assertEqual([outcome.delivery_status for outcome in history.outcomes("main")],
                                      [DeliveryStatus.FULL] * 10)
                     release_first.set()
@@ -539,7 +539,7 @@ class FeishuBackgroundDeliveryTests(unittest.IsolatedAsyncioTestCase):
                 outbound = []
 
                 class Model:
-                    async def stream(self, messages, tools, *, thinking):
+                    async def stream(self, messages, tools, *, thinking, instructions=None):
                         yield TextDelta(full)
 
                 class Voice:
@@ -593,7 +593,7 @@ class FeishuBackgroundDeliveryTests(unittest.IsolatedAsyncioTestCase):
                 finally:
                     await channel.close()
                 self.assertEqual(outbound, [(_PEER, saved, Message("assistant", saved))] if expected_to_send else [])
-                assistant = [entry.message for entry in history.read_after("main") if entry.message.role == "assistant"]
+                assistant = [entry.message for entry in history.read_after("main") if entry.message.kind == "assistant"]
                 outcomes = history.outcomes("main")
                 self.assertEqual(assistant, [] if case in ("commit failed", "zero") else [Message("assistant", saved)])
                 expected_status = DeliveryStatus.UNKNOWN if case == "invalid receipt" else status
@@ -1429,7 +1429,7 @@ class FeishuPollingTests(unittest.IsolatedAsyncioTestCase):
         started, release = asyncio.Event(), asyncio.Event()
 
         class BlockedModel(_Model):
-            async def stream(self, messages, tools, *, thinking):
+            async def stream(self, messages, tools, *, thinking, instructions=None):
                 self.calls.append(tuple(messages))
                 if len(self.calls) == 1:
                     started.set()

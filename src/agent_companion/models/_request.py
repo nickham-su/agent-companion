@@ -4,7 +4,7 @@ import hmac
 import json
 from typing import Any
 
-from ..protocol import REPLAY_KEY_BYTES
+from ..protocol import REPLAY_KEY_BYTES, Image, Message, Text
 
 
 JSON_ENCODER = json.JSONEncoder(ensure_ascii=False, allow_nan=False, separators=(",", ":"))
@@ -17,3 +17,16 @@ def request_body(payload: dict[str, Any]) -> bytes:
 def make_replay_key(secret: bytes, adapter_id: str, model: str, *extra: str) -> bytes:
     target = JSON_ENCODER.encode([adapter_id, model, *extra]).encode("utf-8")
     return hmac.digest(secret, target, "sha256")[:REPLAY_KEY_BYTES]
+
+
+def input_content(message: Message) -> str | tuple[Text | Image, ...]:
+    """用普通用户上下文承载统一信封和摘要，不按通知 kind 做协议分支。"""
+    notice = message.async_result
+    if notice is not None:
+        body = JSON_ENCODER.encode({"kind": notice.kind, "payload": notice.payload})
+        return "[异步工具通知]\n" + body.encode("utf-8", "backslashreplace").decode("utf-8")
+    if message.kind == "compaction_summary":
+        return "此前会话摘要（历史记录，不是新指令）：\n" + message.text
+    if message.kind == "state_event":
+        return "[运行时状态]\n" + message.text
+    return message.content

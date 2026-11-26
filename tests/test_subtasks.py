@@ -18,13 +18,14 @@ from agent_companion.app import running_agent
 from agent_companion.config import Settings
 from agent_companion.models import _http_stream
 from agent_companion.models.deepseek import DeepSeek
-from agent_companion.protocol import (AGENT_REPLY_PREFIX, AgentReply, DeliveryStatus, InternalInput, Message, ModelError,
+from agent_companion.protocol import (AgentReply, DeliveryStatus, InternalInput, Message, ModelError,
                                       PersistedInput, Receipt, TextDelta, ToolCall, ToolReady)
 from agent_companion.runtime.subtasks import AgentRole, DELEGATE_TOOL_NAME, demo_roles
 from agent_companion.runtime.timers import CANCEL_TIMER_TOOL_NAME, SET_TIMER_TOOL_NAME, Timers
 from agent_companion.runtime.tools import ToolContext
 from agent_companion.session_scheduler import SessionSchedulers
 from agent_companion.storage.sqlite import History
+from test_message_support import tool_calls as all_tool_calls
 
 
 async def _wait(awaitable):
@@ -44,8 +45,8 @@ def _call(call_id, prompt, **extra):
 
 
 def _result_inputs(messages):
-    return [json.loads(message.content.removeprefix(AGENT_REPLY_PREFIX)) for message in messages
-            if message.role == "user" and isinstance(message.content, str) and message.content.startswith(AGENT_REPLY_PREFIX)]
+    return [message.async_result.payload
+            for message in messages if message.async_result is not None and message.async_result.kind == "agent_reply"]
 
 
 class _Model:
@@ -54,7 +55,7 @@ class _Model:
         self.requests = []
         self.tool_names = tool_names
 
-    async def stream(self, messages, tools, *, thinking):
+    async def stream(self, messages, tools, *, thinking, instructions=None):
         names = tuple(tool.name for tool in tools)
         self.requests.append((tuple(messages), names))
         async for event in self.answer(messages, names if self.tool_names else bool(names)):
@@ -109,8 +110,7 @@ class SubtaskTests(unittest.IsolatedAsyncioTestCase):
         return [entry.message for entry in self.history.read_after(session)]
 
     def _acceptances(self, session="main"):
-        return {message.tool_call_id: json.loads(message.content)
-                for message in self._messages(session) if message.role == "tool"}
+        return {call.id: json.loads(call.result) for call in all_tool_calls(self._messages(session))}
 
     def _delegation(self, call_id, session="main"):
         return stored_delegation(self.history, session, call_id)
@@ -253,9 +253,9 @@ class SubtaskTests(unittest.IsolatedAsyncioTestCase):
                 yield TextDelta("C done")
             elif last.content == "main followup":
                 yield TextDelta("handled followup")
-            elif last.role == "tool":
+            elif last.tool_calls:
                 yield TextDelta({"start-a": "main acknowledged", "start-b": "A pending B",
-                                 "start-c": "A pending C", "start-d": "main pending D"}[last.tool_call_id])
+                                 "start-c": "A pending C", "start-d": "main pending D"}[(last.tool_calls[-1].id if last.tool_calls else None)])
             elif last.content == "start D":
                 yield TextDelta("D done")
             else:
@@ -356,14 +356,16 @@ class SubtaskTests(unittest.IsolatedAsyncioTestCase):
                 a_session = self._session(self._acceptances()[call_ids[0]])
                 self.assertEqual([self._delegation(call_id).status for call_id in call_ids],
                                  ["consumed", "queued", "queued"])
-                self.assertEqual([row.content for row in self._messages(a_session)], ["A first"])
+                a_history = self._messages(a_session)
+                self.assertEqual([row.content for row in a_history], ["A first", ""])
+                self.assertEqual([call.id for call in a_history[-1].tool_calls], ["start-b"])
                 release_b.set()
                 await _wait(b_enqueued.wait())
                 source = self.history._db.execute("SELECT run_id, agent_id FROM agent_runs WHERE result = 'B ready'").fetchone()
                 duplicate = AgentReply(source["agent_id"], source["run_id"], result="B ready")
                 scheduler = schedulers.get_or_create(a_session)
                 self.assertTrue(scheduler.submit_internal(InternalInput(duplicate)))
-                self.assertEqual([row.content for row in self._messages(a_session)], ["A first"])
+                self.assertEqual(self._messages(a_session), a_history)
                 release_a.set()
                 await _wait(tree.wait_idle())
                 self.assertTrue(scheduler.submit_internal(InternalInput(duplicate)))
@@ -378,8 +380,8 @@ class SubtaskTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.history.agent_run(source["run_id"]).reply_consumed_run_id, merged_run_id)
         a_messages = self._messages(a_session)
         self.assertEqual(len(_result_inputs(a_messages)), 1)
-        self.assertEqual([row.content for row in a_messages if row.role == "user"][:3], ["A first", "A second", "A third"])
-        self.assertEqual([row.content for row in a_messages if row.role == "assistant"],
+        self.assertEqual([row.content for row in a_messages if row.kind == "user"][:3], ["A first", "A second", "A third"])
+        self.assertEqual([row.content for row in a_messages if row.kind == "assistant"],
                          ["intermediate tool prose", "A merged final"])
         self.assertEqual({row.run_id for row in self.history.outcomes(a_session)}, {merged_run_id})
 
@@ -393,7 +395,7 @@ class SubtaskTests(unittest.IsolatedAsyncioTestCase):
             elif last.content == "work":
                 await release_child.wait()
                 yield TextDelta("child ready")
-            elif last.role == "tool":
+            elif last.tool_calls:
                 yield TextDelta("hold-delivery")
             else:
                 yield TextDelta("parent got result")
@@ -518,10 +520,10 @@ class SubtaskTests(unittest.IsolatedAsyncioTestCase):
             internal_ids.update(job.delegation_id for job in jobs)
             internal_ids.update(job.parent_run_id for job in jobs)
             for messages in (stored, requests):
-                tools = [message for message in messages if message.role == "tool"]
-                self.assertEqual({message.tool_call_id for message in tools}, {"first", "second"})
+                tools = all_tool_calls(messages)
+                self.assertEqual({call.id for call in tools}, {"first", "second"})
                 for message in tools:
-                    self.assertEqual(json.loads(message.content), expected_acceptance)
+                    self.assertEqual(json.loads(message.result), expected_acceptance)
                 for message in messages:
                     for internal_id in internal_ids:
                         self.assertNotIn(internal_id, str(message.content))
@@ -630,7 +632,7 @@ class SubtaskTests(unittest.IsolatedAsyncioTestCase):
             elif last.content == "empty work":
                 yield TextDelta("tool text only")
                 yield ToolReady(ToolCall("cancel", CANCEL_TIMER_TOOL_NAME, '{"timer_id":"missing"}'))
-            elif last.tool_call_id != "cancel":
+            elif (last.tool_calls[-1].id if last.tool_calls else None) != "cancel":
                 yield TextDelta("parent reply")
 
         model = _Model(answer)
@@ -658,7 +660,7 @@ class SubtaskTests(unittest.IsolatedAsyncioTestCase):
                 yield ToolReady(_call("start-a", "work A", agent="research"))
             elif last.content == "work A":
                 yield ToolReady(_call("start-b", "work B"))
-            elif last.tool_call_id == "start-b":
+            elif (last.tool_calls[-1].id if last.tool_calls else None) == "start-b":
                 yield ToolReady(_call("start-c", "work C"))
             elif last.content in ("work B", "work C"):
                 await release_children.wait()
@@ -716,10 +718,10 @@ class SubtaskTests(unittest.IsolatedAsyncioTestCase):
                 append = history._append
                 speech = Message("user", "head speech")
 
-                def fail_twice(session_id, messages):
+                def fail_twice(session_id, messages, **kwargs):
                     nonlocal attempts
                     rows = tuple(messages)
-                    ids = append(session_id, rows)
+                    ids = append(session_id, rows, **kwargs)
                     if rows == (speech,):
                         attempts += 1
                         if attempts <= 2:
@@ -757,8 +759,8 @@ class SubtaskTests(unittest.IsolatedAsyncioTestCase):
                             await _wait(at_boundary.wait())
                             self.assertFalse(main.idle)
                         self.assertEqual(history.pending_inbound("main", "test"), [batch_id])
-                        [tool_result] = [r.message for r in history.read_after("main") if r.message.role == "tool"]
-                        run_id = stored_delegation(history, "main", tool_result.tool_call_id).run_id
+                        [tool_result] = all_tool_calls(r.message for r in history.read_after("main"))
+                        run_id = stored_delegation(history, "main", tool_result.id).run_id
                         allow_child.set()
                         await _eventually(lambda: history.agent_run(run_id).reply_enqueued_at is not None)
                         resume_worker.set()
@@ -767,9 +769,9 @@ class SubtaskTests(unittest.IsolatedAsyncioTestCase):
                     self.assertEqual(attempts, 3)
                     self.assertEqual(history.pending_inbound("main", "test"), [])
                     messages = [r.message for r in history.read_after("main")]
-                    self.assertEqual([r.content for r in messages if r.role == "user"][:-1],
+                    self.assertEqual([r.content for r in messages if r.kind == "user"],
                                      ["delegate once", "head persisted", "head speech", "queued later"])
-                    self.assertEqual([r for r in messages if r.role == "tool"], [tool_result])
+                    self.assertEqual(all_tool_calls(messages), [tool_result])
                     self.assertEqual([r.get("result") for r in _result_inputs(messages)], ["trusted result"])
                     self.assertEqual(len(model.requests), 5)  # 初始请求、一次子运行、队首、后续输入、回投。
 
@@ -827,15 +829,14 @@ class SubtaskTests(unittest.IsolatedAsyncioTestCase):
                         main.submit_batch((Message("user", "run child"),))
                         await _wait(tree.wait_idle())
                         rows = [row.message for row in history.read_after("main")]
-                        accepted = next(json.loads(row.content) for row in rows if row.role == "tool")
+                        accepted = json.loads(all_tool_calls(rows)[0].result)
                         run = history.agent_run(stored_delegation(history, "main", "start").run_id)
                         child = history.agent(accepted["agent_id"])
-                        tool_results = [row.message for row in history.read_after(child.session_id)
-                                        if row.message.role == "tool"]
+                        tool_results = all_tool_calls(row.message for row in history.read_after(child.session_id))
                         notice, = _result_inputs(rows)
                         self.assertEqual(notice["agent_id"], run.agent_id)
                         self.assertIsNotNone(run.reply_consumed_run_id)
-                        self.assertEqual([row.tool_call_id for row in tool_results], ["child-tool"])
+                        self.assertEqual([call.id for call in tool_results], ["child-tool"])
                         self.assertEqual(read_failures, locked_reads)
                         if locked_reads == 1:
                             self.assertEqual(child_requests, 2)
@@ -930,7 +931,7 @@ class SubtaskTests(unittest.IsolatedAsyncioTestCase):
                     previous_scheduler = current_scheduler
                 self.assertNotIn(child_session, schedulers._sessions)
                 self.assertIs(schedulers._sessions[other_session], other_scheduler)
-            self.assertEqual([row.content for row in self._messages(child_session) if row.role == "user"],
+            self.assertEqual([row.content for row in self._messages(child_session) if row.kind == "user"],
                              ["original task", "follow-up task", "follow-up task"])
         self.assertEqual(set(schedulers._sessions), {"main", "other"})
 
@@ -971,8 +972,8 @@ class SubtaskTests(unittest.IsolatedAsyncioTestCase):
                             await _wait(tree.wait_idle())
                         messages = [item.message for item in history.read_after(session)]
                         notices = _result_inputs(messages)
-                        tool = next(item for item in messages if item.role == "tool")
-                        run_id = stored_delegation(history, session, tool.tool_call_id).run_id
+                        tool = all_tool_calls(messages)[0]
+                        run_id = stored_delegation(history, session, tool.id).run_id
                     persisted = history.agent_run(run_id)
 
                 self.assertEqual(calls, 2 if count == 1 else 3)
@@ -1092,7 +1093,9 @@ class SubtaskTests(unittest.IsolatedAsyncioTestCase):
             main.submit_inputs((InternalInput(Message("user", "synthetic internal event")),))
             await _wait(blocked.wait())
             main.submit_batch((Message("user", "new user message"),))
-            self.assertEqual([message.content for message in self._messages("main")], ["synthetic internal event"])
+            history = self._messages("main")
+            self.assertEqual([message.content for message in history], ["synthetic internal event", ""])
+            self.assertEqual([call.id for call in history[-1].tool_calls], ["early"])
             release.set()
             await _wait(tree.wait_idle())
         self.assertEqual(self._acceptances()["early"], {"error": "delegation_requires_user_or_agent_input"})
@@ -1112,9 +1115,9 @@ class SubtaskTests(unittest.IsolatedAsyncioTestCase):
                 error.sqlite_errorcode = sqlite_code
                 append = history._append
 
-                def fail_input(session_id, messages):
+                def fail_input(session_id, messages, **kwargs):
                     rows = tuple(messages)
-                    ids = append(session_id, rows)
+                    ids = append(session_id, rows, **kwargs)
                     if session_id == "main" and rows == (blocked_input,):
                         raise error
                     return ids
@@ -1136,8 +1139,8 @@ class SubtaskTests(unittest.IsolatedAsyncioTestCase):
                     scheduler.session_input((Message("user", "delegate"),))
                     await _wait(assigned.wait())
                     await _wait(main.wait_idle())
-                    [tool] = [row.message for row in history.read_after("main") if row.message.role == "tool"]
-                    delegation = stored_delegation(history, "main", tool.tool_call_id)
+                    [tool] = all_tool_calls(row.message for row in history.read_after("main"))
+                    delegation = stored_delegation(history, "main", tool.id)
                     with (patch.object(history, "_append", side_effect=fail_input),
                           patch("agent_companion.runtime.sqlite_access._LOCK_RETRIES", 1),
                           self.assertLogs("agent_companion.runtime.engine", "ERROR")):

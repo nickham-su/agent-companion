@@ -2,16 +2,33 @@
 
 import asyncio
 from collections.abc import AsyncGenerator, AsyncIterator, Awaitable, Callable, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from enum import StrEnum
-import json
 import re
 from typing import Any, Literal, Protocol, runtime_checkable
 
 
+REPLAY_KEY_BYTES = 16
+
+
+@dataclass(frozen=True, slots=True)
+class PrivateData:
+    """适配器私有数据；Runtime 只携带，不解释。"""
+
+    compatibility_key: bytes = field(repr=False)
+    payload: bytes = field(repr=False)
+
+    def __post_init__(self) -> None:
+        if type(self.compatibility_key) is not bytes or len(self.compatibility_key) != REPLAY_KEY_BYTES:
+            raise ValueError("invalid compatibility key")
+        if type(self.payload) is not bytes:
+            raise ValueError("invalid private payload")
+
+
 @dataclass(frozen=True, slots=True)
 class Text:
-    text: str
+    text: str = field(repr=False)
+    private: PrivateData | None = field(default=None, repr=False)
 
 
 @dataclass(frozen=True, slots=True)
@@ -19,7 +36,6 @@ class Image:
     url: str = field(repr=False)
 
 
-Part = Text | Image
 OMITTED_INPUT_IMAGE = Text("[未见图，请告知]")
 
 
@@ -28,37 +44,75 @@ class ToolCall:
     id: str
     name: str
     arguments: str = field(repr=False)
-
-
-REPLAY_KEY_BYTES = 16
-
-
-@dataclass(frozen=True, slots=True)
-class Replay:
-    """完整响应的适配器私有数据。只有适配器可以比较 key 并解释 payload。"""
-
-    replay_key: bytes = field(repr=False)
-    payload: bytes = field(repr=False)
-
-    def __post_init__(self) -> None:
-        if type(self.replay_key) is not bytes or len(self.replay_key) != REPLAY_KEY_BYTES:
-            raise ValueError("invalid replay key")
-        if type(self.payload) is not bytes:
-            raise ValueError("invalid replay payload")
+    result: str | None = field(default=None, repr=False)
+    private: PrivateData | None = field(default=None, repr=False)
 
 
 @dataclass(frozen=True, slots=True)
-class ReplayReady:
-    replay: Replay = field(repr=False)
+class Reasoning:
+    private: PrivateData = field(repr=False)
+
+
+Part = Text | Image | ToolCall | Reasoning
+MessageKind = Literal["user", "assistant", "state_event", "async_tool_result", "compaction_summary"]
 
 
 @dataclass(frozen=True, slots=True)
+class UserSource:
+    kind: Literal["human", "internal", "delegation"]
+    agent_id: str | None = None
+    delegation_id: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class AsyncToolResult:
+    kind: str
+    payload: dict[str, Any] = field(repr=False)
+
+
+@dataclass(frozen=True, slots=True, init=False)
 class Message:
-    role: Literal["system", "user", "assistant", "tool"]
-    content: str | tuple[Part, ...] = field(repr=False)
-    tool_calls: tuple[ToolCall, ...] = ()
-    tool_call_id: str | None = None
-    replay: Replay | None = field(default=None, repr=False)
+    kind: MessageKind
+    parts: tuple[Part, ...] = field(repr=False)
+    source: UserSource | None
+    async_result: AsyncToolResult | None = field(repr=False)
+
+    def __init__(self, kind: MessageKind, parts: str | tuple[Part, ...] = (), *,
+                 source: UserSource | None = None, async_result: AsyncToolResult | None = None) -> None:
+        if kind not in ("user", "assistant", "state_event", "async_tool_result", "compaction_summary"):
+            raise ValueError("unknown message kind")
+        if (async_result is not None) != (kind == "async_tool_result") or (async_result is not None and parts):
+            raise ValueError("async result messages require only a result envelope")
+        if source is not None and kind != "user":
+            raise ValueError("only user messages have a user source")
+        object.__setattr__(self, "kind", kind)
+        object.__setattr__(self, "parts", ((Text(parts),) if parts else ()) if isinstance(parts, str) else parts)
+        object.__setattr__(self, "source", (source or UserSource("human")) if kind == "user" else None)
+        object.__setattr__(self, "async_result", async_result)
+
+    @property
+    def text(self) -> str:
+        return "".join(part.text for part in self.parts if isinstance(part, Text))
+
+    @property
+    def content(self) -> str | tuple[Text | Image, ...]:
+        """普通正文视图；不包含私有数据、工具调用或通知信封。"""
+        if (any(isinstance(part, Image) for part in self.parts)
+                or self.kind == "user" and len(self.parts) > 1):
+            return tuple(Text(part.text) if isinstance(part, Text) else part
+                         for part in self.parts if isinstance(part, (Text, Image)))
+        return self.text
+
+    @property
+    def tool_calls(self) -> tuple[ToolCall, ...]:
+        return tuple(part for part in self.parts if isinstance(part, ToolCall))
+
+
+@dataclass(frozen=True, slots=True)
+class AssistantPartsReady:
+    """已验证的原始输出顺序；TextDelta 仍负责实时投递，ToolReady 仍负责派发。"""
+
+    parts: tuple[Part, ...] = field(repr=False)
 
 
 @dataclass(frozen=True, slots=True)
@@ -68,9 +122,6 @@ class PersistedInput:
     batch_id: int
 
 
-AGENT_REPLY_PREFIX = "[内部子任务结果]\n"
-
-
 @dataclass(frozen=True, slots=True)
 class DelegationTask:
     """已受理的父级委派；正文角色与可信来源分别处理。"""
@@ -78,7 +129,7 @@ class DelegationTask:
     delegation_id: str
     prompt: str = field(repr=False)
 
-    def to_model_message(self) -> Message:
+    def to_history_message(self) -> Message:
         return Message("user", self.prompt)
 
 
@@ -95,17 +146,13 @@ class AgentReply:
         if not self.agent_id or not self.run_id or (self.result is None) == (self.error is None):
             raise ValueError("agent reply requires source IDs and exactly one result or error")
 
-    def to_model_message(self) -> Message:
+    def to_history_message(self) -> Message:
         payload = {"agent_id": self.agent_id}
         if self.error is not None:
             payload.update(status="failed", error=self.error)
         else:
             payload.update(status="completed", result=self.result)
-        content = json.dumps(payload, ensure_ascii=False).encode("utf-8", "backslashreplace").decode("utf-8")
-        return Message("user", AGENT_REPLY_PREFIX + content)
-
-
-TIMER_EVENT_PREFIX = "[内部定时器事件]\n"
+        return Message("async_tool_result", async_result=AsyncToolResult("agent_reply", payload))
 
 
 @dataclass(frozen=True, slots=True)
@@ -116,7 +163,7 @@ class TimerFired:
     repeat: bool
     message: str | None = field(default=None, repr=False)
 
-    def to_model_message(self) -> Message:
+    def to_history_message(self) -> Message:
         completed = self.fire_count == self.max_fires
         if not self.repeat:
             description = "单次定时器已到期并完成，不再触发。"
@@ -124,7 +171,6 @@ class TimerFired:
             progress = f"定时器已触发（第 {self.fire_count}/{self.max_fires} 次），"
             description = progress + ("已达到最大次数，不再触发。" if completed else "还会继续触发。")
         payload = {
-            "event": "timer_fired",
             "timer_id": self.timer_id,
             "fire_count": self.fire_count,
             "max_fires": self.max_fires,
@@ -133,9 +179,7 @@ class TimerFired:
         }
         if self.message is not None:
             payload["message"] = self.message
-        # JSON 可包含孤立代理项；让它保持转义，避免传输或 SQLite 拒绝整条输入。
-        content = json.dumps(payload, ensure_ascii=False).encode("utf-8", "backslashreplace").decode("utf-8")
-        return Message("user", TIMER_EVENT_PREFIX + content)
+        return Message("async_tool_result", async_result=AsyncToolResult("timer_fired", payload))
 
 
 @dataclass(frozen=True, slots=True)
@@ -144,8 +188,10 @@ class InternalInput:
 
     content: Message | AgentReply | DelegationTask | TimerFired = field(repr=False)
 
-    def to_model_message(self) -> Message:
-        return self.content if isinstance(self.content, Message) else self.content.to_model_message()
+    def to_history_message(self) -> Message:
+        if isinstance(self.content, Message):
+            return replace(self.content, source=UserSource("internal"))
+        return self.content.to_history_message()
 
 
 # 未包装的 Message 表示真实用户输入。
@@ -162,9 +208,14 @@ def validate_input_items(items: Sequence[InputItem]) -> None:
         message = item.content if isinstance(item, InternalInput) else item
         if isinstance(item, InternalInput) and isinstance(message, (AgentReply, DelegationTask, TimerFired)):
             continue
-        if (not isinstance(message, Message) or message.role != "user" or message.tool_calls
-                or message.tool_call_id is not None or message.replay is not None):
+        if not is_human_message(message):
             raise ValueError("runtime inputs must be plain user messages")
+
+
+def is_human_message(message: object) -> bool:
+    return (isinstance(message, Message) and message.kind == "user" and message.source == UserSource("human")
+            and all(isinstance(part, Image) or isinstance(part, Text) and part.private is None
+                    for part in message.parts))
 
 
 @dataclass(frozen=True, slots=True)
@@ -201,7 +252,7 @@ class ModelClosing:
     complete: bool
 
 
-ModelEvent = TextDelta | ToolReady | ReplayReady | InputUsage | ModelClosing
+ModelEvent = TextDelta | ToolReady | AssistantPartsReady | InputUsage | ModelClosing
 
 
 class ModelError(Exception):
@@ -230,7 +281,7 @@ _MODEL_DIAGNOSTICS = frozenset({
 
 class Model(Protocol):
     def stream(
-        self, messages: Sequence[Message], tools: Sequence[ToolSpec], *, thinking: bool
+        self, messages: Sequence[Message], tools: Sequence[ToolSpec], *, thinking: bool, instructions: str | None = None
     ) -> AsyncGenerator[ModelEvent, None]: ...
 
 

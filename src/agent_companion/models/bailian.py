@@ -16,6 +16,7 @@ _REPLAY_NAMESPACE = b"agent-companion/bailian-replay"  # 明文不绑定 API Key
 
 class Bailian(ChatCompletions):
     adapter = _ADAPTER_ID
+    include_tool_index = True
 
     def __init__(self, client: httpx.AsyncClient, *, model: str, api_key: str, base_url: str,
                  preserve_thinking: bool | None = None) -> None:
@@ -28,13 +29,9 @@ class Bailian(ChatCompletions):
             return None
         return super()._reasoning(message)
 
-    def _payload(self, messages: Sequence[Message], tools: Sequence[ToolSpec], thinking: bool) -> dict[str, Any]:
-        payload = self._request(messages, tools)
-        # 百炼历史工具调用要求 index；按当前消息的数组顺序重新编号。
-        for item in payload["messages"]:
-            if item["role"] == "assistant":
-                for index, call in enumerate(item.get("tool_calls", ())):
-                    call["index"] = index
+    def _payload(self, messages: Sequence[Message], tools: Sequence[ToolSpec], thinking: bool, *,
+                 instructions: str | None = None) -> dict[str, Any]:
+        payload = self._request(messages, tools, instructions=instructions)
         payload["enable_thinking"] = thinking
         if self._preserve_thinking is not None:
             payload["preserve_thinking"] = self._preserve_thinking

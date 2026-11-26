@@ -3,8 +3,8 @@
 import asyncio
 from collections import deque
 from collections.abc import Callable, Sequence
-from contextlib import aclosing
-from dataclasses import dataclass
+from contextlib import ExitStack, aclosing
+from dataclasses import dataclass, replace
 import logging
 from sqlite3 import OperationalError
 from typing import Literal
@@ -12,9 +12,9 @@ from uuid import uuid4
 
 from ..config import RuntimeSettings
 from ..model_diagnostics import ModelRequestDiagnostics, failure_category
-from ..protocol import (AgentReply, Channel, DelegationTask, DeliveryStatus, InputItem, InputUsage, InternalInput,
-                         Message, Model, ModelClosing, ModelError, PersistedInput, Receipt, ReplayReady,
-                         ReplyDelivery, ReplyInfo, ReplyStream, SelectableChannel, TextDelta, ToolCall,
+from ..protocol import (AgentReply, AssistantPartsReady, Channel, DelegationTask, DeliveryStatus, InputItem, InputUsage,
+                         InternalInput, Message, Model, ModelClosing, ModelError, Part, PersistedInput, Receipt, Reasoning,
+                         ReplyDelivery, ReplyInfo, ReplyStream, SelectableChannel, Text, TextDelta, ToolCall,
                          ToolReady, validate_input_items)
 from ..storage.sqlite import (Agent, AgentReplyInput, DelegatedInput, History, ReplyOutcome, RetryableInputWrite,
                               is_sqlite_lock_error)
@@ -38,8 +38,47 @@ class _InputBatch:
     persisted_ids: frozenset[int] = frozenset()
 
 
+def _settled_parts(visible: str, calls: Sequence[ToolCall], results: dict[str, str],
+                   ordered: tuple[Part, ...] | None) -> tuple[Part, ...]:
+    """将确认前缀和已派发的调用填到适配器给出的原始位置。"""
+    pending = {call.id: call for call in calls}
+    if ordered is None:
+        return ((Text(visible),) if visible else ()) + tuple(
+            replace(call, result=results.get(call.id)) for call in calls)
+    parts: list[Part] = []
+    offset = 0
+    for part in ordered:
+        if isinstance(part, Text):
+            text = visible[offset:offset + len(part.text)]
+            offset += len(part.text)
+            if text:
+                # 部分送达时不能使用原生条目 ID 引用未送达的剩余正文。
+                parts.append(part if text == part.text else Text(text))
+        elif isinstance(part, ToolCall):
+            if (call := pending.pop(part.id, None)) is not None:
+                parts.append(replace(call, result=results.get(call.id)))
+        elif isinstance(part, Reasoning):
+            parts.append(part)
+    if offset < len(visible):
+        parts.append(Text(visible[offset:]))
+    parts.extend(replace(call, result=results.get(call.id)) for call in pending.values())
+    return tuple(parts)
+
+
 class _InputWriteFailed(Exception):
     """输入未确认落库，与已落库后的执行或回复失败区分。"""
+
+
+class _ToolCallWriteFailed(Exception):
+    """调用未确认落库，不是模型错误，不能执行或重新结算。"""
+
+
+class _ToolDispatchTimeout(TimeoutError):
+    """Runtime 等待写入调用时到达截止，不是模型流读取失败。"""
+
+
+class _ToolResultWriteFailed(Exception):
+    """确认正文已结算，但工具结果写入失败，不自动续轮。"""
 
 
 class Runtime:
@@ -244,7 +283,7 @@ class Runtime:
                 rows.append(item.batch_id)
             elif isinstance(item, InternalInput):
                 content = item.content
-                message = item.to_model_message()
+                message = item.to_history_message()
                 if isinstance(content, DelegationTask):
                     rows.append(DelegatedInput(content.delegation_id, message))
                 elif isinstance(content, AgentReply):
@@ -440,9 +479,12 @@ class Runtime:
         info = ReplyInfo(uuid4().hex, self.session_id, run_id, loop.time())
         diagnostics = ModelRequestDiagnostics("reply", self._settings.model_timeout, run_id, info.reply_id)
         text: list[str] = []
-        replay = None
+        output_parts: tuple[Part, ...] | None = None
         request_locks = self._tools.request_locks()
-        scheduled: dict[str, tuple[ToolCall, asyncio.Task[str]]] = {}
+        accepted_calls: dict[str, ToolCall] = {}
+        scheduled: dict[str, asyncio.Task[bool]] = {}
+        ownership = ExitStack()
+        owns_reply = False
 
         def is_generated_prefix(prefix: str) -> bool:
             offset = 0
@@ -500,12 +542,39 @@ class Runtime:
             # 汇合后也尊重投递超时等不完整结算。
             return not (self._closed or voice_incomplete or voice_interrupted())
 
+        def reply_write_failed() -> None:
+            # 回复或工具结果写入失败；只作废唤醒，不动真实输入。
+            self._reply_commit_failed = True
+            self._trigger = None
+
+        def can_dispatch_tool() -> bool:
+            return accept_model_events and not self._closed and not voice_interrupted()
+
+        async def run_tool(call: ToolCall, context: ToolContext) -> bool:
+            try:
+                result = await self._tools.execute(call, context, request_locks=request_locks,
+                                                   can_start_serial=can_start_serial_tool)
+            except asyncio.CancelledError:
+                if asyncio.current_task().cancelling():
+                    raise  # Runtime 清理不伪造工具结果。
+                result = TOOL_CANCELLED
+            try:
+                await self._sqlite.write_input(
+                    lambda: self.history.record_tool_result(self.session_id, info.reply_id, call.id, result))
+            except Exception as exc:
+                reply_write_failed()
+                _LOG.error("tool result write failed; reply=%s error_type=%s sqlite_code=%s",
+                           info.reply_id, type(exc).__name__, getattr(exc, "sqlite_errorcode", None))
+                return False
+            return True
+
         async def read_model() -> bool:
-            nonlocal delivery, input_tokens, replay, read_deadline, reader_closing, model_complete
-            nonlocal selected, idle_timeout
+            nonlocal delivery, input_tokens, output_parts, read_deadline, reader_closing, model_complete
+            nonlocal selected, idle_timeout, owns_reply
             async with model_deadline_at(loop.time() + self._settings.model_timeout, stop_stream) as deadline:
                 read_deadline = deadline
-                async with aclosing(self._model.stream(messages, self._tools.specs, thinking=self._thinking)) as events:
+                async with aclosing(self._model.stream(messages, self._tools.specs, thinking=self._thinking,
+                                                       instructions=self._instructions)) as events:
                     async for event in events:
                         # 即使回执与这一帧同时就绪，也不能发布它或启动新的工具。
                         # 适配器在收到取消后吐出的迟到帧也一律丢弃。
@@ -549,24 +618,54 @@ class Runtime:
                                     await delivery_started
                         elif isinstance(event, InputUsage):
                             input_tokens = event.input_tokens
-                        elif isinstance(event, ReplayReady):
-                            if replay is not None:
+                        elif isinstance(event, AssistantPartsReady):
+                            if output_parts is not None:
                                 raise ModelError("invalid_sse_event")
-                            replay = event.replay
+                            output_parts = event.parts
                         elif isinstance(event, ToolReady):
                             call = event.call
-                            if call.id in scheduled:
+                            if call.id in accepted_calls:
                                 raise ModelError("duplicate_tool_id")
+                            staged = Message("assistant", _settled_parts(
+                                "", (*accepted_calls.values(), call), {}, output_parts))
+
+                            def persist_call() -> bool:
+                                nonlocal owns_reply
+                                # SQLite 锁重试会让出事件循环。每次真正写入前都重新核对路由。
+                                if not can_dispatch_tool() or deadline.expired():
+                                    return False
+                                if not owns_reply:
+                                    ownership.enter_context(self.history.own_reply(info.reply_id))
+                                    owns_reply = True
+                                self.history.stage_tool_calls(self.session_id, info.reply_id, staged)
+                                return True
+
+                            try:
+                                persisted = await self._sqlite.write_input(persist_call)
+                            except asyncio.CancelledError:
+                                # 截止也可能直接取消 SQLite 的等待，来不及走下面的检查。
+                                if deadline.expired():
+                                    raise _ToolDispatchTimeout from None
+                                raise
+                            except Exception:
+                                reply_write_failed()
+                                raise _ToolCallWriteFailed from None
+                            if persisted:
+                                accepted_calls[call.id] = call
+                            if not can_dispatch_tool():
+                                reader_closing = True
+                                deadline.disarm()
+                                return False
+                            if not persisted or deadline.expired():
+                                raise _ToolDispatchTimeout
                             context = ToolContext(self.session_id, run_id, call.id, has_user_input,
                                                   self.agent.agent_id if self.agent is not None else None,
                                                   has_agent_input, workspace=self._workspace, reply_id=info.reply_id)
-                            scheduled[call.id] = (call, loop.create_task(
-                                self._tools.execute(call, context, request_locks=request_locks,
-                                                    can_start_serial=can_start_serial_tool),
-                            ))
+                            scheduled[call.id] = loop.create_task(run_tool(call, context))
             return True
 
         model_task: asyncio.Task[bool] | None = None
+        interrupted_locally = False
 
         def retire_reader(task: asyncio.Task[bool]) -> None:
             nonlocal accept_model_events
@@ -580,11 +679,12 @@ class Runtime:
                     task.cancel()
 
         async def complete_model() -> str:
-            nonlocal model_task
+            nonlocal model_task, interrupted_locally
             with diagnostics.activate():
                 model_task = loop.create_task(read_model())
             while not model_task.done():
                 if voice_interrupted():
+                    interrupted_locally = True
                     retire_reader(model_task)
                     return "complete" if model_complete else "model_interrupted"
                 signal = delivery if delivery is not None else delivery_started
@@ -597,7 +697,10 @@ class Runtime:
             if model_task.cancelled():
                 # 只观察子任务的取消；真正的外层取消由 asyncio.wait 继续抛出。
                 return "model_cancelled"
-            return "complete" if model_task.result() else "model_interrupted"
+            if model_task.result():
+                return "complete"
+            interrupted_locally = True
+            return "model_interrupted"
 
         model_status = "complete"
         model_error = None
@@ -608,8 +711,11 @@ class Runtime:
                 model_status = await complete_model()
                 if model_status == "model_interrupted":
                     reply.abandon()
+            except _ToolCallWriteFailed:
+                raise
             except TimeoutError as exc:
                 model_status = "model_timeout"
+                interrupted_locally = isinstance(exc, _ToolDispatchTimeout)
                 diagnostics.failed(exc)
                 _LOG.warning("model request timed out; reply=%s", info.reply_id)
             except ModelError as exc:
@@ -630,7 +736,7 @@ class Runtime:
             _LOG.debug("model request finished; reply=%s status=%s input_tokens=%s output_chars=%d tools=%d elapsed_ms=%.0f",
                        info.reply_id, model_status, input_tokens, len(generated), len(scheduled),
                        (loop.time() - info.started_at) * 1000)
-            # 工具和投递一直独立运行；这个汇合点只提交成套的终态数据。
+            # 工具结果各自写入；汇合后提交确认正文和投递结算。
             receipt = await self._delivery_result(reply, delivery, generated, idle_timeout=idle_timeout)
             if selected is not None and selected.require_complete_model and model_status != "complete":
                 # 不把收齐了一段不完整模型输出记成用户已收到的正文。
@@ -638,36 +744,41 @@ class Runtime:
             voice_incomplete = (reply.voice_delivery and receipt is not None
                                 and receipt.status != DeliveryStatus.FULL)
             if model_status == "model_cancelled" and voice_interrupted():
+                interrupted_locally = True
                 model_status = "model_interrupted"
             # 内部会话不经过用户投递，只保留完整模型正文。
             generated_text = generated if not has_user_channel and model_status == "complete" else ""
             confirmed_text = receipt.confirmed if receipt else ""
-            calls = tuple(call for call, _ in scheduled.values())
             if scheduled:
-                await asyncio.wait([task for _, task in scheduled.values()])
-            results = [Message("tool", TOOL_CANCELLED if task.cancelled() else task.result(),
-                                 tool_call_id=call.id) for call, task in scheduled.values()]
-            # 完整模型流的协议回放元数据可保留成套工具调用；适配器仍仅从确认正文回放文本。
-            if model_status != "complete":
-                replay = None
-            # 零投递不保留未送达正文；仍可随空正文保存完整的协议回放。
-            keep_reply = (replay is not None or
-                          (receipt.status != DeliveryStatus.ZERO if receipt is not None else bool(generated_text)))
-            rows = ([Message("assistant", confirmed_text if receipt else generated_text, calls, replay=replay),
-                       *results]
-                      if keep_reply or calls else [])
+                await asyncio.wait(scheduled.values())
+            try:
+                # 只有正常汇合看见工具任务取消时，才沿用原有的取消文本。
+                results = {call_id: TOOL_CANCELLED for call_id, task in scheduled.items() if task.cancelled()}
+                written = [task.result() for task in scheduled.values() if not task.cancelled()]
+            except Exception:
+                reply_write_failed()
+                raise
+            visible = confirmed_text if receipt else generated_text
+            calls = tuple(accepted_calls.values())
+            # Runtime 本地中断不否定已验证的顺序；从适配器读流失败时仍不能使用私有回放。
+            if model_status == "complete" or (interrupted_locally and output_parts is not None):
+                parts = _settled_parts(visible, calls, results, output_parts)
+            else:
+                # 已知响应未完整结束时，不把暂存的私有数据当作有效回放。
+                parts = _settled_parts(visible, tuple(replace(call, private=None) for call in calls), results, None)
+            # 保留原来的投递结算，即使已确认正文为空；未送达正文绝不进入历史。
+            keep_reply = bool(parts) or (receipt is not None and receipt.status != DeliveryStatus.ZERO)
+            rows = [Message("assistant", parts)] if keep_reply else []
             outcome = ReplyOutcome(info.reply_id, info.session_id, run_id, model_status,
                                    receipt.status if receipt else None, model_error=model_error,
                                    input_tokens=input_tokens if model_status == "complete" else None)
             try:
                 await self._sqlite.write_input(lambda: self.history.finalize_reply(outcome, rows, **self._origin_options))
             except Exception:
-                # 没有可靠的旧回复结算；只作废唤醒，不动真实输入。也拒绝稍后到达的同一轮空结果。
-                self._reply_commit_failed = True
-                self._trigger = None
+                reply_write_failed()
                 raise
             _LOG.debug("reply committed; reply=%s receipt=%s confirmed_chars=%d tool_results=%d elapsed_ms=%.0f",
-                       info.reply_id, receipt.status if receipt else None, len(confirmed_text), len(results),
+                       info.reply_id, receipt.status if receipt else None, len(confirmed_text), sum(written) + len(results),
                        (loop.time() - info.started_at) * 1000)
             # 外部副本与主投递状态无关，只在历史事务成功后尽力入队。
             try:
@@ -676,12 +787,14 @@ class Runtime:
                     selected.after_commit(info, confirmed_text)
             except Exception:
                 _LOG.warning("background reply could not be queued; reply=%s", info.reply_id)
-            return model_status, bool(calls) and not voice_incomplete, generated_text or confirmed_text or None
+            if not all(written):
+                raise _ToolResultWriteFailed
+            return model_status, bool(scheduled) and not voice_incomplete, generated_text or confirmed_text or None
         finally:
-            unfinished = [task for _, task in scheduled.values() if not task.done()]
             # 异常退出时先撤销工具（含还在等锁的调用），再等待可能延迟的模型收尾。
-            for task in unfinished:
-                task.cancel()
+            for task in scheduled.values():
+                if not task.done():
+                    task.cancel()
             delivery_started.cancel()
             wait_for_child_model = False
             try:
@@ -700,8 +813,11 @@ class Runtime:
                     # 子任务仍持有串行执行权，原生传输收尾或耗尽预算后才能退出。
                     await asyncio.wait((model_task,))
             finally:
-                if unfinished:
-                    await asyncio.gather(*unfinished, return_exceptions=True)
+                try:
+                    if scheduled:
+                        await asyncio.gather(*scheduled.values(), return_exceptions=True)
+                finally:
+                    ownership.close()
 
     def _model_cleanup_finished(self, task: asyncio.Task[bool]) -> None:
         self._retired_models.discard(task)

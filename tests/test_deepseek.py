@@ -1,5 +1,6 @@
 import asyncio
 from contextlib import closing, contextmanager
+from dataclasses import replace
 import json
 import unittest
 from unittest.mock import patch
@@ -9,11 +10,13 @@ import httpx
 from agent_companion.config import RuntimeSettings
 from agent_companion.models.deepseek import MODEL_NAME, DeepSeek, _replay_key, build_request, parse_stream
 from agent_companion.protocol import (DeliveryStatus, Image, InputUsage, Message, ModelClosing, ModelError,
-                                      Receipt, Replay, ReplayReady, Text, TextDelta, ToolCall, ToolReady, ToolSpec)
+                                      Receipt, PrivateData, Reasoning, AssistantPartsReady, Text, TextDelta, ToolCall, ToolReady, ToolSpec)
+from agent_companion.runtime.compaction import Compactions, Prefix
 from agent_companion.runtime.context import _SUMMARIZE
 from agent_companion.runtime.engine import Runtime
 from agent_companion.runtime.tools import Tool, Tools
 from agent_companion.storage.sqlite import History
+from test_message_support import assistant_message, reasoning_parts
 
 
 SAMPLE_IMAGE = Image("data:image/png;base64,iVBORw0KGgo=")
@@ -180,21 +183,10 @@ class DeepSeekTest(unittest.IsolatedAsyncioTestCase):
                         runtime = Runtime("main", history, DeepSeek(client), Voice(), thinking=thinking, tools=tools)
                         try:
                             runtime.submit_batch((Message("user", "现有输入"),))
-                            if thinking and with_tools:
-                                with self.assertLogs("agent_companion.runtime.engine", "WARNING") as log:
-                                    await asyncio.wait_for(runtime.wait_idle(), 2)
-                                self.assertEqual(runtime.last_failure, "context_failed")
-                                self.assertTrue(any("runtime context failed (incompatible_protected_history)" in entry
-                                                    for entry in log.output))
-                                self.assertEqual(len(requests), 1)
-                            else:
-                                await asyncio.wait_for(runtime.wait_idle(), 2)
-                                self.assertIsNone(runtime.last_failure)
-                                self.assertEqual(len(requests), 2)
-                                request = requests[-1]
-                                self.assertEqual(bool(request.get("tools")), with_tools)
-                                self.assertEqual(request["messages"], [{"role": "user", "content": "现有输入"},
-                                                                       {"role": "assistant", "content": "已播放"}])
+                            await asyncio.wait_for(runtime.wait_idle(), 2)
+                            self.assertIsNone(runtime.last_failure)
+                            self.assertEqual(len(requests), 2)
+                            self.assertNotIn("reasoning_content", requests[1]["messages"][-1])
                             partial = history.read_after("main")[1].message
                             self.assertEqual(partial, Message("assistant", "已播放"))
                             outcome = history.outcomes("main")[0]
@@ -350,10 +342,10 @@ class DeepSeekTest(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(assistant["tool_calls"][0]["id"], "internal-call")
                 self.assertEqual(result, {"role": "tool", "content": "tool result", "tool_call_id": "internal-call"})
                 self.assertEqual([row.model_status for row in history.outcomes("main")], ["complete", "complete"])
-                first, _, final = [row.message for row in history.read_after("main")][1:]
-                self.assertEqual(first.replay, Replay(_replay_key(MODEL_NAME), b"tool reasoning"))
-                self.assertEqual((final.content, final.replay),
-                                 ("final answer", Replay(_replay_key(MODEL_NAME), b"final reasoning")))
+                first, final = [row.message for row in history.read_after("main")][1:]
+                self.assertEqual(reasoning_parts(first)[0], PrivateData(_replay_key(MODEL_NAME), b"tool reasoning"))
+                self.assertEqual((final.content, reasoning_parts(final)[0]),
+                                 ("final answer", PrivateData(_replay_key(MODEL_NAME), b"final reasoning")))
 
     async def test_internal_missing_done_never_saves_body_or_replay(self):
         for cancelled in (False, True):
@@ -604,6 +596,38 @@ class DeepSeekTest(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(history.read_after("child")[0].message, old)
             self.assertEqual([outcome.input_tokens for outcome in history.outcomes("child")], [300, 1, 2])
 
+    async def test_normal_and_summary_share_thinking_and_tools_replay_condition(self):
+        requests = []
+
+        def endpoint(request):
+            requests.append(json.loads(request.content))
+            frames = (chunk({"content": "synthetic reply"}), chunk(finish="stop"), "[DONE]")
+            return httpx.Response(200, text="".join(f"data: {frame}\n\n" for frame in frames))
+
+        old = [Message("user", "previous question"), Message("assistant", (
+            Reasoning(PrivateData(_replay_key(MODEL_NAME), b"synthetic thought")),
+            ToolCall("historic-call", SPEC.name, "{}", "historic result"),
+        ))]
+        for thinking, tools in ((True, (SPEC,)), (True, ()), (False, (SPEC,))):
+            with self.subTest(thinking=thinking, has_tools=bool(tools)), closing(History(":memory:")) as history:
+                compactions = Compactions(history)
+                async with httpx.AsyncClient(transport=httpx.MockTransport(endpoint)) as client:
+                    model = DeepSeek(client)
+                    try:
+                        async for _ in model.stream([*old, Message("user", "new question")], tools, thinking=thinking):
+                            pass
+                        compactions.start("main", Prefix(0, 1, 2), [*old, _SUMMARIZE], tools, model=model,
+                                          thinking=thinking, timeout=2)
+                        await asyncio.wait_for(asyncio.shield(compactions._generating), 2)
+                        self.assertIsNotNone(compactions.ready("main", 0))
+                    finally:
+                        await compactions.close()
+                ordinary, summary = requests[-2:]
+                self.assertEqual(ordinary["messages"][:-1], summary["messages"][:-1])
+                assistant, result = ordinary["messages"][1:3]
+                self.assertEqual(assistant.get("reasoning_content"), "synthetic thought" if thinking and tools else None)
+                self.assertEqual(result, {"role": "tool", "tool_call_id": "historic-call", "content": "historic result"})
+
     async def test_image_tool_and_reasoning_round_trip_over_sse(self):
         pending = []
         handler_calls = []
@@ -655,7 +679,7 @@ class DeepSeekTest(unittest.IsolatedAsyncioTestCase):
         assistant, result = pending[1]["messages"][-2:]
         self.assertEqual(assistant["reasoning_content"], "原始推理")
         self.assertEqual(result, {"role": "tool", "content": "尺寸为 2", "tool_call_id": "call-a"})
-        self.assertEqual(history.read_after("main")[1].message.replay, Replay(_replay_key(MODEL_NAME), "原始推理".encode()))
+        self.assertEqual(reasoning_parts(history.read_after("main")[1].message)[0], PrivateData(_replay_key(MODEL_NAME), "原始推理".encode()))
         self.assertEqual(history.search("main", keyword="原始推理"), [])
 
     async def test_json_looking_complete_before_finish_is_not_ready(self):
@@ -675,7 +699,9 @@ class DeepSeekTest(unittest.IsolatedAsyncioTestCase):
         await asyncio.sleep(0)
         self.assertFalse(task.done())
         release.set()
-        self.assertEqual(await asyncio.wait_for(task, 2), ToolReady(ToolCall("id", "test", "{}")))
+        ready = ToolCall("id", "test", "{}", private=PrivateData(_replay_key(MODEL_NAME), b"0"))
+        self.assertEqual(await asyncio.wait_for(task, 2), AssistantPartsReady((ready,)))
+        self.assertEqual(await anext(stream), ToolReady(ready))
         with self.assertRaises(StopAsyncIteration):
             await anext(stream)
 
@@ -705,20 +731,22 @@ class DeepSeekTest(unittest.IsolatedAsyncioTestCase):
                 _ = [event async for event in DeepSeek(client).stream([Message("user", "one")], (), thinking=False)]
 
     async def test_tool_blocks_have_no_reasoning_when_disabled(self):
-        args = [Message("assistant", "", (ToolCall("a", "test", "{}"),), replay=Replay(_replay_key(MODEL_NAME), b"internal")),
-                Message("tool", "ok", tool_call_id="a")]
+        args = [assistant_message("", (replace(ToolCall("a", "test", "{}"), result="ok"),), reasoning=PrivateData(_replay_key(MODEL_NAME), b"internal"))]
         request = build_request(args, [SPEC], thinking=False)
         self.assertEqual(request["thinking"], {"type": "disabled"})
         self.assertIsNone(request["messages"][0]["content"])
         self.assertNotIn("reasoning_content", request["messages"][0])
-        with self.assertRaisesRegex(ModelError, "missing_reasoning"):
-            build_request([Message("assistant", "history without protocol field")], [SPEC], thinking=True)
+        request = build_request([Message("assistant", "history without protocol field")], [SPEC], thinking=True)
+        self.assertNotIn("reasoning_content", request["messages"][0])
 
     async def test_text_is_immediate_and_complete_reasoning_is_delivered_once(self):
         stream = parse_stream(lines(chunk({"reasoning_content": "r", "content": "t"}),
                                     chunk({"reasoning_content": "续"}), chunk(finish="stop"), "[DONE]"))
         self.assertEqual(await anext(stream), TextDelta("t"))
-        self.assertEqual([event async for event in stream], [ReplayReady(Replay(_replay_key(MODEL_NAME), "r续".encode()))])
+        self.assertEqual([event async for event in stream], [AssistantPartsReady((
+            Reasoning(PrivateData(_replay_key(MODEL_NAME), b"r")), Text("t"),
+            Reasoning(PrivateData(_replay_key(MODEL_NAME), "续".encode())),
+        ))])
 
     async def test_explicit_empty_reasoning_survives_until_followup_with_tools(self):
         for reasoning in ({"reasoning_content": ""}, {}, {"reasoning_content": None}):
@@ -749,11 +777,11 @@ class DeepSeekTest(unittest.IsolatedAsyncioTestCase):
                 saved = history.read_after("main")[1].message
                 previous = requests[1]["messages"][1]
                 if reasoning.get("reasoning_content") == "":
-                    self.assertEqual(saved.replay, Replay(_replay_key(MODEL_NAME), b""))
+                    self.assertEqual(reasoning_parts(saved), (PrivateData(_replay_key(MODEL_NAME), b""),))
                     self.assertEqual(previous, {"role": "assistant", "content": "first answer", "reasoning_content": ""})
                 else:
-                    self.assertIsNone(saved.replay)
-                    self.assertEqual(previous["role"], "user")
+                    self.assertFalse(reasoning_parts(saved))
+                    self.assertEqual(previous["role"], "assistant")
                     self.assertIn("first answer", repr(previous))
                     self.assertNotIn("reasoning_content", previous)
 
@@ -762,7 +790,7 @@ class DeepSeekTest(unittest.IsolatedAsyncioTestCase):
                                                               chunk(finish="stop"), "[DONE]"))]
         self.assertEqual(events, [])
 
-    async def test_protected_tool_round_with_incompatible_replay_does_not_send_history(self):
+    async def test_tool_round_missing_reasoning_sends_history_and_surfaces_provider_rejection(self):
         calls = []
         requests = []
 
@@ -772,6 +800,8 @@ class DeepSeekTest(unittest.IsolatedAsyncioTestCase):
 
         def response(request):
             requests.append(json.loads(request.content))
+            if len(requests) == 2:
+                return httpx.Response(400)
             frames = [chunk(call(id="protected", function={"name": "test", "arguments": "{}"})),
                       chunk(finish="tool_calls"), "[DONE]"]
             return httpx.Response(200, text="".join(f"data: {frame}\n\n" for frame in frames))
@@ -783,26 +813,24 @@ class DeepSeekTest(unittest.IsolatedAsyncioTestCase):
                 try:
                     runtime.submit_batch([Message("user", "current input")])
                     await asyncio.wait_for(runtime.wait_idle(), 2)
-                    self.assertEqual(runtime.last_failure, "context_failed")
+                    self.assertEqual(runtime.last_failure, "model_failed")
                 finally:
                     await runtime.close()
-            self.assertEqual(len(requests), 1)
+            self.assertEqual(len(requests), 2)
+            assistant, result = requests[1]["messages"][-2:]
+            self.assertNotIn("reasoning_content", assistant)
+            self.assertEqual(assistant["tool_calls"][0]["id"], result["tool_call_id"])
             self.assertEqual(calls, ["protected"])
             self.assertEqual([row.message for row in history.read_after("main")][1:], [
-                Message("assistant", "", (ToolCall("protected", "test", "{}"),)),
-                Message("tool", "finished tool", tool_call_id="protected"),
+                assistant_message("", (ToolCall("protected", "test", "{}", "finished tool",
+                                                PrivateData(_replay_key(MODEL_NAME), b"0")),)),
             ])
 
     async def test_nonmatching_deepseek_replay_is_never_decoded(self):
-        bad = Replay(_replay_key(MODEL_NAME), b"\xff")
-        entry = Message("assistant", "confirmed", replay=bad)
+        bad = PrivateData(_replay_key(MODEL_NAME), b"\xff")
+        entry = assistant_message("confirmed", reasoning=bad)
         async with httpx.AsyncClient(transport=httpx.MockTransport(lambda _: httpx.Response(200))) as client:
-            with patch("agent_companion.models.deepseek._decode_reasoning", side_effect=AssertionError):
-                other = DeepSeek(client, model="other-model")
-                self.assertIsNone(other.history_replay_bytes(entry, [SPEC], thinking=True))
-                with self.assertRaisesRegex(ModelError, "missing_reasoning"):
-                    other._payload([entry], [SPEC], thinking=True)
-            same = DeepSeek(client)
-            self.assertIsNone(same.history_replay_bytes(entry, [SPEC], thinking=True))
-            with self.assertRaisesRegex(ModelError, "missing_reasoning"):
-                same._payload([entry], [SPEC], thinking=True)
+            for model in (DeepSeek(client, model="other-model"), DeepSeek(client)):
+                self.assertEqual(model.history_replay_bytes(entry, [SPEC], thinking=True), 0)
+                self.assertEqual(model._payload([entry], [SPEC], thinking=True)["messages"],
+                                 [{"role": "assistant", "content": "confirmed"}])
