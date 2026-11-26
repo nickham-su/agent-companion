@@ -49,6 +49,11 @@ class _CaptureQueue:
         self._lock = Lock()
         self._frames: deque[tuple[int, bytes]] = deque(maxlen=_MAX_INPUT_FRAMES)
         self._sequence = 0
+        # 设备回调只累加计数，不在实时线程写日志。
+        self._driver_overflows = 0
+        self._queue_overwrites = 0
+        self._lock_misses = 0
+        self._invalid_frames = 0
         self._last_sample_at: float | None = None  # 和帧序一样，只由设备输入线程写入。
         self._enabled_at: float | None = None  # 由事件循环启用或封闸，每个队列仅用于一通。
         self._closed = False
@@ -74,7 +79,10 @@ class _CaptureQueue:
         if enabled_at is None:
             return  # 接通前不计入帧序，第一帧不能被当作采集缺口。
         self._sequence += 2 if overflow else 1
+        if overflow:
+            self._driver_overflows += 1
         if pcm.nbytes != INPUT_BYTES:
+            self._invalid_frames += 1
             return
         now = monotonic()
         if now >= self._deadline(enabled_at):
@@ -83,12 +91,19 @@ class _CaptureQueue:
             # 原始数据仍在到达；处理侧覆盖旧帧或抢锁丢帧是采集缺口，不是采集停滞。
             self._last_sample_at = now
         if not self._lock.acquire(blocking=False):
+            self._lock_misses += 1
             return
         try:
             if self._enabled_at is not None:
+                if len(self._frames) == self._frames.maxlen:
+                    self._queue_overwrites += 1
                 self._frames.append((self._sequence, bytes(pcm)))
         finally:
             self._lock.release()
+
+    def loss_totals(self) -> tuple[int, int, int, int]:
+        # 只供诊断：读取本通累计值，不加锁，也不尝试归因到某一个缺口。
+        return self._driver_overflows, self._queue_overwrites, self._lock_misses, self._invalid_frames
 
     def drain(self) -> list[tuple[int, bytes]]:
         with self._lock:
@@ -358,13 +373,24 @@ class VoiceChannel:
             result.append((missed, self._vad.probability(pcm) >= self._settings.vad_threshold, pcm))
         return result
 
+    def _log_capture_gap(self) -> None:
+        _LOG.warning("voice capture gap; dropping incomplete turn")
+        if not _LOG.isEnabledFor(logging.DEBUG):
+            return
+        live = self._stream_turn
+        dropped_turn = (self._record is not None or self._segment_turn is not None
+                        or (live is not None and not live.aborted.done()))
+        _LOG.debug("voice capture gap details; dropped_turn=%s driver_overflow_events_total=%d"
+                   " queue_overwrites_total=%d lock_misses_total=%d invalid_frames_total=%d",
+                   dropped_turn, *self._capture.loss_totals())
+
     def _process(self, missed: bool, hot: bool, pcm: bytes) -> None:
         if self._ignoring_tail:
             # 不再记录尾音，但它仍属于原话轮；缺帧不视为静默。
             if missed:
                 # 溢出丢样可能发生在本帧内部，这一帧不算可信静默。
                 if self._stream_turn is not None:
-                    _LOG.warning("voice capture gap; dropping incomplete turn")
+                    self._log_capture_gap()
                     self._abort_stream_turn()
                 self._quiet_frames = 0
                 return
@@ -387,7 +413,7 @@ class VoiceChannel:
         if missed:
             # 采集溢出不能拼接成假的完整话轮；静默后再接纳下一轮。
             if not self._discard_gap:
-                _LOG.warning("voice capture gap; dropping incomplete turn")
+                self._log_capture_gap()
             self._discard_gap = True
             self._record = None
             self._abort_stream_turn()

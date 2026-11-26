@@ -1108,6 +1108,42 @@ class VoiceInputTest(unittest.IsolatedAsyncioTestCase):
         with self.assertRaisesRegex(VoiceSetupError, "voice_asr_max_audio_seconds_below_one_sample"):
             VoiceChannel(_ASR(), _TTS(), _Vad(), _SETTINGS, asr_timeout=0.5, max_audio_seconds=0.5 / _RATE)
 
+    async def test_capture_gap_debug_counts_loss_sources_even_when_idle(self):
+        asr, vad, device = _ASR(), _Vad(), _Device()
+        with (patch("agent_companion.speech.voice._MAX_INPUT_FRAMES", 4),
+              self.assertLogs("agent_companion.speech.voice", level="DEBUG") as log):
+            voice = VoiceChannel(asr, _TTS(), vad, _SETTINGS, asr_timeout=0.5, max_audio_seconds=500)
+            async with voice.connected(device, lambda *_: None, capture_enabled=False):
+                device.frame(False, overflow=True)  # 接通前不计入本通累计值。
+                voice.enable_capture()
+                device.frame(False, overflow=True)
+                device.capture(memoryview(b""), False)
+                with voice._capture._lock:
+                    device.frame(False)
+                device.frame(False, 4)  # 队列覆盖最早入队的帧。
+                await _processed(vad, 4)
+        details = [record.getMessage() for record in log.records if record.levelname == "DEBUG"]
+        self.assertEqual(details, ["voice capture gap details; dropped_turn=False driver_overflow_events_total=1"
+                                   " queue_overwrites_total=1 lock_misses_total=1 invalid_frames_total=1"])
+        self.assertFalse(asr.called.is_set())
+
+    async def test_capture_gap_debug_marks_discarded_turn_without_repeating_for_consecutive_gaps(self):
+        asr, vad, device = _ASR(), _Vad(), _Device()
+        voice = VoiceChannel(asr, _TTS(), vad, _SETTINGS, asr_timeout=0.5, max_audio_seconds=500)
+        events = []
+        with self.assertLogs("agent_companion.speech.voice", level="DEBUG") as log:
+            async with voice.connected(device, lambda *event: events.append(event)):
+                device.frame(True, 3)
+                await _until(lambda: events == [(None, True)])
+                device.frame(True, 3, overflow=True)
+                await _processed(vad, 6)
+        details = [record.getMessage() for record in log.records
+                   if record.getMessage().startswith("voice capture gap details;")]
+        self.assertEqual(len(details), 1)
+        self.assertIn("dropped_turn=True", details[0])
+        self.assertIn("driver_overflow_events_total=3", details[0])
+        self.assertFalse(asr.called.is_set())
+
     async def test_gap_and_asr_timeout_drop_only_affected_turns(self):
         asr, vad, device = _ASR(block=True), _Vad(), _Device()
         voice = VoiceChannel(asr, _TTS(), vad, _SETTINGS, asr_timeout=0.03, max_audio_seconds=500)

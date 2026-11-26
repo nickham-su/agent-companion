@@ -171,6 +171,8 @@ MiniMax TTS 用 [`/v1/t2a_v2` HTTP SSE](https://platform.minimax.cn/docs/api-ref
 
 如果本机的 `[voice]` 仍显式使用旧示例的 `delivery_timeout = 90`，可改为 `600` 或删除这行使用新默认值。
 
+排查 `voice capture gap` 时，开启 `log_level = "DEBUG"` 查找 `voice capture gap details`。`dropped_turn` 表示这次缺口是否让程序丢弃了正在处理的录音；驱动溢出、队列覆盖、锁抢占和帧大小异常的计数是本通累计值，不是单次缺口的精确归因。
+
 通话中若设备流断开、采集停滞或 VAD 推理出错，程序会记日志、解除本通语音绑定并停止收音和播报：丢弃尚未提交的录音，取消在途实时转写并忽略迟到结果，不等待清理。已交给语音的回复仍按原回执结算；主 Runtime 继续处理放行的输入，私聊消息轮询、语音条转写和文字回复继续运行。程序不会替你挂断飞书通话，也不会把已交语音的回复改用文字发送或自动重连设备；排查后可再试下一通。
 
 MiniMax 流式合成也可能以 HTTP 200 返回 JSON 业务错误而不是 SSE。该响应最多读取 64 KiB，受 `timeouts.tts` 限制；适配器使用固定错误码分类，不输出响应正文。
