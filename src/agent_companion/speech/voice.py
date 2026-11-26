@@ -31,6 +31,7 @@ _MIN_SEGMENT_BYTES = 10 * INPUT_RATE * SAMPLE_BYTES
 _CAPTURE_STALL_SECONDS = 2.0  # 接通后首帧也用此宽限，远大于 32 ms 的正常采集周期。
 
 # 状态为 None 表示只交付一条转写，不结束仍在进行的其他话轮。
+# 仅确定为空且真正打断过播报的当前话轮，以 ("", False) 请求唤醒。
 VoiceInput = Callable[[str | None, bool | None], None]
 
 
@@ -159,6 +160,7 @@ class VoiceChannel:
         self._ignoring_tail = False
         self._tail_recording: bytes | None = None
         self._tail_text: str | None = None
+        self._interrupted_turn: bytearray | bytes | SegmentedTurn | StreamingTurn | None = None
         self._obsolete_until = -float("inf")
         self._record: bytearray | None = None
         self._segment_turn: SegmentedTurn | None = None
@@ -193,6 +195,10 @@ class VoiceChannel:
         return self._failed
 
     @property
+    def can_wake(self) -> bool:
+        return not (self._failed or self._io_stopped or self._input_active)
+
+    @property
     def _asr_task(self) -> asyncio.Task[str] | None:
         request = self._asr_request
         return request.task if request is not None else None
@@ -210,6 +216,7 @@ class VoiceChannel:
         self._capture.close()
         self._speaking = self._ignoring_tail = False
         self._tail_recording = None
+        self._interrupted_turn = None
         self._tail_text = None  # 尚未结束的话轮没有交接；挂断只放行已入调度器的内容。
         self._record = None
         self._segment_turn = None
@@ -223,7 +230,8 @@ class VoiceChannel:
         self._obsolete_until = asyncio.get_running_loop().time()
         if self._streaming is None and self._segment_frames is None:
             _LOG.debug("voice turn started")
-        self._output.interrupt()
+        self._interrupted_turn = None  # 新话轮作废先前尚未结算的唤醒资格。
+        interrupted = self._output.interrupt()
         if self._on_input is not None:
             self._on_input(None, True)
         if self._io_stopped:  # 开口事件本身可能同步发现通话已经解绑。
@@ -244,6 +252,10 @@ class VoiceChannel:
                 self._record = bytearray()
             else:
                 self._segment_turn = SegmentedTurn()
+            if interrupted:
+                # 整轮文件路径此时的 bytearray 尚为空，不按真假值选择。
+                self._interrupted_turn = (self._record if self._record is not None else
+                                          self._stream_turn or self._segment_turn)
             self._record_audio(preroll[first_speech - lead_in:], hot=True)
         self._preroll.clear()
 
@@ -291,6 +303,7 @@ class VoiceChannel:
     def _abort_stream_turn(self) -> None:
         live, self._stream_turn = self._stream_turn, None
         if live is not None:
+            self._turn_result(live, None)
             live.abort()
             if live in self._turns:
                 # worker 取得话轮后只由其 finally 释放；旧请求清理由 _asr_request 跟踪。
@@ -324,7 +337,15 @@ class VoiceChannel:
                     self._queue_segment(turn)
                 else:
                     _LOG.warning("voice turn dropped (asr backlog); turn=%s", turn.asr_owner)
+            if not turn.queued:
+                self._turn_result(turn, None)
         self._report_input()
+
+    def _turn_result(self, turn: object, text: str | None) -> str | None:
+        if self._interrupted_turn is turn:
+            self._interrupted_turn = None
+            return text
+        return text or None
 
     def _report_input(self, text: str | None = None) -> None:
         if self._failed or self._io_stopped:
@@ -354,13 +375,17 @@ class VoiceChannel:
         recording, self._record = self._record, None
         if recording and self._pending < _MAX_ASR_TURNS:
             pcm = bytes(recording)
+            if self._interrupted_turn is recording:
+                self._interrupted_turn = pcm
             if ignore_tail:
                 self._tail_recording = pcm
             self._enqueue_turn(pcm)
             _LOG.debug("voice turn queued for transcription; pcm_bytes=%d duration_limited=%s pending=%d",
                        len(recording), ignore_tail, self._pending)
-        elif recording:
-            _LOG.warning("voice turn dropped (asr backlog)")
+        elif recording is not None:
+            self._turn_result(recording, None)
+            if recording:
+                _LOG.warning("voice turn dropped (asr backlog)")
         self._report_input()
 
     def _detect(self, frames: list[tuple[int, bytes]]) -> list[tuple[bool, bool, bytes]]:
@@ -392,6 +417,13 @@ class VoiceChannel:
                 if self._stream_turn is not None:
                     self._log_capture_gap()
                     self._abort_stream_turn()
+                # 封顶后的尾部仍属于同一话轮。保留既有转写策略，但掉帧不能唤醒。
+                if self._segment_turn is not None:
+                    self._turn_result(self._segment_turn, None)
+                if self._tail_recording is not None:
+                    self._turn_result(self._tail_recording, None)
+                if self._tail_text == "":
+                    self._tail_text = None
                 self._quiet_frames = 0
                 return
             self._quiet_frames = 0 if hot else self._quiet_frames + 1
@@ -415,10 +447,13 @@ class VoiceChannel:
             if not self._discard_gap:
                 self._log_capture_gap()
             self._discard_gap = True
+            if self._record is not None:
+                self._turn_result(self._record, None)
             self._record = None
             self._abort_stream_turn()
             turn, self._segment_turn = self._segment_turn, None
             if turn is not None:
+                self._turn_result(turn, None)
                 turn.discard()
                 request = self._asr_request
                 if (request is not None and request.owner is turn.asr_owner
@@ -491,6 +526,7 @@ class VoiceChannel:
         self._speaking = self._ignoring_tail = False
         self._tail_recording = None
         self._tail_text = None
+        self._interrupted_turn = None
         self._record = None
         self._segment_turn = None
         self._preroll.clear()
@@ -531,26 +567,59 @@ class VoiceChannel:
         self._asr_request = request
         task.add_done_callback(self._reap)
 
-    async def _recognize(self, recording: bytes) -> str:
+    def _start_file_asr(self, audio: AudioFile, request: _AsrRequest) -> asyncio.Task[str]:
+        clock = asyncio.get_running_loop().time
+
+        async def transcribe() -> str:
+            try:
+                return await self._asr.transcribe(audio)
+            finally:
+                # 记录适配器实际返回时刻，不用等待方被调度或 done 回调执行的时刻。
+                request.finished_at = clock()
+
+        task = asyncio.create_task(transcribe())
+        self._register_asr(request, task)
+        return task
+
+    @staticmethod
+    def _file_transcript(task: asyncio.Task[str]) -> str | None:
+        if task.cancelled():
+            return None
+        try:
+            return task.result().strip()
+        except AsrError as exc:
+            if exc.diagnostic == "asr_empty_transcript" and exc.phase in (None, "finish"):
+                return ""
+            raise
+
+    async def _recognize(self, recording: bytes) -> str | None:
         if self._asr_task is not None and not self._asr_task.done():
             # 已超时但尚未退出的异常适配器不能阻塞或无限累积外部请求。
-            return ""
-        task = asyncio.create_task(self._asr.transcribe(_wav(recording)))
-        self._register_asr(_AsrRequest(), task)
+            return None
+        clock = asyncio.get_running_loop().time
+        audio = _wav(recording)
+        current = _AsrRequest()
+        deadline = clock() + self._asr_timeout
+        task = self._start_file_asr(audio, current)
         done, _ = await asyncio.wait((task,), timeout=self._asr_timeout)
         if not done:
             task.cancel()
             _LOG.warning("voice transcription deadline reached")
-            return ""
-        return "" if task.cancelled() else task.result().strip()
+            return None
+        text = self._file_transcript(task)
+        # 整轮文件沿用既有有效文本判定；只有新增的空结果唤醒要求 ASR 确认按时结束。
+        if text == "" and current.finished_at is not None and current.finished_at >= deadline:
+            _LOG.warning("voice transcription deadline reached")
+            return None
+        return text
 
-    async def _request_segment(self, turn: SegmentedTurn, end: int, *, final: bool, phase: str) -> str:
+    async def _request_segment(self, turn: SegmentedTurn, end: int, *, final: bool, phase: str) -> str | None:
         clock = asyncio.get_running_loop().time
         previous = self._asr_request
         if previous is not None and not previous.task.done():
             if not (final and turn.retry and previous.early and previous.timed_out and previous.owner is turn.asr_owner):
                 _LOG.warning("voice segment transcription skipped (ASR busy); phase=%s turn=%s", phase, turn.asr_owner)
-                return ""
+                return None
             # 仅同一话轮的提前请求还在退出时，为最终补交保留一段额外预算。
             previous_task = previous.task
             cleanup_deadline = clock() + self._asr_timeout
@@ -563,41 +632,33 @@ class VoiceChannel:
                     or (previous.finished_at is not None and previous.finished_at >= cleanup_deadline)):
                 _LOG.warning("voice final transcription could not start (ASR cancellation pending); turn=%s",
                              turn.asr_owner)
-                return ""
+                return None
 
         audio = _wav(turn.snapshot(end))
         current = _AsrRequest(owner=turn.asr_owner, early=not final)
-
-        async def request() -> str:
-            try:
-                return await self._asr.transcribe(audio)
-            finally:
-                # 记录适配器实际返回时刻，不用等待方被调度或 done 回调执行的时刻。
-                current.finished_at = clock()
-
         deadline = clock() + self._asr_timeout
-        task = asyncio.create_task(request())
-        self._register_asr(current, task)
+        task = self._start_file_asr(audio, current)
         await asyncio.wait((task,), timeout=max(0, deadline - clock()))
         if not task.done() or (current.finished_at is not None and current.finished_at >= deadline):
             current.timed_out = True
             if not task.done():
                 task.cancel()
             _LOG.warning("voice segment transcription deadline reached; phase=%s turn=%s", phase, turn.asr_owner)
-            return ""
-        return "" if task.cancelled() else task.result().strip()
+            return None
+        return self._file_transcript(task)
 
-    async def _recognize_segment(self, turn: SegmentedTurn, end: int, *, final: bool) -> str:
+    async def _recognize_segment(self, turn: SegmentedTurn, end: int, *, final: bool) -> str | None:
         phase = "final" if final else "early"
         try:
             return await self._request_segment(turn, end, final=final, phase=phase)
         except Exception:
             _LOG.warning("voice segment transcription failed; phase=%s turn=%s", phase, turn.asr_owner)
-            return ""
+            return None
 
     async def _transcribe_segment(self, job: SegmentJob) -> None:
         turn = job.turn
         transcript = None
+        explicitly_empty = False
         try:
             if job.early_bytes and not turn.closed and not turn.discarded:
                 text = await self._recognize_segment(turn, job.early_bytes, final=False)
@@ -611,10 +672,14 @@ class VoiceChannel:
                 text = await self._recognize_segment(turn, end, final=True)
                 if text:
                     turn.accept(end, text)
-                else:
+                elif text is None:
                     turn.discard()
+                else:
+                    explicitly_empty = True
             if turn.closed and not turn.discarded:
                 transcript = turn.transcript()
+                if transcript is None and explicitly_empty:
+                    transcript = ""
         finally:
             turn.queued = False
             self._pending -= 1
@@ -623,6 +688,8 @@ class VoiceChannel:
             _LOG.debug("voice turn transcript ready; turn=%s at_mono_ms=%.0f endpoint_to_transcript_ms=%.0f",
                        turn.asr_owner, ready_at * 1000, (ready_at - turn.endpoint_at) * 1000)
         # 缺帧时话轮可能先被摘除、长静默又先到；最后一项任务退出仍需检查是否已空闲。
+        if turn.closed or turn.discarded:
+            transcript = self._turn_result(turn, transcript)
         self._report_input(transcript)
 
     async def _recognize_stream(self, turn: StreamingTurn) -> tuple[str, float] | None:
@@ -670,6 +737,8 @@ class VoiceChannel:
                 await asyncio.wait((task,), timeout=max(0, deadline - monotonic()))
             if not task.done() or (request.finished_at is not None and request.finished_at >= deadline):
                 raise TimeoutError
+        if turn.aborted.done():
+            return None
         if task.cancelled():
             raise AsrError("asr_adapter_cancelled")
         text = task.result().strip()
@@ -680,7 +749,7 @@ class VoiceChannel:
 
     async def _transcribe_stream(self, turn: StreamingTurn) -> None:
         self._stream_in_flight = turn
-        text = ""
+        text = None
         ready_at = None
         try:
             result = await self._recognize_stream(turn)
@@ -693,6 +762,10 @@ class VoiceChannel:
             reason, phase = (exc.diagnostic, exc.phase) if isinstance(exc, AsrError) else ("asr_failed", None)
             _LOG.warning("voice streaming transcription failed; turn=%s reason=%s phase=%s",
                          turn.id, reason, phase or "-")
+            if (reason == "asr_empty_transcript" and phase == "finish" and turn.endpoint_at is not None
+                    and turn.exhausted and not turn.aborted.done() and turn.started.done()
+                    and turn.started.result() < turn.opened_at + self._asr_timeout):
+                text = ""
         finally:
             self._stream_in_flight = None
             if not text:
@@ -705,7 +778,7 @@ class VoiceChannel:
         if text and ready_at is not None and turn.endpoint_at is not None and not self._failed and not self._io_stopped:
             _LOG.debug("voice turn transcript ready; turn=%s at_mono_ms=%.0f endpoint_to_transcript_ms=%.0f",
                        turn.id, ready_at * 1000, (ready_at - turn.endpoint_at) * 1000)
-        self._report_input(text or None)
+        self._report_input(self._turn_result(turn, text))
 
     async def _transcribe(self) -> None:
         clock = asyncio.get_running_loop().time
@@ -727,21 +800,21 @@ class VoiceChannel:
                 text = await self._recognize(recording)
             except Exception:
                 _LOG.warning("voice transcription failed")
-                text = ""
+                text = None
             finally:
                 waiting_for_tail = recording is self._tail_recording
                 if waiting_for_tail:
                     self._tail_recording = None
-                # 等待下一轮入队期间不保留本轮 PCM。
-                del recording
                 self._pending -= 1
+            text = self._turn_result(recording, text)
+            del recording  # 等待下一轮入队期间不保留本轮 PCM。
             if text and not self._failed and not self._io_stopped:
                 _LOG.debug("voice transcription ready; chars=%d elapsed_ms=%.0f", len(text), (clock() - started) * 1000)
             if waiting_for_tail:
                 # 只有这个封顶话轮的转写等静默；较早话轮仍按序交接。
-                self._tail_text = text or None
+                self._tail_text = text
             else:
-                self._report_input(text or None)
+                self._report_input(text)
 
     @asynccontextmanager
     async def connected(self, device: AudioDevice, on_input: VoiceInput, *,

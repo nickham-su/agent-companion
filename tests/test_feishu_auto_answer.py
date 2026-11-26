@@ -4,6 +4,7 @@ from dataclasses import replace
 from hashlib import sha256
 import json
 from pathlib import Path
+import sqlite3
 from threading import Event
 import unittest
 from unittest.mock import Mock, patch
@@ -17,6 +18,7 @@ from agent_companion.feishu_private import _Route
 from agent_companion.protocol import (AGENT_REPLY_PREFIX, ChannelUser, DeliveryStatus, InternalInput, Message,
                                       TextDelta, ToolCall, ToolReady)
 from agent_companion.runtime.subtasks import DELEGATE_TOOL_NAME, demo_roles
+from agent_companion.speech.asr import AsrError
 from agent_companion.speech.vad import INPUT_FRAMES, INPUT_RATE
 from agent_companion.speech.voice import VoiceChannel
 from agent_companion.storage.sqlite import History
@@ -987,6 +989,177 @@ class IncomingCallTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_voice_intercepts_obsolete_first_handoff_even_after_transcription_finished(self):
         await self._assert_voice_intercept(after_idle=True)
+
+    async def test_call_empty_transcript_wakes_only_after_playback_and_yields_to_input(self):
+        sender = _SENDERS[0]
+        session = _session(sender)
+        original = Message("user", "最初输入")
+        for scenario in ("confirmed", "unconfirmed", "not_played", "queued_text", "transcript", "hangup"):
+            with self.subTest(scenario=scenario):
+                # 每种时序用独立的离线通话和收件箱。
+                self.setUp()
+                tts = _TTS()
+                asr = _ASR("有效转写" if scenario == "transcript" else AsrError("asr_empty_transcript"), block=True)
+                requests = []
+
+                class Model:
+                    async def stream(self, messages, tools, *, thinking):
+                        requests.append(tuple(message for message in messages if message.role != "system"))
+                        if len(requests) == 1:
+                            yield TextDelta("确认的首句。")
+                            yield TextDelta("未确认的尾句。")
+                        else:
+                            yield TextDelta("新生成的回复。")
+
+                async with self._serve(Model(), tts=tts, make_asr=lambda _: asr) as (history, agents):
+                    await self._ring_connect(sender, 1, 1)
+                    device = self.devices[0]
+                    self._text(0, original.content)
+                    await _eventually(lambda: len(tts.calls) == 2)
+                    self.assertEqual(requests, [(original,)])
+                    if scenario != "not_played":
+                        heard = 1 if scenario == "unconfirmed" else 5
+                        self.assertEqual(device.pull(heard), _A * heard)
+                    _talk(device)
+                    await asyncio.wait_for(asr.called.wait(), 2)
+                    await _eventually(lambda: bool(history.outcomes(session)))
+                    (old,) = history.outcomes(session)
+                    confirmed = scenario not in ("not_played", "unconfirmed")
+                    self.assertEqual(old.delivery_status, DeliveryStatus.PARTIAL if confirmed else DeliveryStatus.ZERO)
+                    expected = (original, Message("assistant", "确认的首句。")) if confirmed else (original,)
+                    self.assertEqual(tuple(row.message for row in history.tail(session, 10)), expected)
+                    self.assertFalse(any(device.pull(32)))
+                    if scenario == "queued_text":
+                        self._text(0, "已排队的文字")
+                        await _eventually(lambda: bool(history.pending_inbound(session, "feishu-private")))
+                        expected += (Message("user", "已排队的文字"),)
+                    elif scenario == "transcript":
+                        expected += (Message("user", "有效转写"),)
+                    elif scenario == "hangup":
+                        self.desktop.main = ()
+                        await _eventually(lambda: device.closed)
+                    scheduler = agents.call_args.kwargs["schedulers"].get_or_create(session)
+                    with patch.object(scheduler, "_trigger", wraps=scheduler._trigger) as trigger:
+                        asr.release.set()
+                        await _eventually(lambda: not scheduler._input_active)
+                        if scenario not in ("not_played", "hangup"):
+                            await _eventually(lambda: len(tts.calls) == 3)
+                            self.assertEqual(device.pull(32)[:8], _A * 4)
+                            await _eventually(lambda: len(history.outcomes(session)) == 2)
+                            self.assertEqual(requests, [(original,), expected])
+                            _, new = history.outcomes(session)
+                            self.assertNotEqual(old.run_id, new.run_id)
+                            self.assertEqual(history.agent_run(new.run_id).status, "completed")
+                            self.assertEqual(tuple(row.message for row in history.tail(session, 10)),
+                                             (*expected, Message("assistant", "新生成的回复。")))
+                        else:
+                            self.assertEqual(requests, [(original,)])
+                        self.assertEqual(trigger.call_count, int(scenario in ("confirmed", "unconfirmed")))
+                    if scenario != "transcript":
+                        self.assertFalse(self.runner.posts)
+
+    @asynccontextmanager
+    async def _interrupted_call_waiting_for_empty_asr(self):
+        model, tts = _Echo(), _TTS()
+        asr = _ASR(AsrError("asr_empty_transcript"), block=True)
+        async with (self._pause_follow() as (bindings, _),
+                    self._serve(model, tts=tts, make_asr=lambda _: asr) as (history, _)):
+            await self._ring_connect(_SENDERS[0], 1, 1)
+            binding = await asyncio.wait_for(bindings.get(), 2)
+            self._text(0, "最初输入")
+            await _eventually(lambda: len(tts.calls) == 1)
+            self.assertEqual(self.devices[0].pull(1), _A)
+            _talk(self.devices[0])
+            await asyncio.wait_for(asr.called.wait(), 2)
+            await _eventually(lambda: len(history.outcomes(_session(_SENDERS[0]))) == 1)
+            route = binding._peer
+            yield binding, asr, history, route._scheduler, route._agent[0], model, tts
+
+    async def test_empty_call_yields_to_persisted_feishu_input_before_plan_and_after_lock_retry(self):
+        for scenario in ("raw_before", "normalized_before", "raw_late", "normalized_late", "other_user", "read_error"):
+            with self.subTest(scenario=scenario):
+                self.setUp()
+                async with self._interrupted_call_waiting_for_empty_asr() as (_, asr, history, scheduler,
+                                                                           runtime, model, tts):
+                    peer = _SENDERS[1] if scenario == "other_user" else _SENDERS[0]
+                    session = _session(peer)
+                    late = scenario.endswith("_late")
+                    retry = asyncio.Event()
+                    start = history.start_agent_run
+                    start_attempts = []
+
+                    def start_after_lock(agent_id, run_id, *, can_start):
+                        start_attempts.append(run_id)
+                        if late and len(start_attempts) == 1:
+                            retry.set()
+                            raise sqlite3.OperationalError("database is locked")
+                        return start(agent_id, run_id, can_start=can_start)
+
+                    def persist(target, *, normalize=False):
+                        history.record_feishu_window(None, now=0,
+                                                     verified={target: [("synthetic-" + target, 0, "text", "待处理")]},
+                                                     discarded=(), retry=())
+                        if normalize:
+                            batch, _ = history.next_feishu_raw(target)
+                            history.finish_feishu_raw(target, batch, _session(target), [Message("user", "待处理")])
+                            self.assertIsNone(history.next_feishu_raw(target))
+
+                    # 暂停收件通知，确保持久批次还未交给调度器或 Runtime。
+                    with (patch.object(_Route, "notify_inbound"),
+                          patch.object(scheduler, "_trigger", wraps=scheduler._trigger) as trigger,
+                          patch.object(history, "start_agent_run", side_effect=start_after_lock),
+                          patch.object(history, "has_pending_feishu_input", wraps=history.has_pending_feishu_input)
+                          as inbox):
+                        if scenario == "read_error":
+                            inbox.side_effect = sqlite3.OperationalError("database is locked")
+                        elif not late:
+                            persist(peer, normalize=scenario == "normalized_before")
+                            if scenario == "other_user":
+                                # 其他用户的原始批次及归一化批次都不应抑制本通唤醒。
+                                history.record_inbound(session, "feishu-private", 0,
+                                                       [("synthetic-normalized-elsewhere", Message("user", "别的输入"))])
+                        asr.release.set()
+                        if late:
+                            await asyncio.wait_for(retry.wait(), 2)
+                            persist(peer, normalize=scenario == "normalized_late")
+                        await _eventually(lambda: not scheduler._input_active)
+                        if scenario == "other_user":
+                            await _eventually(lambda: len(tts.calls) == 2)
+                            self.assertEqual(self.devices[0].pull(4), _A * 4)
+                        await asyncio.wait_for(runtime.wait_idle(), 2)
+                        count = 2 if scenario == "other_user" else 1
+                        self.assertEqual(model.calls, [("最初输入",)] * count)
+                        self.assertEqual(trigger.call_count, int(late or scenario == "other_user"))
+                        if late:
+                            self.assertEqual(len(start_attempts), 2)
+                            self.assertIsNone(history.agent_run(start_attempts[-1]))
+                        if scenario != "read_error":
+                            self.assertTrue(history.has_pending_feishu_input(peer, session))
+
+    async def test_queued_empty_call_does_not_fall_back_to_text_after_window_or_io_loss(self):
+        for lost in ("window", "io"):
+            with self.subTest(lost=lost):
+                self.setUp()
+                async with self._interrupted_call_waiting_for_empty_asr() as (binding, asr, history, scheduler,
+                                                                             runtime, model, _):
+                    original = scheduler._trigger
+
+                    def lose_after_enqueue(can_start):
+                        original(can_start)
+                        if lost == "window":
+                            self.desktop.main = ()
+                        else:
+                            binding._voice.stop_io()
+
+                    with patch.object(scheduler, "_trigger", side_effect=lose_after_enqueue) as trigger:
+                        asr.release.set()
+                        await _eventually(lambda: trigger.call_count == 1)
+                        await asyncio.wait_for(runtime.wait_idle(), 2)
+                    if lost == "window":
+                        self.assertTrue(binding.closed)  # 轮询已暂停，只有启动资格检查能发现窗口消失。
+                    self.assertEqual(model.calls, [("最初输入",)])
+                    self.assertEqual(len(history.outcomes(_session(_SENDERS[0]))), 1)
+                    self.assertFalse(self.runner.sent.get(_SENDERS[0]))
 
     async def test_feishu_and_internal_input_wait_for_last_transcript_in_fifo_order(self):
         sender = _SENDERS[0]

@@ -6,7 +6,7 @@ import asyncio
 from collections.abc import Callable
 from contextlib import AbstractAsyncContextManager, AsyncExitStack
 import logging
-from sqlite3 import OperationalError
+from sqlite3 import DatabaseError, OperationalError
 from time import time
 from typing import TYPE_CHECKING
 
@@ -45,6 +45,7 @@ class _Route:
         self._closed = False
         self._stop_call: Callable[[], None] | None = None
         self._select_call: Callable[[ReplyStream], ReplyDelivery | None] | None = None
+        self._can_wake_call: Callable[[], bool] | None = None
         self._open_agent = open_agent
         self._inbound = asyncio.Event()
         self._last_submitted = 0
@@ -108,8 +109,12 @@ class _Route:
                 return None
             return scheduler.select_voice(reply, target)
 
+        def can_wake() -> bool:
+            return voice.can_wake and check_window() and voice.can_wake and self._inbox_empty()
+
         scheduler.call_started(stop)
         self._select_call = select
+        self._can_wake_call = can_wake
         return True
 
     def call_input(self, stop: Callable[[], None], text: str | None, input_active: bool | None) -> None:
@@ -117,13 +122,23 @@ class _Route:
         if self._closed or self._stop_call != stop or scheduler is None:
             return
         items = (Message("user", text),) if text else ()
-        if scheduler.call_input(stop, items, input_active=input_active) and text:
+        can_wake = self._can_wake_call
+        empty = text == "" and input_active is False and can_wake is not None and self._inbox_empty()
+        if scheduler.call_input(stop, items, input_active=input_active, empty_transcript=empty,
+                                can_wake=can_wake if empty else None) and text:
             self.channel.enqueue_transcript(text)
+
+    def _inbox_empty(self) -> bool:
+        try:
+            return not self._history.has_pending_feishu_input(self._user.key, self._session_id)
+        except DatabaseError as exc:
+            _LOG.warning("Feishu call wake skipped: inbox lookup failed (%s)", type(exc).__name__)
+            return False
 
     def call_ended(self, stop: Callable[[], None]) -> None:
         if self._stop_call != stop:
             return
-        self._stop_call = self._select_call = None
+        self._stop_call = self._select_call = self._can_wake_call = None
         if self._scheduler is not None:
             self._scheduler.call_ended(stop)
 

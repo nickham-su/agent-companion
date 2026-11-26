@@ -255,6 +255,27 @@ class SegmentedVoiceTest(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(asr.pcm, [prefix, prefix + extra])
             self.assertEqual(events[-1], ("完整转写", False))
 
+    async def test_final_empty_wakes_only_if_no_segment_already_has_text(self):
+        empty = AsrError("asr_empty_transcript")
+        for earlier in (None, "已识别的前段"):
+            with self.subTest(earlier=earlier):
+                responses = (empty,) if earlier is None else (earlier, empty)
+                async with _channel(*responses) as (voice, frames, asr, events):
+                    playback = asyncio.create_task(voice.deliver(_reply("old", "仍在播报。")))
+                    await _until(lambda: voice._output._active is not None and voice._output._active.draining)
+                    pcm = bytearray(2)
+                    voice._output.render(memoryview(pcm))
+                    self.assertTrue(any(pcm))
+                    if earlier is not None:
+                        frames.push(True, _LONG)
+                        frames.short_pause()
+                        await _until(lambda: len(asr.pcm) == 1 and voice._pending == 0)
+                    frames.push(True, 3)
+                    frames.end_turn()
+                    await playback
+                    await _until(lambda: not voice._input_active)
+                    self.assertEqual(events, [(None, True), (earlier or "", False)])
+
     async def test_final_failure_supresses_partial_text_and_next_turn_is_unaffected(self):
         async with _channel("不要交付", AsrError("synthetic"), "下一轮") as (voice, frames, asr, events):
             prefix = frames.push(True, _LONG) + frames.short_pause()
@@ -606,6 +627,25 @@ class SegmentedVoiceTest(unittest.IsolatedAsyncioTestCase):
                 await _until(lambda: not voice._input_active)
                 self.assertEqual(asr.pcm, [recorded])
                 self.assertEqual(events, [(None, True), ("整段转写原有行为", False)])
+
+    async def test_late_file_empty_does_not_wake_even_if_asr_finishes_before_observation(self):
+        settings = replace(_SETTINGS, segment_pause_seconds=None)
+        with _loop_time_jump() as jump:
+            async def late():
+                jump()
+                raise AsrError("asr_empty_transcript")
+
+            async with _channel(late, timeout=0.2, settings=settings) as (voice, frames, _, events):
+                playback = asyncio.create_task(voice.deliver(_reply("old", "仍在播报。")))
+                await _until(lambda: voice._output._active is not None and voice._output._active.draining)
+                pcm = bytearray(2)
+                voice._output.render(memoryview(pcm))
+                self.assertTrue(any(pcm))
+                frames.push(True, 3)
+                frames.end_turn()
+                await playback
+                await _until(lambda: not voice._input_active)
+                self.assertEqual(events, [(None, True), (None, False)])
 
     async def test_new_short_turn_does_not_wait_for_another_turns_stuck_request(self):
         for previous_was_early in (False, True):

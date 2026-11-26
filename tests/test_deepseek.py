@@ -137,6 +137,72 @@ class DeepSeekTest(unittest.IsolatedAsyncioTestCase):
                 self.assertTrue(closed_wire.is_set())
                 self.assertFalse(close_cancelled.is_set())
 
+    async def test_trigger_after_partial_voice_reply_obeys_real_adapter_replay_constraints(self):
+        for thinking, with_tools in ((True, True), (True, False), (False, True)):
+            with self.subTest(thinking=thinking, with_tools=with_tools):
+                reading = asyncio.Event()
+                requests = []
+
+                class InterruptedWire(httpx.AsyncByteStream):
+                    async def __aiter__(self):
+                        frame = chunk({"content": "已播放未播完", "reasoning_content": "未完成的回放"})
+                        yield f"data: {frame}\n\n".encode()
+                        reading.set()
+                        await asyncio.Future()
+
+                def endpoint(request):
+                    requests.append(json.loads(request.content))
+                    if len(requests) == 1:
+                        return httpx.Response(200, stream=InterruptedWire())
+                    frames = [chunk({"content": "新答案", "reasoning_content": "新推理"}), chunk(finish="stop"), "[DONE]"]
+                    return httpx.Response(200, text="".join(f"data: {frame}\n\n" for frame in frames))
+
+                class Voice:
+                    first = True
+
+                    async def deliver(self, reply):
+                        reply.select_voice_delivery()
+                        if self.first:
+                            self.first = False
+                            await anext(reply)
+                            await reading.wait()
+                            runtime.trigger_run()
+                            return Receipt(reply.info.reply_id, DeliveryStatus.PARTIAL, "已播放")
+                        text = "".join([part async for part in reply])
+                        return Receipt(reply.info.reply_id, DeliveryStatus.FULL, text)
+
+                async def tool(args, context):
+                    self.fail("模型未请求工具")
+
+                with closing(History(":memory:")) as history:
+                    async with httpx.AsyncClient(transport=httpx.MockTransport(endpoint)) as client:
+                        tools = Tools([Tool(SPEC, tool)]) if with_tools else Tools()
+                        runtime = Runtime("main", history, DeepSeek(client), Voice(), thinking=thinking, tools=tools)
+                        try:
+                            runtime.submit_batch((Message("user", "现有输入"),))
+                            if thinking and with_tools:
+                                with self.assertLogs("agent_companion.runtime.engine", "WARNING") as log:
+                                    await asyncio.wait_for(runtime.wait_idle(), 2)
+                                self.assertEqual(runtime.last_failure, "context_failed")
+                                self.assertTrue(any("runtime context failed (incompatible_protected_history)" in entry
+                                                    for entry in log.output))
+                                self.assertEqual(len(requests), 1)
+                            else:
+                                await asyncio.wait_for(runtime.wait_idle(), 2)
+                                self.assertIsNone(runtime.last_failure)
+                                self.assertEqual(len(requests), 2)
+                                request = requests[-1]
+                                self.assertEqual(bool(request.get("tools")), with_tools)
+                                self.assertEqual(request["messages"], [{"role": "user", "content": "现有输入"},
+                                                                       {"role": "assistant", "content": "已播放"}])
+                            partial = history.read_after("main")[1].message
+                            self.assertEqual(partial, Message("assistant", "已播放"))
+                            outcome = history.outcomes("main")[0]
+                            self.assertEqual((outcome.model_status, outcome.delivery_status),
+                                             ("model_interrupted", DeliveryStatus.PARTIAL))
+                        finally:
+                            await runtime.close()
+
     async def test_done_commits_reasoning_usage_and_native_tool_before_http_close(self):
         closing_wire, release_close, closed_wire = (asyncio.Event() for _ in range(3))
         next_reading, release_next = asyncio.Event(), asyncio.Event()

@@ -59,7 +59,18 @@ class MiniMaxASR:
             raise AsrError("asr_transport") from None
         except (ValueError, RecursionError):
             raise AsrError("asr_invalid_response") from None
-        text = result.get("text") if isinstance(result, dict) else None
-        if not isinstance(text, str) or not text.strip():
+        if not isinstance(result, dict):
+            raise AsrError("asr_invalid_response")
+        if "base_resp" in result:
+            status = result["base_resp"]
+            code = status.get("status_code") if isinstance(status, dict) else None
+            if type(code) is not int:
+                raise AsrError("asr_invalid_response")
+            if code != 0:
+                raise AsrError("asr_business_error")
+        text = result.get("text")
+        if not isinstance(text, str):
+            raise AsrError("asr_invalid_response")
+        if not text.strip():
             raise AsrError("asr_empty_transcript")
         return text.strip()

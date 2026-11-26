@@ -10,6 +10,7 @@ from .protocol import (DeliveryStatus, InputItem, InternalInput, PersistedInput,
 
 _LOG = logging.getLogger(__name__)
 _Submit = Callable[[tuple[InputItem, ...]], None]
+_Trigger = Callable[[Callable[[], bool]], None]
 
 
 async def _reject_voice(reply: ReplyStream) -> Receipt:
@@ -21,9 +22,11 @@ class SessionScheduler:
     def __init__(self) -> None:
         self._agent_owner: object | None = None
         self._submit: _Submit | None = None
+        self._trigger: _Trigger | None = None
         self._revoke_input: Callable[[], None] | None = None
         self._call: Callable[[], None] | None = None
         self._input_active = False
+        self._input_epoch = 0
         self._obsolete_until = -float("inf")
         self._pending: list[InputItem] = []
         self._pending_inbound: set[int] = set()
@@ -46,15 +49,17 @@ class SessionScheduler:
             return True
         return False
 
-    def bind(self, submit: _Submit, *, owner: object | None = None,
+    def bind(self, submit: _Submit, *, trigger: _Trigger | None = None, owner: object | None = None,
              on_revoke: Callable[[], None] | None = None) -> Callable[[], None]:
         self._ensure_unbound(owner)
         self._submit = submit
+        self._trigger = trigger
 
         def revoke() -> None:
             if self._revoke_input is revoke:
                 # 立即封住输入和回投，但不释放父会话所有权。
                 self._submit = None
+                self._trigger = None
                 self._revoke_input = None
                 self._call = None
                 self._input_active = False
@@ -80,11 +85,21 @@ class SessionScheduler:
         self._call = stop
 
     def call_input(self, stop: Callable[[], None], items: Sequence[InputItem], *,
-                   input_active: bool | None) -> bool:
+                   input_active: bool | None, empty_transcript: bool = False,
+                   can_wake: Callable[[], bool] | None = None) -> bool:
         """返回本通输入是否被接收（也可能暂存在队列中）。"""
         if self._call != stop:
             return False
+        may_trigger = empty_transcript and input_active is False and not (items or self._pending)
         self.session_input(items, input_active=input_active)
+        if may_trigger and self._trigger is not None:
+            epoch = self._input_epoch
+
+            def current() -> bool:
+                return self._call == stop and not self._input_active and not self._pending and self._input_epoch == epoch
+
+            # 窗口检查可能同步解绑并放行输入；资格回调返回后仍需核对绑定和队列。
+            self._trigger(lambda: current() and (can_wake is None or can_wake()) and current())
         return True
 
     def call_ended(self, stop: Callable[[], None]) -> None:
@@ -104,6 +119,7 @@ class SessionScheduler:
         self._append_inputs(items)
         if input_active is not None:
             if input_active or self._input_active:
+                self._input_epoch += 1
                 self._obsolete_until = asyncio.get_running_loop().time()
             self._input_active = input_active
         self._flush_pending(submit)

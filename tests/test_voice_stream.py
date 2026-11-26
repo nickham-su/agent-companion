@@ -60,6 +60,75 @@ def _texts(events):
 
 
 class StreamingVoiceTest(unittest.IsolatedAsyncioTestCase):
+    async def _interruptible_playback(self, voice):
+        playback = asyncio.create_task(voice.deliver(_reply("old", "尚未完整播放。")))
+        await _until(lambda: voice._output._active is not None and voice._output._active.draining)
+        pcm = bytearray(2)
+        voice._output.render(memoryview(pcm))
+        self.assertTrue(any(pcm))
+        return playback
+
+    async def test_empty_stream_only_wakes_after_normal_asr_finish(self):
+        for outcome in ("finish", "returned_empty", "premature", "timeout", "gap", "wrong_phase"):
+            with self.subTest(outcome=outcome):
+                entered = asyncio.Event()
+
+                async def recognize(frames, chunks):
+                    if outcome == "premature":
+                        chunks.append(await anext(frames))
+                        raise AsrError("asr_empty_transcript", phase="finish")
+                    entered.set()
+                    await _read(frames, chunks)
+                    if outcome == "timeout":
+                        await asyncio.Future()
+                    if outcome == "returned_empty":
+                        return "  "
+                    phase = "receive" if outcome == "wrong_phase" else "finish"
+                    raise AsrError("asr_empty_transcript", phase=phase)
+
+                async with _channel(recognize, timeout=0.1) as (voice, frames, live, _, events):
+                    playback = await self._interruptible_playback(voice)
+                    frames.push(True, 3)
+                    # 让伪提前空或采集缺口发生在正常端点之前。
+                    if outcome == "premature":
+                        await _until(lambda: len(live.calls) == 1 and voice._pending == 0)
+                    elif outcome == "gap":
+                        await asyncio.wait_for(entered.wait(), 1)
+                        frames.push(False, gap=True)
+                    _finish(voice, frames)
+                    self.assertEqual((await playback).status, DeliveryStatus.ZERO)
+                    await _until(lambda: not voice._input_active)
+                    expected = "" if outcome in ("finish", "returned_empty") else None
+                    self.assertEqual(events, [(None, True), (expected, False)])
+
+    async def test_new_turn_revokes_previous_pending_empty_without_overriding_valid_text(self):
+        empty_waiting, release = asyncio.Event(), asyncio.Event()
+
+        async def recognize(frames, chunks):
+            await _read(frames, chunks)
+            empty_waiting.set()
+            await release.wait()
+            raise AsrError("asr_empty_transcript", phase="finish")
+
+        for next_result in ("valid", "gap"):
+            with self.subTest(next_result=next_result):
+                empty_waiting.clear()
+                release.clear()
+                async with _channel(recognize) as (voice, frames, _, _, events):
+                    playback = await self._interruptible_playback(voice)
+                    frames.push(True, 3)
+                    _finish(voice, frames)
+                    await asyncio.wait_for(empty_waiting.wait(), 1)
+                    frames.push(True, 3)
+                    if next_result == "gap":
+                        frames.push(False, gap=True)
+                    _finish(voice, frames)
+                    release.set()
+                    await playback
+                    await _until(lambda: not voice._input_active)
+                    expected = "合成话轮 2" if next_result == "valid" else None
+                    self.assertEqual(events, [(None, True), (None, True), (expected, False)])
+
     async def test_endpoint_frame_count_matches_file_mode_without_changing_legacy_rounding(self):
         # 刚超过 9 帧的浮点值，旧整轮路径向上取整前的除法仍得到 9。
         above = nextafter(0.288, inf)

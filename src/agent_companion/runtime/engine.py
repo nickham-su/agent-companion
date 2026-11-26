@@ -73,6 +73,8 @@ class Runtime:
         self._instructions = instructions
         self._origin_options = {"model_origin": model_origin} if model_origin is not None else {}
         self._pending: deque[_InputBatch] = deque()
+        self._trigger: Callable[[], bool] | None = None
+        self._reply_commit_failed = False
         self._queued_inbound: set[int] = set()
         self._input_blocked: Literal["retryable", "unsafe"] | None = None
         self._input_retry_requested = False
@@ -118,6 +120,7 @@ class Runtime:
         if not inputs:
             return
         loop = asyncio.get_running_loop()
+        self._trigger = None  # 真实或既有内部输入优先于尚未运行的空转写唤醒。
         self._pending.append(_InputBatch(tuple(inputs), frozenset(persisted_ids)))
         self._queued_inbound.update(persisted_ids)
         # 只以真正入队的输入唤醒。轮询重复移交同一个持久批次不会反复消耗重试预算。
@@ -128,8 +131,19 @@ class Runtime:
                    len(inputs), len(persisted_ids), len(self._pending))
         self._start_worker(loop)
 
+    def trigger_run(self, can_start: Callable[[], bool] = lambda: True) -> None:
+        """无输入地请求一次新运行；队列有内容或路由过期时让位。"""
+        if (self._closed or self._reply_to_parent is not None or self._pending or self._input_blocked
+                or self._reply_commit_failed):
+            return
+        self._trigger = can_start
+        self._start_worker(asyncio.get_running_loop())
+
+    def _has_work(self) -> bool:
+        return bool(self._pending) or self._trigger is not None
+
     def _start_worker(self, loop: asyncio.AbstractEventLoop) -> None:
-        if (self._worker is None and self._pending and not self._closed and not self._input_blocked
+        if (self._worker is None and self._has_work() and not self._closed and not self._input_blocked
                 and self._has_model_slot()):
             self._idle.clear()
             self._worker = loop.create_task(self._drain())
@@ -198,14 +212,16 @@ class Runtime:
         if self._owns_compactions:
             await self._compactions.close()
         self._pending.clear()
+        self._trigger = None
         self._queued_inbound.clear()
         self._worker = None
         self._idle.set()
 
     async def _drain(self) -> None:
         try:
-            while self._pending and not self._closed and not self._input_blocked and self._has_model_slot():
-                await self._process(uuid4().hex)
+            while self._has_work() and not self._closed and not self._input_blocked and self._has_model_slot():
+                trigger, self._trigger = self._trigger, None
+                await self._process(uuid4().hex, trigger=trigger)
         finally:
             self._worker = None
             self._idle.set()
@@ -262,17 +278,26 @@ class Runtime:
                    run_id, len(batch.persisted_ids), len(ids), has_user_input, has_agent_input)
         return ids, has_user_input, has_agent_input
 
-    async def _process(self, run_id: str) -> None:
+    async def _process(self, run_id: str, *, trigger: Callable[[], bool] | None) -> None:
         self.last_failure = None
         clock = asyncio.get_running_loop().time
         started = clock()
-        message_ids: list[int] = []
+        recorded = False
         result = None
         try:
-            message_ids, has_user_input, has_agent_input = await self._record_head(run_id, start=True)
-            if message_ids:
-                result = await self._run(run_id, message_ids[0], has_user_input=has_user_input,
-                                         has_agent_input=has_agent_input)
+            if trigger is None:
+                message_ids, has_user_input, has_agent_input = await self._record_head(run_id, start=True)
+                if message_ids:
+                    recorded = True
+                    result = await self._run(run_id, message_ids[0], has_user_input=has_user_input,
+                                             has_agent_input=has_agent_input)
+            else:
+                prepared = await self._prepare_trigger(run_id, trigger)
+                if prepared is not None:
+                    protected_from, messages = prepared
+                    recorded = True
+                    result = await self._run(run_id, protected_from, has_user_input=False,
+                                             has_agent_input=False, first_messages=messages)
         except _InputWriteFailed as exc:
             self.last_failure = "input_write_failed"
             cause = exc.__cause__
@@ -298,7 +323,7 @@ class Runtime:
             self.last_failure = "runtime_failed"
             _LOG.error("session runtime could not finish the current input; run=%s error_type=%s",
                        run_id, type(exc).__name__)
-        if self.agent is not None and message_ids and not self._closed:
+        if self.agent is not None and recorded and not self._closed:
             await self._finish_agent_run(run_id, result)
         _LOG.debug("runtime run finished; run=%s status=%s elapsed_ms=%.0f",
                    run_id, self.last_failure or "complete", (clock() - started) * 1000)
@@ -330,30 +355,65 @@ class Runtime:
                 _LOG.warning("agent reply enqueue could not be recorded; run=%s error_type=%s",
                              run_id, type(exc).__name__)
 
+    async def _prepare_trigger(self, run_id: str,
+                               route_is_current: Callable[[], bool]) -> tuple[int, list[Message]] | None:
+        def idle_for_trigger() -> bool:
+            return not (self._closed or self._pending or self._reply_commit_failed)
+
+        def can_start() -> bool:
+            # 重入的窗口失效回调可能同步提交真实输入。
+            return idle_for_trigger() and route_is_current() and idle_for_trigger()
+
+        if not can_start():
+            return None
+        prepared = await self._prepare_run(run_id, None, can_send=idle_for_trigger)
+        if prepared is None:
+            return None
+        agent = self.agent
+
+        def start() -> bool:
+            if not idle_for_trigger():
+                return False
+            if agent is None:
+                return can_start()
+            # 拿到写锁后再检查；锁重试期间仍可能有收件落库或旧通话失效。
+            return self.history.start_agent_run(agent.agent_id, run_id, can_start=can_start)
+
+        return prepared if await self._sqlite(start) else None
+
+    async def _prepare_run(self, run_id: str, protected_from: int | None, *,
+                           can_send: Callable[[], bool]) -> tuple[int, list[Message]] | None:
+        try:
+            # 无消息首轮在确认提交运行前不启动额外的摘要请求。
+            last_input_tokens = (await self._sqlite(self.history.last_input_tokens, self.session_id,
+                                                   **self._origin_options) if protected_from is not None else None)
+            return await self._context.prepare(self.session_id, thinking=self._thinking,
+                                               tools=self._tools.specs, instructions=self._instructions,
+                                               protected_from=protected_from, can_send=can_send,
+                                               last_input_tokens=last_input_tokens, run_id=run_id)
+        except OperationalError as exc:
+            if not is_sqlite_lock_error(exc):
+                raise
+            self.last_failure = "context_lock_timeout"
+            _LOG.warning("runtime context lock retries exhausted; run=%s sqlite_code=%s",
+                         run_id, getattr(exc, "sqlite_errorcode", None))
+            return None
+
     async def _run(self, run_id: str, protected_from: int, *, has_user_input: bool,
-                   has_agent_input: bool) -> str | None:
+                   has_agent_input: bool, first_messages: list[Message] | None = None) -> str | None:
         def can_send() -> bool:
             return not self._closed
 
         for index in range(self._settings.max_tool_rounds):
             if not can_send():
                 return None
-            try:
-                last_input_tokens = await self._sqlite(self.history.last_input_tokens, self.session_id,
-                                                       **self._origin_options)
-                messages = await self._context.prepare(self.session_id, thinking=self._thinking,
-                                                       tools=self._tools.specs, instructions=self._instructions,
-                                                       protected_from=protected_from, can_send=can_send,
-                                                       last_input_tokens=last_input_tokens, run_id=run_id)
-            except OperationalError as exc:
-                if not is_sqlite_lock_error(exc):
-                    raise
-                self.last_failure = "context_lock_timeout"
-                _LOG.warning("runtime context lock retries exhausted; run=%s sqlite_code=%s",
-                             run_id, getattr(exc, "sqlite_errorcode", None))
-                return None
-            if messages is None:
-                return None
+            if index == 0 and first_messages is not None:
+                messages = first_messages
+            else:
+                prepared = await self._prepare_run(run_id, protected_from, can_send=can_send)
+                if prepared is None:
+                    return None
+                _, messages = prepared
             model_status, continue_tools, final_text = await self._reply(
                 run_id, messages, has_user_input=has_user_input, has_agent_input=has_agent_input)
             if model_status != "complete":
@@ -378,6 +438,7 @@ class Runtime:
 
     async def _reply(self, run_id: str, messages: Sequence[Message], *,
                      has_user_input: bool, has_agent_input: bool) -> tuple[str, bool, str | None]:
+        self._reply_commit_failed = False  # 新回复有自己的结算，不沿用上一条的失败。
         loop = asyncio.get_running_loop()
         info = ReplyInfo(uuid4().hex, self.session_id, run_id, loop.time())
         diagnostics = ModelRequestDiagnostics("reply", self._settings.model_timeout, run_id, info.reply_id)
@@ -601,7 +662,13 @@ class Runtime:
             outcome = ReplyOutcome(info.reply_id, info.session_id, run_id, model_status,
                                    receipt.status if receipt else None, model_error=model_error,
                                    input_tokens=input_tokens if model_status == "complete" else None)
-            await self._sqlite.write_input(lambda: self.history.finalize_reply(outcome, rows, **self._origin_options))
+            try:
+                await self._sqlite.write_input(lambda: self.history.finalize_reply(outcome, rows, **self._origin_options))
+            except Exception:
+                # 没有可靠的旧回复结算；只作废唤醒，不动真实输入。也拒绝稍后到达的同一轮空结果。
+                self._reply_commit_failed = True
+                self._trigger = None
+                raise
             _LOG.debug("reply committed; reply=%s receipt=%s confirmed_chars=%d tool_results=%d elapsed_ms=%.0f",
                        info.reply_id, receipt.status if receipt else None, len(confirmed_text), len(results),
                        (loop.time() - info.started_at) * 1000)

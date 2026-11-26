@@ -96,11 +96,10 @@ def _protocol_messages(blocks: Sequence[_Projection]) -> list[Message]:
     return [message for block in blocks for message in block.messages]
 
 
-def _checked_blocks(summary: Summary | None, entries: Sequence[HistoryEntry], *, protected_from: int,
+def _checked_blocks(summary: Summary | None, blocks: Sequence[_Block], *, protected_from: int,
                     replay_bytes: Callable[[Message], int | None]) -> tuple[list[_Projection], int]:
     if summary is not None and summary.covers_through >= protected_from:
         raise ModelError("protected_history_already_compacted")
-    blocks = _blocks(entries)
     protected = next(i for i, block in enumerate(blocks) if block.end_id >= protected_from)
     result = []
     for index, block in enumerate(blocks):
@@ -129,9 +128,9 @@ class Context:
         self._compactions = compactions
         self._sqlite = sqlite
 
-    async def prepare(self, session_id: str, *, thinking: bool, tools: Sequence[ToolSpec], protected_from: int,
+    async def prepare(self, session_id: str, *, thinking: bool, tools: Sequence[ToolSpec], protected_from: int | None,
                       can_send: Callable[[], bool], instructions: str | None = None,
-                      last_input_tokens: int | None = None, run_id: str | None = None) -> list[Message] | None:
+                      last_input_tokens: int | None = None, run_id: str | None = None) -> tuple[int, list[Message]] | None:
         fixed = [Message("system", instructions)] if instructions is not None else []
         summary, entries = await self._sqlite(self._history.context_snapshot, session_id)
         if not can_send():
@@ -143,7 +142,17 @@ class Context:
         def replay_bytes(message: Message) -> int | None:
             return check(message, tools, thinking=thinking) if check is not None else 0
 
-        blocks, protected = _checked_blocks(summary, entries, protected_from=protected_from,
+        history_blocks = _blocks(entries)
+        if protected_from is None:
+            # 无新输入时用同一快照的最新可见组。空白投递条目不是上下文；只有摘要也可用。
+            latest = next((block.end_id for block in reversed(history_blocks) if block.messages), None)
+            if latest is None:
+                summarized = _summary_message(summary)
+                if not summarized:
+                    return None
+                return (entries[-1].message_id if entries else covered) + 1, fixed + summarized
+            protected_from = latest
+        blocks, protected = _checked_blocks(summary, history_blocks, protected_from=protected_from,
                                             replay_bytes=replay_bytes)
 
         # 读取可能等锁；只有收口且通过路由核对后才进入同步写入/发包边界。
@@ -168,7 +177,8 @@ class Context:
                             fresh = self._history.try_context_snapshot(session_id)
                             if fresh is not None:
                                 summary, latest_entries = fresh
-                                blocks, _ = _checked_blocks(summary, latest_entries, protected_from=protected_from,
+                                blocks, _ = _checked_blocks(summary, _blocks(latest_entries),
+                                                            protected_from=protected_from,
                                                             replay_bytes=replay_bytes)
             # 不在同一准备点上用旧投影的 usage 再发一次摘要请求。
         elif (protected and last_input_tokens is not None and last_input_tokens >= self._settings.context_budget
@@ -181,7 +191,7 @@ class Context:
                     self._compactions.start(session_id, prefix, fixed + _summary_message(summary) + old + [_SUMMARIZE],
                                              tools, model=self._model, thinking=thinking,
                                              timeout=self._settings.model_timeout, run_id=run_id)
-        return fixed + _summary_message(summary) + _protocol_messages(blocks)
+        return protected_from, fixed + _summary_message(summary) + _protocol_messages(blocks)
 
     def _tail_cut(self, blocks: Sequence[_Projection], protected: int) -> int:
         # 先计入必须保留的本轮，再从近到远加入旧块；本轮自己超尾窗也不裁剪。

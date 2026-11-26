@@ -74,6 +74,7 @@ class _PlaybackReply:
     offered_bytes: int = 0
     stopped_at: float | None = None
     worker_finished_at: float | None = None
+    draining: bool = False  # 合成完毕，只剩已经排队的 PCM。
 
     def terminal_at(self, now: float) -> float | None:
         events = (self.worker_finished_at, self.stopped_at,
@@ -114,12 +115,21 @@ class _PcmQueue:
         with self._lock:
             self._active = state
 
-    def detach(self, state: _PlaybackReply) -> None:
+    def detach(self, state: _PlaybackReply, *, stopping: bool = False) -> bool:
         with self._lock:
-            if self._active is state:
-                self._active = None
-                self._packets.clear()
-                self._queued = 0
+            if self._active is not state:
+                return False
+            was_playing = False
+            if stopping:
+                now = state.stopped_at = state.clock()
+                # 与设备消费原子取证；有合成任务不等于已经播出过音频。
+                was_playing = (state.played_bytes > 0 and state.worker_finished_at is None
+                               and now < min(state.hard_deadline, state.idle_deadline)
+                               and (not state.draining or self._queued > 0))
+            self._active = None
+            self._packets.clear()
+            self._queued = 0
+            return was_playing
 
     def size(self, state: _PlaybackReply) -> int:
         with self._lock:
@@ -201,19 +211,20 @@ class VoiceOutput:
     def render(self, output: memoryview) -> None:
         self._pcm.fill(output)
 
-    def interrupt(self) -> None:
-        self._stop(DeliveryStatus.PARTIAL)
+    def interrupt(self) -> bool:
+        return self._stop(DeliveryStatus.PARTIAL)
 
     def fail(self) -> None:
         self._closed = True
         self._stop(DeliveryStatus.FAILED)
 
-    def _stop(self, status: DeliveryStatus) -> None:
+    def _stop(self, status: DeliveryStatus) -> bool:
         state = self._active
         if state is not None and not state.signal.done():
-            self._pcm.detach(state)  # 现在清除待播，不等待 HTTP 或回执任务
-            state.stopped_at = state.clock()
+            was_playing = self._pcm.detach(state, stopping=True)  # 不等待 HTTP 或回执任务
             state.signal.set_result(status)
+            return was_playing
+        return False
 
     def _finished(self, task: asyncio.Task[None]) -> None:
         self._workers.discard(task)
@@ -336,6 +347,7 @@ class VoiceOutput:
             if not part.received:
                 raise TtsError("tts_empty_audio")
             state.complete(part)
+        state.draining = True
         while self._pcm.size(state):
             await asyncio.sleep(_TICK)
         if state.signal.done() or reply.abandoned:

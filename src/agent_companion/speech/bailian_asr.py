@@ -269,9 +269,16 @@ class BailianASR:
                 text = await self._transcribe(_file_chunks(file.data, self._file_rate), audio_format, _Upload.new())
                 if clock() >= deadline:
                     raise TimeoutError
-                return text
+                return self._required_text(text)
         except TimeoutError:
             raise AsrError("asr_timeout") from None
+
+    @staticmethod
+    def _required_text(text: str) -> str:
+        # 到这里已确认本地 finish-task 写入成功；空结果不能绕过发送收尾。
+        if not text:
+            raise AsrError("asr_empty_transcript", phase="finish")
+        return text
 
     async def transcribe_stream(self, frames: AsyncIterator[bytes]) -> str:
         previous = self._live_upload
@@ -282,7 +289,7 @@ class BailianASR:
             raise AsrError("asr_busy")
         upload = self._live_upload = _Upload.new()
         try:
-            return await self._transcribe(frames, "pcm", upload)
+            return self._required_text(await self._transcribe(frames, "pcm", upload))
         finally:
             if upload.sender is not None and not upload.sender.done():
                 # 连接已经释放；输入若吞掉取消，仍占用唯一的实时槽，不能累积孤儿。
@@ -396,10 +403,7 @@ class BailianASR:
                     raise AsrError("asr_timeout", phase="finish")
                 if unfinished or (sentences and max(sentences) != len(sentences)):
                     raise InvalidEvent
-                text = "\n".join(value for _, value in sorted(sentences.items()) if value)
-                if not text:
-                    raise AsrError("asr_empty_transcript", phase="finish")
-                return text
+                return "\n".join(value for _, value in sorted(sentences.items()) if value)
             if event != "result-generated":
                 raise InvalidEvent
             output = payload.get("output")

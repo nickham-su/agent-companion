@@ -136,6 +136,7 @@ class AgentTree:
                               workspace=self._workspace, agent=agent,
                               reply_to_parent=reply_to_parent if parent_id is not None else None)
             revoke = scheduler.bind(runtime.submit_inputs, owner=owner,
+                                    trigger=runtime.trigger_run if parent_id is None else None,
                                     on_revoke=timers.close if timers is not None else None)
             binding = self._bindings[agent.agent_id] = _Binding(runtime, scheduler, owner, revoke)
             return binding

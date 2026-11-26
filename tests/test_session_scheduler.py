@@ -45,6 +45,34 @@ class SessionSchedulerTest(unittest.IsolatedAsyncioTestCase):
         (batch_id,) = set(history.pending_inbound("main", "test")) - set(prior)
         return PersistedInput(batch_id)
 
+    async def test_empty_call_signal_is_valid_only_for_its_current_settled_turn(self):
+        registry = SessionSchedulers()
+        scheduler = registry.get_or_create("main")
+        triggers, accepted = [], []
+        revoke = scheduler.bind(accepted.append, trigger=triggers.append)
+
+        def stop():
+            pass
+
+        scheduler.call_started(stop)
+        self.assertTrue(scheduler.call_input(stop, (), input_active=False))
+        self.assertEqual(triggers, [])
+        scheduler.call_input(stop, (), input_active=True)
+        scheduler.call_input(stop, (), input_active=False, empty_transcript=True)
+        self.assertTrue(triggers[-1]())
+        scheduler.call_input(stop, (), input_active=True)
+        scheduler.call_input(stop, (), input_active=False)
+        self.assertFalse(triggers[-1]())
+        scheduler.call_input(stop, (), input_active=True)
+        scheduler.call_input(stop, (), input_active=False, empty_transcript=True)
+        self.assertTrue(triggers[-1]())
+        scheduler.call_ended(stop)
+        self.assertFalse(triggers[-1]())
+        self.assertFalse(scheduler.call_input(stop, (), input_active=False, empty_transcript=True))
+        self.assertEqual(len(triggers), 2)
+        self.assertEqual(accepted, [])
+        revoke()
+
     async def test_first_use_and_rebind_keep_one_instance_but_clear_old_route_state(self):
         registry = SessionSchedulers()
         start = asyncio.Event()

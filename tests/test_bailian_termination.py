@@ -232,33 +232,41 @@ class BailianASRTerminationTests(unittest.IsolatedAsyncioTestCase):
         socket.transport.write.assert_not_called()
 
     async def test_reader_can_finish_while_finish_send_is_still_draining(self):
-        for fail_drain in (False, True):
-            socket = _BufferedWebSocket()
-            socket.client.pause_writing()
-            with self.subTest(fail_drain=fail_drain):
-                async with _using_socket(socket):
-                    call = asyncio.create_task(_asr().transcribe_stream(_frames(_FRAME)))
-                    try:
-                        await socket.finish.wait()
-                        socket.transport.write.assert_called_once()  # 已写入，send 仍卡在排空。
-                        socket.sentence(1, "完整结果")
-                        socket.event("task-finished")
-                        for _ in range(3):
-                            raw = await socket.received.get()
-                        self.assertIn("task-finished", raw)
-                        self.assertFalse(call.done())
-                        if fail_drain:
-                            socket.client.connection_lost(OSError("不应暴露"))
-                            with self.assertRaisesRegex(AsrError, "^asr_transport$"):
-                                await call
-                        else:
-                            socket.client.resume_writing()
-                            self.assertEqual(await call, "完整结果")
-                    finally:
-                        if not call.done():
-                            call.cancel()
-                            await asyncio.gather(call, return_exceptions=True)
-                self.assertTrue(socket.closed)
+        for text in ("完整结果", ""):
+            for drain in ("resume", "failed", "timeout"):
+                socket = _BufferedWebSocket()
+                socket.client.pause_writing()
+                with self.subTest(text=text, drain=drain):
+                    async with _using_socket(socket):
+                        asr = _asr(timeout=0.2 if drain == "timeout" else 1)
+                        call = asyncio.create_task(asr.transcribe_stream(_frames(_FRAME)))
+                        try:
+                            await asyncio.wait_for(socket.finish.wait(), 2)
+                            socket.transport.write.assert_called_once()  # 已写入，send 仍卡在排空。
+                            if text:
+                                socket.sentence(1, text)
+                            socket.event("task-finished")
+                            for _ in range(3 if text else 2):
+                                raw = await asyncio.wait_for(socket.received.get(), 2)
+                            self.assertIn("task-finished", raw)
+                            self.assertFalse(call.done())
+                            if drain == "failed":
+                                socket.client.connection_lost(OSError("不应暴露"))
+                            elif drain == "resume":
+                                socket.client.resume_writing()
+                            diagnostic = {"failed": "asr_transport", "timeout": "asr_timeout"}.get(drain)
+                            if diagnostic is None and text:
+                                self.assertEqual(await asyncio.wait_for(call, 2), text)
+                            else:
+                                with self.assertRaises(AsrError) as captured:
+                                    await asyncio.wait_for(call, 2)
+                                self.assertEqual(captured.exception.diagnostic, diagnostic or "asr_empty_transcript")
+                                self.assertEqual(captured.exception.phase, "finish")
+                        finally:
+                            if not call.done():
+                                call.cancel()
+                                await asyncio.gather(call, return_exceptions=True)
+                    self.assertTrue(socket.closed)
 
     async def test_done_writer_slot_is_reclaimed_before_old_cleanup_callback(self):
         waiting = asyncio.Event()

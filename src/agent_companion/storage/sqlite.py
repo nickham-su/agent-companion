@@ -1,6 +1,6 @@
 """SQLite 中的 Agent、会话历史、摘要和投递记录。"""
 
-from collections.abc import Iterable, Iterator, Sequence
+from collections.abc import Callable, Iterable, Iterator, Sequence
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass, field, replace
 import json
@@ -654,6 +654,13 @@ class History:
             "SELECT peer_open_id FROM feishu_raw_batches UNION SELECT peer_open_id FROM inbound_batches"
             " WHERE source = ? AND peer_open_id IS NOT NULL", (_FEISHU_INBOX[1],))]
 
+    def has_pending_feishu_input(self, peer: str, session_id: str) -> bool:
+        """在同一快照覆盖原始批次与归一化后的批次，不读取正文。"""
+        return bool(self._db.execute("""
+            SELECT EXISTS (SELECT 1 FROM feishu_raw_batches WHERE peer_open_id = ?)
+                OR EXISTS (SELECT 1 FROM inbound_batches WHERE session_id = ? AND source = ?)
+            """, (peer, session_id, _FEISHU_INBOX[1])).fetchone()[0])
+
     def next_feishu_raw(self, peer: str) -> tuple[int, bool] | None:
         row = self._db.execute("SELECT batch_id, has_media FROM feishu_raw_batches WHERE peer_open_id = ?"
                                " ORDER BY batch_id LIMIT 1", (peer,)).fetchone()
@@ -698,6 +705,19 @@ class History:
                     ids.extend(self._append(session_id, (item,)))
         return ids, consumed
 
+    def _start_agent_run(self, agent_id: str, run_id: str) -> None:
+        self._db.execute("INSERT INTO agent_runs (run_id, agent_id, status, started_at)"
+                         " VALUES (?, ?, 'running', ?)", (run_id, agent_id, time()))
+
+    def start_agent_run(self, agent_id: str, run_id: str, *, can_start: Callable[[], bool]) -> bool:
+        """拿到写锁后确认唤醒资格，只写运行元数据，不新增对话消息。"""
+        with self._input_transaction(retryable_io=False):
+            self._db.execute("BEGIN IMMEDIATE")
+            if not can_start():
+                return False
+            self._start_agent_run(agent_id, run_id)
+        return True
+
     def append_agent_inputs(self, agent_id: str, run_id: str,
                             items: Sequence[Message | int | DelegatedInput | AgentReplyInput], *,
                             start: bool) -> tuple[list[int], bool, bool]:
@@ -710,8 +730,7 @@ class History:
             if agent is None:
                 raise ValueError("unknown input agent")
             if start:
-                self._db.execute("INSERT INTO agent_runs (run_id, agent_id, status, started_at)"
-                                 " VALUES (?, ?, 'running', ?)", (run_id, agent_id, time()))
+                self._start_agent_run(agent_id, run_id)
             elif not self._agent_run_active(agent_id, run_id):
                 raise ValueError("cannot append to an inactive agent run")
             for item in items:

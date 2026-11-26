@@ -1,4 +1,5 @@
 import asyncio
+import sqlite3
 import unittest
 from unittest.mock import patch
 
@@ -9,7 +10,7 @@ from agent_companion.protocol import (DeliveryStatus, Message, ModelError, Recei
                                       ToolReady, ToolSpec)
 from agent_companion.runtime.engine import Runtime
 from agent_companion.runtime.tools import Tool, Tools
-from agent_companion.storage.sqlite import History
+from agent_companion.storage.sqlite import History, Summary
 
 
 SPEC = ToolSpec("test", "模拟工具", {"type": "object", "properties": {}})
@@ -58,6 +59,115 @@ class RuntimeTest(unittest.IsolatedAsyncioTestCase):
     async def idle(self, runtime):
         await asyncio.wait_for(runtime.wait_idle(), 2)
         self.assertIsNone(runtime.last_failure)
+
+    async def test_trigger_run_keeps_tool_permissions_and_protects_summary_only_context(self):
+        usage = []
+
+        async def tool(args, context):
+            usage.append((context.has_user_input, context.has_agent_input))
+            return "工具结果"
+
+        model = ScriptModel(events(ToolReady(CALL)), events(TextDelta("新回复")))
+        runtime, history = self.setup_runtime(model, Channel(), tools=Tools([Tool(SPEC, tool)]))
+        runtime.trigger_run()
+        await self.idle(runtime)
+        self.assertEqual(model.requests, [])
+        (old_id,) = history.append("main", [Message("user", "已压缩的输入")])
+        history.save_summary("main", Summary(old_id, "合成摘要"))
+        runtime.trigger_run()
+        await self.idle(runtime)
+        self.assertEqual(usage, [(False, False)])
+        (first, _, _), (second, _, _) = model.requests
+        self.assertEqual(first, [Message("system", "此前会话摘要：\n合成摘要")])
+        self.assertEqual([message.role for message in second], ["system", "assistant", "tool"])
+        self.assertEqual([row.message.role for row in history.tail("main", 10)],
+                         ["user", "assistant", "tool", "assistant"])
+
+    async def test_real_pending_input_replaces_or_prevents_trigger(self):
+        for before_trigger in (False, True):
+            with self.subTest(before_trigger=before_trigger):
+                model = ScriptModel(events(TextDelta("仅真实输入的回复")))
+                runtime, history = self.setup_runtime(model, Channel())
+                message = Message("user", "真正输入")
+                history.append("main", [Message("assistant", "已有历史")])
+                if before_trigger:
+                    runtime.submit_batch((message,))
+                runtime.trigger_run()
+                if not before_trigger:
+                    runtime.submit_batch((message,))
+                await self.idle(runtime)
+                self.assertEqual(len(model.requests), 1)
+                self.assertEqual(model.requests[0][0][-1], message)
+
+    async def test_real_input_wins_during_trigger_run_record_lock_retry(self):
+        model, channel = ScriptModel(events(TextDelta("真实输入的回复"))), Channel()
+        self.addCleanup((history := History(":memory:")).close)
+        agent = history.ensure_main_agent("main")
+        runtime = Runtime("main", history, model, channel, agent=agent, retry_sqlite_locks=True)
+        self.addAsyncCleanup(runtime.close)
+        history.append("main", [Message("assistant", "已有历史")])
+        attempted = asyncio.Event()
+        failed_run_ids = []
+
+        def locked(agent_id, run_id, *, can_start):
+            failed_run_ids.append(run_id)
+            attempted.set()
+            error = sqlite3.OperationalError("synthetic lock")
+            error.sqlite_errorcode = sqlite3.SQLITE_BUSY
+            raise error
+
+        with patch.object(history, "start_agent_run", side_effect=locked):
+            runtime.trigger_run()
+            await asyncio.wait_for(attempted.wait(), 2)
+            real = Message("user", "在重试期间到达")
+            runtime.submit_batch((real,))
+            await self.idle(runtime)
+        self.assertEqual(len(model.requests), 1)
+        self.assertEqual(model.requests[0][0][-1], real)
+        (skipped,) = failed_run_ids
+        self.assertIsNone(history.agent_run(skipped))
+        ((info, _),) = channel.replies
+        self.assertEqual(history.agent_run(info.run_id).status, "completed")
+
+    async def test_reentrant_trigger_guard_does_not_steal_queued_input(self):
+        model = ScriptModel(events(TextDelta("处理真实输入")))
+        runtime, history = self.setup_runtime(model, Channel())
+        history.append("main", [Message("assistant", "已有历史")])
+        real = Message("user", "检查通话时同步交接")
+
+        def handoff():
+            runtime.submit_batch((real,))
+            return True
+
+        runtime.trigger_run(handoff)
+        await self.idle(runtime)
+        self.assertEqual(len(model.requests), 1)
+        self.assertEqual(model.requests[0][0][-1], real)
+
+    async def test_failed_reply_commit_discards_queued_and_late_wake_without_blocking_real_input(self):
+        model = ScriptModel(events(TextDelta("没有可靠结算")), events(TextDelta("真实输入的回复")))
+        runtime, history = self.setup_runtime(model, Channel())
+        original = Message("user", "最初输入")
+
+        def fail_commit(outcome, rows, **kwargs):
+            runtime.trigger_run()
+            self.assertIsNotNone(runtime._trigger)
+            raise RuntimeError("synthetic reply commit failure")
+
+        with patch.object(history, "finalize_reply", side_effect=fail_commit):
+            runtime.submit_batch((original,))
+            await asyncio.wait_for(runtime.wait_idle(), 2)
+        self.assertEqual(runtime.last_failure, "runtime_failed")
+        self.assertEqual(history.outcomes("main"), [])
+        self.assertEqual(len(model.requests), 1)
+        runtime.trigger_run()  # ASR 也可能晚于失败的回执写入。
+        await asyncio.wait_for(runtime.wait_idle(), 2)
+        self.assertEqual(len(model.requests), 1)
+        real = Message("user", "下一个实际输入")
+        runtime.submit_batch((real,))
+        await self.idle(runtime)
+        self.assertEqual([request[0] for request in model.requests], [[original], [original, real]])
+        self.assertEqual(len(history.outcomes("main")), 1)
 
     async def test_close_cancels_active_and_queued_tools_before_waiting_for_child_model(self):
         model_closing, model_release, model_stopped = (asyncio.Event() for _ in range(3))

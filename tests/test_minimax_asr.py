@@ -83,6 +83,19 @@ class MiniMaxASRTests(unittest.IsolatedAsyncioTestCase):
             self.assertIn(wav, calls[0])
             self.assertIn(_OGG_OPUS, calls[1])
 
+    async def test_only_explicit_empty_text_is_empty_transcript(self):
+        for payload, code in (({"text": " "}, "asr_empty_transcript"),
+                              ({"text": "", "base_resp": {"status_code": 0}}, "asr_empty_transcript"),
+                              ({"text": "", "base_resp": {"status_code": 1000}}, "asr_business_error"),
+                              ({"status": "unexpected"}, "asr_invalid_response"),
+                              ({"text": None}, "asr_invalid_response")):
+            with self.subTest(code=code, payload=payload):
+                async with httpx.AsyncClient(transport=httpx.MockTransport(
+                        lambda _: httpx.Response(200, json=payload))) as client:
+                    asr = MiniMaxASR(client, region="cn", timeout=1, max_audio_seconds=1)
+                    with self.assertRaisesRegex(AsrError, code):
+                        await asr.transcribe(AudioFile(_wave()))
+
     async def test_timeout_and_http_error_never_retry(self):
         for delayed in (False, True):
             calls = 0

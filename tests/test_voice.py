@@ -1191,6 +1191,29 @@ class VoiceInputTest(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(events[2:], [(None, True), ("转写结果", False)])
             self.assertEqual(len(asr.files), 1)
 
+    async def test_capped_file_empty_waits_for_quiet_and_gap_revokes_wake(self):
+        for outcome in ("empty", "gap", "timeout", "wrong_phase"):
+            with self.subTest(outcome=outcome):
+                phase = "receive" if outcome == "wrong_phase" else None
+                asr = _ASR(AsrError("asr_empty_transcript", phase=phase), block=outcome == "timeout")
+                device = _Device()
+                voice = VoiceChannel(asr, _TTS(), _Vad(), _SETTINGS, asr_timeout=0.05, max_audio_seconds=0.1)
+                events = []
+                async with voice.connected(device, lambda *event: events.append(event), capture_enabled=False):
+                    playback = asyncio.create_task(voice.deliver(_reply("old", "正在播报。")))
+                    await _until(lambda: voice._output._active is not None and voice._output._active.draining)
+                    self.assertEqual(device.pull(1), _A)
+                    for _ in range(4):
+                        voice._process(False, True, _HOT)
+                    await playback
+                    await _until(lambda: len(asr.files) == 1 and voice._pending == 0)
+                    self.assertEqual(events, [(None, True)])
+                    if outcome == "gap":
+                        voice._process(True, False, _QUIET)
+                    for _ in range(voice._end_frames):
+                        voice._process(False, False, _QUIET)
+                    self.assertEqual(events, [(None, True), ("" if outcome == "empty" else None, False)])
+
     async def test_empty_failed_and_timed_out_asr_report_idle(self):
         for text, blocked in (("  ", False), (RuntimeError("synthetic"), False), ("迟到结果", True)):
             with self.subTest(text=text, timeout=blocked):
