@@ -101,7 +101,7 @@ def _resolve_role_models(settings: Settings, roles: Mapping[str, AgentRole]) -> 
             raise ConfigError(f"{location} 必须显式设置")
         profile = settings.models.get(model_id)
         if profile is None:
-            raise ConfigError(f"{location} 引用的模型配置不存在，请检查 [models.<ID>]")
+            raise ConfigError(f"{location} 引用的模型配置不存在，请检查 [models.llm.<ID>]")
         provider = settings.llm_providers.get(profile.provider)
         if provider is None:
             raise ConfigError(f"{location} 所引用模型的 provider 不存在或不支持 llm")

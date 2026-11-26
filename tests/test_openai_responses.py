@@ -867,19 +867,20 @@ class OpenAIResponsesTests(unittest.IsolatedAsyncioTestCase):
             "other_effort": (*default[:3], "future-value"),
         }
         tables = """
-asr_provider = "speech"
+asr_model = "speech"
 [timeouts]
 llm = 0.75
 [feishu]
 [providers.speech]
 adapter = "minimax"
 api_key = "synthetic-speech-test"
-[providers.speech.asr]
+[models.asr.speech]
+provider = "speech"
 max_audio_seconds = 500
 """
         for name, (key, address, model, effort) in profiles.items():
             tables += (f'[providers.{name}]\nadapter = "openai_responses"\napi_key = "{key}"\nbase_url = "{address}"\n'
-                       f'[models.{name}]\nprovider = "{name}"\nmodel = "{model}"\nreasoning_effort = "{effort}"\n'
+                       f'[models.llm.{name}]\nprovider = "{name}"\nmodel = "{model}"\nreasoning_effort = "{effort}"\n'
                        'context_budget = 64000\ntail_budget = 16000\n')
 
         async def exercise(settings, history, model, asr, tts, roles):

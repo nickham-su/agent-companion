@@ -24,7 +24,7 @@ from agent_companion.storage.sqlite import History, ReplyOutcome, _SCHEMA, _SCHE
 from test_openai_responses import _Wire, _answer, _call, _completed
 
 
-_CONFIG = '''asr_provider = "speech"
+_CONFIG = '''asr_model = "speech"
 [feishu]
 [providers.speech]
 adapter = "minimax"
@@ -36,16 +36,17 @@ api_key = "fixture-deep"
 adapter = "openai_responses"
 api_key = "fixture-responses"
 base_url = "https://responses.example.invalid/v1"
-[providers.speech.asr]
+[models.asr.speech]
+provider = "speech"
 max_audio_seconds = 100
-[models.chat]
+[models.llm.chat]
 provider = "deep"
 model = "main-model"
 reasoning_effort = "high"
 context_budget = 100
 tail_budget = 1
 max_tool_rounds = 3
-[models.review]
+[models.llm.review]
 provider = "responses"
 model = "child-model"
 reasoning_effort = "low"
@@ -113,20 +114,7 @@ class ProfileValidationTests(_Files, unittest.TestCase):
                 for effect in (discovery, history, client):
                     effect.assert_not_called()
 
-    def test_migration_diagnostics_and_profile_budget_validation(self):
-        for field, old in (
-            ("llm_provider", 'llm_provider="fixture-obsolete"\n' + _CONFIG),
-            ("llm", _CONFIG + '\n[providers.inactive.llm]\nmodel="fixture-obsolete"\n'),
-            *((key, _CONFIG + f'\n[runtime]\n{key}=10\n')
-              for key in ("context_budget", "tail_budget", "max_tool_rounds")),
-        ):
-            with self.subTest(field=field):
-                self.config.write_text(old, encoding="utf-8")
-                with self.assertRaises(ConfigError) as error:
-                    self.settings()
-                for hint in ("fixture.toml", field, "[models.<ID>]", "model_id"):
-                    self.assertIn(hint, str(error.exception))
-                self.assertNotIn("fixture-obsolete", str(error.exception))
+    def test_profile_budget_validation(self):
         for update, field in (("context_budget = false", "context_budget"),
                               ("tail_budget = 100", "tail_budget"),
                               ("max_tool_rounds = 0", "max_tool_rounds"),
@@ -301,7 +289,7 @@ class ProfileRuntimeTests(_Files, unittest.IsolatedAsyncioTestCase):
         phase = "same"
         requests.clear()
         # 换档案名但保留实际连接、模型和 effort：旧用量及有归属的私有推理仍可用。
-        self.config.write_text(_CONFIG.replace("[models.chat]", "[models.renamed]"), encoding="utf-8")
+        self.config.write_text(_CONFIG.replace("[models.llm.chat]", "[models.llm.renamed]"), encoding="utf-8")
         self.role("main", 'model_id="renamed"')
         self.role("unused_child", 'model_id="renamed"')
         self.assertEqual(await self.serve(respond, drive, expected_clients=2), ["deep"])
@@ -313,7 +301,7 @@ class ProfileRuntimeTests(_Files, unittest.IsolatedAsyncioTestCase):
 
         phase = "rotated"
         requests.clear()
-        rotated = (_CONFIG.replace("[models.chat]", "[models.renamed]")
+        rotated = (_CONFIG.replace("[models.llm.chat]", "[models.llm.renamed]")
                    .replace('api_key = "fixture-deep"', 'api_key = "fixture-deep-rotated"'))
         self.config.write_text(rotated, encoding="utf-8")
         self.assertEqual(await self.serve(respond, drive, expected_clients=2), ["deep"])

@@ -17,16 +17,18 @@ from agent_companion.speech.minimax import MiniMaxASR
 from agent_companion.speech.minimax_tts import MiniMaxTTS
 
 
-_CONFIG = '''asr_provider = "speech"
-tts_provider = "speech"
+_CONFIG = '''asr_model = "mic"
+tts_model = "speaker"
 [feishu]
 mode = "voice"
 [providers.speech]
 adapter = "minimax"
 api_key = "fixture-speech"
-[providers.speech.asr]
+[models.asr.mic]
+provider = "speech"
 max_audio_seconds = 100
-[providers.speech.tts]
+[models.tts.speaker]
+provider = "speech"
 model = "speech-2.8-turbo"
 voice_id = "male-qn-qingse"
 [providers.other]
@@ -34,13 +36,13 @@ adapter = "bailian"
 api_key = "fixture-other"
 region = "ap-southeast-1"
 workspace_id = "fixture-space"
-[models.first]
+[models.llm.first]
 provider = "speech"
 model = "MiniMax-M3.1-Flash"
 reasoning_effort = "disabled"
 context_budget = 64000
 tail_budget = 16000
-[models.second]
+[models.llm.second]
 provider = "other"
 model = "qwen4-max"
 reasoning_effort = "enabled"
@@ -69,10 +71,14 @@ class ChatConfigTests(unittest.IsolatedAsyncioTestCase):
                     config = _CONFIG.replace('api_key = "fixture-speech"',
                                              'api_key = "fixture-speech"\nbase_url = "https://api.minimax.io/v1/"')
                 else:
-                    config = (_CONFIG.replace('asr_provider = "speech"', 'asr_provider = "other"')
-                              .replace('tts_provider = "speech"', 'tts_provider = "other"')
-                              .replace('[models.first]', '[providers.other.asr]\nmax_audio_seconds = 100\n'
-                                       '[providers.other.tts]\n\n[models.first]'))
+                    config = (_CONFIG.replace('asr_model = "mic"', 'asr_model = "bailian_mic"')
+                              .replace('tts_model = "speaker"', 'tts_model = "bailian_speaker"') + '''
+[models.asr.bailian_mic]
+provider = "other"
+max_audio_seconds = 100
+[models.tts.bailian_speaker]
+provider = "other"
+''')
                 settings = self.settings(config)
                 self.assertIs(settings.asr.connection, settings.tts.connection)
                 roles = {"main": AgentRole(None, model_id="first"), "child": AgentRole(None, model_id="second")}
@@ -125,17 +131,16 @@ class ChatConfigTests(unittest.IsolatedAsyncioTestCase):
                 self.assertTrue(all(owned.is_closed for owned, _ in clients))
 
     def test_unchosen_speech_providers_are_not_validated_as_llm(self):
-        config = _CONFIG.replace('provider = "speech"', 'provider = "separate"')
-        # 替换只针对模型引用；语音仍选择原 Provider。
-        config = config.replace('asr_provider = "separate"', 'asr_provider = "speech"')
-        config = config.replace('tts_provider = "separate"', 'tts_provider = "speech"')
+        config = _CONFIG.replace('[models.llm.first]\nprovider = "speech"',
+                                 '[models.llm.first]\nprovider = "separate"')
         config += '''
 [providers.separate]
 adapter = "minimax"
 api_key = "fixture-separate"
 [providers.unused_bailian]
 adapter = "bailian"
-[providers.unused_bailian.tts]
+[models.tts.unused]
+provider = "unused_bailian"
 model = false
 '''
         settings = self.settings(config)
@@ -155,7 +160,8 @@ model = false
         for adapter in ("minimax", "deepseek", "openai_responses"):
             config = _CONFIG.replace('model = "MiniMax-M3.1-Flash"', 'model = "kimi/kimi-k3"')
             if adapter != "minimax":
-                config = (config.replace('[models.first]\nprovider = "speech"', '[models.first]\nprovider = "native"')
+                config = (config.replace('[models.llm.first]\nprovider = "speech"',
+                                         '[models.llm.first]\nprovider = "native"')
                           + f'\n[providers.native]\nadapter = "{adapter}"\n')
             with self.subTest(adapter=adapter), self.assertRaisesRegex(ConfigError, "model 格式无效"):
                 self.settings(config)

@@ -1,6 +1,6 @@
 +++
 description = "适合审阅方案、检查遗漏和边界条件"
-# 显式共用 [models.chat]；也可改为已配置可用的 "review" 等其他 ID。
+# 显式共用 [models.llm.chat]；也可改为已配置可用的 "review" 等其他 ID。
 model_id = "chat"
 # 可用工具：
 # - delegate_subtask：将任务异步委派给子 Agent。

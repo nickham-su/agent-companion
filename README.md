@@ -47,26 +47,26 @@ Bash 排查时看 `bash call finished`：记录结果类别、退出码和耗时
 
 ## 选择模型与 Provider
 
-每个角色用 `model_id` 引用全局 `[models.<ID>]`。一套模型配置必填 `provider`、`model`、`reasoning_effort`、`context_budget`、`tail_budget`；`max_tool_rounds` 可省略（默认 `8`），限制一次运行中的模型请求轮数，**含首轮**，不是工具调用次数。两个预算和轮数上限都必须是正整数，且 `tail_budget < context_budget`。
+每个角色用 `model_id` 引用 `[models.llm.<ID>]`。LLM 配置必填 `provider`、`model`、`reasoning_effort`、`context_budget`、`tail_budget`；`max_tool_rounds` 可省略（默认 `8`），限制一次运行中的模型请求轮数，**含首轮**，不是工具调用次数。两个预算和轮数上限都必须是正整数，且 `tail_budget < context_budget`。
 
-`provider` 指向 `[providers.<ID>]`，其中的 `adapter` 才是实际适配器。多个模型配置可引用同一个 Provider，多个角色也可显式引用同一个模型配置；改动一套配置会影响所有引用它的角色，修改后重启生效。各角色的普通请求、工具续轮和摘要都使用自己的配置。语音仍通过顶层 `asr_provider`、`tts_provider` 引用 Provider；`text` 不使用 TTS。密钥只填本机配置的 `api_key`，不从环境变量读取。未被实际角色或语音能力选用的 Provider 不要求有效密钥；启动先校验配置和引用，不探测模型端点。
+语音用顶层 `asr_model`、`tts_model` 分别引用 `[models.asr.<ID>]`、`[models.tts.<ID>]`，填的是配置 ID，不是厂商模型名。`text` 和 `voice` 都使用 ASR；只有 `voice` 使用 TTS。
 
-**从旧配置迁移**：参照 [config.example.toml](config.example.toml)，删除顶层 `llm_provider`、`[providers.<ID>.llm]` 和 `[runtime]`；将原 Provider 引用、模型名（以前省略时也要显式填写）、推理强度、两个预算及轮数上限集中到 `[models.<ID>]`。在每个实际角色文件显式加上 `model_id`；原先共用模型的角色可填写同一个 ID。旧格式不会回退读取，原 SQLite 数据库无需更换。切换到上下文窗口较小的模型时，旧模型的用量不会触发压缩；若已有历史过长，新模型的第一次请求仍可能被拒绝。
+三类模型配置都必须填写 `provider`，指向 `[providers.<ID>]`。Provider 只保存连接配置，包括 `adapter` 和 `api_key`，可供多个模型共用。同一 LLM 配置也可被多个角色引用，各角色的普通请求、工具续轮和摘要都使用选中的配置，修改后重启生效。密钥只填本机的 `api_key`，不从环境变量读取。未被实际角色或语音能力选用的 Provider 不要求有效密钥；启动只校验配置和引用，不探测模型端点。
 
-请求时限统一配置在 `[timeouts]`，单位秒：`llm` 是单次模型请求总时限（默认 60），`asr` 是单次文件转写总时限（默认 30，包含请求握手、文件上传和等待结果）；实时流式转写的启动、停口后的等待分别使用该时限，录音时长不计入其中，`tts` 是单次网络读写及等待响应的时限（默认 25，仅 `voice` 启用）。切换 Provider 不改变这些值。旧的 `runtime.model_timeout` 和 Provider 能力表里的 `timeout` 不再兼容；语音投递与飞书 CLI 的时限独立配置。升级时删除 `[runtime]` 中旧的 `delivery_timeout`。
+请求时限统一配置在 `[timeouts]`，单位秒：`llm` 是单次模型请求总时限（默认 60），`asr` 是单次文件转写总时限（默认 30，包含请求握手、文件上传和等待结果）；实时流式转写的启动、停口后的等待分别使用该时限，录音时长不计入其中，`tts` 是单次网络读写及等待响应的时限（默认 25，仅 `voice` 启用）。切换模型或 Provider 不改变这些值。语音投递与飞书 CLI 的时限独立配置。
 
 | `adapter` | 配置 |
 | --- | --- |
 | `deepseek` | `model` 必填，例如 `deepseek-flash`。`reasoning_effort = "disabled"` 显式关闭思考；其他值由所选模型解释。只有来源匹配的历史才会回传私有推理字段；不匹配或无来源的旧块保留可见内容，思考模式要求推理字段时按完整块作为历史归档投影。 |
 | `openai_responses` | `model` 必填。可选 Provider 层 `base_url`，默认 `https://api.openai.com/v1`，请求时在其后追加 `/responses`。`reasoning_effort` 原样传给 Responses，例如 `low`，或选用明确支持 `none` 的模型来关闭推理。 |
-| `minimax` | Provider 层 `region` 选 `cn`（默认）或 `global`。`.asr.model` 默认 `asr-1.0`，也可填写其他兼容同一文件转写接口的模型名；`.asr.max_audio_seconds` 必填，无默认值。`.tts` 配置模型和音色。ASR、TTS 可以共用一套 Provider，也可以分别使用不同区域和 Key。 |
-| `bailian` | Provider 层填 `workspace_id` 及同地域的 Key，`region` 为 `cn-beijing`（默认）或 `ap-southeast-1`，连接百炼业务空间域名。ASR 支持 `qwen-audio-3.1-asr-flash-message`（文件和流式），`.asr.max_audio_seconds` 必填。TTS 默认 `qwen-audio-3.1-tts-flash` / `longanhuan_v3.1`；也支持 `cosyvoice-v3-flash`，须同时配置与模型和地域匹配的 `voice_id`，如 `longanyang`。 |
+| `minimax` | Provider 层 `region` 选 `cn`（默认）或 `global`。ASR 的 `model` 默认 `asr-1.0`，也可填写其他兼容同一文件转写接口的模型名。TTS 的模型与音色分别用 `model`、`voice_id` 配置。 |
+| `bailian` | Provider 层填 `workspace_id` 及同地域的 Key，`region` 为 `cn-beijing`（默认）或 `ap-southeast-1`，连接百炼业务空间域名。ASR 支持 `qwen-audio-3.1-asr-flash-message`（文件和流式）。TTS 默认 `qwen-audio-3.1-tts-flash` / `longanhuan_v3.1`；也支持 `cosyvoice-v3-flash`，须同时配置与模型和地域匹配的 `voice_id`，如 `longanyang`。 |
 
-默认示例继续使用 MiniMax。`asr_provider` 在语音条和实时通话间共用；`tts_provider` 可独立选择，例如 ASR 用百炼、播报仍用 MiniMax。程序启动时按配置构造适配器，飞书语音条只使用文件能力，实时通话优先使用流式能力，不支持时才选择同一适配器的文件能力。失败时任何路径都不自动切换供应商；百炼流式 ASR 失败不会降级为文件转写或重发，MiniMax 提前分段失败仍按下文的规则补交。
+示例默认使用 MiniMax 语音。`asr_model` 在语音条和实时通话间共用；`tts_model` 可独立选择，例如 ASR 用百炼、播报仍用 MiniMax。程序启动时按配置构造适配器，飞书语音条只使用文件能力，实时通话优先使用流式能力，不支持时才选择同一适配器的文件能力。失败时任何路径都不自动切换供应商；百炼流式 ASR 失败不会降级为文件转写或重发，MiniMax 提前分段失败仍按下文的规则补交。
 
 百炼示例的 `max_audio_seconds = 120` 是应用侧通话录音和 WAV 文件的时长上限，不是文件转写保证。120 秒的 16 kHz 单声道 16-bit PCM WAV 按当前 128 kB/s 的发送策略，仅上传就约需 30 秒；默认 `timeouts.asr = 30` 不保证文件能转写到此上限。实时通话边录边发，停口后仍使用默认 30 秒的等待时限。
 
-升级旧配置时，删除 `[voice]` 的 `max_turn_seconds`，在 `asr_provider` 选中的 `[providers.<名称>.asr]` 中明确设置 `max_audio_seconds`（有限正数，单位为秒）。正式的 `text` 和 `voice` 模式都要填写；示例中的 `500` 是 `asr-1.0` 的参考值，使用其他模型时请按其接口限制填写。
+ASR 配置必须显式填写 `max_audio_seconds`（有限正数，单位为秒）。示例中的 `500` 是 `asr-1.0` 的参考值，使用其他模型时请按其接口限制填写。
 
 `openai_responses` 可在可信内网或本机使用 HTTP，例如 `base_url = "http://127.0.0.1:8000/v1"`。服务必须支持 `POST /v1/responses` 的流式响应，仅支持 `/v1/chat/completions` 不行。**HTTP 不加密**，不要使用云端 API Key；仍须填写 `api_key`，服务无需认证时可以填写本地占位值。自定义服务会收到所选 Provider 的 Key 和模型输入；地址不能包含凭据、查询参数或片段，客户端不跟随重定向。MiniMax LLM 的 `base_url` 仍只允许 HTTPS。
 
@@ -134,7 +134,7 @@ python scripts/build_source_zip.py
    ```
 
 3. 从 [Silero VAD 官方源码](https://github.com/snakers4/silero-vad/blob/master/src/silero_vad/data/silero_vad.onnx)单独取得 `silero_vad.onnx`（使用带 `input/state/sr` 接口的 v6 系列模型，不选只支持其他输入形状的变体），放在本机配置指定路径。程序只加载已有文件，不下载模型，不需要 PyTorch；相对路径以 TOML 文件所在目录为准。音频和 ONNX 依赖不在 `text` 或模拟模式下加载。
-4. 沿用[文字模式](#本机启动飞书文字模式)的 CLI 登录和私聊权限，另给同一 CLI 用户授权 `vc:meeting.meetingevent:read`（获取会议信息）；飞书桌面客户端与 CLI 必须登录同一用户，运行中不要切换。检查 `tts_provider` 选中的 Provider 含 `.tts` 配置表和 `api_key`，并按示例填写 `[voice]` 的设备与 VAD 模型路径。
+4. 沿用[文字模式](#本机启动飞书文字模式)的 CLI 登录和私聊权限，另给同一 CLI 用户授权 `vc:meeting.meetingevent:read`（获取会议信息）；飞书桌面客户端与 CLI 必须登录同一用户，运行中不要切换。通过 `tts_model` 选择 TTS 配置，为它引用的 Provider 填写 `api_key`，并按示例填写 `[voice]` 的设备与 VAD 模型路径。
 5. 在目标 Mac 的图形桌面中设置 `[feishu].mode = "voice"`，以同一 `--run --config config.local.toml` 命令启动。可沿用同一账号的库，也可以直接用新库，不需要先运行 `text`。为运行程序的终端或应用授予发送鼠标事件和收音的权限；如系统不提供通话窗口标题，也需授予屏幕录制权限并重启应用。自动接听会移动鼠标，测试时不要同时参加其他通话。
 
 程序为本次来电准备设备时检查两路是否支持所需流格式。输入为 16 kHz 单声道有符号 16-bit PCM（512 样本一帧），直接供 Silero 及流式/文件转写使用。输出为与 TTS 相同采样率的单声道 16-bit PCM，默认 44.1 kHz；MiniMax 可用 16/24/32/44.1 kHz，百炼可用 16/24/44.1 kHz。CoreAudio 在需要且支持时转换设备格式，程序不更改设备全局采样率、不再做第二次重采样。若报 `voice_input_pcm_16khz_mono_not_supported` 或 `voice_output_pcm_rate_or_channels_not_supported`，在「音频 MIDI 设置」和 `sounddevice` 列表核对两条线路；输出可选一个双方支持的采样率，输入需选择能提供 16 kHz 单声道流的设备或系统转换。若通话对端无声，核对虚拟设备首个单声道的路由、飞书麦克风/扬声器选项和设备权限。
@@ -187,7 +187,7 @@ MiniMax 流式合成也可能以 HTTP 200 返回 JSON 业务错误而不是 SSE�
 正式启动时，只从进程启动工作目录的 `agents/` 加载顶层 UTF-8 `.md` 文件，不跟随符号链接，不读取旧 `AGENTS.md`。必须有通过校验的 `agents/main.md`，否则启动失败。仓库和部署包只提供 `main.example.md` 和 `sub.example.md`；`*.example.md` 不加载。本机实际角色文件由 Git 忽略。配置修改后重启生效。
 
 - `main.md` 是主角色。要添加子角色，将 `sub.example.md` 复制为 `review.md` 等实际文件；去掉 `.md` 的文件名就是角色 ID。
-- 每个文件开头用两行独占的 `+++` 包围 TOML 头部：`model_id` 必须指向已定义的 `[models.<ID>]`，没有默认、继承或角色级字段覆盖；`tools` 必须是工具名数组，可填 `delegate_subtask`、`set_timer`、`cancel_timer`、`bash`，或填 `[]` 不启用工具；`description` 是角色分工，子角色必填非空描述，主角色可省略。只有主角色也能启动，这时不向模型提供委派工具。
+- 每个文件开头用两行独占的 `+++` 包围 TOML 头部：`model_id` 必须指向已定义的 `[models.llm.<ID>]`，没有默认、继承或角色级字段覆盖；`tools` 必须是工具名数组，可填 `delegate_subtask`、`set_timer`、`cancel_timer`、`bash`，或填 `[]` 不启用工具；`description` 是角色分工，子角色必填非空描述，主角色可省略。只有主角色也能启动，这时不向模型提供委派工具。
 - 结束分隔线后的 Markdown 正文原样作为该角色的系统提示词，包括空行与换行。角色文件限 32 KiB，格式或工具名无效会在启动时报告对应文件。**角色正文和用于选择子角色的描述会发给模型服务，不要放入密钥、凭据或隐私信息，只在可信工作目录启动。**
 
 ## 用户工作区与 Bash
@@ -218,6 +218,8 @@ MiniMax 流式合成也可能以 HTTP 200 返回 JSON 业务错误而不是 SSE�
 
 压缩指令要求模型不归纳私有协议字段。客户端会拒绝明显原样回显（摘要全文与字段相同，或原样包含较长字段），不保存该摘要、不推进覆盖点；对模型改写、截取或自行生成的文字，不能保证识别。
 
-`[models.<ID>].context_budget` 是软阈值：同一会话上次成功普通请求的实际输入 token 数达到阈值后，下一次普通请求前才尝试压缩。全应用同时最多生成一份摘要。用量随普通回复写入 SQLite，只有实际适配器、端点、凭据、模型和推理档位一致时才沿用；档案 ID 不作为身份。旧库没有来源标记的用量、缺失的用量和摘要用量不参与判断，不使用本地估算兜底。`tail_budget` 仍按 UTF-8 字节数除以 3 加固定开销，从近到远保留完整消息块；当前轮不会因超过尾部预算被截断。会话摘要完整保存和发送，不按本地估算截断或分批。配置阈值时给下一轮输入和输出留出余量。
+`[models.llm.<ID>].context_budget` 是软阈值：同一会话上次成功普通请求的实际输入 token 数达到阈值后，下一次普通请求前才尝试压缩。全应用同时最多生成一份摘要。用量随普通回复写入 SQLite，只有实际适配器、端点、凭据、模型和推理档位一致时才沿用；档案 ID 不作为身份。旧库没有来源标记的用量、缺失的用量和摘要用量不参与判断，不使用本地估算兜底。`tail_budget` 仍按 UTF-8 字节数除以 3 加固定开销，从近到远保留完整消息块；当前轮不会因超过尾部预算被截断。会话摘要完整保存和发送，不按本地估算截断或分批。配置阈值时给下一轮输入和输出留出余量。
+
+切换到上下文窗口较小的模型时，原模型的用量不会触发压缩；若已有历史过长，新模型的第一次请求仍可能被拒绝。
 
 方案见 [首版架构方案](<docs/design/0001-MVP方案/飞书多模态 Agent 首版架构方案.md>)和[首版实施与验收计划](<docs/design/0001-MVP方案/飞书多模态 Agent 首版实施与验收计划.md>)。

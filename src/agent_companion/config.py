@@ -1,4 +1,4 @@
-"""启动配置；语言模型档案与 Provider 连接分别定义。"""
+"""启动配置；模型档案与 Provider 连接分别定义。"""
 
 from collections.abc import Mapping
 from dataclasses import MISSING, InitVar, dataclass, field, fields
@@ -28,8 +28,6 @@ DEFAULT_TTS_TIMEOUT = 25
 _DEFAULT_WORKSPACE_ROOT = "workspaces"
 _DEFAULT_LOG_LEVEL = "WARNING"
 _LOG_LEVELS = ("DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL")
-_LEGACY_CONFIG_ERROR = "旧配置格式不再支持，请按 config.example.toml 迁移到命名 Provider"
-_MODEL_MIGRATION = "请迁到 [models.<ID>]，并在每个 Agent 角色文件中设置 model_id，参考 config.example.toml"
 _CHAT_ADAPTERS = ("minimax", "bailian")
 _LLM_ADAPTERS = ("deepseek", "openai_responses", *_CHAT_ADAPTERS)
 _DNS_LABEL = re.compile(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?")
@@ -338,26 +336,35 @@ def _section(data: Any, cls: type, name: str, *, exclude: tuple[str, ...] = ()) 
     return data
 
 
-def _selected_provider(data: dict[str, Any], providers: dict[str, Any], ability: str,
-                       adapters: tuple[str, ...]) -> tuple[str, dict[str, Any], dict[str, Any]]:
-    selector = f"{ability}_provider"
+def _selected_speech_profile(data: dict[str, Any], models: dict[str, Any], providers: dict[str, Any],
+                             ability: str, cls: type[ASRSettings] | type[TTSSettings],
+                             ) -> tuple[str, dict[str, Any], dict[str, Any]]:
+    selector = f"{ability}_model"
+    section = f"models.{ability}"
     name = data.get(selector)
-    if not isinstance(name, str) or not name.strip():
+    if not valid_config_id(name):
         raise ConfigError(f"必须显式设置 {selector}，请参考 config.example.toml")
-    if name not in providers:
-        raise ConfigError(f"{selector} 引用的 Provider 不存在")
-    provider = _table(providers[name], {"adapter", "api_key", "base_url", "region", "workspace_id",
-                                        "asr", "tts"}, selector)
+    profiles = models.get(ability, {})
+    if not isinstance(profiles, dict):
+        raise ConfigError(f"{section} 必须是命名模型配置表")
+    if name not in profiles:
+        raise ConfigError(f"{selector} 引用的模型配置不存在，请检查 [{section}.<ID>]")
+    profile = profiles[name]
+    if not isinstance(profile, dict):
+        raise ConfigError(f"{selector} 引用的模型配置必须是 TOML 表")
+    provider_id = profile.get("provider")
+    if not valid_config_id(provider_id):
+        raise ConfigError(f"{selector} 所引用模型的 provider 必须显式设置为非空 Provider ID")
+    if provider_id not in providers:
+        raise ConfigError(f"{selector} 所引用模型的 provider 指向不存在的 Provider")
+    provider = _table(providers[provider_id], {"adapter", "api_key", "base_url", "region", "workspace_id"}, selector)
     if "workspace_id" in provider and provider.get("adapter") != "bailian":
         raise ConfigError("workspace_id 仅适用于百炼 Provider")
-    if provider.get("adapter") not in adapters:
-        raise ConfigError(f"{selector} 需要显式设置支持 {ability} 的 adapter（{' 或 '.join(adapters)}）")
-    options = provider.get(ability)
-    if not isinstance(options, dict):
-        raise ConfigError(f"{selector} 引用的 Provider 缺少 {ability} 能力配置表")
-    if "timeout" in options:
-        raise ConfigError(f"Provider 能力配置 {ability}.timeout 不再支持，请改用 timeouts.{ability}")
-    return name, provider, options
+    if provider.get("adapter") not in _CHAT_ADAPTERS:
+        raise ConfigError(f"{selector} 需要显式设置支持 {ability} 的 adapter（{' 或 '.join(_CHAT_ADAPTERS)}）")
+    options = _section({key: value for key, value in profile.items() if key != "provider"},
+                       cls, section, exclude=("connection",))
+    return provider_id, provider, options
 
 
 def _api_key(provider: dict[str, Any], selector: str) -> str:
@@ -385,21 +392,10 @@ def _speech_connection(provider: dict[str, Any], selector: str, llm: LLMProvider
         raise ConfigError("百炼 Provider 须设置有效的 workspace_id，region 为 cn-beijing 或 ap-southeast-1") from None
 
 
-def _provider_tables(data: dict[str, Any]) -> dict[str, Any]:
-    providers = data.get("providers", {})
-    if not isinstance(providers, dict):
-        raise ConfigError("providers 必须是命名 Provider 配置表")
-    for index, provider in enumerate(providers.values(), 1):
-        location = f"providers 第 {index} 项"
-        if isinstance(provider, dict) and "llm" in provider:
-            raise ConfigError(f"{location} 的 llm 表已移除；{_MODEL_MIGRATION}")
-    return providers
-
-
-def _load_model_profiles(data: Any, providers: dict[str, Any], model_timeout: float,
-                         ) -> tuple[dict[str, ModelProfile], dict[str, LLMProvider]]:
+def _load_llm_profiles(data: Any, providers: dict[str, Any], model_timeout: float,
+                       ) -> tuple[dict[str, ModelProfile], dict[str, LLMProvider]]:
     if not isinstance(data, dict):
-        raise ConfigError("models 必须是命名模型配置表")
+        raise ConfigError("models.llm 必须是命名模型配置表")
     references = {options["provider"] for options in data.values()
                   if isinstance(options, dict) and isinstance(options.get("provider"), str)}
     llm_providers = {}
@@ -411,11 +407,11 @@ def _load_model_profiles(data: Any, providers: dict[str, Any], model_timeout: fl
         keys = {"adapter", "api_key", "base_url"}
         if adapter in _CHAT_ADAPTERS:
             if name not in references:
-                continue  # 既有纯语音表不因新增同名 LLM 适配器而被解析为 LLM。
+                continue  # 仅用于语音的 Provider 不按 LLM 连接解析。
             keys.add("region")
             if adapter == "bailian":
                 keys.add("workspace_id")
-        _table(provider, keys | ({"asr", "tts"} if adapter in _CHAT_ADAPTERS else set()), location)
+        _table(provider, keys, location)
         try:
             llm_providers[name] = LLMProvider(**{key: provider[key] for key in keys if key in provider})
         except ConfigError as exc:
@@ -424,7 +420,7 @@ def _load_model_profiles(data: Any, providers: dict[str, Any], model_timeout: fl
     models = {}
     required = ("provider", "model", "reasoning_effort", "context_budget", "tail_budget")
     for index, (name, options) in enumerate(data.items(), 1):
-        location = f"models 第 {index} 项"
+        location = f"models.llm 第 {index} 项"
         if not valid_config_id(name):
             raise ConfigError(f"{location} 的 ID 必须是非空字符串且不能有首尾空白")
         options = _table(options, set(required) | {"max_tool_rounds", "preserve_thinking"}, location)
@@ -451,26 +447,25 @@ def _load_model_profiles(data: Any, providers: dict[str, Any], model_timeout: fl
     return models, llm_providers
 
 
-def _load_speech(data: dict[str, Any], providers: dict[str, Any], llm_providers: dict[str, LLMProvider], *, voice: bool
+def _load_speech(data: dict[str, Any], models: dict[str, Any], providers: dict[str, Any],
+                 llm_providers: dict[str, LLMProvider], *, voice: bool,
                  ) -> tuple[ASRSettings, TTSSettings | None]:
-    asr_name, provider, asr_data = _selected_provider(data, providers, "asr", ("minimax", "bailian"))
-    connection = _speech_connection(provider, "asr_provider", llm_providers.get(asr_name))
-    asr_options = _section(asr_data, ASRSettings, "asr", exclude=("connection",)).copy()
+    asr_provider, provider, asr_options = _selected_speech_profile(data, models, providers, "asr", ASRSettings)
+    connection = _speech_connection(provider, "asr_model", llm_providers.get(asr_provider))
     if isinstance(connection, BailianConnection):
         asr_options.setdefault("model", BAILIAN_ASR_MODEL)
     asr = ASRSettings(connection, **asr_options)
     tts = None
     if voice:
-        tts_name, provider, tts_data = _selected_provider(data, providers, "tts", ("minimax", "bailian"))
-        tts_connection = connection if tts_name == asr_name else _speech_connection(
-            provider, "tts_provider", llm_providers.get(tts_name))
-        tts_options = _section(tts_data, TTSSettings, "tts", exclude=("connection",)).copy()
+        tts_provider, provider, tts_options = _selected_speech_profile(data, models, providers, "tts", TTSSettings)
+        tts_connection = connection if tts_provider == asr_provider else _speech_connection(
+            provider, "tts_model", llm_providers.get(tts_provider))
         if isinstance(tts_connection, BailianConnection):
             tts_model = tts_options.setdefault("model", BAILIAN_TTS_MODEL)
             if tts_model == BAILIAN_TTS_MODEL:
                 tts_options.setdefault("voice_id", BAILIAN_TTS_VOICE)
             elif "voice_id" not in tts_options:
-                raise ConfigError("切换百炼 tts.model 时必须同时设置匹配的 tts.voice_id")
+                raise ConfigError("百炼 models.tts 的 model 必须搭配匹配的 voice_id")
         tts = TTSSettings(tts_connection, **tts_options)
     return asr, tts
 
@@ -497,8 +492,6 @@ def _read_toml(path: Path) -> dict[str, Any]:
 
 
 def _load_voice(data: Any, path: Path) -> VoiceSettings:
-    if isinstance(data, dict) and data.keys() & {"tts_model", "tts_timeout", "voice_id"}:
-        raise ConfigError(_LEGACY_CONFIG_ERROR)
     voice = _section(data, VoiceSettings, "voice").copy()
     if "vad_model" in voice:
         model = voice["vad_model"]
@@ -509,19 +502,9 @@ def _load_voice(data: Any, path: Path) -> VoiceSettings:
 
 
 def _parse_settings(data: dict[str, Any], path: Path, *, for_run: bool) -> Settings:
-    runtime_data = data.get("runtime", {})
-    if "llm_provider" in data:
-        raise ConfigError(f"顶层 llm_provider 已移除；{_MODEL_MIGRATION}")
-    if isinstance(runtime_data, dict):
-        for key in ("context_budget", "tail_budget", "max_tool_rounds"):
-            if key in runtime_data:
-                raise ConfigError(f"runtime.{key} 已移除；{_MODEL_MIGRATION}")
-    if (data.keys() & {"deepseek", "llm", "minimax"}
-            or isinstance(runtime_data, dict) and "model_timeout" in runtime_data):
-        raise ConfigError(_LEGACY_CONFIG_ERROR)
     _table(data, {"database", "log_level", "runtime", "feishu", "voice", "providers", "models", "timeouts",
-                  "asr_provider", "tts_provider", "workspace_root"}, "顶层")
-    _table(runtime_data, set(), "runtime")
+                  "asr_model", "tts_model", "workspace_root"}, "顶层")
+    _table(data.get("runtime", {}), set(), "runtime")
     database = data.get("database", "db.sqlite3")
     if not isinstance(database, str) or not database.strip() or "\x00" in database:
         raise ConfigError("database 必须是非空且不含 NUL 字符的路径")
@@ -544,9 +527,12 @@ def _parse_settings(data: dict[str, Any], path: Path, *, for_run: bool) -> Setti
     if for_run:
         if feishu is None:
             raise ConfigError("正式启动需要 [feishu] 配置，请参考 config.example.toml")
-        providers = _provider_tables(data)
-        models, llm_providers = _load_model_profiles(data.get("models", {}), providers, runtime.model_timeout)
-        asr, tts = _load_speech(data, providers, llm_providers, voice=use_voice)
+        providers = data.get("providers", {})
+        if not isinstance(providers, dict):
+            raise ConfigError("providers 必须是命名 Provider 配置表")
+        model_groups = _table(data.get("models", {}), {"llm", "asr", "tts"}, "models")
+        models, llm_providers = _load_llm_profiles(model_groups.get("llm", {}), providers, runtime.model_timeout)
+        asr, tts = _load_speech(data, model_groups, providers, llm_providers, voice=use_voice)
     return Settings(
         database=Path(database),
         runtime=runtime,

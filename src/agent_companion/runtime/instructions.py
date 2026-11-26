@@ -73,7 +73,7 @@ def _parse_role(name: str, text: str) -> AgentRole:
         raise _invalid_role(name, "头部有未知字段，仅支持 description、tools 和 model_id")
     model_id = fields.get("model_id")
     if not valid_config_id(model_id):
-        raise _invalid_role(name, "model_id 必须显式设置为非空模型配置 ID，请参考 [models.<ID>]")
+        raise _invalid_role(name, "model_id 必须显式设置为非空模型配置 ID，请参考 [models.llm.<ID>]")
     description = fields.get("description", "")
     if not isinstance(description, str) or (name != "main.md" and not description.strip()):
         raise _invalid_role(name, "description 必须为字符串，子角色须填写非空描述")

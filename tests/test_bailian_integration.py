@@ -40,9 +40,9 @@ segment_pause_seconds = 0.032
 
 def _example(asr=False, tts=False, *, voice=True):
     config = _EXAMPLE.read_text(encoding="utf-8")
-    for selector, bailian in (("asr_provider", asr), ("tts_provider", tts)):
+    for ability, bailian in (("asr", asr), ("tts", tts)):
         if bailian:
-            config = config.replace(f'{selector} = "minimax_cn"', f'{selector} = "bailian_beijing"')
+            config = config.replace(f'{ability}_model = "minimax_{ability}"', f'{ability}_model = "bailian_{ability}"')
     return config + (_VOICE if voice else '\n[feishu]\nmode = "text"\n')
 
 

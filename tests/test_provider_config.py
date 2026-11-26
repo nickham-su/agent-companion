@@ -29,8 +29,8 @@ _FEISHU = '''
 [feishu]
 mode = "text"
 '''
-_CONFIG = '''asr_provider = "speech"
-tts_provider = "speech"
+_CONFIG = '''asr_model = "mic"
+tts_model = "speaker"
 ''' + _FEISHU + f'''
 [voice]
 output_sample_rate = 24000
@@ -38,7 +38,7 @@ output_sample_rate = 24000
 [providers.chat]
 adapter = "deepseek"
 api_key = "{_KEY}"
-[models.chat]
+[models.llm.chat]
 provider = "chat"
 model = "deepseek-flash"
 reasoning_effort = "disabled"
@@ -48,9 +48,11 @@ tail_budget = 16000
 [providers.speech]
 adapter = "minimax"
 api_key = "synthetic-speech-value"
-[providers.speech.asr]
+[models.asr.mic]
+provider = "speech"
 max_audio_seconds = 500
-[providers.speech.tts]
+[models.tts.speaker]
+provider = "speech"
 model = "synthetic-tts-model"
 voice_id = "synthetic-shared-voice"
 '''
@@ -110,22 +112,54 @@ class ProviderConfigTests(unittest.TestCase):
     def test_selected_references_must_exist_and_support_the_capability(self):
         for before, after, error in (
             ('provider = "chat"\nmodel', 'model', 'provider 必须显式设置'),
-            ('asr_provider = "speech"', '', '必须显式设置 asr_provider'),
+            ('asr_model = "mic"', '', '必须显式设置 asr_model'),
             ('provider = "chat"', f'provider = "{_KEY}_absent"', 'provider 引用的 Provider 不存在'),
-            ('asr_provider = "speech"', 'asr_provider = "absent"', 'asr_provider 引用的 Provider 不存在'),
-            ('asr_provider = "speech"', 'asr_provider = "chat"', '支持 asr 的 adapter'),
             ('adapter = "deepseek"', 'adapter = "unsupported"', '支持 llm 的 adapter'),
-            ('[providers.speech.asr]\nmax_audio_seconds = 500\n', '', '缺少 asr 能力配置表'),
+            ('asr_model = "mic"', 'asr_model = "speech"', 'asr_model 引用的模型配置不存在'),
+            ('asr_model = "mic"', 'asr_model = "speaker"', 'asr_model 引用的模型配置不存在'),
         ):
             with self.subTest(error=error):
                 self.assert_startup_error(_CONFIG.replace(before, after), error)
         voice = _CONFIG.replace('mode = "text"', 'mode = "voice"')
-        for target, error in (('', '必须显式设置 tts_provider'),
-                              ('tts_provider = "absent"', 'tts_provider 引用的 Provider 不存在'),
-                              ('tts_provider = "chat"', '支持 tts 的 adapter')):
+        for target, error in (('', '必须显式设置 tts_model'),
+                              ('tts_model = "absent"', 'tts_model 引用的模型配置不存在'),
+                              ('tts_model = "mic"', 'tts_model 引用的模型配置不存在')):
             with self.subTest(error=error):
-                self.assert_startup_error(voice.replace('tts_provider = "speech"', target), error)
-        self.assert_startup_error(voice.split('[providers.speech.tts]')[0], '缺少 tts 能力配置表')
+                self.assert_startup_error(voice.replace('tts_model = "speaker"', target), error)
+        for ability, name in (("asr", "mic"), ("tts", "speaker")):
+            table = f'[models.{ability}.{name}]\n'
+            for replacement, error in (('', f'{ability}_model 所引用模型的 provider 必须显式设置'),
+                                       (f'provider = "{_KEY}_absent"\n', 'provider 指向不存在的 Provider'),
+                                       ('provider = "chat"\n', f'支持 {ability} 的 adapter')):
+                with self.subTest(ability=ability, error=error):
+                    self.assert_startup_error(voice.replace(table + 'provider = "speech"\n', table + replacement),
+                                              error)
+
+    def test_can_switch_asr_and_tts_profiles_without_changing_provider(self):
+        voice = _CONFIG.replace('mode = "text"', 'mode = "voice"') + '''
+[models.asr.alternate]
+provider = "speech"
+model = "asr-fixture-alt"
+max_audio_seconds = 250
+[models.tts.alternate]
+provider = "speech"
+model = "tts-fixture-alt"
+voice_id = "alternate-voice"
+'''
+        for change_asr, change_tts in ((False, False), (True, False), (False, True), (True, True)):
+            with self.subTest(change_asr=change_asr, change_tts=change_tts):
+                config = voice
+                if change_asr:
+                    config = config.replace('asr_model = "mic"', 'asr_model = "alternate"')
+                if change_tts:
+                    config = config.replace('tts_model = "speaker"', 'tts_model = "alternate"')
+                self.path.write_text(config, encoding="utf-8")
+                settings = load_settings(self.path, for_run=True)
+                self.assertEqual(settings.asr.model, "asr-fixture-alt" if change_asr else "asr-1.0")
+                self.assertEqual(settings.asr.max_audio_seconds, 250 if change_asr else 500)
+                self.assertEqual(settings.tts.model, "tts-fixture-alt" if change_tts else "synthetic-tts-model")
+                self.assertEqual(settings.tts.voice_id, "alternate-voice" if change_tts else "synthetic-shared-voice")
+                self.assertIs(settings.asr.connection, settings.tts.connection)
 
     def test_selected_credentials_are_checked_without_environment_fallback_or_repr(self):
         for value in ('', 'api_key = 123', 'api_key = ""', f'api_key = "{_KEY}\\ninvalid"'):
@@ -136,26 +170,27 @@ class ProviderConfigTests(unittest.TestCase):
                 asyncio.run(_serve(settings, roles=configured_roles()))
             prepare.assert_not_called()
             self.assertNotIn(_KEY, str(caught.exception))
-        self.assert_startup_error(_CONFIG.replace('api_key = "synthetic-speech-value"', ''), 'asr_provider')
+        self.assert_startup_error(_CONFIG.replace('api_key = "synthetic-speech-value"', ''), 'asr_model')
         self.assert_startup_error(_CONFIG.replace('mode = "text"', 'mode = "voice"')
-                                  .replace('tts_provider = "speech"', 'tts_provider = "speaker"')
-                                  + '\n[providers.speaker]\nadapter = "minimax"\n[providers.speaker.tts]\n',
-                                  'tts_provider 引用的 Provider 必须设置非空 api_key')
+                                  .replace('[models.tts.speaker]\nprovider = "speech"',
+                                           '[models.tts.speaker]\nprovider = "speaker"')
+                                  + '\n[providers.speaker]\nadapter = "minimax"\n',
+                                  'tts_model 引用的 Provider 必须设置非空 api_key')
         self.path.write_text(_CONFIG, encoding="utf-8")
         rendered = repr(load_settings(self.path, for_run=True))
         self.assertNotIn(_KEY, rendered)
         self.assertNotIn("synthetic-speech-value", rendered)
 
     def test_text_ignores_inactive_tts_and_other_providers(self):
-        for selector in ('', 'tts_provider = false', 'tts_provider = "missing"', 'tts_provider = "unselected"',
-                         'tts_provider = "speech"'):
+        for selector in ('', 'tts_model = false', 'tts_model = "missing"', 'tts_model = "unselected"',
+                         'tts_model = "speaker"'):
             with self.subTest(selector=selector):
-                config = _CONFIG.replace('tts_provider = "speech"', selector).split('[providers.speech.tts]')[0]
-                config = config.replace('[providers.speech.asr]', 'tts = false\n[providers.speech.asr]')
+                config = _CONFIG.replace('tts_model = "speaker"', selector).split('[models.tts.speaker]')[0]
                 config += '''
 [providers.unselected]
 adapter = "minimax"
-[providers.unselected.tts]
+[models.tts.unselected]
+provider = "unselected"
 model = false
 [providers.bad_key]
 api_key = 123
@@ -168,8 +203,8 @@ api_key = 123
     def test_text_checks_provider_fields_and_table_shape_only_when_selected(self):
         cases = (
             (_CONFIG + '\n[providers.inactive]\nadapter = "minimax"\nunknown_field = true\n',
-             'asr_provider 配置字段无效'),
-            ('providers.inactive = false\n' + _CONFIG, 'asr_provider 必须是 TOML 表'),
+             'asr_model 配置字段无效'),
+            ('providers.inactive = false\n' + _CONFIG, 'asr_model 必须是 TOML 表'),
         )
         for config, diagnostic in cases:
             with self.subTest(diagnostic=diagnostic):
@@ -177,7 +212,8 @@ api_key = 123
                 settings = load_settings(self.path, for_run=True)
                 self.assertEqual(settings.asr.max_audio_seconds, 500)
                 self.assertIsNone(settings.tts)
-                selected = config.replace('asr_provider = "speech"', 'asr_provider = "inactive"')
+                selected = config.replace('[models.asr.mic]\nprovider = "speech"',
+                                          '[models.asr.mic]\nprovider = "inactive"')
                 self.assert_startup_error(selected, diagnostic)
 
     def test_formal_text_ignores_invalid_voice_values_and_table_shape(self):
@@ -187,7 +223,6 @@ api_key = 123
             (_CONFIG.replace(voice_table, '[voice]\ninput_device = false'), 'voice.input_device'),
             ('voice = false\n' + _CONFIG.replace(voice_table, ''), 'voice 必须是 TOML 表'),
             (_CONFIG.replace(voice_table, f'[voice]\n{_KEY} = true'), 'voice 配置字段无效'),
-            (_CONFIG.replace(voice_table, '[voice]\ntts_model = "legacy"'), '旧配置格式不再支持'),
         )
         for config, diagnostic in variants:
             with self.subTest(diagnostic=diagnostic):
@@ -356,7 +391,7 @@ api_key = 123
             ('model = "deepseek-flash"', '', 'model 必须显式设置'),
             ('adapter = "deepseek"', 'adapter = "deepseek"\nbase_url = "https://example.invalid"', 'base_url'),
             ('adapter = "minimax"', 'adapter = "minimax"\nbase_url = "https://example.invalid"', 'base_url'),
-            ('[providers.speech.asr]', '[providers.speech.asr]\nmodel = " "', 'asr.model 必须是非空字符串'),
+            ('[models.asr.mic]', '[models.asr.mic]\nmodel = " "', 'asr.model 必须是非空字符串'),
         ):
             with self.subTest(message=message):
                 self.assert_startup_error(_CONFIG.replace(before, after), message)
@@ -395,29 +430,25 @@ api_key = 123
                         config = config.replace('mode = "text"', 'mode = "voice"')
                     self.assert_startup_error(config, f'timeouts.{ability} 必须是有限正数')
 
-    def test_provider_timeout_migration_only_checks_active_capabilities(self):
-        for name, ability in (('speech', 'asr'), ('speech', 'tts')):
+    def test_speech_profiles_accept_only_their_model_fields_when_selected(self):
+        for ability, name in (('asr', 'mic'), ('tts', 'speaker')):
             with self.subTest(ability=ability):
-                table = f'[providers.{name}.{ability}]'
+                table = f'[models.{ability}.{name}]'
                 config = _CONFIG.replace(table, f'{table}\ntimeout = "{_KEY}"')
                 if ability == 'tts':
                     self.path.write_text(config, encoding="utf-8")
                     self.assertIsNone(load_settings(self.path, for_run=True).tts)
                     config = config.replace('mode = "text"', 'mode = "voice"')
-                self.assert_startup_error(config, f'{ability}.timeout 不再支持，请改用 timeouts.{ability}')
+                self.assert_startup_error(config, f'models.{ability} 配置字段无效')
         voice = _CONFIG.replace('mode = "text"', 'mode = "voice"')
         self.path.write_text(voice + '''
-[providers.unused]
-[providers.unused.tts]
+[models.tts.unused]
+provider = "speech"
 timeout = false
 ''', encoding="utf-8")
         self.assertEqual(load_settings(self.path, for_run=True).tts_timeout, 25)
 
-    def test_migration_and_toml_parse_errors_have_safe_diagnostics(self):
-        for section in ('[deepseek]\nthinking = false', '[llm]\nadapter = "deepseek"', '[minimax]\nasr_timeout = 2',
-                        '[runtime]\nmodel_timeout = 1.25'):
-            with self.subTest(section=section):
-                self.assert_startup_error(section, '旧配置格式不再支持，请按 config.example.toml 迁移')
+    def test_toml_parse_errors_have_safe_diagnostics(self):
         invalid = f'[providers.chat]\napi_key = "{_KEY}'.encode()
         self.assert_startup_error(invalid.decode(), 'TOML 无法解析')
         self.path.write_bytes(invalid + b'\xff')
@@ -658,7 +689,7 @@ class ProviderCompositionTests(unittest.IsolatedAsyncioTestCase):
 [providers.other]
 adapter = "{other}"
 api_key = "fixture-other"
-[models.other]
+[models.llm.other]
 provider = "other"
 model = "fixture-other-model"
 reasoning_effort = "low"
@@ -820,12 +851,13 @@ tail_budget = 16000
                 text = text.replace('[voice]', '[voice]\ninput_device = "mock-in"\n'
                                     'output_device = "mock-out"\nvad_model = "synthetic.onnx"')
                 if mode == "separate":
-                    text = text.replace('tts_provider = "speech"', 'tts_provider = "speaker"') + '''
+                    text = text.replace('tts_model = "speaker"', 'tts_model = "alternate"') + '''
 [providers.speaker]
 adapter = "minimax"
 api_key = "synthetic-separate-tts-value"
 region = "global"
-[providers.speaker.tts]
+[models.tts.alternate]
+provider = "speaker"
 model = "synthetic-other-model"
 voice_id = "synthetic-other-voice"
 '''

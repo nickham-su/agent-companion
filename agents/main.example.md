@@ -1,6 +1,6 @@
 +++
 description = "负责与用户对话并协调子 Agent"
-# 引用 config.toml 中 [models.chat]，不是服务商模型名。
+# 引用 config.toml 中 [models.llm.chat]，不是服务商模型名。
 model_id = "chat"
 # 可用工具：
 # - delegate_subtask：将任务异步委派给子 Agent。

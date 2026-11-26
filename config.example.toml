@@ -7,10 +7,10 @@ workspace_root = "workspaces"
 # 日志只写标准输出，部署默认 WARNING；排查时改为 DEBUG，修改后重启。
 log_level = "WARNING"
 # 真实 Key 只填写在本机私有配置中；Agent 的语言模型由各自的 model_id 选择。
-asr_provider = "minimax_cn"       # 或 "bailian_beijing"；语音条和实时通话共用
-tts_provider = "minimax_cn"       # 或 "bailian_beijing"；仅 voice 使用，可与 ASR 独立选择
+asr_model = "minimax_asr"  # 引用 models.asr 下的 ID；也可选 "bailian_asr"。语音条和实时通话共用
+tts_model = "minimax_tts"  # 引用 models.tts 下的 ID；也可选 "bailian_tts"。仅 voice 使用
 
-# 各能力共用同一时限，切换 Provider 不变。单位为秒。
+# 每种能力共用自己的时限，切换模型不变。单位为秒。
 [timeouts]
 llm = 60  # 单次模型请求总时限
 asr = 30  # 文件转写总时限，含握手、上传和等结果；流式 ASR 的启动和停口后等待分别计时
@@ -27,8 +27,20 @@ api_key = "your-openai-api-key"
 # base_url = "https://api.openai.com/v1"  # 默认；不配置时使用官方地址
 # base_url = "http://127.0.0.1:8000/v1"  # 仅用于可信本机或内网的 Responses 服务；不要发送云端 Key
 
-# 模型配置 ID 由角色文件的 model_id 引用，不是服务商模型名。
-[models.chat]
+# MiniMax 和百炼各用一个 Provider 供 LLM 与语音共用；如需使用不同的 Key，可以拆开配置。
+[providers.minimax_cn]
+adapter = "minimax"
+api_key = "your-minimax-api-key"
+region = "cn"  # cn 或 global（应与 MiniMax API 账号的区域一致）
+
+[providers.bailian_beijing]
+adapter = "bailian"
+api_key = "your-bailian-api-key"  # LLM 使用此地域和业务空间的按量付费 Key
+region = "cn-beijing"  # 也可用 ap-southeast-1；Key、业务空间、模型和音色须在所选地域可用
+workspace_id = "your-workspace-id"
+
+# LLM 配置 ID 由角色文件的 model_id 引用，不是服务商模型名。
+[models.llm.chat]
 provider = "deepseek_default"
 model = "deepseek-flash"
 reasoning_effort = "disabled"  # 关闭思考；启用时按模型填写强度
@@ -37,7 +49,7 @@ tail_budget = 16000  # 压缩时保留近期历史原文的预算，须小于 co
 max_tool_rounds = 8  # 可省略（默认 8），一次运行的模型请求轮数上限，含首轮
 
 # 如给角色设置 model_id = "review"，请填真实可用的模型名和对应 Provider 的 Key。
-[models.review]
+[models.llm.review]
 provider = "openai_default"
 model = "your-openai-model"
 reasoning_effort = "low"  # 支持的值取决于所选模型
@@ -45,14 +57,14 @@ context_budget = 32000
 tail_budget = 8000
 
 # 要切换某个角色，在它的 agents/<角色>.md 中设置 model_id = "minimax_chat" 或 "bailian_chat"。
-[models.minimax_chat]
+[models.llm.minimax_chat]
 provider = "minimax_cn"
 model = "MiniMax-M3.1-Flash"
 reasoning_effort = "low"  # 开启思考；"disabled" 会请求关闭，是否支持由厂商决定（本示例模型不支持）
 context_budget = 64000
 tail_budget = 16000
 
-[models.bailian_chat]
+[models.llm.bailian_chat]
 provider = "bailian_beijing"
 model = "qwen3.8-flash"  # 业务空间支持的带命名空间模型也可按原 ID 填写，如 kimi/kimi-k3
 reasoning_effort = "enabled"  # 明文思考；用 "disabled" 关闭本轮思考
@@ -60,34 +72,25 @@ reasoning_effort = "enabled"  # 明文思考；用 "disabled" 关闭本轮思考
 context_budget = 64000
 tail_budget = 16000
 
-# MiniMax 和百炼各用一个 Provider 供 LLM 与语音共用；如需使用不同的 Key，可以拆开配置。
-[providers.minimax_cn]
-adapter = "minimax"
-api_key = "your-minimax-api-key"
-region = "cn"  # cn 或 global（应与 MiniMax API 账号的区域一致）
-
-[providers.minimax_cn.asr]
+[models.asr.minimax_asr]
+provider = "minimax_cn"
 model = "asr-1.0"  # 可省略，默认 asr-1.0；所选模型须兼容 MiniMax 文件转写接口
 max_audio_seconds = 500  # 必填；按所选模型的单文件时长上限填写（秒）
 
-[providers.minimax_cn.tts]
-model = "speech-2.8-turbo"
-voice_id = "male-qn-qingse"
-
-# 百炼是可选 Provider。启用时更换相应顶层引用，并在本机填写同地域的 API Key 与业务空间 ID。
-[providers.bailian_beijing]
-adapter = "bailian"
-api_key = "your-bailian-api-key"  # LLM 使用此地域和业务空间的按量付费 Key
-region = "cn-beijing"  # 也可用 ap-southeast-1；Key、业务空间、模型和音色须在所选地域可用
-workspace_id = "your-workspace-id"
-
-[providers.bailian_beijing.asr]
+[models.asr.bailian_asr]
+provider = "bailian_beijing"
 model = "qwen-audio-3.1-asr-flash-message"  # 语音条用文件接口；实时通话用流式接口
 # 120 秒的 16 kHz 单声道 16-bit PCM WAV 按当前 128 kB/s 策略仅上传就约需 30 秒；
 # 默认 timeouts.asr 不保证文件能转写到此上限。通话流式路径边录边发，停口后的等待仍默认为 30 秒。
 max_audio_seconds = 120  # 必填，应用侧单轮录音/WAV 上限（秒），不是服务商配额
 
-[providers.bailian_beijing.tts]
+[models.tts.minimax_tts]
+provider = "minimax_cn"
+model = "speech-2.8-turbo"
+voice_id = "male-qn-qingse"
+
+[models.tts.bailian_tts]
+provider = "bailian_beijing"
 model = "qwen-audio-3.1-tts-flash"
 voice_id = "longanhuan_v3.1"  # 示例配对；也可将两项同时改为 cosyvoice-v3-flash / longanyang
 
