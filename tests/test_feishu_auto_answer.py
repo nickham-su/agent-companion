@@ -9,6 +9,8 @@ from threading import Event
 import unittest
 from unittest.mock import Mock, patch
 
+from test_agent_support import stored_delegation
+
 from agent_companion.app import run_feishu, running_agent
 from agent_companion.channels.feishu.cli import CliError, CommandResult, FeishuDiscovery
 from agent_companion.channels.feishu.macos_calls import DesktopCallError, MacCallDesktop, RingingWindow, WindowIdentity
@@ -925,15 +927,15 @@ class IncomingCallTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(tts.calls, [])
                 self.assertEqual(agents.call_count, 1)
                 rows = history.tail(_session(sender), 20)
-                accepted, = (json.loads(row.message.content) for row in rows if row.message.role == "tool")
-                delegation = history.delegation(accepted["delegation_id"])
+                tool, = (row.message for row in rows if row.message.role == "tool")
+                delegation = stored_delegation(history, _session(sender), tool.tool_call_id)
+                self.assertEqual(json.loads(tool.content), {"status": "accepted", "agent_id": delegation.agent_id})
                 child = history.agent_run(delegation.run_id)
                 self.assertEqual(child.status, "completed")
                 self.assertIsNotNone(child.reply_enqueued_at)
                 notice, = notices
                 self.assertEqual(delegation.tool_call_id, "voice-child")
-                self.assertEqual(notice["delegation_ids"], [delegation.delegation_id])
-                self.assertEqual(notice["result"], "子任务结果。")
+                self.assertEqual(notice, {"agent_id": delegation.agent_id, "status": "completed", "result": "子任务结果。"})
                 self.assertIn("挂断前排队转写", [row.message.content for row in rows])
 
     async def _assert_voice_intercept(self, *, after_idle):

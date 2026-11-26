@@ -107,7 +107,8 @@ class TimerTest(unittest.IsolatedAsyncioTestCase):
         repeat = await _execute(tools, SET_TIMER_TOOL_NAME,
                                 {"mode": "repeat", "interval_seconds": 3, "max_fires": 3, "message": ""})
         self.assertEqual([single["status"], repeat["status"]], ["accepted", "accepted"])
-        self.assertNotEqual(single["timer_id"], repeat["timer_id"])
+        self.assertRegex(single["timer_id"], r"^t-[0-9a-f]{10}-1$")
+        self.assertEqual(repeat["timer_id"], single["timer_id"].rsplit("-", 1)[0] + "-2")
         self.clock.advance(2)
         self.assertEqual(batches, [])
         self.clock.advance(0.5)
@@ -132,6 +133,38 @@ class TimerTest(unittest.IsolatedAsyncioTestCase):
         for result in (single, repeat):
             self.assertEqual(await _execute(tools, CANCEL_TIMER_TOOL_NAME, {"timer_id": result["timer_id"]}),
                              {"status": "not_active"})
+
+    async def test_ids_are_not_reused_after_cancellation_expiry_or_rebind(self):
+        scheduler = SessionScheduler()
+        batches = []
+        with patch("agent_companion.runtime.timers.token_hex", side_effect=("a1b2c3d4e5", "0a1b2c3d4e")):
+            first = Timers("main", scheduler.submit_internal)
+            self.addCleanup(first.close)
+            revoke = scheduler.bind(batches.append, on_revoke=first.close)
+            tools = Tools(first.tools)
+            initial = await _execute(tools, SET_TIMER_TOOL_NAME, {"interval_seconds": 1})
+            self.assertEqual(await _execute(tools, CANCEL_TIMER_TOOL_NAME, {"timer_id": initial["timer_id"]}),
+                             {"status": "cancelled"})
+            expires = await _execute(tools, SET_TIMER_TOOL_NAME, {"interval_seconds": 1})
+            self.clock.advance(1)
+            self.assertEqual([_event(item)["timer_id"] for (item,) in batches], [expires["timer_id"]])
+            old = await _execute(tools, SET_TIMER_TOOL_NAME, {"interval_seconds": 1})
+            self.assertEqual([item["timer_id"] for item in (initial, expires, old)],
+                             [f"t-a1b2c3d4e5-{count}" for count in range(1, 4)])
+            revoke()
+
+            rebound = Timers("main", scheduler.submit_internal)
+            self.addCleanup(rebound.close)
+            scheduler.bind(batches.append, on_revoke=rebound.close)
+            tools = Tools(rebound.tools)
+            fresh = await _execute(tools, SET_TIMER_TOOL_NAME, {"interval_seconds": 1})
+            self.assertEqual(fresh["timer_id"], "t-0a1b2c3d4e-1")
+            for item in (initial, expires, old):
+                self.assertEqual(await _execute(tools, CANCEL_TIMER_TOOL_NAME, {"timer_id": item["timer_id"]}),
+                                 {"status": "not_active"})
+            self.clock.advance(1)
+            self.assertEqual([_event(item)["timer_id"] for (item,) in batches],
+                             [expires["timer_id"], fresh["timer_id"]])
 
     async def test_invalid_arguments_do_not_register_timers(self):
         tools, _, _, _ = self.make_tools()

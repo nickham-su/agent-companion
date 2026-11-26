@@ -88,7 +88,6 @@ class AgentReply:
 
     agent_id: str
     run_id: str
-    delegation_ids: tuple[str, ...] = ()
     result: str | None = field(default=None, repr=False)
     error: str | None = None
 
@@ -97,7 +96,7 @@ class AgentReply:
             raise ValueError("agent reply requires source IDs and exactly one result or error")
 
     def to_model_message(self) -> Message:
-        payload = {"agent_id": self.agent_id, "run_id": self.run_id, "delegation_ids": self.delegation_ids}
+        payload = {"agent_id": self.agent_id}
         if self.error is not None:
             payload.update(status="failed", error=self.error)
         else:

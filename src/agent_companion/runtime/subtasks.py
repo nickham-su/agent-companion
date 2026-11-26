@@ -83,7 +83,7 @@ class AgentTree:
         choices = "；".join(f"{role}：{description}" for role, description in descriptions.items())
         return Tool(ToolSpec(
             DELEGATE_TOOL_NAME,
-            "将工作异步委派给直属子 Agent。工具立即返回受理标识，回复随后作为内部输入送达。"
+            "将工作异步委派给直属子 Agent。工具立即返回受理状态和 agent_id，回复随后作为内部输入送达。"
             f"创建请选择角色：{choices}。复用请提供 agent_id。",
             {
                 "type": "object",
@@ -205,7 +205,7 @@ class AgentTree:
             return '{"error":"delegation_handoff_failed"}'
         _LOG.debug("delegation accepted; agent=%s delegation=%s parent_run=%s",
                    child.agent_id, delegation.delegation_id, context.run_id)
-        return json.dumps({"status": "accepted", "agent_id": child.agent_id, "delegation_id": delegation.delegation_id})
+        return json.dumps({"status": "accepted", "agent_id": child.agent_id})
 
     async def wait_idle(self) -> None:
         """供离线验收使用：等待包括回投唤起的运行均停止。"""

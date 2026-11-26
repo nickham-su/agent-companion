@@ -335,9 +335,6 @@ class Runtime:
         if error is not None:
             result = None
         try:
-            delegation_ids = ()
-            if self._reply_to_parent is not None:
-                delegation_ids = await self._sqlite.write_input(lambda: self.history.run_delegation_ids(run_id))
             await self._sqlite.write_input(lambda: self.history.finish_agent_run(run_id, result=result, error=error))
         except Exception as exc:
             self.last_failure = "run_terminal_write_failed"
@@ -346,7 +343,7 @@ class Runtime:
         if self._reply_to_parent is None or self._closed:
             return
         assert self.agent is not None
-        notice = AgentReply(self.agent.agent_id, run_id, delegation_ids, result=result, error=error)
+        notice = AgentReply(self.agent.agent_id, run_id, result=result, error=error)
         if self._reply_to_parent(notice):
             _LOG.debug("agent reply queued; agent=%s run=%s", self.agent.agent_id, run_id)
             try:

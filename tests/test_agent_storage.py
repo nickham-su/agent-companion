@@ -5,6 +5,8 @@ import sqlite3
 from tempfile import TemporaryDirectory
 from threading import Barrier
 import unittest
+from unittest.mock import patch
+from uuid import UUID
 
 from agent_companion.protocol import Message
 from agent_companion.storage.sqlite import AgentReplyInput, DatabaseFormatError, DelegatedInput, FeishuCandidate, History, is_sqlite_lock_error
@@ -44,6 +46,48 @@ class AgentStorageTests(unittest.TestCase):
                 other = history.ensure_main_agent("session-b")
                 self.assertNotEqual(other.agent_id, agent.agent_id)
                 self.assertEqual(history.ensure_main_agent("session-a"), agent)
+
+    def test_short_ids_retry_real_collisions_for_main_and_child(self) -> None:
+        with closing(History(":memory:")) as history, patch(
+                "agent_companion.storage.sqlite.token_hex",
+                side_effect=("7c3e9b2f", "7c3e9b2f", "0a0b0c0d", "0a0b0c0d", "7c3e9b2f", "deadbeef")) as generate:
+            first = history.ensure_main_agent("first")
+            parent = history.ensure_main_agent("parent")
+            self.assertEqual(history.ensure_main_agent("first"), first)
+            _start(history, parent.agent_id, "parent-run")
+            child, delegation = history.accept_delegation(parent.agent_id, "parent-run", "call", role_id="review")
+            self.assertEqual((first.agent_id, parent.agent_id, child.agent_id),
+                             ("a-7c3e9b2f", "a-0a0b0c0d", "a-deadbeef"))
+            self.assertRegex(child.session_id, r"^child-[0-9a-f]{32}$")
+            self.assertEqual(history.agent(child.agent_id), child)
+            self.assertEqual(history.delegation(delegation.delegation_id).agent_id, child.agent_id)
+            self.assertEqual([call.args for call in generate.call_args_list], [(4,)] * 6)
+
+    def test_short_id_retry_is_bounded_and_session_conflicts_are_not_retried(self) -> None:
+        with closing(History(":memory:")) as history:
+            parent = history.ensure_main_agent("parent")
+            other = history.ensure_main_agent("other")
+            _start(history, parent.agent_id, "parent-run")
+            with patch("agent_companion.storage.sqlite.token_hex",
+                       return_value=other.agent_id.removeprefix("a-")) as generate:
+                with self.assertRaisesRegex(sqlite3.IntegrityError, r"agents\.agent_id"):
+                    history.accept_delegation(parent.agent_id, "parent-run", "collision", role_id="review")
+                self.assertGreater(generate.call_count, 1)
+                self.assertLessEqual(generate.call_count, 8)
+            self.assertEqual(history._db.execute("SELECT count(*) FROM agents").fetchone()[0], 2)
+            self.assertEqual(history._db.execute("SELECT count(*) FROM delegations").fetchone()[0], 0)
+
+            child, _ = history.accept_delegation(parent.agent_id, "parent-run", "success", role_id="review")
+            occupied_session = UUID(hex=child.session_id.removeprefix("child-"))
+            available_id = next(value for value in ("11111111", "22222222", "33333333", "44444444")
+                                if f"a-{value}" not in (parent.agent_id, other.agent_id, child.agent_id))
+            with (patch("agent_companion.storage.sqlite.uuid4", return_value=occupied_session),
+                  patch("agent_companion.storage.sqlite.token_hex", return_value=available_id) as generate):
+                with self.assertRaisesRegex(sqlite3.IntegrityError, r"agents\.session_id"):
+                    history.accept_delegation(parent.agent_id, "parent-run", "session-conflict", role_id="review")
+                generate.assert_called_once_with(4)
+            self.assertIsNone(history.agent(f"a-{available_id}"))
+            self.assertEqual(history._db.execute("SELECT count(*) FROM delegations").fetchone()[0], 1)
 
     def test_old_database_is_not_changed(self) -> None:
         for version in (1, 2):

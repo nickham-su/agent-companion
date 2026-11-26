@@ -13,6 +13,8 @@ import unittest
 from unittest.mock import patch
 import wave
 
+from test_agent_support import stored_delegation
+
 from agent_companion.app import run_feishu
 from agent_companion.channels.feishu.cli import CommandResult, FeishuDiscovery
 from agent_companion.channels.feishu.macos_calls import RingingWindow, WindowIdentity
@@ -326,9 +328,9 @@ class MVPIntegrationTest(unittest.IsolatedAsyncioTestCase):
                 tool_result = next(row.message for row in history.read_after(session) if row.message.role == "tool")
                 accepted = json.loads(tool_result.content)
                 self.assertEqual(tool_result.tool_call_id, "synthetic-call")
-                child, delegation_id = accepted["agent_id"], accepted["delegation_id"]
-                self.assertEqual(set(accepted), {"status", "agent_id", "delegation_id"})
-                delegation = history.delegation(delegation_id)
+                delegation = stored_delegation(history, session, tool_result.tool_call_id)
+                child = delegation.agent_id
+                self.assertEqual(accepted, {"status": "accepted", "agent_id": child})
                 run = delegation.run_id
                 self.assertEqual((accepted["status"], history.agent_run(run).status), ("accepted", "running"))
 
@@ -338,8 +340,7 @@ class MVPIntegrationTest(unittest.IsolatedAsyncioTestCase):
                 returned = next(row.message.content for row in history.read_after(session)
                                 if isinstance(row.message.content, str) and row.message.content.startswith(AGENT_REPLY_PREFIX))
                 self.assertEqual(json.loads(returned.removeprefix(AGENT_REPLY_PREFIX)), {
-                    "agent_id": child, "run_id": run, "status": "completed", "result": _RESULT,
-                    "delegation_ids": [delegation_id],
+                    "agent_id": child, "status": "completed", "result": _RESULT,
                 })
                 self.assertIsNotNone(history.agent_run(run).reply_enqueued_at)
                 self.assertEqual([row.message.content for row in history.read_after(history.agent(child).session_id)], [_PROMPT, _RESULT])

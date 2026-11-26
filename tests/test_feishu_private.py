@@ -11,6 +11,8 @@ from tempfile import TemporaryDirectory
 import unittest
 from unittest.mock import patch
 
+from test_agent_support import stored_delegation
+
 from agent_companion.__main__ import _serve
 from agent_companion.app import private_feishu_identity, run_feishu, running_agent
 from agent_companion.channels.feishu.cli import CliError, CommandResult, FeishuDiscovery
@@ -509,7 +511,7 @@ class FeishuPrivateTests(unittest.IsolatedAsyncioTestCase):
                 await _eventually(lambda: len(runner.sent[sb]) >= 2)
                 tool = next(e.message for e in history.read_after(session_b) if e.message.role == "tool")
                 accepted = json.loads(tool.content)
-                delegation_id = accepted["delegation_id"]
+                delegation_id = stored_delegation(history, session_b, tool.tool_call_id).delegation_id
                 child = history.agent(accepted["agent_id"]).session_id
                 self.assertEqual(history.delegation(delegation_id).status, "queued")
                 self.assertIsNone(history.delegation(delegation_id).run_id)
@@ -543,7 +545,7 @@ class FeishuPrivateTests(unittest.IsolatedAsyncioTestCase):
                 outcome, rows = attempts["tool_reply"][0][0]
                 self.assertTrue(all(args[0] is outcome and args[1] is rows for args, _ in attempts["tool_reply"]))
 
-    async def test_real_sqlite_read_lock_retries_only_completed_child_result(self):
+    async def test_real_sqlite_lock_retries_only_child_terminal_write(self):
         release_child = asyncio.Event()
 
         class PausedChild(_Model):
@@ -560,24 +562,24 @@ class FeishuPrivateTests(unittest.IsolatedAsyncioTestCase):
         with TemporaryDirectory() as tmp:
             database = Path(tmp) / "result.db"
             with closing(History(database)) as history, closing(sqlite3.connect(database, timeout=0)) as blocker:
-                finalize, read_links = history.finalize_reply, history.run_delegation_ids
+                finalize, finish = history.finalize_reply, history.finish_agent_run
 
                 def commit(outcome, rows):
                     ids = finalize(outcome, rows)
                     if outcome.session_id != session:
-                        # 子回复已经提交；另一个连接现在锁住数据库，专门阻断下一步的结果读取。
+                        # 子回复已经提交；另一个连接现在锁住数据库，专门阻断下一步的终态写入。
                         blocker.execute("BEGIN EXCLUSIVE")
                     return ids
 
-                def read_result(run_id):
+                def finish_result(run_id, **kwargs):
                     try:
-                        return read_links(run_id)
+                        return finish(run_id, **kwargs)
                     except sqlite3.OperationalError as exc:
                         failures.append((run_id, exc.sqlite_errorcode))
                         raise
 
                 with (patch.object(history, "finalize_reply", side_effect=commit),
-                      patch.object(history, "run_delegation_ids", side_effect=read_result)):
+                      patch.object(history, "finish_agent_run", side_effect=finish_result)):
                     async with _serve_private(self.settings, history, model, runner, clock):
                         await runner.verified.wait()
                         runner.messages[b] = [_message("delegate", b, sb, "first B")]
@@ -586,8 +588,7 @@ class FeishuPrivateTests(unittest.IsolatedAsyncioTestCase):
                         tool = next(e.message for e in history.read_after(session) if e.message.role == "tool")
                         accepted = json.loads(tool.content)
                         child = history.agent(accepted["agent_id"]).session_id
-                        delegation_id = accepted["delegation_id"]
-                        run_id = history.delegation(delegation_id).run_id
+                        run_id = stored_delegation(history, session, tool.tool_call_id).run_id
                         try:
                             release_child.set()
                             await _eventually(lambda: len(failures) >= 2)
@@ -603,9 +604,8 @@ class FeishuPrivateTests(unittest.IsolatedAsyncioTestCase):
                         payloads = [json.loads(e.message.content.removeprefix(AGENT_REPLY_PREFIX))
                                     for e in history.read_after(session) if e.message.content.startswith(AGENT_REPLY_PREFIX)]
                         run = history.agent_run(run_id)
-                        self.assertEqual(payloads, [{"agent_id": accepted["agent_id"], "run_id": run_id,
-                                                     "status": "completed", "result": "reply: child B",
-                                                     "delegation_ids": [delegation_id]}])
+                        self.assertEqual(payloads, [{"agent_id": accepted["agent_id"],
+                                                     "status": "completed", "result": "reply: child B"}])
                         self.assertEqual(run.status, "completed")
                         self.assertIsNotNone(run.reply_enqueued_at)
 

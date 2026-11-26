@@ -5,7 +5,7 @@ from contextlib import contextmanager
 from dataclasses import asdict, dataclass, field, replace
 import json
 from pathlib import Path
-from secrets import token_bytes
+from secrets import token_bytes, token_hex
 import sqlite3
 from time import time
 from uuid import uuid4
@@ -14,6 +14,7 @@ from ..protocol import REPLAY_KEY_BYTES, DeliveryStatus, Image, Message, Replay,
 
 
 _SCHEMA_VERSION = 3
+_AGENT_ID_ATTEMPTS = 8
 _FEISHU_INBOX = ("feishu-inbox", "feishu-private")
 _FEISHU_INITIAL_RETRY_SECONDS = 10
 _FEISHU_MAX_RETRY_SECONDS = 900
@@ -404,15 +405,31 @@ class History:
     def ensure_main_agent(self, session_id: str) -> Agent:
         """按内部 Session 键建立可复用的主 Agent。"""
         with self._input_transaction(retryable_io=False):
-            return self._ensure_main_agent(session_id)
+            self._db.execute("BEGIN IMMEDIATE")
+            row = self._db.execute("SELECT * FROM agents WHERE session_id = ?", (session_id,)).fetchone()
+            if row is None:
+                return self._insert_agent(session_id, "main", None)
+            if row["parent_agent_id"] is not None:
+                raise ValueError("session belongs to a child agent")
+            return Agent(**dict(row))
 
-    def _ensure_main_agent(self, session_id: str) -> Agent:
-        self._db.execute("INSERT INTO agents (agent_id, session_id, role_id) VALUES (?, ?, 'main')"
-                         " ON CONFLICT(session_id) DO NOTHING", (f"agent-{uuid4().hex}", session_id))
-        row = self._db.execute("SELECT * FROM agents WHERE session_id = ?", (session_id,)).fetchone()
-        if row["parent_agent_id"] is not None:
-            raise ValueError("session belongs to a child agent")
-        return Agent(**dict(row))
+    def _insert_agent(self, session_id: str, role_id: str, parent_agent_id: str | None) -> Agent:
+        for attempt in range(1, _AGENT_ID_ATTEMPTS + 1):
+            agent_id = f"a-{token_hex(4)}"
+            # 在运行的父 Agent 已占用这个 ID；直接写入会先触发禁止自引用的 CHECK。
+            if agent_id == parent_agent_id:
+                continue
+            try:
+                self._db.execute(
+                    "INSERT INTO agents (agent_id, session_id, role_id, parent_agent_id) VALUES (?, ?, ?, ?)",
+                    (agent_id, session_id, role_id, parent_agent_id))
+            except sqlite3.IntegrityError as exc:
+                if (attempt == _AGENT_ID_ATTEMPTS or exc.sqlite_errorcode != sqlite3.SQLITE_CONSTRAINT_PRIMARYKEY
+                        or str(exc) != "UNIQUE constraint failed: agents.agent_id"):
+                    raise
+            else:
+                return Agent(agent_id, session_id, role_id, parent_agent_id)
+        raise sqlite3.IntegrityError("could not allocate a unique agents.agent_id")
 
     def agent(self, agent_id: str) -> Agent | None:
         row = self._db.execute("SELECT * FROM agents WHERE agent_id = ?", (agent_id,)).fetchone()
@@ -428,9 +445,7 @@ class History:
             if not self._agent_run_active(parent_agent_id, parent_run_id):
                 raise ValueError("delegation requires an active parent run")
             if role_id is not None:
-                child = Agent(f"agent-{uuid4().hex}", f"child-{uuid4().hex}", role_id, parent_agent_id)
-                self._db.execute("INSERT INTO agents VALUES (?, ?, ?, ?)",
-                                 (child.agent_id, child.session_id, child.role_id, child.parent_agent_id))
+                child = self._insert_agent(f"child-{uuid4().hex}", role_id, parent_agent_id)
             else:
                 assert agent_id is not None
                 child = self.agent(agent_id)

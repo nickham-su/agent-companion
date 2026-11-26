@@ -6,8 +6,8 @@ from dataclasses import dataclass, field
 import json
 import logging
 from math import isfinite
+from secrets import token_hex
 from typing import Any
-from uuid import uuid4
 
 from ..protocol import InternalInput, TimerFired, ToolSpec
 from .tools import Tool, ToolContext
@@ -70,6 +70,8 @@ class Timers:
         self._session_id = session_id
         self._submit = submit
         self._loop = get_running_loop()
+        self._id_prefix = f"t-{token_hex(5)}"
+        self._next_id = 1
         self._active: dict[str, _Timer] = {}
         self._closed = False
         self.tools = (Tool(_SET_TIMER, self._set), Tool(_CANCEL_TIMER, self._cancel))
@@ -109,7 +111,8 @@ class Timers:
         if len(self._active) >= _MAX_ACTIVE_TIMERS:
             return '{"error":"timer_capacity_reached"}'
 
-        timer_id = uuid4().hex
+        timer_id = f"{self._id_prefix}-{self._next_id}"
+        self._next_id += 1
         timer = _Timer(interval, repeat, max_fires, message)
         timer.handle = self._loop.call_later(timer.interval, self._fire, timer_id)
         self._active[timer_id] = timer
