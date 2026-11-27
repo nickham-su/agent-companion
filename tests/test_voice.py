@@ -266,13 +266,18 @@ class VoiceOutputTest(unittest.IsolatedAsyncioTestCase):
         reply = _reply("limit", "已确认。", close=False)
         task = asyncio.create_task(output.deliver(reply))
         try:
-            await _until(lambda: bool(tts.calls))
-            reply.publish("未发送" * 10_000)
-            reply.publish("也不发送。")
-            self.assertTrue(reply.overflowed)
-            self.assertEqual(device.pull(4), _A * 4)
-            receipt = await task
+            with self.assertLogs("agent_companion.speech.playback", level="DEBUG") as logs:
+                await _until(lambda: bool(tts.calls))
+                reply.publish("未发送" * 10_000)
+                reply.publish("也不发送。")
+                self.assertTrue(reply.overflowed)
+                self.assertEqual(device.pull(4), _A * 4)
+                receipt = await task
             self.assertEqual((receipt.status, receipt.confirmed), (DeliveryStatus.FAILED, "已确认。"))
+            debug = "\n".join(logs.output)
+            self.assertIn("voice playback finished; reply=limit status=failed confirmed_chars=4", debug)
+            self.assertNotIn(receipt.confirmed, debug)
+            self.assertNotIn("未发送", debug)
             self.assertEqual(len(tts.calls), 1)
         finally:
             await output.close()

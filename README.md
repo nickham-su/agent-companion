@@ -41,6 +41,9 @@ python -m venv .venv
 
 排查时改为 `log_level = "DEBUG"`。用 `run` 和 `reply` ID 串起输入、模型、工具与投递；另外记录上下文压缩、子任务和实时语音的阶段状态。日志只有计数、耗时、状态等诊断信息，不包含消息正文、语音转写、工具参数、原始请求或密钥；不逐 token 或逐音频帧输出。
 
+- `scheduler input submitted`：按提交给 Runtime 的顺序逐条记录，包含主/子 Agent、批内位置、消息类型、投递意图、正文字符数和图片数。
+- `Feishu text receipt confirmed` 表示通道收齐文字，不表示已发送；CLI 确认发送另有 `Feishu text send confirmed`。语音看 `voice playback finished`，其中 `confirmed_chars` 只统计回执已确认的文字。
+
 模型调用失败时看 `model request failure`：`purpose` 区分回复和后台摘要，`stage`、`reason`、`category` 帮助判断出错阶段和类别；已知时还会记录 HTTP 状态和请求字节数。不会输出请求地址、响应内容或打开第三方 HTTP 库的调试日志。
 
 Bash 排查时看 `bash call finished`：记录结果类别、退出码和耗时。若工具未进入执行，查看同一 `reply` 的 `tool dispatch rejected`。两者都不记录命令、工作目录或命令输出。

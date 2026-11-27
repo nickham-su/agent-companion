@@ -24,6 +24,7 @@ from .protocol import (DeliveryStatus, Message, MessageDelivery, ModelEvent, Rec
                        TextDelta, ToolCall, ToolReady, ToolSpec)
 from .runtime.instructions import load_roles
 from .runtime.subtasks import AgentRole, DELEGATE_TOOL_NAME, ModelBinding, demo_roles
+from .session_scheduler import SessionSchedulers
 from .speech.bailian_ws import BailianConnection
 from .speech.minimax import MiniMaxASR
 from .speech.vad import VoiceSetupError
@@ -81,11 +82,12 @@ class _Console:
 
 async def run_demo(settings: Settings, *, delegate: bool = False) -> bool:
     model = _DemoModel()
+    schedulers = SessionSchedulers()
     with closing(History(":memory:")) as history:
         async with running_agent(settings, history, model, _Console(), session_id=_DEMO_SESSION_ID,
-                                 roles=demo_roles()) as (runtime, tree):
+                                 roles=demo_roles(), schedulers=schedulers) as (runtime, tree):
             message = Message("user", _DEMO_DELEGATION if delegate else "离线模拟输入")
-            runtime.submit_messages((MessageDelivery(message, "trigger"),))
+            schedulers.get_or_create(_DEMO_SESSION_ID).session_input((MessageDelivery(message, "trigger"),))
             await tree.wait_idle()
             return runtime.last_failure is None and (not delegate or model.received_subtask_result)
 

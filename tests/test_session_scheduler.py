@@ -88,14 +88,22 @@ class SessionSchedulerTest(unittest.IsolatedAsyncioTestCase):
 
         scheduler.bind(submit, trigger=wakes.append)
         scheduler.call_started(stop)
-        scheduler.call_input(stop, (), input_active=True)
-        scheduler.call_ended(old_stop, (late,))
-        scheduler.session_input((text,))
+        logger = "agent_companion.session_scheduler"
+        with self.assertNoLogs(logger, level="DEBUG"):
+            scheduler.call_input(stop, (), input_active=True)
+            scheduler.call_ended(old_stop, (late,))
+            scheduler.session_input((text,))
         self.assertEqual(accepted, [])
         self.assertEqual(history.read_after("main"), [])
         self.assertTrue(scheduler.has_pending_messages)
 
-        scheduler.call_ended(stop, (current_end,))
+        with self.assertLogs(logger, level="DEBUG") as logs:
+            scheduler.call_ended(stop, (current_end,))
+        self.assertEqual(len(logs.output), 3)
+        self.assertIn("position=1/3 kind=state_event intent=record", logs.output[0])
+        self.assertIn("position=2/3 kind=user intent=trigger", logs.output[1])
+        self.assertIn("position=3/3 kind=state_event intent=record", logs.output[2])
+        self.assertNotIn(text.message.text, "\n".join(logs.output))
         await asyncio.wait_for(runtime.wait_idle(), 2)
         self.assertEqual(accepted, [(late, text, current_end)])
         self.assertEqual(wakes, [])

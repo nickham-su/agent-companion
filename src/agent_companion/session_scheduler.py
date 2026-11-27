@@ -3,8 +3,10 @@
 import asyncio
 from collections.abc import Callable, Sequence
 import logging
+from typing import Literal
 
-from .protocol import DeliveryStatus, MessageDelivery, Receipt, ReplyDelivery, ReplyStream, validate_deliveries
+from .protocol import (DeliveryStatus, Image, MessageDelivery, Receipt, ReplyDelivery, ReplyStream, Text,
+                       validate_deliveries)
 
 
 _LOG = logging.getLogger(__name__)
@@ -21,6 +23,8 @@ class SessionScheduler:
     def __init__(self) -> None:
         self._agent_owner: object | None = None
         self._submit: _Submit | None = None
+        self._agent_id: str | None = None
+        self._agent_kind: Literal["main", "child"] | None = None
         self._trigger: _Trigger | None = None
         self._revoke_input: Callable[[], None] | None = None
         self._call: Callable[[], None] | None = None
@@ -52,15 +56,20 @@ class SessionScheduler:
         return False
 
     def bind(self, submit: _Submit, *, trigger: _Trigger | None = None, owner: object | None = None,
-             on_revoke: Callable[[], None] | None = None) -> Callable[[], None]:
+             on_revoke: Callable[[], None] | None = None, agent_id: str | None = None,
+             agent_kind: Literal["main", "child"] | None = None) -> Callable[[], None]:
         self._ensure_unbound(owner)
         self._submit = submit
+        self._agent_id = agent_id
+        self._agent_kind = agent_kind
         self._trigger = trigger
 
         def revoke() -> None:
             if self._revoke_input is revoke:
                 # 立即封住输入和回投，但不释放父会话所有权。
                 self._submit = None
+                self._agent_id = None
+                self._agent_kind = None
                 self._trigger = None
                 self._revoke_input = None
                 self._call = None
@@ -140,6 +149,19 @@ class SessionScheduler:
             _LOG.warning("runtime input handoff failed; batch retained; error_type=%s", type(exc).__name__)
             return
         self._pending.clear()
+        if _LOG.isEnabledFor(logging.DEBUG):
+            for position, item in enumerate(batch, 1):
+                message = item.message
+                result_kind = message.async_result.kind if message.async_result is not None else None
+                if result_kind not in (None, "agent_reply", "timer_fired"):
+                    result_kind = "other"
+                _LOG.debug("scheduler input submitted; agent=%s agent_kind=%s position=%d/%d kind=%s "
+                           "intent=%s source=%s delegated=%s async_kind=%s text_chars=%d images=%d",
+                           self._agent_id or "-", self._agent_kind or "-", position, len(batch), message.kind,
+                           item.intent, message.source.kind if message.source is not None else "-",
+                           item.delegation is not None, result_kind or "-",
+                           sum(len(part.text) for part in message.parts if isinstance(part, Text)),
+                           sum(isinstance(part, Image) for part in message.parts))
 
     def select_voice(self, reply: ReplyStream, target: ReplyDelivery) -> ReplyDelivery:
         """语音选路后同步决定是否拦截，不在转写结束后恢复过期回复。"""

@@ -59,10 +59,18 @@ class LoggingTests(unittest.TestCase):
         output = self.run_cli("--demo-subtasks")
         debug = "\n".join(line for line in output.splitlines() if " DEBUG " in line)
         for event in ("runtime input recorded", "model request started", "model request finished", "reply committed",
-                      "delegation accepted", "agent reply queued"):
+                       "delegation accepted", "agent reply queued"):
             self.assertIn(event, debug)
+        submissions = [line for line in debug.splitlines() if "scheduler input submitted" in line]
+        self.assertEqual(len(submissions), 5)
+        self.assertIn("agent_kind=main position=1/1 kind=user", submissions[0])
+        self.assertIn("agent_kind=child position=1/1 kind=user", submissions[1])
+        self.assertIn("delegated=True", submissions[1])
+        self.assertIn("agent_kind=main position=1/1 kind=async_tool_result", submissions[2])
+        self.assertIn("async_kind=agent_reply", submissions[2])
         self.assertIn("INFO agent_companion.__main__ agent companion started", output)
         self.assertIn("output_chars=", debug)
         self.assertIn("elapsed_ms=", debug)
         self.assertNotIn("离线模拟", debug)
         self.assertNotIn("模拟协议字段", debug)
+        self.assertNotIn("给出一个模拟子任务结果", debug)

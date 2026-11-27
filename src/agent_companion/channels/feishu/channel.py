@@ -71,6 +71,8 @@ class FeishuChannel:
         text = "".join([segment async for segment in reply])
         if self._closed or reply.abandoned:
             return Receipt(reply.info.reply_id, DeliveryStatus.ZERO)
+        _LOG.debug("Feishu text receipt confirmed; reply=%s status=%s confirmed_chars=%d",
+                   reply.info.reply_id, DeliveryStatus.FULL, len(text))
         return Receipt(reply.info.reply_id, DeliveryStatus.FULL, text)
 
     def enqueue(self, info: ReplyInfo, text: str) -> None:
@@ -95,8 +97,8 @@ class FeishuChannel:
                     if await self._cli.send_text(text) != DeliveryStatus.FULL:
                         _LOG.warning("Feishu text send not confirmed; reply=%s", reply_id)
                     else:
-                        _LOG.debug("Feishu text send confirmed; reply=%s elapsed_ms=%.0f",
-                                   reply_id, (clock() - started) * 1000)
+                        _LOG.debug("Feishu text send confirmed; reply=%s sent_chars=%d elapsed_ms=%.0f",
+                                   reply_id, len(text), (clock() - started) * 1000)
                 except Exception:
                     _LOG.warning("Feishu text send failed; reply=%s", reply_id)
         finally:

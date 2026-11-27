@@ -21,7 +21,7 @@ from agent_companion.channels.feishu.cli import CliError, CliStdoutLimit, Comman
 from agent_companion.config import FeishuSettings, Settings, load_settings
 from agent_companion.images import UNAVAILABLE_IMAGE, save_image
 from agent_companion.protocol import (OMITTED_INPUT_IMAGE, ChannelUser, DeliveryStatus, Image, Message, MessageDelivery, Receipt,
-                                      ReplyDelivery, ReplyInfo, Text, TextDelta)
+                                      ReplyDelivery, ReplyInfo, ReplyStream, Text, TextDelta)
 from agent_companion.runtime.subtasks import demo_roles
 from agent_companion.speech.asr import AsrError
 from agent_companion.storage.sqlite import History
@@ -349,6 +349,43 @@ print(json.dumps({"ok": True, "identity": "user", "data": {"size_bytes": peak}})
 
 
 class FeishuBackgroundDeliveryTests(unittest.IsolatedAsyncioTestCase):
+    async def test_receipt_and_successful_send_are_logged_separately_without_text(self):
+        sent, finished = [], asyncio.Event()
+
+        class CLI:
+            async def send_text(self, text):
+                sent.append(text)
+                if len(sent) == 1:
+                    return DeliveryStatus.FULL
+                finished.set()
+                return DeliveryStatus.UNKNOWN
+
+        channel = FeishuChannel(CLI())
+        self.addAsyncCleanup(channel.close)
+        info = ReplyInfo("first", "main", "run", 0)
+        reply = ReplyStream(info)
+        text, unconfirmed = "模拟回复。", "模拟未确认回复。"
+        reply.publish(text)
+        reply.close()
+
+        with self.assertLogs("agent_companion.channels.feishu.channel", level="DEBUG") as logs:
+            receipt = await channel.deliver(reply)
+            self.assertEqual(receipt, Receipt(info.reply_id, DeliveryStatus.FULL, text))
+            self.assertEqual(sent, [])
+            self.assertEqual([record.getMessage() for record in logs.records], [
+                "Feishu text receipt confirmed; reply=first status=full confirmed_chars=5",
+            ])
+            channel.enqueue(info, receipt.confirmed)
+            channel.enqueue(ReplyInfo("second", "main", "run", 0), unconfirmed)
+            await asyncio.wait_for(finished.wait(), 1)
+
+        output = "\n".join(logs.output)
+        self.assertIn("Feishu text send confirmed; reply=first sent_chars=5", output)
+        self.assertIn("Feishu text send not confirmed; reply=second", output)
+        self.assertNotIn("Feishu text send confirmed; reply=second", output)
+        self.assertNotIn(text, output)
+        self.assertNotIn(unconfirmed, output)
+
     async def test_rejected_transcripts_do_not_take_queue_slots(self):
         for reason, invalid in (("多字节超限", "字" * 10_000), ("转义超限", '"' * 10_000),
                                 ("无效编码", "\ud800")):
