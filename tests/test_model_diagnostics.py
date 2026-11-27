@@ -11,7 +11,7 @@ from agent_companion.config import RuntimeSettings
 from agent_companion.logging_setup import stdout_logging
 from agent_companion.models.deepseek import DeepSeek
 from agent_companion.models.openai_responses import OpenAIResponses
-from agent_companion.protocol import Message, ModelError
+from agent_companion.protocol import Message, MessageDelivery, ModelError
 from agent_companion.runtime.compaction import Compactions, Prefix
 from agent_companion.runtime.engine import Runtime
 from agent_companion.storage.sqlite import History
@@ -62,7 +62,7 @@ class ModelDiagnosticTests(unittest.IsolatedAsyncioTestCase):
 
     async def submit(self, runtime, history, session=_SESSION):
         try:
-            runtime.submit_batch([Message("user", _INPUT)])
+            runtime.submit_messages([MessageDelivery(Message("user", _INPUT), "trigger")])
             await asyncio.wait_for(runtime.wait_idle(), 2)
             outcome, = history.outcomes(session)
             return outcome

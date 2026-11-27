@@ -13,7 +13,7 @@ import httpx
 
 from agent_companion.config import RuntimeSettings
 from agent_companion.models.deepseek import DeepSeek
-from agent_companion.protocol import (DeliveryStatus, Message, Receipt, Reasoning, Text, TextDelta, ToolCall,
+from agent_companion.protocol import (DeliveryStatus, Message, MessageDelivery, Receipt, Reasoning, Text, TextDelta, ToolCall,
                                       ToolReady, ToolSpec)
 from agent_companion.runtime.compaction import Compactions
 from agent_companion.runtime.context import Context
@@ -65,7 +65,7 @@ import asyncio
 import os
 from pathlib import Path
 import sys
-from agent_companion.protocol import (REPLAY_KEY_BYTES, AssistantPartsReady, Message, PrivateData, Reasoning,
+from agent_companion.protocol import (REPLAY_KEY_BYTES, AssistantPartsReady, Message, MessageDelivery, PrivateData, Reasoning,
                                       Text, TextDelta, ToolCall, ToolReady, ToolSpec)
 from agent_companion.runtime.engine import Runtime
 from agent_companion.runtime.tools import Tool, Tools
@@ -113,7 +113,7 @@ async def tool(args, context):
 
 async def main():
     runtime = Runtime('main', CrashHistory(path), Model(), None, tools=Tools((Tool(spec, tool),)))
-    runtime.submit_batch((Message('user', 'request'),))
+    runtime.submit_messages((MessageDelivery(Message('user', 'request'), 'trigger'),))
     await runtime.wait_idle()
     raise RuntimeError('crash hook was not reached')
 
@@ -229,7 +229,7 @@ class ToolHistoryTest(unittest.IsolatedAsyncioTestCase):
                         self.assertEqual(staged.message.tool_calls[0].private.payload, b"native-call")
                         self.assertIsNone(staged.message.tool_calls[0].result)
                         context, _ = _context(other)
-                        _, projected = await _prepare(context)
+                        projected = (await _prepare(context)).messages
                         self.assertEqual([message.kind for message in projected], ["user"])
                         later, = other.append("main", [Message("user", "later input")])
                         self.assertFalse(other.try_save_summary("main", Summary(staged.message_id, "must wait"),
@@ -256,7 +256,7 @@ class ToolHistoryTest(unittest.IsolatedAsyncioTestCase):
                     model = _Model()
                     runtime = Runtime("main", reopened, model, None, tools=Tools((Tool(_SPEC, tool),)))
                     try:
-                        runtime.submit_batch((Message("user", "continue"),))
+                        runtime.submit_messages((MessageDelivery(Message("user", "continue"), "trigger"),))
                         await asyncio.wait_for(runtime.wait_idle(), 2)
                         self.assertIsNone(runtime.last_failure)
                     finally:
@@ -294,19 +294,19 @@ class ToolHistoryTest(unittest.IsolatedAsyncioTestCase):
                                   tools=Tools((Tool(_SPEC, tool),)))
                 try:
                     with patch.object(history, "record_tool_result", side_effect=record_and_notify):
-                        runtime.submit_batch((Message("user", "request"),))
+                        runtime.submit_messages((MessageDelivery(Message("user", "request"), "trigger"),))
                         await asyncio.wait_for(asyncio.gather(first_started.wait(), second_committed.wait()), 2)
                         _, entries = other.context_snapshot("main")
                         self.assertTrue(entries[-1].active_reply)
                         self.assertEqual([(c.id, c.result) for c in entries[-1].message.tool_calls],
                                          [("first", None), ("second", "")])
                         context, _ = _context(other)
-                        _, projected = await _prepare(context)
+                        projected = (await _prepare(context)).messages
                         self.assertEqual([message.kind for message in projected], ["user"])
                 finally:
                     await runtime.close()
                 self.assertEqual(other.outcomes("main"), [])
-                _, projected = await _prepare(context)
+                projected = (await _prepare(context)).messages
                 first, second = projected[-1].tool_calls
                 self.assertEqual(json.loads(first.result)["status"], "unknown")
                 self.assertEqual(second.result, "")
@@ -323,7 +323,7 @@ class ToolHistoryTest(unittest.IsolatedAsyncioTestCase):
                 history.record_tool_result("main", "working", _SECOND.id, "true result")
                 active = history.read_after("main")[-1].message_id
                 later, latest = history.append("main", [Message("user", "later"), Message("user", "latest")])
-                _, projected = await _prepare(context, protected_from=latest, last_input_tokens=1000)
+                projected = (await _prepare(context, protected_from=latest, last_input_tokens=1000)).messages
                 self.assertEqual([message.text for message in projected], ["old words " * 50, "later", "latest"])
                 self.assertFalse(history.try_save_summary("main", Summary(later, "skip over active"),
                                                           covered=0, protected_from=latest))
@@ -335,7 +335,7 @@ class ToolHistoryTest(unittest.IsolatedAsyncioTestCase):
                 await _prepare(context, protected_from=latest, last_input_tokens=1000)
                 self.assertEqual(history.summary("main").covers_through, old)
             # 所有者退出后，同一组在普通续轮和摘要请求中使用相同的缺失占位与已有结果。
-            _, projected = await _prepare(context, protected_from=latest, last_input_tokens=1000)
+            projected = (await _prepare(context, protected_from=latest, last_input_tokens=1000)).messages
             assistant = projected[1]
             self.assertEqual(json.loads(assistant.tool_calls[0].result)["status"], "unknown")
             self.assertEqual(assistant.tool_calls[1].result, "true result")
@@ -362,7 +362,7 @@ class ToolHistoryTest(unittest.IsolatedAsyncioTestCase):
                 with patch.object(history, "stage_tool_calls", side_effect=fail):
                     runtime = Runtime("main", history, _Model(_FIRST), None, tools=Tools((Tool(_SPEC, tool),)))
                     try:
-                        runtime.submit_batch((Message("user", "request"),))
+                        runtime.submit_messages((MessageDelivery(Message("user", "request"), "trigger"),))
                         await asyncio.wait_for(runtime.wait_idle(), 2)
                         self.assertEqual(runtime.last_failure, "runtime_failed")
                     finally:
@@ -413,7 +413,7 @@ class ToolHistoryTest(unittest.IsolatedAsyncioTestCase):
                                   tools=Tools((Tool(_SPEC, tool),)))
                 try:
                     with patch.object(history, "stage_tool_calls", side_effect=try_stage):
-                        runtime.submit_batch((Message("user", "request"),))
+                        runtime.submit_messages((MessageDelivery(Message("user", "request"), "trigger"),))
                         await asyncio.wait_for(voice_ready.wait(), 2)
                         competing.execute("BEGIN IMMEDIATE")
                         allow_tool.set()
@@ -536,7 +536,7 @@ class ToolHistoryTest(unittest.IsolatedAsyncioTestCase):
                         with (patch.object(history, "stage_tool_calls", side_effect=lock_second),
                               patch.object(history, "record_tool_result", side_effect=record_first),
                               patch.object(runtime._sqlite, "write_input", new=observe_write)):
-                            runtime.submit_batch((Message("user", "request"),))
+                            runtime.submit_messages((MessageDelivery(Message("user", "request"), "trigger"),))
                             await asyncio.wait_for(attempted.wait(), 2)
                             if by_voice:
                                 voice_cut.set()
@@ -603,7 +603,7 @@ class ToolHistoryTest(unittest.IsolatedAsyncioTestCase):
                     try:
                         with patch.object(history, "record_tool_result", side_effect=fail_first), self.assertLogs(
                                 "agent_companion.runtime.engine", level="ERROR") as logs:
-                            runtime.submit_batch((Message("user", "request"),))
+                            runtime.submit_messages((MessageDelivery(Message("user", "request"), "trigger"),))
                             await asyncio.wait_for(runtime.wait_idle(), 2)
                             runtime.trigger_run()
                             await asyncio.wait_for(runtime.wait_idle(), 2)
@@ -627,7 +627,7 @@ class ToolHistoryTest(unittest.IsolatedAsyncioTestCase):
                     self.assertEqual(outcome.model_status, "complete")
                     context, compactions = _context(history)
                     try:
-                        _, projected = await _prepare(context)
+                        projected = (await _prepare(context)).messages
                         result = projected[-1].tool_calls[0].result
                         if committed:
                             self.assertEqual(result, "unsettled result")

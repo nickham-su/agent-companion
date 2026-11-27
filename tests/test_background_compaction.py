@@ -1,10 +1,12 @@
 import asyncio
+from collections import Counter
 from contextlib import closing
 from dataclasses import replace
 from pathlib import Path
 import json
 import sqlite3
 import tempfile
+from threading import Event
 from time import monotonic
 import unittest
 from unittest.mock import Mock, patch
@@ -12,12 +14,14 @@ from unittest.mock import Mock, patch
 import httpcore
 import httpx
 
+from agent_companion import images
 from agent_companion.app import prepare_private_feishu, running_agent
 from agent_companion.config import FeishuSettings, RuntimeSettings, Settings
+from agent_companion.images import UNAVAILABLE_IMAGE, image_filename, save_image
 from agent_companion.models import _http_stream
 from agent_companion.models.deepseek import DeepSeek
-from agent_companion.protocol import (ChannelUser, InputUsage, Message, PrivateData,
-                                      TextDelta, ToolCall, ToolReady)
+from agent_companion.protocol import (ChannelUser, Image, InputUsage, Message, MessageDelivery, PrivateData,
+                                      Text, TextDelta, ToolCall, ToolReady)
 from agent_companion.runtime.subtasks import demo_roles
 from agent_companion.runtime.compaction import Compactions, Prefix
 from agent_companion.runtime.context import _SUMMARIZE
@@ -26,7 +30,7 @@ from agent_companion.runtime.tools import Tool, ToolContext, Tools
 from agent_companion.speech.asr import ASRCapabilities, FileASR
 from agent_companion.storage.sqlite import History, ReplyOutcome, Summary
 from test_history_context import Sink, SPEC
-from test_message_support import assistant_message
+from test_message_support import PNG_BYTES, PNG_URL, assistant_message, image_workspace
 
 
 _SETTINGS = RuntimeSettings(context_budget=240, tail_budget=60)
@@ -126,7 +130,7 @@ class _NativeSummaryTransport:
 
 class BackgroundCompactionTest(unittest.IsolatedAsyncioTestCase):
     async def _begin(self, runtime, model, text="first"):
-        runtime.submit_batch([Message("user", text)])
+        runtime.submit_messages([MessageDelivery(Message("user", text), "trigger")])
         await _wait(model.generating)
         task = runtime._compactions._generating
         self.assertIsNotNone(task)
@@ -135,6 +139,158 @@ class BackgroundCompactionTest(unittest.IsolatedAsyncioTestCase):
     async def _finish(self, model, task):
         model.release.set()
         await asyncio.wait_for(asyncio.shield(task), 2)
+
+    async def test_call_state_messages_are_visible_to_background_compaction(self):
+        connected = Message("state_event", "通话已接通 - 2026-01-20 11:12:13+00:00")
+        ended = Message("state_event", "通话已结束 - 2026-01-20 11:14:15+00:00")
+        model = _GatedModel()
+        with closing(History(":memory:")) as history:
+            history.append("main", [connected, ended, _OLD])
+            _report_high_usage(history, "main")
+            runtime = Runtime("main", history, model, Sink(), settings=_SETTINGS)
+            try:
+                task = await self._begin(runtime, model, "当前消息")
+                await _idle(runtime)
+                plain, = model.requests
+                compressed, = model.summary_requests
+                self.assertEqual(plain[:3], (connected, ended, _OLD))
+                self.assertEqual(compressed, (connected, ended, _OLD, _SUMMARIZE))
+                await self._finish(model, task)
+            finally:
+                model.release.set()
+                await runtime.close()
+
+    async def test_each_request_loads_only_its_selected_images_after_planning(self):
+        workspace = image_workspace(self)
+        covered, old, recent = (save_image(workspace, PNG_BYTES) for _ in range(3))
+        missing = Image(".agent/images/" + "a" * 32)
+        old_message = Message("user", (Text("前"), old, missing, Text("后")))
+        recent_message = Message("user", (recent,))
+        model = _GatedModel()
+        with (closing(History(":memory:")) as history,
+              patch.object(images, "_read_image", wraps=images._read_image) as read):
+            covered_id, old_id = history.append("main", [Message("user", (covered,)), old_message])
+            history.save_summary("main", Summary(covered_id, "已压缩"))
+            _report_high_usage(history, "main")
+            runtime = Runtime("main", history, model, Sink(), settings=_SETTINGS, workspace=workspace)
+            try:
+                runtime.submit_messages([MessageDelivery(recent_message, "trigger")])
+                await _wait(model.generating)
+                await _idle(runtime)
+                plain, = model.requests
+                compressed, = model.summary_requests
+                sent_old = (Text("前"), Image(PNG_URL), UNAVAILABLE_IMAGE, Text("后"))
+                self.assertEqual(plain[1].parts, sent_old)
+                self.assertEqual(plain[2].parts, (Image(PNG_URL),))
+                self.assertEqual(compressed[1].parts, sent_old)
+                self.assertEqual(compressed[2], _SUMMARIZE)
+                self.assertEqual(Counter(call.args[1] for call in read.call_args_list), {
+                    image_filename(old.url): 2, image_filename(missing.url): 2, image_filename(recent.url): 1,
+                })
+                await self._finish(model, runtime._compactions._generating)
+                read.reset_mock()
+                runtime.submit_messages([MessageDelivery(Message("user", "第二轮"), "trigger")])
+                await _idle(runtime)
+                self.assertEqual(history.summary("main").covers_through, old_id)
+                self.assertEqual([call.args[1] for call in read.call_args_list], [image_filename(recent.url)])
+                self.assertEqual([row.message for row in history.read_after("main")[:3]],
+                                 [Message("user", (covered,)), old_message, recent_message])
+            finally:
+                model.release.set()
+                await runtime.close()
+
+    async def test_slow_image_wait_is_interruptible_without_dispatching_model(self):
+        workspace = image_workspace(self)
+        picture = Message("user", (save_image(workspace, PNG_BYTES),))
+        loop = asyncio.get_running_loop()
+        actual_read = images._read_image
+        for summary in (False, True):
+            for cancel in (False, True):
+                with self.subTest(summary=summary, cancel=cancel), closing(History(":memory:")) as history:
+                    started, finished = asyncio.Event(), asyncio.Event()
+                    release = Event()
+
+                    def slow_read(*args):
+                        loop.call_soon_threadsafe(started.set)
+                        try:
+                            if not release.wait(3):
+                                raise AssertionError("image read blocked the event loop")
+                            return actual_read(*args)
+                        finally:
+                            loop.call_soon_threadsafe(finished.set)
+
+                    model = Mock()  # 具有原生 stop_stream，但图片准备时还没有可关闭的请求。
+                    model.stop_stream.return_value = False
+                    other_model = _GatedModel()
+                    settings = replace(_SETTINGS, model_timeout=5 if cancel else 0.15)
+                    runtime = Runtime("main", history, model, Sink(), settings=settings, workspace=workspace)
+                    other = Runtime("other", history, other_model, Sink())
+                    try:
+                        with patch.object(images, "_read_image", side_effect=slow_read):
+                            if summary:
+                                runtime._compactions.start("main", Prefix(0, 1, 1), [picture, _SUMMARIZE], (),
+                                                           model=model, thinking=False, timeout=settings.model_timeout,
+                                                           workspace=workspace)
+                                summary_task = runtime._compactions._generating
+                            else:
+                                runtime.submit_messages([MessageDelivery(picture, "trigger")])
+                            await _wait(started)
+                            other.submit_messages([MessageDelivery(Message("user", "另一个用户"), "trigger")])
+                            await _idle(other)
+                            self.assertEqual(len(other_model.requests), 1)
+                            if cancel:
+                                await asyncio.wait_for(runtime.close(), 1)
+                            elif summary:
+                                await asyncio.wait_for(asyncio.shield(summary_task), 1)
+                                self.assertIsNone(runtime._compactions.ready("main", 0))
+                                self.assertFalse(runtime._compactions.can_start("main", 0, 1))
+                            else:
+                                await _idle(runtime)
+                                self.assertEqual(runtime.last_failure, "model_timeout")
+                            self.assertFalse(finished.is_set())  # 取消等待不等于中止同步读取。
+                            model.stream.assert_not_called()
+                    finally:
+                        release.set()
+                        await runtime.close()
+                        await other.close()
+                        if started.is_set():
+                            await _wait(finished)
+                    model.stream.assert_not_called()
+
+    async def test_already_expired_picture_request_does_not_race_deadline_callback(self):
+        workspace = image_workspace(self)
+        picture = Message("user", (save_image(workspace, PNG_BYTES),))
+        loop = asyncio.get_running_loop()
+        clock = loop.time
+        for summary, module in ((False, "engine"), (True, "compaction")):
+            with self.subTest(summary=summary), closing(History(":memory:")) as history:
+                offset = 0
+
+                async def prepare(messages, *_args, **_kwargs):
+                    nonlocal offset
+                    # 返回与检查间无让步，让单调时间先越过截止，而定时器还未运行。
+                    offset = 2
+                    return messages
+
+                model = Mock()
+                model.stop_stream.return_value = False
+                runtime = Runtime("main", history, model, Sink(), settings=replace(_SETTINGS, model_timeout=1))
+                try:
+                    with (patch(f"agent_companion.runtime.{module}.prepare_request_images", side_effect=prepare),
+                          patch.object(loop, "time", side_effect=lambda: clock() + offset)):
+                        if summary:
+                            runtime._compactions.start("main", Prefix(0, 1, 1), [picture, _SUMMARIZE], (),
+                                                       model=model, thinking=False, timeout=1)
+                            await runtime._compactions._generating
+                            self.assertFalse(runtime._compactions.can_start("main", 0, 1))
+                        else:
+                            runtime.submit_messages([MessageDelivery(picture, "trigger")])
+                            await runtime.wait_idle()
+                            self.assertEqual(runtime.last_failure, "model_timeout")
+                    model.stream.assert_not_called()
+                    model.stop_stream.assert_not_called()
+                finally:
+                    await runtime.close()
 
     async def test_first_and_tool_continuation_do_not_wait_and_apply_only_after_full_batch(self):
         calls = [ToolCall(f"call{i}", SPEC.name, json.dumps({"i": i})) for i in range(3)]
@@ -168,7 +324,7 @@ class BackgroundCompactionTest(unittest.IsolatedAsyncioTestCase):
                 task = await self._begin(runtime, model)
                 await _wait(reached[0])
                 self.assertEqual(model.requests[0], (_OLD, Message("user", "first")))
-                runtime.submit_batch([Message("user", "queued during first batch")])
+                runtime.submit_messages([MessageDelivery(Message("user", "queued during first batch"), "trigger")])
                 release[0].set()
                 await _wait(reached[1])
                 await _wait(reached[2])
@@ -180,7 +336,7 @@ class BackgroundCompactionTest(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(len(model.requests), 2)
                 self.assertIsNone(history.summary("main"))
                 self.assertEqual(model.summary_requests, [(_OLD, _SUMMARIZE)])
-                runtime.submit_batch([Message("user", "queued during second batch")])
+                runtime.submit_messages([MessageDelivery(Message("user", "queued during second batch"), "trigger")])
                 release[2].set()
                 await _idle(runtime)
                 self.assertIsNone(runtime.last_failure)
@@ -212,11 +368,12 @@ class BackgroundCompactionTest(unittest.IsolatedAsyncioTestCase):
             async with running_agent(settings, history, model, Sink(), session_id="main",
                                      roles=demo_roles()) as (main, tree):
                 agent_id = main.agent.agent_id
-                history.append_agent_inputs(agent_id, "test", [Message("user", "fixture parent input")], start=True)
+                fixture = MessageDelivery(Message("user", "fixture parent input"), "trigger")
+                history.append_agent_inputs(agent_id, "test", (fixture,), start=True)
 
                 async def delegate(label, prompt, child=None):
                     args = {"prompt": prompt, **({"agent_id": child} if child else {"agent": "general"})}
-                    context = ToolContext("main", "test", label, True, agent_id=agent_id)
+                    context = ToolContext("main", "test", label, agent_id=agent_id)
                     accepted = json.loads(await tree._delegate(args, context))
                     self.assertEqual(accepted["status"], "accepted")
                     return accepted["agent_id"]
@@ -237,7 +394,7 @@ class BackgroundCompactionTest(unittest.IsolatedAsyncioTestCase):
 
                 history.append("main", [_OLD])
                 _report_high_usage(history, "main")
-                main.submit_batch([Message("user", "main while child is generating")])
+                main.submit_messages([MessageDelivery(Message("user", "main while child is generating"), "trigger")])
                 await _idle(main)
                 self.assertIn(_OLD, model.requests[-1])
                 self.assertEqual(len(model.summary_requests), 1)
@@ -285,7 +442,7 @@ class BackgroundCompactionTest(unittest.IsolatedAsyncioTestCase):
                 async with open_agent(history.ensure_main_agent("main-a"), Sink(), ChannelUser("ou_a")) as (first, _):
                     first_task = await self._begin(first, model, "first group input")
                     await _idle(first)
-                    second.submit_batch([Message("user", "second group while occupied")])
+                    second.submit_messages([MessageDelivery(Message("user", "second group while occupied"), "trigger")])
                     await _idle(second)
                     self.assertIsNone(second.last_failure)
                     self.assertEqual(model.requests[-1][-1].content, "second group while occupied")
@@ -349,14 +506,14 @@ class BackgroundCompactionTest(unittest.IsolatedAsyncioTestCase):
                     return await original(*args, **kwargs)
 
                 with patch.object(revoked._context, "_sqlite", side_effect=slow_read):
-                    revoked.submit_batch([Message("user", "revoked during preparation")])
+                    revoked.submit_messages([MessageDelivery(Message("user", "revoked during preparation"), "trigger")])
                     await _wait(reading)
                     revoked.stop_accepting()
                     allow_read.set()
                     await _idle(revoked)
                     self.assertIsNone(history.summary("main"))
                     self.assertEqual(len(model.requests), 1)
-                next_runtime.submit_batch([Message("user", "text afterwards")])
+                next_runtime.submit_messages([MessageDelivery(Message("user", "text afterwards"), "trigger")])
                 await _idle(next_runtime)
                 self.assertIn(_SUMMARY, model.requests[-1])
                 self.assertIn(Message("user", "revoked during preparation"), model.requests[-1])
@@ -517,7 +674,7 @@ class BackgroundCompactionTest(unittest.IsolatedAsyncioTestCase):
                                                       timeout=0.05)
                                     settled = asyncio.shield(compactions._generating)
                                 else:
-                                    runtime.submit_batch([Message("user", "fixture input")])
+                                    runtime.submit_messages([MessageDelivery(Message("user", "fixture input"), "trigger")])
                                     settled = runtime.wait_idle()
                                 await asyncio.wait_for(settled, 0.5)
                             self.assertTrue(fixture.interrupted.is_set())
@@ -550,7 +707,7 @@ class BackgroundCompactionTest(unittest.IsolatedAsyncioTestCase):
                     await asyncio.wait_for(asyncio.shield(task), 2)
                 self.assertTrue(model.cancelled.is_set())
                 self.assertIn("timeout", logs.output[0])
-                runtime.submit_batch([Message("user", "during timeout cooldown")])
+                runtime.submit_messages([MessageDelivery(Message("user", "during timeout cooldown"), "trigger")])
                 await _idle(runtime)
                 self.assertIsNone(history.summary("main"))
                 self.assertEqual(len(model.summary_requests), 1)
@@ -586,7 +743,7 @@ class BackgroundCompactionTest(unittest.IsolatedAsyncioTestCase):
 
                     with (patch.object(history, "try_save_summary", side_effect=locked),
                           self.assertLogs("agent_companion.runtime.compaction", level="WARNING") as logs):
-                        runtime.submit_batch([Message("user", "while write locked")])
+                        runtime.submit_messages([MessageDelivery(Message("user", "while write locked"), "trigger")])
                         await _idle(runtime)
                     elapsed, restored = observations[0]
                     self.assertLess(elapsed, 1)  # 普通连接等待上限为 5 秒。
@@ -652,7 +809,7 @@ class BackgroundCompactionTest(unittest.IsolatedAsyncioTestCase):
 
                         with (patch.object(history, "try_save_summary", side_effect=commit_first) as write,
                               patch.object(history, "try_context_snapshot", side_effect=read_once)):
-                            runtime.submit_batch([racing_input])
+                            runtime.submit_messages([MessageDelivery(racing_input, "trigger")])
                             await _idle(runtime)
                             write.assert_called_once()
                         self.assertEqual(len(reads), 1)
@@ -688,7 +845,7 @@ class BackgroundCompactionTest(unittest.IsolatedAsyncioTestCase):
                 await _idle(runtime)
                 clock.return_value = 401
                 with patch.object(history, "try_save_summary", wraps=history.try_save_summary) as write:
-                    runtime.submit_batch([Message("user", "after expiration")])
+                    runtime.submit_messages([MessageDelivery(Message("user", "after expiration"), "trigger")])
                     await _idle(runtime)
                     write.assert_not_called()
                 self.assertIsNone(history.summary("main"))

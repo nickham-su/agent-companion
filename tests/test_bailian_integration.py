@@ -10,7 +10,7 @@ from unittest.mock import AsyncMock, patch
 import httpx
 
 from agent_companion.__main__ import _serve
-from agent_companion.channels.feishu.messages import BatchMediaBudget, IncomingMessage, MessageNormalizer
+from agent_companion.channels.feishu.messages import IncomingMessage, MessageNormalizer
 from agent_companion.config import ConfigError, MiniMaxConnection, load_settings
 from agent_companion.speech.audio import AudioFormat
 from agent_companion.speech.bailian_asr import BailianASR
@@ -168,8 +168,8 @@ class BailianStartupIntegrationTests(unittest.IsolatedAsyncioTestCase):
             self.assertIsInstance(file, BailianASR if use_bailian_asr else MiniMaxASR)
             cli = SimpleNamespace(download=AsyncMock(return_value=opus))
             message = IncomingMessage("om_fixture", 1, "audio", '{"file_key":"file_fixture"}')
-            actual = await MessageNormalizer(cli, file).normalize(message, BatchMediaBudget(1024))
-            self.assertEqual(actual.content, "合成转写")
+            actual = await MessageNormalizer(cli, file).normalize(message)
+            self.assertEqual(actual, "合成转写")
             voice, device = await incoming._voice_factory()
             events = []
             self.assertEqual(voice._segment_frames is None, use_bailian_asr)

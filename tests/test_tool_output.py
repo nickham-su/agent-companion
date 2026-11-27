@@ -31,7 +31,7 @@ class ToolOutputTests(unittest.IsolatedAsyncioTestCase):
             return result
 
         tool = Tool(ToolSpec("example", "", {}), handler)
-        context = ToolContext("session", "run", "call", False, workspace=self.workspace if workspace else None)
+        context = ToolContext("session", "run", "call", workspace=self.workspace if workspace else None)
         return await Tools([tool]).execute(ToolCall("call", "example", "{}"), context)
 
     def _archive_path(self, output):

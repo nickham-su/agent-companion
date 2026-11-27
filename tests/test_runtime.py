@@ -1,18 +1,21 @@
 import asyncio
 from dataclasses import replace
 import sqlite3
+from threading import Event
 import unittest
 from unittest.mock import patch
 
 from agent_companion.config import RuntimeSettings
+from agent_companion.images import save_image
 from agent_companion.models.deepseek import MODEL_NAME, DeepSeek, _replay_key, build_request
-from agent_companion.protocol import (DeliveryStatus, Message, ModelError, Receipt, PrivateData, Reasoning, AssistantPartsReady,
+from agent_companion.protocol import (AssistantPartsReady, DeliveryStatus, Message, MessageDelivery, ModelError,
+                                      PrivateData, Reasoning, Receipt,
                                       ReplyDelivery, TextDelta, ToolCall,
                                       ToolReady, ToolSpec)
 from agent_companion.runtime.engine import Runtime
 from agent_companion.runtime.tools import Tool, Tools
 from agent_companion.storage.sqlite import History, Summary
-from test_message_support import assistant_message, reasoning_parts
+from test_message_support import PNG_BYTES, assistant_message, image_workspace, reasoning_parts
 
 
 SPEC = ToolSpec("test", "模拟工具", {"type": "object", "properties": {}})
@@ -62,11 +65,11 @@ class RuntimeTest(unittest.IsolatedAsyncioTestCase):
         await asyncio.wait_for(runtime.wait_idle(), 2)
         self.assertIsNone(runtime.last_failure)
 
-    async def test_trigger_run_keeps_tool_permissions_and_protects_summary_only_context(self):
+    async def test_trigger_run_can_use_configured_tool_and_protects_summary_only_context(self):
         usage = []
 
         async def tool(args, context):
-            usage.append((context.has_user_input, context.has_agent_input))
+            usage.append(context.call_id)
             return "工具结果"
 
         model = ScriptModel(events(ToolReady(CALL)), events(TextDelta("新回复")))
@@ -78,7 +81,7 @@ class RuntimeTest(unittest.IsolatedAsyncioTestCase):
         history.save_summary("main", Summary(old_id, "合成摘要"))
         runtime.trigger_run()
         await self.idle(runtime)
-        self.assertEqual(usage, [(False, False)])
+        self.assertEqual(usage, [CALL.id])
         (first, _, _), (second, _, _) = model.requests
         self.assertEqual(first, [Message("compaction_summary", "合成摘要")])
         self.assertEqual([message.kind for message in second], ["compaction_summary", "assistant"])
@@ -93,10 +96,10 @@ class RuntimeTest(unittest.IsolatedAsyncioTestCase):
                 message = Message("user", "真正输入")
                 history.append("main", [Message("assistant", "已有历史")])
                 if before_trigger:
-                    runtime.submit_batch((message,))
+                    runtime.submit_messages((MessageDelivery(message, "trigger"),))
                 runtime.trigger_run()
                 if not before_trigger:
-                    runtime.submit_batch((message,))
+                    runtime.submit_messages((MessageDelivery(message, "trigger"),))
                 await self.idle(runtime)
                 self.assertEqual(len(model.requests), 1)
                 self.assertEqual(model.requests[0][0][-1], message)
@@ -122,7 +125,7 @@ class RuntimeTest(unittest.IsolatedAsyncioTestCase):
             runtime.trigger_run()
             await asyncio.wait_for(attempted.wait(), 2)
             real = Message("user", "在重试期间到达")
-            runtime.submit_batch((real,))
+            runtime.submit_messages((MessageDelivery(real, "trigger"),))
             await self.idle(runtime)
         self.assertEqual(len(model.requests), 1)
         self.assertEqual(model.requests[0][0][-1], real)
@@ -131,6 +134,49 @@ class RuntimeTest(unittest.IsolatedAsyncioTestCase):
         ((info, _),) = channel.replies
         self.assertEqual(history.agent_run(info.run_id).status, "completed")
 
+    async def test_empty_wake_yields_after_waiting_for_images(self):
+        for incoming in (False, True):
+            with self.subTest(incoming=incoming):
+                workspace = image_workspace(self)
+                picture = save_image(workspace, PNG_BYTES)
+                model = ScriptModel(events(TextDelta("真实输入回复")))
+                history = History(":memory:")
+                self.addCleanup(history.close)
+                agent = history.ensure_main_agent("main")
+                history.append("main", [Message("user", (picture,))])
+                runtime = Runtime("main", history, model, Channel(), agent=agent, workspace=workspace)
+                self.addAsyncCleanup(runtime.close)
+                reading, release = asyncio.Event(), Event()
+                loop = asyncio.get_running_loop()
+                call_binding = original_call = object()
+
+                def slow_read(*args):
+                    loop.call_soon_threadsafe(reading.set)
+                    if not release.wait(3):
+                        raise AssertionError("image read was not released")
+                    return PNG_BYTES
+
+                with (patch("agent_companion.images._read_image", side_effect=slow_read),
+                      self.assertLogs("agent_companion.runtime.engine", level="DEBUG") as logs):
+                    runtime.trigger_run(lambda: call_binding is original_call)
+                    try:
+                        await asyncio.wait_for(reading.wait(), 2)
+                        pending_run, = history._db.execute("SELECT run_id FROM agent_runs").fetchone()
+                        real = Message("user", "真正输入")
+                        if incoming:
+                            runtime.submit_messages((MessageDelivery(real, "trigger"),))
+                        else:
+                            call_binding = object()
+                    finally:
+                        release.set()
+                    await self.idle(runtime)
+                self.assertEqual(history.agent_run(pending_run).status, "completed")
+                self.assertEqual(len(history.outcomes("main")), int(incoming))
+                self.assertEqual(len(model.requests), int(incoming))
+                self.assertEqual(sum("model request started" in line for line in logs.output), int(incoming))
+                if incoming:
+                    self.assertEqual(model.requests[0][0][-1], real)
+
     async def test_reentrant_trigger_guard_does_not_steal_queued_input(self):
         model = ScriptModel(events(TextDelta("处理真实输入")))
         runtime, history = self.setup_runtime(model, Channel())
@@ -138,7 +184,7 @@ class RuntimeTest(unittest.IsolatedAsyncioTestCase):
         real = Message("user", "检查通话时同步交接")
 
         def handoff():
-            runtime.submit_batch((real,))
+            runtime.submit_messages((MessageDelivery(real, "trigger"),))
             return True
 
         runtime.trigger_run(handoff)
@@ -157,7 +203,7 @@ class RuntimeTest(unittest.IsolatedAsyncioTestCase):
             raise RuntimeError("synthetic reply commit failure")
 
         with patch.object(history, "finalize_reply", side_effect=fail_commit):
-            runtime.submit_batch((original,))
+            runtime.submit_messages((MessageDelivery(original, "trigger"),))
             await asyncio.wait_for(runtime.wait_idle(), 2)
         self.assertEqual(runtime.last_failure, "runtime_failed")
         self.assertEqual(history.outcomes("main"), [])
@@ -166,7 +212,7 @@ class RuntimeTest(unittest.IsolatedAsyncioTestCase):
         await asyncio.wait_for(runtime.wait_idle(), 2)
         self.assertEqual(len(model.requests), 1)
         real = Message("user", "下一个实际输入")
-        runtime.submit_batch((real,))
+        runtime.submit_messages((MessageDelivery(real, "trigger"),))
         await self.idle(runtime)
         self.assertEqual([request[0] for request in model.requests], [[original], [original, real]])
         self.assertEqual(len(history.outcomes("main")), 1)
@@ -205,7 +251,7 @@ class RuntimeTest(unittest.IsolatedAsyncioTestCase):
                     await tool_release.wait()
 
         runtime, _ = self.setup_runtime(Model(), None, tools=Tools([Tool(SPEC, tool)]))
-        runtime.submit_batch((Message("user", "synthetic"),))
+        runtime.submit_messages((MessageDelivery(Message("user", "synthetic"), "trigger"),))
         await asyncio.wait_for(tool_active.wait(), 2)
         await asyncio.wait_for(queued_started.wait(), 2)
         first = asyncio.create_task(runtime.close())
@@ -269,9 +315,10 @@ class RuntimeTest(unittest.IsolatedAsyncioTestCase):
                 model = ScriptModel(mixed, events(TextDelta("second")))
                 channel = GatedChannel()
                 runtime, history = self.setup_runtime(model, channel, tools=Tools([Tool(SPEC, tool)]))
-                runtime.submit_batch([Message("user", "one")])
+                runtime.submit_messages([MessageDelivery(Message("user", "one"), "trigger")])
                 await asyncio.wait_for(asyncio.gather(tool_started.wait(), receipt_started.wait()), 2)
-                runtime.submit_batch([Message("user", "two"), Message("user", "three")])
+                runtime.submit_messages((MessageDelivery(Message("user", "two"), "trigger"),
+                                         MessageDelivery(Message("user", "three"), "trigger")))
                 if first == "tool":
                     tool_release.set()
                     await tool_sent.wait()
@@ -322,9 +369,9 @@ class RuntimeTest(unittest.IsolatedAsyncioTestCase):
 
         model = ScriptModel(mixed, events())
         runtime, history = self.setup_runtime(model, EarlyChannel(), tools=Tools([Tool(SPEC, tool)]))
-        runtime.submit_batch([Message("user", "one")])
+        runtime.submit_messages([MessageDelivery(Message("user", "one"), "trigger")])
         await asyncio.wait_for(asyncio.gather(tool_done.wait(), receipt_done.wait()), 2)
-        runtime.submit_batch([Message("user", "two")])
+        runtime.submit_messages([MessageDelivery(Message("user", "two"), "trigger")])
         self.assertEqual(len(model.requests), 1)
         self.assertEqual(history.outcomes("main"), [])
         stop.set()
@@ -375,9 +422,9 @@ class RuntimeTest(unittest.IsolatedAsyncioTestCase):
                 voice = Voice()
                 runtime, history = self.setup_runtime(Model(), voice, tools=Tools([Tool(SPEC, tool)]))
                 try:
-                    runtime.submit_batch([Message("user", "one")])
+                    runtime.submit_messages([MessageDelivery(Message("user", "one"), "trigger")])
                     await asyncio.wait_for(tool_started.wait(), 2)
-                    runtime.submit_batch([Message("user", "two")])
+                    runtime.submit_messages([MessageDelivery(Message("user", "two"), "trigger")])
                     receipt_ready.set()
                     await asyncio.wait_for(model_cancelled.wait(), 2)
                     self.assertEqual(history.outcomes("main"), [])
@@ -433,9 +480,9 @@ class RuntimeTest(unittest.IsolatedAsyncioTestCase):
 
                 model = ScriptModel(script, events(TextDelta("next")))
                 runtime, history = self.setup_runtime(model, ChannelForTest(), tools=Tools([Tool(SPEC, tool)]))
-                runtime.submit_batch([Message("user", "one")])
+                runtime.submit_messages([MessageDelivery(Message("user", "one"), "trigger")])
                 await asyncio.wait_for(tool_started.wait(), 2)
-                runtime.submit_batch([Message("user", "two")])
+                runtime.submit_messages([MessageDelivery(Message("user", "two"), "trigger")])
                 if order != "simultaneous":
                     release_model.set()
                     await asyncio.wait_for(model_exiting.wait(), 2)
@@ -491,13 +538,16 @@ class RuntimeTest(unittest.IsolatedAsyncioTestCase):
         runtime, history = self.setup_runtime(model, Voice())
         try:
             with self.assertLogs("agent_companion.runtime.engine", level="WARNING") as reached:
-                for text in ("one", "two", "three"):
-                    runtime.submit_batch([Message("user", text)])
+                for text in ("one", "two"):
+                    runtime.submit_messages([MessageDelivery(Message("user", text), "trigger")])
+                runtime.submit_messages((MessageDelivery(Message("user", "deferred record"), "record"),))
+                runtime.submit_messages((MessageDelivery(Message("user", "three"), "trigger"),))
                 await asyncio.wait_for(runtime.wait_idle(), 2)
             self.assertEqual(len(model.requests), 2)
             self.assertEqual(runtime.last_failure, "model_cleanup_blocked")
             self.assertTrue(any("capacity reached; pending=2" in row for row in reached.output))
             self.assertEqual([r.message.content for r in history.read_after("main")], ["one", "two"])
+            self.assertTrue(runtime.has_pending_messages)
 
             releases[0].set()
             async with asyncio.timeout(2):
@@ -505,7 +555,8 @@ class RuntimeTest(unittest.IsolatedAsyncioTestCase):
                     await asyncio.sleep(0)
             await self.idle(runtime)
             self.assertEqual([r.message.content for r in history.read_after("main")],
-                             ["one", "two", "three", "last response"])
+                             ["one", "two", "deferred record", "three", "last response"])
+            self.assertIn(Message("user", "deferred record"), model.requests[-1][0])
             with patch("agent_companion.runtime.engine._MODEL_CLOSE_GRACE", .01):
                 with self.assertLogs("agent_companion.runtime.engine", level="WARNING") as closing:
                     await asyncio.wait_for(runtime.close(), 2)
@@ -562,8 +613,8 @@ class RuntimeTest(unittest.IsolatedAsyncioTestCase):
         voice = Voice()
         runtime, history = self.setup_runtime(model, voice, tools=Tools([Tool(SPEC, tool)]))
         try:
-            runtime.submit_batch([Message("user", "one")])
-            runtime.submit_batch([Message("user", "two")])
+            runtime.submit_messages([MessageDelivery(Message("user", "one"), "trigger")])
+            runtime.submit_messages([MessageDelivery(Message("user", "two"), "trigger")])
             await asyncio.wait_for(asyncio.gather(tool_started.wait(), cleanup_started.wait()), 2)
             # 模拟执行中的工具链遇到容量紧缩；正常完成的应答本身不占退役名额。
             with patch("agent_companion.runtime.engine._MAX_RETIRED_MODELS", 1):
@@ -628,7 +679,7 @@ class RuntimeTest(unittest.IsolatedAsyncioTestCase):
 
         model = ScriptModel(script)
         runtime, history = self.setup_runtime(model, Voice(), tools=Tools([Tool(SPEC, tool)]))
-        runtime.submit_batch([Message("user", "one")])
+        runtime.submit_messages([MessageDelivery(Message("user", "one"), "trigger")])
         await self.idle(runtime)
         self.assertFalse(ran_tool.is_set())
         self.assertEqual([entry.message for entry in history.read_after("main")], [Message("user", "one")])
@@ -662,9 +713,9 @@ class RuntimeTest(unittest.IsolatedAsyncioTestCase):
 
         model = ScriptModel(script, events(TextDelta("next")))
         runtime, history = self.setup_runtime(model, Voice(), tools=Tools([Tool(SPEC, tool)]))
-        runtime.submit_batch([Message("user", "one")])
+        runtime.submit_messages([MessageDelivery(Message("user", "one"), "trigger")])
         await asyncio.wait_for(model_finished.wait(), 2)
-        runtime.submit_batch([Message("user", "two")])
+        runtime.submit_messages([MessageDelivery(Message("user", "two"), "trigger")])
         release_receipt.set()
         await self.idle(runtime)
         first, second = history.outcomes("main")
@@ -705,7 +756,7 @@ class RuntimeTest(unittest.IsolatedAsyncioTestCase):
 
                 model = ScriptModel(script)
                 runtime, history = self.setup_runtime(model, Voice(), tools=Tools([Tool(SPEC, tool, serial_per_request=True)]))
-                runtime.submit_batch([Message("user", "one")])
+                runtime.submit_messages([MessageDelivery(Message("user", "one"), "trigger")])
                 await self.idle(runtime)
                 self.assertEqual(invocations, [CALL.id])
                 self.assertEqual(len(model.requests), 1)
@@ -742,7 +793,7 @@ class RuntimeTest(unittest.IsolatedAsyncioTestCase):
                 model = ScriptModel(events(ToolReady(CALL), ToolReady(queued)))
                 runtime, _ = self.setup_runtime(model, None, tools=tools)
                 with patch.object(tools, "execute", new=record):
-                    runtime.submit_batch([Message("user", "one")])
+                    runtime.submit_messages([MessageDelivery(Message("user", "one"), "trigger")])
                     await asyncio.wait_for(started.wait(), 2)
                     release.set()
                     if close_now:
@@ -763,7 +814,7 @@ class RuntimeTest(unittest.IsolatedAsyncioTestCase):
         model = ScriptModel(events(ToolReady(CALL)), events(TextDelta("done")))
         channel = Channel()
         runtime, history = self.setup_runtime(model, channel, tools=Tools([Tool(SPEC, tool)]))
-        runtime.submit_batch([Message("user", "one")])
+        runtime.submit_messages([MessageDelivery(Message("user", "one"), "trigger")])
         await self.idle(runtime)
         self.assertEqual(len(channel.replies), 1)
         self.assertEqual([outcome.delivery_status for outcome in history.outcomes("main")], [None, DeliveryStatus.FULL])
@@ -778,9 +829,9 @@ class RuntimeTest(unittest.IsolatedAsyncioTestCase):
                 model = ScriptModel(events(TextDelta("abcdef")), events())
                 channel = Channel(lambda info, text: Receipt(info.reply_id, status, confirmed))
                 runtime, history = self.setup_runtime(model, channel)
-                runtime.submit_batch([Message("user", "one")])
+                runtime.submit_messages([MessageDelivery(Message("user", "one"), "trigger")])
                 await self.idle(runtime)
-                runtime.submit_batch([Message("user", "two")])
+                runtime.submit_messages([MessageDelivery(Message("user", "two"), "trigger")])
                 await self.idle(runtime)
                 prefix = "" if confirmed == "bad prefix" else confirmed
                 saved = [row.message for row in history.read_after("main") if row.message.kind == "assistant"]
@@ -798,7 +849,7 @@ class RuntimeTest(unittest.IsolatedAsyncioTestCase):
         model = ScriptModel(events(TextDelta("not sent"), ToolReady(CALL)), events())
         channel = Channel(lambda info, text: Receipt(info.reply_id, DeliveryStatus.ZERO))
         runtime, _ = self.setup_runtime(model, channel, tools=Tools([Tool(SPEC, tool)]))
-        runtime.submit_batch([Message("user", "one")])
+        runtime.submit_messages([MessageDelivery(Message("user", "one"), "trigger")])
         await self.idle(runtime)
         self.assertEqual(model.requests[1][0][-1:], [assistant_message("", (replace(CALL, result="ok"),))])
 
@@ -812,8 +863,8 @@ class RuntimeTest(unittest.IsolatedAsyncioTestCase):
         model = ScriptModel(events(TextDelta("unknown")), events())
         runtime, history = self.setup_runtime(model, UnresponsiveChannel())
         with patch("agent_companion.runtime.engine._DELIVERY_TIMEOUT", .01):
-            runtime.submit_batch([Message("user", "one")])
-            runtime.submit_batch([Message("user", "two")])
+            runtime.submit_messages([MessageDelivery(Message("user", "one"), "trigger")])
+            runtime.submit_messages([MessageDelivery(Message("user", "two"), "trigger")])
             await self.idle(runtime)
         self.assertEqual(history.outcomes("main")[0].delivery_status, DeliveryStatus.UNKNOWN)
         self.assertEqual([m.content for m in model.requests[1][0]], ["one", "two"])
@@ -848,7 +899,7 @@ class RuntimeTest(unittest.IsolatedAsyncioTestCase):
                     with (patch.object(loop, "time", new=lambda: clock[0]),
                           patch.object(loop, "slow_callback_duration", float("inf")),
                           patch("agent_companion.runtime.engine._DELIVERY_TIMEOUT", 2)):
-                        runtime.submit_batch([Message("user", "one")])
+                        runtime.submit_messages([MessageDelivery(Message("user", "one"), "trigger")])
                         await entered.wait()
                         release.set()
                         await runtime.wait_idle()
@@ -867,8 +918,8 @@ class RuntimeTest(unittest.IsolatedAsyncioTestCase):
 
         model = ScriptModel(events(TextDelta("not confirmed"), ToolReady(CALL)), events())
         runtime, history = self.setup_runtime(model, CancellingChannel(), tools=Tools([Tool(SPEC, tool)]))
-        runtime.submit_batch([Message("user", "one")])
-        runtime.submit_batch([Message("user", "two")])
+        runtime.submit_messages([MessageDelivery(Message("user", "one"), "trigger")])
+        runtime.submit_messages([MessageDelivery(Message("user", "two"), "trigger")])
         await self.idle(runtime)
         self.assertEqual(history.outcomes("main")[0].delivery_status, DeliveryStatus.UNKNOWN)
         self.assertEqual(model.requests[-1][0][1:], [assistant_message("", (replace(CALL, result='{"error":"tool_cancelled"}'),)),
@@ -912,8 +963,8 @@ class RuntimeTest(unittest.IsolatedAsyncioTestCase):
                 model = ScriptModel(events(TextDelta("first"), TextDelta(" stale buffer")), events(TextDelta("next")))
                 runtime, history = self.setup_runtime(model, SlowCleanupChannel(),
                                                       delivery_idle_timeout=.02)
-                runtime.submit_batch([Message("user", "one")])
-                runtime.submit_batch([Message("user", "two")])
+                runtime.submit_messages([MessageDelivery(Message("user", "one"), "trigger")])
+                runtime.submit_messages([MessageDelivery(Message("user", "two"), "trigger")])
                 try:
                     await asyncio.wait_for(cancelled.wait(), 2)
                     await self.idle(runtime)
@@ -958,7 +1009,7 @@ class RuntimeTest(unittest.IsolatedAsyncioTestCase):
                             events(TextDelta("not committed")))
         channel = Background()
         runtime, history = self.setup_runtime(model, channel, tools=Tools([Tool(SPEC, tool)]))
-        runtime.submit_batch([Message("user", "one")])
+        runtime.submit_messages([MessageDelivery(Message("user", "one"), "trigger")])
         await asyncio.wait_for(tool_started.wait(), 1)
         self.assertEqual(channel.replies, [])
         tool_released.set()
@@ -968,12 +1019,12 @@ class RuntimeTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([item.delivery_status for item in history.outcomes("main")],
                          [DeliveryStatus.FULL, DeliveryStatus.FULL])
 
-        runtime.submit_batch([Message("user", "two")])
+        runtime.submit_messages([MessageDelivery(Message("user", "two"), "trigger")])
         await asyncio.wait_for(runtime.wait_idle(), 2)
         self.assertEqual(runtime.last_failure, "model_failed")
         self.assertNotIn("unfinished", [row.message.content for row in history.read_after("main")])
         with patch.object(history, "finalize_reply", side_effect=ValueError("simulated write failure")):
-            runtime.submit_batch([Message("user", "three")])
+            runtime.submit_messages([MessageDelivery(Message("user", "three"), "trigger")])
             await asyncio.wait_for(runtime.wait_idle(), 2)
             self.assertEqual(runtime.last_failure, "runtime_failed")
         self.assertEqual([item[1] for item in channel.replies], ["start", "end"])
@@ -1018,9 +1069,9 @@ class RuntimeTest(unittest.IsolatedAsyncioTestCase):
             return "unexpected"
 
         runtime, history = self.setup_runtime(Model(), HangingChannel(), tools=Tools([Tool(SPEC, check_tool)]))
-        runtime.submit_batch([Message("user", "started")])
+        runtime.submit_messages([MessageDelivery(Message("user", "started"), "trigger")])
         await asyncio.wait_for(asyncio.gather(delivery_started.wait(), tool_started.wait()), 2)
-        runtime.submit_batch([Message("user", "discarded on close")])
+        runtime.submit_messages([MessageDelivery(Message("user", "discarded on close"), "trigger")])
         await asyncio.wait_for(runtime.close(), 2)
         await asyncio.wait_for(asyncio.gather(delivery_cancelled.wait(), tool_cancelled.wait(), model_closed.wait()), 2)
         self.assertEqual(late_calls, [])
@@ -1048,7 +1099,7 @@ class RuntimeTest(unittest.IsolatedAsyncioTestCase):
 
         model = ScriptModel(delayed)
         runtime, history = self.setup_runtime(model, DiscardingChannel())
-        runtime.submit_batch([Message("user", "one")])
+        runtime.submit_messages([MessageDelivery(Message("user", "one"), "trigger")])
         await asyncio.wait_for(model_started.wait(), 2)
         newer_input_started = loop.time()
         self.assertEqual(seen, [])
@@ -1072,8 +1123,8 @@ class RuntimeTest(unittest.IsolatedAsyncioTestCase):
 
                 model = ScriptModel(incomplete, events())
                 runtime, history = self.setup_runtime(model, Channel(), settings=RuntimeSettings(model_timeout=.01))
-                runtime.submit_batch([Message("user", "one")])
-                runtime.submit_batch([Message("user", "two")])
+                runtime.submit_messages([MessageDelivery(Message("user", "one"), "trigger")])
+                runtime.submit_messages([MessageDelivery(Message("user", "two"), "trigger")])
                 await self.idle(runtime)
                 outcomes = history.outcomes("main")
                 self.assertEqual(outcomes[0].model_status, "model_timeout" if timeout else "model_failed")
@@ -1091,8 +1142,8 @@ class RuntimeTest(unittest.IsolatedAsyncioTestCase):
 
         model = ScriptModel(failed, events())
         runtime, history = self.setup_runtime(model, Channel(), tools=Tools([Tool(SPEC, tool)]))
-        runtime.submit_batch([Message("user", "one")])
-        runtime.submit_batch([Message("user", "two")])
+        runtime.submit_messages([MessageDelivery(Message("user", "one"), "trigger")])
+        runtime.submit_messages([MessageDelivery(Message("user", "two"), "trigger")])
         await self.idle(runtime)
         self.assertEqual(history.outcomes("main")[0].model_status, "model_failed")
         self.assertEqual(model.requests[1][0][1:2], [assistant_message("", (replace(CALL, result="done despite model failure"),))])
@@ -1113,8 +1164,8 @@ class RuntimeTest(unittest.IsolatedAsyncioTestCase):
         model = ScriptModel(failed, events(TextDelta("new answer"), AssistantPartsReady((Reasoning(complete),))))
         model.history_replay_bytes = DeepSeek(None).history_replay_bytes
         runtime, history = self.setup_runtime(model, Channel(), tools=Tools([Tool(SPEC, tool)]), thinking=True)
-        runtime.submit_batch([Message("user", "one")])
-        runtime.submit_batch([Message("user", "two")])
+        runtime.submit_messages([MessageDelivery(Message("user", "one"), "trigger")])
+        runtime.submit_messages([MessageDelivery(Message("user", "two"), "trigger")])
         await self.idle(runtime)
         raw = [item.message for item in history.read_after("main")]
         self.assertEqual(raw[1], assistant_message("confirmed prefix", (replace(CALL, result="completed tool result"),)))
@@ -1141,7 +1192,7 @@ class RuntimeTest(unittest.IsolatedAsyncioTestCase):
         broken = ToolCall("broken", "test", '{"a":')
         model = ScriptModel(events(ToolReady(broken)), events())
         runtime, _ = self.setup_runtime(model, Channel(), tools=Tools([Tool(SPEC, tool)]))
-        runtime.submit_batch([Message("user", "one")])
+        runtime.submit_messages([MessageDelivery(Message("user", "one"), "trigger")])
         await self.idle(runtime)
         self.assertEqual(invoked, [])
         self.assertEqual(model.requests[1][0][-1].tool_calls[0].result, '{"error":"invalid_arguments"}')

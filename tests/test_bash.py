@@ -18,7 +18,7 @@ from unittest.mock import AsyncMock, patch
 from agent_companion import workspace as workspace_module
 from agent_companion.app import running_agent
 from agent_companion.config import ConfigError, Settings, load_settings
-from agent_companion.protocol import (ChannelUser, DeliveryStatus, Message,
+from agent_companion.protocol import (ChannelUser, DeliveryStatus, Message, MessageDelivery,
                                       Receipt, TextDelta, ToolCall, ToolReady)
 from agent_companion.runtime import _proc_group_probe
 from agent_companion.runtime import bash as bash_runtime
@@ -128,7 +128,7 @@ class BashExecutionTests(unittest.IsolatedAsyncioTestCase):
 
     async def _execute(self, *, workspace=True, request_locks=None, **arguments):
         call = _call("call", **arguments).call
-        context = ToolContext("test-session", "run", call.id, False, workspace=self.workspace if workspace else None,
+        context = ToolContext("test-session", "run", call.id, workspace=self.workspace if workspace else None,
                               reply_id="test-reply")
         return json.loads(await self.tools.execute(call, context, request_locks=request_locks))
 
@@ -150,7 +150,7 @@ class BashExecutionTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual((await self._execute(command=":"))["exit_code"], 0)
 
     async def test_debug_dispatch_rejection_does_not_echo_model_input(self):
-        context = ToolContext("test-session", "run", "synthetic-provider-id", False, reply_id="test-reply")
+        context = ToolContext("test-session", "run", "synthetic-provider-id", reply_id="test-reply")
         bad_name = ToolCall(context.call_id, "synthetic-unknown-name", "synthetic-arguments")
         bad_args = ToolCall(context.call_id, "bash", "synthetic-arguments")
         with self.assertLogs("agent_companion.runtime.tools", level="DEBUG") as logs:
@@ -464,7 +464,7 @@ class BashExecutionTests(unittest.IsolatedAsyncioTestCase):
                     os.fstat(fd)  # 启动助手阻塞时，父进程已关闭自己的状态写端。
                 other_workspace = Workspace(self.root / "other-workspace")
                 call = _call("other", command="printf other").call
-                context = ToolContext("other-user", "run", call.id, True, workspace=other_workspace)
+                context = ToolContext("other-user", "run", call.id, workspace=other_workspace)
                 tools = Tools([Bash().tool])
                 result = json.loads(await asyncio.wait_for(tools.execute(call, context), 2))
                 self.assertEqual(result["stdout"], "other")
@@ -674,13 +674,13 @@ class BashExecutionTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(result["timed_out"])
         self.assertEqual(result["stdout"], "ready")
         self.assertEqual(result["exit_code"], -signal.SIGKILL)
-        context = ToolContext("test-session", "run", "call", False, workspace=self.workspace)
+        context = ToolContext("test-session", "run", "call", workspace=self.workspace)
         output = await self.tools.execute(_call("call", command=r'''printf '汉字\377\n"' ''').call, context)
         self.assertIn("汉字", output)
         self.assertEqual(json.loads(output)["stdout"], '汉字\ufffd\n"')
 
     async def test_bash_combined_limit_and_public_archive(self):
-        context = ToolContext("test-session", "run", "call", False, workspace=self.workspace)
+        context = ToolContext("test-session", "run", "call", workspace=self.workspace)
         width = _MAX_OUTPUT_BYTES // 2
         command = f"printf '%0*d' {width} 0; printf '%0*d' {width} 0 >&2; "
         for extra_bytes in (0, 1, 512 * 1024):
@@ -986,7 +986,7 @@ class BashRuntimeTests(unittest.IsolatedAsyncioTestCase):
                 session_id = f"test-{expected}"
                 async with running_agent(self.settings, self.history, model, _Channel(), session_id=session_id,
                                          roles={"main": role}, user=user) as (runtime, _):
-                    runtime.submit_batch((Message("user", "test"),))
+                    runtime.submit_messages((MessageDelivery(Message("user", "test"), "trigger"),))
                     await asyncio.wait_for(runtime.wait_idle(), 3)
                 self.assertEqual(BASH_TOOL_NAME in model.requests[0][1], BASH_TOOL_NAME in role.tools)
                 self.assertEqual(_results(model.requests[-1][0])["last"], {"error": expected})
@@ -1002,7 +1002,7 @@ class BashRuntimeTests(unittest.IsolatedAsyncioTestCase):
                                      user=self.user) as (runtime, _):
                 if session_id == "new-agent-a":
                     self.assertFalse(self.settings.workspace_root.exists())
-                runtime.submit_batch((Message("user", "test"),))
+                runtime.submit_messages((MessageDelivery(Message("user", "test"), "trigger"),))
                 await asyncio.wait_for(runtime.wait_idle(), 3)
             self.assertEqual(_results(model.requests[-1][0])["last"]["stdout"], output)
             self.assertEqual((self._workspace(self.user) / "fixture").read_text(), "marker")
@@ -1035,11 +1035,11 @@ class BashRuntimeTests(unittest.IsolatedAsyncioTestCase):
                                   user=self.user) as (runtime, _),
                     running_agent(self.settings, self.history, model, _Channel(), session_id="other", roles=roles,
                                   user=other_user) as (other, _)):
-            runtime.submit_batch((Message("user", "begin"),))
+            runtime.submit_messages((MessageDelivery(Message("user", "begin"), "trigger"),))
             await _eventually(lambda: (workspace / "started").exists())
             await _eventually(lambda: any("child-bash" in _results(messages) for messages, _ in model.requests))
             self.assertEqual((workspace / "child-ran").read_text(), "child")
-            other.submit_batch((Message("user", "other user"),))
+            other.submit_messages((MessageDelivery(Message("user", "other user"), "trigger"),))
             await asyncio.wait_for(other.wait_idle(), 3)
             self.assertEqual((other_workspace / "shared").read_text(), "other")
             self.assertFalse((workspace / "second-ran").exists())
@@ -1065,7 +1065,7 @@ class BashRuntimeTests(unittest.IsolatedAsyncioTestCase):
         roles = {"main": AgentRole(None, (SET_TIMER_TOOL_NAME, BASH_TOOL_NAME))}
         async with running_agent(self.settings, self.history, model, _Channel(), session_id="main", roles=roles,
                                  user=self.user) as (runtime, _):
-            runtime.submit_batch((Message("user", "schedule"),))
+            runtime.submit_messages((MessageDelivery(Message("user", "schedule"), "trigger"),))
             await _eventually(lambda: any("timer-bash" in _results(messages) for messages, _ in model.requests))
             await asyncio.wait_for(runtime.wait_idle(), 3)
         self.assertEqual(_results(model.requests[-1][0])["timer-bash"]["stdout"], "fired")
@@ -1083,7 +1083,7 @@ class BashRuntimeTests(unittest.IsolatedAsyncioTestCase):
 
                 async def execute(call_id, command):
                     call = _call(call_id, command=command, timeout=5).call
-                    context = ToolContext(runtime.session_id, "run", call.id, True, workspace=runtime._workspace)
+                    context = ToolContext(runtime.session_id, "run", call.id, workspace=runtime._workspace)
                     if call_id == "queued":
                         queued.set()
                     return json.loads(await runtime._tools.execute(call, context, request_locks=request_locks))
@@ -1117,7 +1117,7 @@ class BashRuntimeTests(unittest.IsolatedAsyncioTestCase):
         with _record_processes(processes), patch("os.killpg", wraps=os.killpg) as killpg:
             async with running_agent(self.settings, self.history, model, _Channel(), session_id="main", user=self.user,
                                      roles={"main": AgentRole(None, (BASH_TOOL_NAME,))}) as (runtime, _):
-                runtime.submit_batch((Message("user", "test"),))
+                runtime.submit_messages((MessageDelivery(Message("user", "test"), "trigger"),))
                 await _eventually(lambda: (self._workspace(self.user) / "started").exists())
             child, = _shells(processes)
             self.assertEqual(child.returncode, -signal.SIGKILL)

@@ -15,7 +15,7 @@ from agent_companion.app import running_agent
 from agent_companion.config import ConfigError, RuntimeSettings, load_settings
 from agent_companion.models.deepseek import CHAT_COMPLETIONS, DeepSeek
 from agent_companion.models.openai_responses import OpenAIResponses
-from agent_companion.protocol import DeliveryStatus, Message, Receipt, TextDelta
+from agent_companion.protocol import DeliveryStatus, Message, MessageDelivery, Receipt, TextDelta
 from agent_companion.runtime.compaction import Compactions
 from agent_companion.runtime.context import _SUMMARIZE
 from agent_companion.runtime.engine import Runtime
@@ -218,7 +218,7 @@ class ProfileRuntimeTests(_Files, unittest.IsolatedAsyncioTestCase):
             self.assertEqual(models["main"].settings.max_tool_rounds, 3)
             self.assertEqual(models["reviewer"].settings.max_tool_rounds, 2)
             async with running_agent(settings, history, models, _Channel(), session_id="root", roles=roles) as (root, tree):
-                root.submit_batch([Message("user", "reuse" if restarting else "delegate")])
+                root.submit_messages([MessageDelivery(Message("user", "reuse" if restarting else "delegate"), "trigger")])
                 await asyncio.wait_for(tree.wait_idle(), 3)
                 self.assertIsNone(root.last_failure)
                 accepts = [json.loads(call.result) for call in tool_calls(row.message for row in history.read_after("root"))]
@@ -265,7 +265,7 @@ class ProfileRuntimeTests(_Files, unittest.IsolatedAsyncioTestCase):
 
         async def drive(settings, history, models, roles):
             async with running_agent(settings, history, models, _Channel(), session_id="root", roles=roles) as (root, _):
-                root.submit_batch([Message("user", f"{phase} prompt")])
+                root.submit_messages([MessageDelivery(Message("user", f"{phase} prompt"), "trigger")])
                 await asyncio.wait_for(root.wait_idle(), 2)
                 self.assertIsNone(root.last_failure)
                 if phase == "same":
@@ -372,7 +372,7 @@ class SharedSummarySlotTests(unittest.IsolatedAsyncioTestCase):
                     runtime = Runtime(session, history, model, _Channel(), compactions=compactions,
                                       settings=RuntimeSettings(context_budget=20, tail_budget=1))
                     runtimes.append(runtime)
-                    runtime.submit_batch([Message("user", "new input")])
+                    runtime.submit_messages([MessageDelivery(Message("user", "new input"), "trigger")])
                     await asyncio.wait_for(runtime.wait_idle(), 2)
                     await asyncio.wait_for(started.wait(), 2)
                 self.assertEqual([model.summaries for model in models], [1, 0])

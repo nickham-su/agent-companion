@@ -138,6 +138,9 @@ class _ScriptedModel:
             yield TextDelta(_RESULT)
         elif last.tool_calls:
             yield TextDelta(_ACCEPTED)
+        elif last.kind == "state_event":
+            assert last.text.startswith("通话已接通 - ")
+            return  # 模拟模型收到接通通知后保持安静，不增加固定开场白。
         elif last.content == _USER:
             assert {tool.name for tool in tools} == {DELEGATE_TOOL_NAME, SET_TIMER_TOOL_NAME, CANCEL_TIMER_TOOL_NAME}
             yield ToolReady(ToolCall("synthetic-call", DELEGATE_TOOL_NAME, json.dumps({"agent": "general", "prompt": _PROMPT})))
@@ -343,7 +346,8 @@ class MVPIntegrationTest(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(returned.kind, "agent_reply")
                 self.assertEqual(returned.payload, {"agent_id": child,
                                                     "status": "completed", "result": _RESULT})
-                self.assertIsNotNone(history.agent_run(run).reply_enqueued_at)
+                terminal = history.agent_run(run)
+                self.assertEqual((terminal.status, terminal.result), ("completed", _RESULT))
                 self.assertEqual([row.message.content for row in history.read_after(history.agent(child).session_id)], [_PROMPT, _RESULT])
                 self.assertNotIn(_PROMPT, [row.message.content for row in history.read_after(session)])
 
@@ -365,6 +369,9 @@ class MVPIntegrationTest(unittest.IsolatedAsyncioTestCase):
                     await asyncio.sleep(0.002)
                 self.assertEqual(desktop.clicks, 1)
                 self.assertEqual(transport.meeting_lookups, ["list", "detail"])
+                self.assertEqual(await _outcome(history, session, 6), (None, None))
+                self.assertEqual(history.outcomes(session)[-1].model_status, "complete")
+                self.assertTrue(history.tail(session, 1)[0].message.text.startswith("通话已接通 - "))
                 device.frames(_HOT, 3)
                 device.frames(bytes(len(_HOT)), 2)
                 await tts.old_buffered.wait()
@@ -372,7 +379,7 @@ class MVPIntegrationTest(unittest.IsolatedAsyncioTestCase):
                 device.frames(_HOT, 3)
                 device.frames(bytes(len(_HOT)), 2)
                 await asr.started.wait()
-                status, prefix = await _outcome(history, session, 6)
+                status, prefix = await _outcome(history, session, 7)
                 self.assertEqual((status, prefix), (DeliveryStatus.PARTIAL, _OLD_VOICE_PREFIX))
                 await tts.old_closed.wait()
                 self.assertEqual(device.pull(4), bytes(8))
@@ -386,7 +393,7 @@ class MVPIntegrationTest(unittest.IsolatedAsyncioTestCase):
                 asr.release.set()
                 await tts.new_buffered.wait()
                 self.assertEqual(device.pull(4), _PCM * 4)
-                self.assertEqual(await _outcome(history, session, 7), (DeliveryStatus.FULL, _NEW_VOICE))
+                self.assertEqual(await _outcome(history, session, 8), (DeliveryStatus.FULL, _NEW_VOICE))
                 self.assertEqual(tts.calls, [_OLD_VOICE_PREFIX, _OLD_VOICE_TAIL, _NEW_VOICE])
                 while len(transport.sends) < 6:
                     await asyncio.sleep(0.002)
@@ -399,14 +406,15 @@ class MVPIntegrationTest(unittest.IsolatedAsyncioTestCase):
                 transport.push(_TEXT_IN_CALL)
                 await tts.new_buffered.wait()
                 self.assertEqual(device.pull(4), _PCM * 4)
-                self.assertEqual(await _outcome(history, session, 8), (DeliveryStatus.FULL, _TEXT_REPLY))
+                self.assertEqual(await _outcome(history, session, 9), (DeliveryStatus.FULL, _TEXT_REPLY))
                 self.assertEqual(tts.calls, [_OLD_VOICE_PREFIX, _OLD_VOICE_TAIL, _NEW_VOICE, _TEXT_REPLY])
                 while len(transport.sends) < 7:
                     await asyncio.sleep(0.002)
                 self.assertEqual(transport.sends[-1], _TEXT_REPLY)
                 desktop.connected = False
-                while not device.closed:
+                while not device.closed or not history.tail(session, 1)[0].message.text.startswith("通话已结束 - "):
                     await asyncio.sleep(0.002)
+                self.assertEqual(len(history.outcomes(session)), 9)
             self.assertTrue(device.closed)
             before_restart = history.read_after(session)
 
@@ -416,7 +424,7 @@ class MVPIntegrationTest(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(history.read_after(session), before_restart)
             async with _service(settings, history, restart_model, transport, asr):
                 transport.push("重启后的新输入")
-                self.assertEqual(await _outcome(history, session, 9), (DeliveryStatus.FULL, _RESTARTED))
+                self.assertEqual(await _outcome(history, session, 10), (DeliveryStatus.FULL, _RESTARTED))
                 while len(transport.sends) < 8:
                     await asyncio.sleep(0.002)
                 self.assertEqual(transport.sends,
@@ -430,3 +438,6 @@ class MVPIntegrationTest(unittest.IsolatedAsyncioTestCase):
                 for recorded in (_ACCEPTED, _RETURNED, _FAILED, _UNKNOWN, prefix, _ASR_TEXT, _NEW_VOICE):
                     self.assertIn(recorded, model_history)
                 self.assertNotIn(_OLD_VOICE, model_history)
+                statuses = [message for message in restart_model.restart_request if message.kind == "state_event"]
+                self.assertEqual([message.text.partition(" - ")[0] for message in statuses], ["通话已接通", "通话已结束"])
+                self.assertEqual(statuses, [row.message for row in before_restart if row.message.kind == "state_event"])

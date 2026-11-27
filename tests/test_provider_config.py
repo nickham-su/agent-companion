@@ -19,7 +19,7 @@ from agent_companion.app import prepare_private_feishu, running_agent
 from agent_companion.config import ConfigError, VoiceSettings, load_settings
 from agent_companion.models.deepseek import CHAT_COMPLETIONS, DeepSeek
 from agent_companion.models.openai_responses import OpenAIResponses
-from agent_companion.protocol import DeliveryStatus, Message, Receipt
+from agent_companion.protocol import DeliveryStatus, Message, MessageDelivery, Receipt
 from agent_companion.speech.asr import AudioFile
 from agent_companion.speech.minimax_tts import MiniMaxTTS
 
@@ -668,7 +668,7 @@ class ProviderCompositionTests(unittest.IsolatedAsyncioTestCase):
                 async def run(model, asr, tts):
                     async with running_agent(settings, history, model, Voice(), session_id="transport",
                                              roles=roles) as (runtime, _):
-                        runtime.submit_batch([Message("user", "fixture input")])
+                        runtime.submit_messages([MessageDelivery(Message("user", "fixture input"), "trigger")])
                         await asyncio.wait_for(runtime.wait_idle(), 2)
                         outcome, = history.outcomes("transport")
                         self.assertEqual((outcome.model_status, outcome.delivery_status),
@@ -802,7 +802,7 @@ tail_budget = 16000
                         async def run(model, asr, tts):
                             async with running_agent(settings, history, model, Voice(), session_id="eof",
                                                      roles=roles) as (runtime, _):
-                                runtime.submit_batch([Message("user", "prompt")])
+                                runtime.submit_messages([MessageDelivery(Message("user", "prompt"), "trigger")])
                                 await asyncio.wait_for(runtime.wait_idle(), 2)
                                 outcome, = history.outcomes("eof")
                                 self.assertEqual((outcome.model_status, outcome.delivery_status),

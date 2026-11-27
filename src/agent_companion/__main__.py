@@ -20,7 +20,7 @@ from .models.bailian import Bailian
 from .models.deepseek import CHAT_COMPLETIONS, DeepSeek
 from .models.minimax import MiniMax
 from .models.openai_responses import OpenAIResponses
-from .protocol import (DeliveryStatus, Message, ModelEvent, Receipt, ReplyStream,
+from .protocol import (DeliveryStatus, Message, MessageDelivery, ModelEvent, Receipt, ReplyStream,
                        TextDelta, ToolCall, ToolReady, ToolSpec)
 from .runtime.instructions import load_roles
 from .runtime.subtasks import AgentRole, DELEGATE_TOOL_NAME, ModelBinding, demo_roles
@@ -84,7 +84,8 @@ async def run_demo(settings: Settings, *, delegate: bool = False) -> bool:
     with closing(History(":memory:")) as history:
         async with running_agent(settings, history, model, _Console(), session_id=_DEMO_SESSION_ID,
                                  roles=demo_roles()) as (runtime, tree):
-            runtime.submit_batch([Message("user", _DEMO_DELEGATION if delegate else "离线模拟输入")])
+            message = Message("user", _DEMO_DELEGATION if delegate else "离线模拟输入")
+            runtime.submit_messages((MessageDelivery(message, "trigger"),))
             await tree.wait_idle()
             return runtime.last_failure is None and (not delegate or model.received_subtask_result)
 

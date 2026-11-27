@@ -12,12 +12,13 @@ import sqlite3
 from time import time
 from uuid import uuid4
 
-from ..protocol import (AgentReply, AsyncToolResult, DeliveryStatus, Image, Message, Part, PrivateData, Reasoning,
-                        Text, ToolCall, UserSource, is_human_message)
+from ..images import UNAVAILABLE_IMAGE, image_filename
+from ..protocol import (AsyncToolResult, DeliveryStatus, Image, Message, MessageDelivery, Part, PrivateData,
+                        Reasoning, Text, ToolCall, UserSource)
 from ._reply_writers import ReplyWriters
 
 
-_SCHEMA_VERSION = 4
+_SCHEMA_VERSION = 5
 _AGENT_ID_ATTEMPTS = 8
 _FEISHU_INBOX = ("feishu-inbox", "feishu-private")
 _FEISHU_INITIAL_RETRY_SECONDS = 10
@@ -89,15 +90,6 @@ CREATE TABLE IF NOT EXISTS inbound_seen (
     external_id TEXT NOT NULL,
     PRIMARY KEY (session_id, source, external_id)
 );
-CREATE TABLE IF NOT EXISTS inbound_batches (
-    batch_id INTEGER PRIMARY KEY AUTOINCREMENT,
-    session_id TEXT NOT NULL,
-    source TEXT NOT NULL,
-    contents TEXT NOT NULL,
-    peer_open_id TEXT
-);
-CREATE INDEX IF NOT EXISTS inbound_pending ON inbound_batches(session_id, source, batch_id);
-CREATE INDEX IF NOT EXISTS inbound_feishu_peers ON inbound_batches(peer_open_id) WHERE peer_open_id IS NOT NULL;
 CREATE TABLE IF NOT EXISTS feishu_raw_batches (
     batch_id INTEGER PRIMARY KEY AUTOINCREMENT,
     peer_open_id TEXT NOT NULL,
@@ -137,8 +129,6 @@ CREATE TABLE IF NOT EXISTS agent_runs (
     finished_at REAL,
     result TEXT,
     error TEXT,
-    reply_enqueued_at REAL,
-    reply_consumed_run_id TEXT REFERENCES agent_runs(run_id),
     UNIQUE (agent_id, run_id)
 );
 CREATE TABLE IF NOT EXISTS delegations (
@@ -216,21 +206,6 @@ class AgentRun:
     finished_at: float | None
     result: str | None = field(repr=False)
     error: str | None
-    reply_enqueued_at: float | None
-    reply_consumed_run_id: str | None
-
-
-@dataclass(frozen=True, slots=True)
-class DelegatedInput:
-    delegation_id: str
-    message: Message = field(repr=False)
-
-
-@dataclass(frozen=True, slots=True)
-class AgentReplyInput:
-    source_agent_id: str
-    source_run_id: str
-    message: Message = field(repr=False)
 
 
 def _has_reply_text(value: str | None) -> bool:
@@ -247,7 +222,8 @@ def _encode_parts(parts: Sequence[Part]) -> str:
         if isinstance(part, Text):
             item = {"type": "text", "text": part.text}
         elif isinstance(part, Image):
-            item = {"type": "image", "url": part.url}
+            item = ({"type": "image", "url": part.url} if image_filename(part.url) is not None else
+                    {"type": "text", "text": UNAVAILABLE_IMAGE.text})
         elif isinstance(part, ToolCall):
             item = {"type": "tool_call", "id": part.id, "name": part.name, "arguments": part.arguments}
         else:
@@ -317,6 +293,14 @@ class SummaryWriteError(Exception):
 
 class RetryableInputWrite(Exception):
     """输入写语句遇到 IOERR，且提交前已成功回滚。"""
+
+
+class InputCommitUnknown(RuntimeError):
+    """不能仅凭提交报错判定事务可重试。"""
+
+
+class FeishuRawConfirmationUnresolved(RuntimeError):
+    """连接仍可用，但不能确认该用户的原始批次已删除。"""
 
 
 class InputRollbackFailed(RuntimeError):
@@ -412,7 +396,6 @@ class History:
             UNION ALL SELECT 1 FROM reply_outcomes
             UNION ALL SELECT 1 FROM inbound_windows
             UNION ALL SELECT 1 FROM inbound_seen
-            UNION ALL SELECT 1 FROM inbound_batches
             UNION ALL SELECT 1 FROM feishu_raw_batches
             UNION ALL SELECT 1 FROM feishu_recovery
             UNION ALL SELECT 1 FROM message_search
@@ -567,8 +550,9 @@ class History:
             self._db.execute("INSERT INTO message_search (rowid, body) VALUES (?, ?)", (message_id, searchable))
 
     @contextmanager
-    def _input_transaction(self, *, retryable_io: bool) -> Iterator[None]:
-        """区分写语句与提交阶段；不能重试提交结果未知的 IOERR。"""
+    def _input_transaction(self, *, retryable_io: bool,
+                           commit_unknown_on_db_error: bool = False) -> Iterator[None]:
+        """区分写语句与提交；飞书原批确认可要求核验非锁提交错误。"""
         connection = self._db
         try:
             yield
@@ -582,7 +566,13 @@ class History:
             try:
                 connection.commit()
             except BaseException as exc:
+                locked = isinstance(exc, sqlite3.OperationalError) and is_sqlite_lock_error(exc)
+                unknown = ((locked and not connection.in_transaction)
+                           or (commit_unknown_on_db_error and not locked
+                               and isinstance(exc, sqlite3.DatabaseError)))
                 self._rollback_input(connection, exc)
+                if unknown:
+                    raise InputCommitUnknown("input commit outcome is unknown") from exc
                 raise
 
     def _rollback_input(self, connection: sqlite3.Connection, trigger: BaseException) -> None:
@@ -618,41 +608,9 @@ class History:
         return self._db.execute("SELECT 1 FROM inbound_seen WHERE session_id = ? AND source = ? AND external_id = ?",
                                 (session_id, source, external_id)).fetchone() is not None
 
-    def record_inbound(self, session_id: str, source: str, through: int,
-                       items: Sequence[tuple[str, Message | None]]) -> set[str]:
-        """同一事务记录水位、去重键和待接收的批次；None 表示已处理但没有输入。"""
-        key = (session_id, source)
-        with self._db:
-            recorded = self._record_inbound_items(key, session_id, items)
-            self._advance_inbound(key, through)
-        return recorded
-
     def _mark_inbound_seen(self, key: tuple[str, str], message_id: str) -> bool:
         return self._db.execute("INSERT INTO inbound_seen VALUES (?, ?, ?) ON CONFLICT DO NOTHING",
                                 (*key, message_id)).rowcount == 1
-
-    def _record_inbound_items(self, seen_key: tuple[str, str], session_id: str,
-                              items: Sequence[tuple[str, Message | None]]) -> set[str]:
-        recorded: set[str] = set()
-        messages = []
-        for external_id, message in items:
-            if self._mark_inbound_seen(seen_key, external_id):
-                recorded.add(external_id)
-                if message is not None:
-                    messages.append(message)
-        self._insert_inbound_batch(session_id, seen_key[1], messages)
-        return recorded
-
-    def _insert_inbound_batch(self, session_id: str, source: str, messages: Sequence[Message], *,
-                              peer_open_id: str | None = None) -> None:
-        contents = []
-        for message in messages:
-            if not is_human_message(message):
-                raise ValueError("inbound batches require plain user messages")
-            contents.append(_encode_parts(message.parts))
-        if contents:
-            self._db.execute("INSERT INTO inbound_batches (session_id, source, contents, peer_open_id)"
-                             " VALUES (?, ?, ?, ?)", (session_id, source, json.dumps(contents, ensure_ascii=False), peer_open_id))
 
     def _advance_inbound(self, key: tuple[str, str], through: int) -> None:
         self._db.execute("UPDATE inbound_windows SET scanned_until = max(scanned_until, ?)"
@@ -725,15 +683,12 @@ class History:
 
     def pending_feishu_users(self) -> list[str]:
         return [row[0] for row in self._db.execute(
-            "SELECT peer_open_id FROM feishu_raw_batches UNION SELECT peer_open_id FROM inbound_batches"
-            " WHERE source = ? AND peer_open_id IS NOT NULL", (_FEISHU_INBOX[1],))]
+            "SELECT DISTINCT peer_open_id FROM feishu_raw_batches")]
 
-    def has_pending_feishu_input(self, peer: str, session_id: str) -> bool:
-        """在同一快照覆盖原始批次与归一化后的批次，不读取正文。"""
-        return bool(self._db.execute("""
-            SELECT EXISTS (SELECT 1 FROM feishu_raw_batches WHERE peer_open_id = ?)
-                OR EXISTS (SELECT 1 FROM inbound_batches WHERE session_id = ? AND source = ?)
-            """, (peer, session_id, _FEISHU_INBOX[1])).fetchone()[0])
+    def has_pending_feishu_input(self, peer: str) -> bool:
+        """查询飞书尚未确认的原始批次，不读取正文。"""
+        return self._db.execute("SELECT 1 FROM feishu_raw_batches WHERE peer_open_id = ? LIMIT 1",
+                                (peer,)).fetchone() is not None
 
     def next_feishu_raw(self, peer: str) -> tuple[int, bool] | None:
         row = self._db.execute("SELECT batch_id, has_media FROM feishu_raw_batches WHERE peer_open_id = ?"
@@ -747,37 +702,25 @@ class History:
             raise ValueError("missing Feishu raw batch")
         return [tuple(item) for item in json.loads(row[0])]
 
-    def finish_feishu_raw(self, peer: str, batch_id: int, session_id: str, messages: Sequence[Message]) -> None:
-        with self._input_transaction(retryable_io=False):
-            removed = self._db.execute("DELETE FROM feishu_raw_batches WHERE batch_id = ? AND peer_open_id = ?",
-                                       (batch_id, peer)).rowcount
-            if removed != 1:
-                raise ValueError("missing Feishu raw batch")
-            self._insert_inbound_batch(session_id, _FEISHU_INBOX[1], messages, peer_open_id=peer)
-
-    def pending_inbound(self, session_id: str, source: str) -> list[int]:
-        rows = self._db.execute("SELECT batch_id FROM inbound_batches WHERE session_id = ? AND source = ?"
-                                " ORDER BY batch_id", (session_id, source))
-        return [row["batch_id"] for row in rows]
-
-    def consume_inbound(self, session_id: str, batch_id: int) -> list[int]:
-        """原子移交：提交原始用户历史与移出待处理批次不可分开。"""
-        with self._input_transaction(retryable_io=True):
-            return self._consume_inbound(session_id, batch_id)
-
-    def append_with_inbound(self, session_id: str, items: Sequence[Message | int]) -> tuple[list[int], bool]:
-        """按给定顺序写入内存消息与飞书批次，返回消息 ID 和是否确实消费了持久化消息。"""
-        ids = []
-        consumed = False
-        with self._input_transaction(retryable_io=True):
-            for item in items:
-                if isinstance(item, int):
-                    inbound_ids = self._consume_inbound(session_id, item)
-                    ids.extend(inbound_ids)
-                    consumed = consumed or bool(inbound_ids)
-                else:
-                    ids.extend(self._append(session_id, (item,)))
-        return ids, consumed
+    def finish_feishu_raw(self, peer: str, batch_id: int) -> None:
+        """确认本用户已整理的原始批次；消息随后直接交调度器。"""
+        try:
+            with self._input_transaction(retryable_io=False, commit_unknown_on_db_error=True):
+                removed = self._db.execute("DELETE FROM feishu_raw_batches WHERE batch_id = ? AND peer_open_id = ?",
+                                           (batch_id, peer)).rowcount
+                if removed != 1:
+                    raise ValueError("missing Feishu raw batch")
+        except InputCommitUnknown as exc:
+            # 仅在安全回滚之后核验这次删除；不是查询外部去重键，也不重试确认事务。
+            try:
+                remaining = self._db.execute("SELECT 1 FROM feishu_raw_batches"
+                                             " WHERE batch_id = ? AND peer_open_id = ?", (batch_id, peer)).fetchone()
+            except sqlite3.ProgrammingError:
+                raise  # 共享连接失效不是单用户交接故障。
+            except sqlite3.DatabaseError as lookup_error:
+                raise FeishuRawConfirmationUnresolved("Feishu raw confirmation could not be verified") from lookup_error
+            if remaining is not None:
+                raise FeishuRawConfirmationUnresolved("Feishu raw batch remains after commit error") from exc
 
     def _start_agent_run(self, agent_id: str, run_id: str) -> None:
         self._db.execute("INSERT INTO agent_runs (run_id, agent_id, status, started_at)"
@@ -793,79 +736,40 @@ class History:
         return True
 
     def append_agent_inputs(self, agent_id: str, run_id: str,
-                            items: Sequence[Message | int | DelegatedInput | AgentReplyInput], *,
-                            start: bool) -> tuple[list[int], bool, bool]:
-        """按顺序写输入；返回消息 ID、是否消费飞书输入、是否消费可信 Agent 输入。"""
+                            deliveries: Sequence[MessageDelivery], *, start: bool) -> tuple[list[int], bool]:
+        """按序原子写入整批，返回消息 ID 及是否创建了运行。"""
         ids: list[int] = []
-        consumed_inbound = consumed_agent = False
+        started = False
         with self._input_transaction(retryable_io=True):
             self._db.execute("BEGIN IMMEDIATE")
             agent = self.agent(agent_id)
             if agent is None:
                 raise ValueError("unknown input agent")
-            if start:
-                self._start_agent_run(agent_id, run_id)
-            elif not self._agent_run_active(agent_id, run_id):
+            if not start and not self._agent_run_active(agent_id, run_id):
                 raise ValueError("cannot append to an inactive agent run")
-            for item in items:
-                if isinstance(item, int):
-                    inbound_ids = self._consume_inbound(agent.session_id, item)
-                    ids.extend(inbound_ids)
-                    consumed_inbound = consumed_inbound or bool(inbound_ids)
-                elif isinstance(item, (DelegatedInput, AgentReplyInput)):
-                    if self._consume_agent_input(agent_id, run_id, item):
-                        message = item.message
-                        if isinstance(item, DelegatedInput):
-                            message = replace(message, source=UserSource("delegation", agent.parent_agent_id,
-                                                                         item.delegation_id))
-                        ids.extend(self._append(agent.session_id, (message,)))
-                        consumed_agent = True
-                else:
-                    ids.extend(self._append(agent.session_id, (item,)))
-            if start and not ids:
-                # 作废的批次或重复回投不产生运行；删除仍在同一事务内。
-                self._db.execute("DELETE FROM agent_runs WHERE run_id = ?", (run_id,))
-        return ids, consumed_inbound, consumed_agent
+            for delivery in deliveries:
+                message = delivery.message
+                delegation = delivery.delegation
+                if start and not started and delivery.intent == "trigger":
+                    # 委派有运行外键。先在同一写锁下核对首个候选，再创建运行、消费和写正文。
+                    if delegation is not None and not self._db.execute(
+                            "SELECT 1 FROM delegations WHERE delegation_id = ? AND agent_id = ? AND status = 'queued'",
+                            (delegation.delegation_id, agent_id)).fetchone():
+                        continue
+                    self._start_agent_run(agent_id, run_id)
+                    started = True
+                if delegation is not None:
+                    if not self._consume_delegation(agent_id, run_id, delegation.delegation_id):
+                        continue
+                    message = replace(message, source=UserSource("delegation"))
+                ids.extend(self._append(agent.session_id, (message,)))
+        return ids, started
 
-    def _consume_agent_input(self, agent_id: str, run_id: str, item: DelegatedInput | AgentReplyInput) -> bool:
-        if isinstance(item, DelegatedInput):
-            cursor = self._db.execute("UPDATE delegations SET run_id = ?, status = 'consumed'"
-                                      " WHERE delegation_id = ? AND agent_id = ? AND status = 'queued'",
-                                      (run_id, item.delegation_id, agent_id))
-        else:
-            source = self._db.execute("""
-                SELECT r.status, r.result, r.error FROM agent_runs AS r
-                JOIN agents AS a ON a.agent_id = r.agent_id
-                WHERE r.agent_id = ? AND r.run_id = ? AND a.parent_agent_id = ?
-                  AND r.status IN ('completed', 'failed') AND r.reply_consumed_run_id IS NULL
-                """, (item.source_agent_id, item.source_run_id, agent_id)).fetchone()
-            if source is None:
-                return False
-            result, error = source["result"], source["error"]
-            if source["status"] == "completed":
-                valid = error is None and _has_reply_text(result)
-            else:
-                valid = result is None and _has_reply_text(error)
-            if not valid:
-                return False
-            expected = AgentReply(item.source_agent_id, item.source_run_id, result=result, error=error)
-            if item.message != expected.to_history_message():
-                return False
-            # 调用方已持有写事务；校验、去重标记与消息写入不会被拆开。
-            cursor = self._db.execute("UPDATE agent_runs SET reply_consumed_run_id = ? WHERE run_id = ?",
-                                      (run_id, item.source_run_id))
+    def _consume_delegation(self, agent_id: str, run_id: str, delegation_id: str) -> bool:
+        cursor = self._db.execute("UPDATE delegations SET run_id = ?, status = 'consumed'"
+                                  " WHERE delegation_id = ? AND agent_id = ? AND status = 'queued'",
+                                  (run_id, delegation_id, agent_id))
         return cursor.rowcount == 1
-
-    def _consume_inbound(self, session_id: str, batch_id: int) -> list[int]:
-        key = (session_id, batch_id)
-        row = self._db.execute("SELECT contents FROM inbound_batches WHERE session_id = ? AND batch_id = ?",
-                               key).fetchone()
-        if row is None:
-            return []
-        if self._db.execute("DELETE FROM inbound_batches WHERE session_id = ? AND batch_id = ?", key).rowcount != 1:
-            return []
-        return self._append(session_id, (Message("user", _decode_parts(content))
-                                         for content in json.loads(row["contents"])))
 
     @contextmanager
     def own_reply(self, reply_id: str) -> Iterator[None]:
@@ -977,12 +881,6 @@ class History:
                                        has_reply))
             if cursor.rowcount != 1:
                 raise ValueError("invalid agent run state transition or missing child reply")
-
-    def mark_agent_reply_enqueued(self, run_id: str) -> None:
-        """记录已回投，不参与消费判断；父级可能先消费才写入此诊断。"""
-        with self._input_transaction(retryable_io=False):
-            self._db.execute("UPDATE agent_runs SET reply_enqueued_at = ? WHERE run_id = ?"
-                             " AND status IN ('completed', 'failed') AND reply_enqueued_at IS NULL", (time(), run_id))
 
     def interrupt_agent_work(self, *, reason: str, agent_id: str | None = None) -> None:
         """中断单个 Agent 的排队委派及运行，或在应用启动/关闭时收尾全库。"""

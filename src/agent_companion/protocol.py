@@ -2,7 +2,7 @@
 
 import asyncio
 from collections.abc import AsyncGenerator, AsyncIterator, Awaitable, Callable, Sequence
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, field
 from enum import StrEnum
 import re
 from typing import Any, Literal, Protocol, runtime_checkable
@@ -33,6 +33,8 @@ class Text:
 
 @dataclass(frozen=True, slots=True)
 class Image:
+    """历史中为工作区相对引用，交给模型的请求副本中为实际图片 URL。"""
+
     url: str = field(repr=False)
 
 
@@ -60,8 +62,6 @@ MessageKind = Literal["user", "assistant", "state_event", "async_tool_result", "
 @dataclass(frozen=True, slots=True)
 class UserSource:
     kind: Literal["human", "internal", "delegation"]
-    agent_id: str | None = None
-    delegation_id: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -116,21 +116,37 @@ class AssistantPartsReady:
 
 
 @dataclass(frozen=True, slots=True)
-class PersistedInput:
-    """已持久化的用户输入，交给 Runtime 在执行边界消费。"""
+class DelegatedInput:
+    """已受理的委派标识，只供子运行的录入事务使用。"""
 
-    batch_id: int
+    delegation_id: str
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.delegation_id, str) or not self.delegation_id:
+            raise ValueError("invalid delegated input identifier")
 
 
 @dataclass(frozen=True, slots=True)
-class DelegationTask:
-    """已受理的父级委派；正文角色与可信来源分别处理。"""
+class MessageDelivery:
+    """交给运行时的一条消息；投递意图及录入关联不属于历史消息。"""
 
-    delegation_id: str
-    prompt: str = field(repr=False)
+    message: Message = field(repr=False)
+    intent: Literal["trigger", "record"]
+    delegation: DelegatedInput | None = field(default=None, kw_only=True)
 
-    def to_history_message(self) -> Message:
-        return Message("user", self.prompt)
+    def __post_init__(self) -> None:
+        message = self.message
+        if (self.intent not in ("trigger", "record") or not isinstance(message, Message)
+                or message.kind not in ("user", "state_event", "async_tool_result")):
+            raise ValueError("invalid runtime message delivery")
+        if message.kind == "user" and message.source not in (UserSource("human"), UserSource("internal")):
+            raise ValueError("invalid runtime message source")
+        if not all((message.kind == "user" and isinstance(part, Image))
+                   or (isinstance(part, Text) and part.private is None) for part in message.parts):
+            raise ValueError("invalid runtime message parts")
+        if self.delegation is not None and (not isinstance(self.delegation, DelegatedInput)
+                                            or self.intent != "trigger" or message.source != UserSource("human")):
+            raise ValueError("invalid delegated delivery")
 
 
 @dataclass(frozen=True, slots=True)
@@ -182,40 +198,10 @@ class TimerFired:
         return Message("async_tool_result", async_result=AsyncToolResult("timer_fired", payload))
 
 
-@dataclass(frozen=True, slots=True)
-class InternalInput:
-    """可进入模型上下文，但不授予用户输入权限。"""
-
-    content: Message | AgentReply | DelegationTask | TimerFired = field(repr=False)
-
-    def to_history_message(self) -> Message:
-        if isinstance(self.content, Message):
-            return replace(self.content, source=UserSource("internal"))
-        return self.content.to_history_message()
-
-
-# 未包装的 Message 表示真实用户输入。
-InputItem = Message | PersistedInput | InternalInput
-
-
-def validate_input_items(items: Sequence[InputItem]) -> None:
-    """在调度器或 Runtime 修改队列前校验同一批输入。"""
-    for item in items:
-        if isinstance(item, PersistedInput):
-            if type(item.batch_id) is not int:
-                raise ValueError("persisted input requires an integer batch ID")
-            continue
-        message = item.content if isinstance(item, InternalInput) else item
-        if isinstance(item, InternalInput) and isinstance(message, (AgentReply, DelegationTask, TimerFired)):
-            continue
-        if not is_human_message(message):
-            raise ValueError("runtime inputs must be plain user messages")
-
-
-def is_human_message(message: object) -> bool:
-    return (isinstance(message, Message) and message.kind == "user" and message.source == UserSource("human")
-            and all(isinstance(part, Image) or isinstance(part, Text) and part.private is None
-                    for part in message.parts))
+def validate_deliveries(deliveries: Sequence[MessageDelivery]) -> None:
+    """在修改队列前拒绝不是投递项的值。"""
+    if not all(isinstance(delivery, MessageDelivery) for delivery in deliveries):
+        raise ValueError("runtime inputs require message deliveries")
 
 
 @dataclass(frozen=True, slots=True)

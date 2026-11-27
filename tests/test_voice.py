@@ -1,4 +1,5 @@
 import asyncio
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import aclosing, closing
 from dataclasses import replace
 import io
@@ -8,8 +9,9 @@ from unittest.mock import patch
 import wave
 from weakref import ref
 
+from agent_companion import images
 from agent_companion.config import VoiceSettings
-from agent_companion.protocol import (DeliveryStatus, Message, ReplyInfo, ReplyStream, TextDelta,
+from agent_companion.protocol import (DeliveryStatus, Message, MessageDelivery, ReplyInfo, ReplyStream, TextDelta,
                                       ToolCall, ToolReady, ToolSpec)
 from agent_companion.runtime.engine import Runtime
 from agent_companion.runtime.tools import Tool, Tools
@@ -20,7 +22,7 @@ from agent_companion.speech.tts import TtsError
 from agent_companion.speech.vad import INPUT_FRAMES, VoiceSetupError
 from agent_companion.speech.voice import VoiceChannel
 from agent_companion.storage.sqlite import History
-from test_message_support import tool_calls
+from test_message_support import PNG_BYTES, image_workspace, tool_calls
 
 
 _RATE = 16000
@@ -183,7 +185,7 @@ class VoiceOutputTest(unittest.IsolatedAsyncioTestCase):
             runtime = Runtime("main", history, Model(), output)
             try:
                 with self.assertLogs("agent_companion", level="DEBUG") as logs:
-                    runtime.submit_batch([Message("user", "合成测试输入")])
+                    runtime.submit_messages([MessageDelivery(Message("user", "合成测试输入"), "trigger")])
                     await _until(lambda: any("voice playback started;" in row for row in logs.output))
                     self.assertEqual(self._render(output), bytes(8))
                     self.assertEqual(tts.calls, [])
@@ -531,7 +533,7 @@ class VoiceDeliveryWatchdogTest(unittest.IsolatedAsyncioTestCase):
         runtime, history, device = self.setup_runtime(Output(TTS(), settings), Model(), settings, tools=tools)
         with (patch.object(loop, "time", new=lambda: clock[0]),
               patch.object(loop, "slow_callback_duration", float("inf"))):
-            runtime.submit_batch([Message("user", "运行工具")])
+            runtime.submit_messages([MessageDelivery(Message("user", "运行工具"), "trigger")])
             await buffered.wait()
             self.assertEqual(device.pull(4), _A * 4)
             clock[0] += .02
@@ -556,7 +558,7 @@ class VoiceDeliveryWatchdogTest(unittest.IsolatedAsyncioTestCase):
 
         settings = replace(_SETTINGS, idle_timeout=.05)
         runtime, history, device = self.setup_runtime(VoiceOutput(TTS(), settings), Model(), settings)
-        runtime.submit_batch([Message("user", "合成测试")])
+        runtime.submit_messages([MessageDelivery(Message("user", "合成测试"), "trigger")])
         await asyncio.wait_for(tts_started.wait(), 1)
         await asyncio.sleep(.08)
         self.assertEqual(history.outcomes("main"), [])
@@ -580,10 +582,10 @@ class VoiceDeliveryWatchdogTest(unittest.IsolatedAsyncioTestCase):
         tts = _TTS()
         settings = replace(_SETTINGS, idle_timeout=.08)
         runtime, history, device = self.setup_runtime(VoiceOutput(tts, settings), Model(), settings)
-        runtime.submit_batch([Message("user", "先问")])
+        runtime.submit_messages([MessageDelivery(Message("user", "先问"), "trigger")])
         await _until(lambda: len(tts.calls) == 2)
         self.assertEqual(device.pull(5), _A * 5)
-        runtime.submit_batch([Message("user", "再问")])
+        runtime.submit_messages([MessageDelivery(Message("user", "再问"), "trigger")])
         await asyncio.wait_for(runtime.wait_idle(), .5)
         self.assertEqual(history.outcomes("main")[0].delivery_status, DeliveryStatus.UNKNOWN)
         self.assertEqual(requests[1], [Message("user", "先问"), Message("assistant", "已交给设备。"),
@@ -610,7 +612,7 @@ class VoiceDeliveryWatchdogTest(unittest.IsolatedAsyncioTestCase):
         clock = [loop.time()]
         with (patch.object(loop, "time", new=lambda: clock[0]),
               patch.object(loop, "slow_callback_duration", float("inf"))):
-            runtime.submit_batch([Message("user", "测试")])
+            runtime.submit_messages([MessageDelivery(Message("user", "测试"), "trigger")])
             await buffered.wait()
             # 两次消费都发生在各自的滚动截止前；第二次已过原始截止。
             clock[0] += 1.75
@@ -645,7 +647,7 @@ class VoiceDeliveryWatchdogTest(unittest.IsolatedAsyncioTestCase):
 
                 settings = replace(_SETTINGS, idle_timeout=.10, delivery_timeout=.34 if continuous else .9)
                 runtime, history, device = self.setup_runtime(VoiceOutput(TTS(), settings), Model(), settings)
-                runtime.submit_batch([Message("user", "播放器合成测试")])
+                runtime.submit_messages([MessageDelivery(Message("user", "播放器合成测试"), "trigger")])
                 await asyncio.wait_for(produced.wait(), 1)
                 a, b = 0, 0
                 async with asyncio.timeout(.7):
@@ -900,6 +902,78 @@ class VoiceInputTest(unittest.IsolatedAsyncioTestCase):
                     release.set()
                 await _until(lambda: vad.count > 1)
 
+    async def test_cancelled_image_reads_at_capacity_do_not_delay_actual_vad(self):
+        loop = asyncio.get_running_loop()
+        workers = images._IMAGE_WORKERS
+        # 若图片误送默认池，这些未结束的读操作会占用 VAD 使用的所有线程。
+        loop.set_default_executor(ThreadPoolExecutor(max_workers=workers))
+        workspace = image_workspace(self)
+        pictures = [images.save_image(workspace, PNG_BYTES) for _ in range(workers + 2)]
+        blocked_names = {images.image_filename(picture.url) for picture in pictures[:workers]}
+        skipped = images.image_filename(pictures[-2].url)
+        started, submitted = set(), []
+        unexpected_read, unexpected_write = Event(), Event()
+        release = Event()
+        actual_read = images._read_image
+        actual_submit = images._IMAGE_EXECUTOR.submit
+
+        def slow_read(workspace, name, remaining):
+            if name == skipped:
+                unexpected_read.set()
+            if name not in blocked_names:
+                return actual_read(workspace, name, remaining)
+            loop.call_soon_threadsafe(started.add, name)
+            if not release.wait(5):
+                raise AssertionError("image worker was not released")
+            return actual_read(workspace, name, remaining)
+
+        def track_submit(operation):
+            job = actual_submit(operation)
+            submitted.append(job)
+            return job
+
+        def request(picture):
+            return asyncio.create_task(images.prepare_request_images([Message("user", (picture,))], workspace))
+
+        vad, device = _Vad(), _Device()
+        voice = VoiceChannel(_ASR(), _TTS(), vad, _SETTINGS, asr_timeout=1, max_audio_seconds=500)
+        tasks = []
+        with (patch.object(images, "_read_image", side_effect=slow_read),
+              patch.object(images._IMAGE_EXECUTOR, "submit", side_effect=track_submit)):
+            try:
+                tasks.extend(request(picture) for picture in pictures[:workers])
+                await _until(lambda: started == blocked_names, timeout=2)
+                for task in tasks:
+                    task.cancel()
+                await asyncio.wait_for(asyncio.gather(*tasks, return_exceptions=True), 1)
+
+                queued = [request(pictures[-2]), asyncio.create_task(
+                    images.run_image_io(unexpected_write.set, settle_write=True))]
+                tasks.extend(queued)
+                await asyncio.sleep(0)  # 两种任务都已开始等图片额度。
+                for task in queued:
+                    task.cancel()
+                await asyncio.wait_for(asyncio.gather(*queued, return_exceptions=True), 1)
+                live = request(pictures[-1])
+                tasks.append(live)
+                async with voice.connected(device, lambda *_: None):
+                    device.frame(False)
+                    await _processed(vad, 1)  # 真实 _listen → 默认池 → VAD，在图片释放前应完成。
+                    self.assertFalse(any(job.done() for job in submitted))
+                    self.assertEqual(len(submitted), workers)
+                    self.assertFalse(live.done())
+                release.set()
+                await asyncio.wait_for(live, 1)
+                self.assertFalse(unexpected_read.is_set())
+                self.assertFalse(unexpected_write.is_set())
+                self.assertEqual(len(submitted), workers + 1)
+            finally:
+                release.set()
+                for task in tasks:
+                    task.cancel()
+                await asyncio.gather(*tasks, return_exceptions=True)
+                await asyncio.gather(*(asyncio.wrap_future(job) for job in submitted), return_exceptions=True)
+
     async def test_device_fault_returns_prefix_and_never_falls_back_to_text(self):
         asr, vad, device = _ASR(), _Vad(), _Device()
         first = asyncio.Event()
@@ -995,7 +1069,7 @@ class VoiceInputTest(unittest.IsolatedAsyncioTestCase):
             def on_input(text, active):
                 events.append((text, active))
                 if text:
-                    runtime.submit_batch([Message("user", text)])
+                    runtime.submit_messages([MessageDelivery(Message("user", text), "trigger")])
 
             try:
                 async with voice.connected(device, on_input):
@@ -1255,8 +1329,11 @@ class VoiceInputTest(unittest.IsolatedAsyncioTestCase):
         with closing(History(":memory:")) as history:
             runtime = Runtime("main", history, Model(), voice, tools=tools)
             try:
-                async with voice.connected(device, _transcripts(lambda text: runtime.submit_batch([Message("user", text)]))):
-                    runtime.submit_batch([Message("user", "运行工具")])
+                def submit(text):
+                    runtime.submit_messages((MessageDelivery(Message("user", text), "trigger"),))
+
+                async with voice.connected(device, _transcripts(submit)):
+                    runtime.submit_messages([MessageDelivery(Message("user", "运行工具"), "trigger")])
                     await tool_started.wait()
                     device.frame(True, 3)
                     device.frame(False, 2)
@@ -1314,7 +1391,7 @@ class VoiceInputTest(unittest.IsolatedAsyncioTestCase):
             runtime = Runtime("main", history, Model(), voice, tools=tools)
             try:
                 async with voice.connected(device, lambda *_: None):
-                    runtime.submit_batch([Message("user", "测试请求")])
+                    runtime.submit_messages([MessageDelivery(Message("user", "测试请求"), "trigger")])
                     await _until(spoke.is_set)
                     self.assertEqual(device.pull(4 + _RATE // 2), _B * 4 + _A * (_RATE // 2))
                     device.frame(True, 3)

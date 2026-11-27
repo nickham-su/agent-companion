@@ -1,6 +1,7 @@
 import asyncio
 from contextlib import asynccontextmanager, closing, suppress
 from dataclasses import replace
+from datetime import datetime, timezone
 from hashlib import sha256
 import json
 from pathlib import Path
@@ -17,8 +18,8 @@ from agent_companion.channels.feishu.macos_calls import DesktopCallError, MacCal
 from agent_companion.config import ASRSettings, FeishuSettings, MiniMaxConnection, Settings
 from agent_companion.feishu_calls import IncomingCalls
 from agent_companion.feishu_private import _Route
-from agent_companion.protocol import (ChannelUser, DeliveryStatus, InternalInput, Message,
-                                      TextDelta, ToolCall, ToolReady)
+from agent_companion.protocol import (ChannelUser, DeliveryStatus, Message, MessageDelivery,
+                                      TextDelta, ToolCall, ToolReady, UserSource)
 from agent_companion.runtime.subtasks import DELEGATE_TOOL_NAME, demo_roles
 from agent_companion.speech.asr import AsrError
 from agent_companion.speech.vad import INPUT_FRAMES, INPUT_RATE
@@ -28,6 +29,10 @@ from agent_companion.storage.sqlite import History
 from test_feishu_private import _CHATS, _OWN, _SENDERS, _Runner, _eventually, _message
 from test_voice import _A, _ASR, _Device, _SETTINGS, _TTS, _Vad
 from test_message_support import tool_calls
+
+
+def _internal_result():
+    return MessageDelivery(Message("user", "内部结果", source=UserSource("internal")), "trigger")
 
 
 def _ok(data, *, identity="user"):
@@ -291,6 +296,14 @@ def _session(sender):
     return "feishu-private:" + sha256(sender.encode("ascii")).hexdigest()
 
 
+def _conversation_lines(history, session):
+    return tuple(row.message for row in history.read_after(session) if row.message.kind != "state_event")
+
+
+def _reply_deliveries(history, session):
+    return [row for row in history.outcomes(session) if row.delivery_status is not None]
+
+
 class IncomingCallTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
         self.runner = _CallRunner()
@@ -302,7 +315,18 @@ class IncomingCallTests(unittest.IsolatedAsyncioTestCase):
 
     @asynccontextmanager
     async def _serve(self, model, *, make_asr=lambda i: _ASR(f"测试语音{i}"), make_device=_Device,
-                     tts=None, copy=True, max_audio_seconds=30, asr_timeout=2):
+                     tts=None, copy=True, max_audio_seconds=30, asr_timeout=2, observe_state=False):
+        stream = model.stream
+
+        async def test_stream(messages, tools, *, thinking, instructions=None):
+            if not observe_state:
+                # 为既有语音场景模拟接通时沉默；仅专门的生命周期用例查看真实完整请求。
+                if messages[-1].kind == "state_event" and messages[-1].text.startswith("通话已接通 - "):
+                    return
+                messages = [message for message in messages if message.kind != "state_event"]
+            async for event in stream(messages, tools, thinking=thinking, instructions=instructions):
+                yield event
+
         tts = _TTS() if tts is None else tts
         settings = Settings(feishu=FeishuSettings(mode="voice", voice_text_copy=copy),
                             voice=replace(_SETTINGS, input_device="mock-in", output_device="mock-out",
@@ -318,6 +342,7 @@ class IncomingCallTests(unittest.IsolatedAsyncioTestCase):
                                 max_audio_seconds=max_audio_seconds, streaming=streaming), device
 
         with (closing(History(":memory:")) as history,
+              patch.object(model, "stream", test_stream),
               patch("agent_companion.channels.feishu.macos_calls.MacCallDesktop", return_value=self.desktop),
               patch("agent_companion.app._make_voice", side_effect=build),
               patch("agent_companion.app.running_agent", wraps=running_agent) as agents,
@@ -361,6 +386,91 @@ class IncomingCallTests(unittest.IsolatedAsyncioTestCase):
         messages.append(_message(str(len(messages)), _CHATS[index], _SENDERS[index], content))
         self.clock = 102.0
 
+    async def test_confirmed_call_status_uses_voice_then_records_ending_without_request(self):
+        sender, tts = _SENDERS[0], _TTS()
+        session = _session(sender)
+        connected = datetime(2026, 1, 20, 11, 12, 13, tzinfo=timezone.utc)
+        ended = datetime(2026, 1, 20, 11, 14, 15, tzinfo=timezone.utc)
+        start_message = Message("state_event", "通话已接通 - 2026-01-20 11:12:13+00:00")
+        end_message = Message("state_event", "通话已结束 - 2026-01-20 11:14:15+00:00")
+        requests = []
+
+        class Model:
+            async def stream(self, messages, tools, *, thinking, instructions=None):
+                requests.append(tuple(messages))
+                yield TextDelta("模型应答。")
+
+        with patch("agent_companion.feishu_calls.datetime") as clock:
+            clock.now.return_value.astimezone.return_value = connected
+            async with self._serve(Model(), tts=tts, copy=False, observe_state=True) as (history, _):
+                self.desktop.ring(sender, 1)
+                await _eventually(lambda: len(self.desktop.clicks) == 1)
+                self.assertEqual(requests, [])
+                self.assertEqual(history.read_after(session), [])
+                self.desktop.connect(101)
+                await _eventually(lambda: bool(tts.calls))
+                self.assertEqual(requests, [(start_message,)])
+                self.assertEqual(tts.calls, [("模型应答。", 16000)])
+                self.assertFalse(self.runner.sent.get(sender))
+                await _eventually(lambda: any(self.devices[0].pull(32)))
+                await _eventually(lambda: len(history.outcomes(session)) == 1)
+
+                clock.now.return_value.astimezone.return_value = ended
+                self.desktop.main = ()
+                await _eventually(lambda: bool(history.tail(session, 1)) and
+                                  history.tail(session, 1)[0].message == end_message)
+                self.assertEqual(len(requests), 1)
+                self.assertEqual(len(history.outcomes(session)), 1)
+
+                self._text(0, "稍后发来的文字")
+                await _eventually(lambda: self.runner.sent[sender] == ["模型应答。"])
+                self.assertEqual(requests[1], (start_message, Message("assistant", "模型应答。"), end_message,
+                                               Message("user", "稍后发来的文字")))
+                self.assertEqual([row.message for row in history.read_after(session)
+                                  if row.message.kind == "state_event"], [start_message, end_message])
+
+    async def test_device_fault_releases_audio_before_confirmed_window_end(self):
+        sender, session = _SENDERS[0], _session(_SENDERS[0])
+        earlier = datetime(2026, 1, 20, 11, 12, 13, tzinfo=timezone.utc)
+        later = datetime(2026, 1, 20, 11, 14, 15, tzinfo=timezone.utc)
+
+        def events(history):
+            return [row.message.text for row in history.read_after(session) if row.message.kind == "state_event"]
+
+        with (patch("agent_companion.speech.voice._DEVICE_CHECK_SECONDS", .015),
+              patch("agent_companion.feishu_calls.datetime") as clock):
+            clock.now.return_value.astimezone.return_value = earlier
+            async with self._serve(_Echo()) as (history, _):
+                await self._ring_connect(sender, 1, 1)
+                await _eventually(lambda: len(events(history)) == 1)
+                self.devices[0].fault = True
+                await _eventually(lambda: self.devices[0].closed)
+                self.assertTrue(self.desktop.main)
+                self._text(0, "设备停用后仍可收文字")
+                await _eventually(lambda: bool(self.runner.sent[sender]))
+                self.assertEqual(events(history), ["通话已接通 - 2026-01-20 11:12:13+00:00"])
+                clock.now.return_value.astimezone.return_value = later
+                self.desktop.main = ()
+                await _eventually(lambda: len(events(history)) == 2)
+                self.assertEqual(events(history)[-1], "通话已结束 - 2026-01-20 11:14:15+00:00")
+
+    async def test_shutdown_of_connected_call_does_not_invent_end_event(self):
+        ended = []
+        detach = _Route.call_ended
+
+        def call_ended(route, stop, *, ended_at=None):
+            if ended_at is not None:
+                ended.append(ended_at)
+            return detach(route, stop, ended_at=ended_at)
+
+        with patch.object(_Route, "call_ended", call_ended):
+            async with self._serve(_Echo()) as _:
+                await self._ring_connect(_SENDERS[0], 1, 1)
+                self.assertTrue(self.desktop.main)
+                self.assertFalse(self.devices[0].closed)
+        self.assertTrue(self.devices[0].closed)
+        self.assertEqual(ended, [])
+
     async def test_first_call_looks_up_once_after_audio_opens_and_shares_text_history(self):
         self.runner.release_detail.clear()
         model, tts = _Echo(), _TTS()
@@ -399,7 +509,7 @@ class IncomingCallTests(unittest.IsolatedAsyncioTestCase):
             ]]}}]})
             self.assertEqual(agents.call_count, 1)
             self.assertEqual(self.runner.lookups, 1)
-            self.assertEqual([row.message.content for row in history.tail(_session(sender), 10)],
+            self.assertEqual([message.content for message in _conversation_lines(history, _session(sender))],
                              ["测试语音1", "测试语音1。", "通话中发文字", "通话中发文字。"])
 
     async def test_retries_same_window_when_user_session_is_temporarily_busy(self):
@@ -490,7 +600,7 @@ class IncomingCallTests(unittest.IsolatedAsyncioTestCase):
                 self.assertTrue(desktop.rings)
                 self.assertFalse(self.asrs[0].files)
                 _talk(self.devices[1])
-                await _eventually(lambda: bool(history.tail(_session(_SENDERS[0]), 10)))
+                await _eventually(lambda: bool(_conversation_lines(history, _session(_SENDERS[0]))))
                 self.assertEqual(self.runner.lookups, 2)
 
     async def test_confirmation_timeout_logs_poll_summary_and_one_snapshot(self):
@@ -506,10 +616,11 @@ class IncomingCallTests(unittest.IsolatedAsyncioTestCase):
         with (patch.object(desktop, "answer", side_effect=answer),
               patch.object(desktop, "main_window_diagnostics", wraps=desktop.main_window_diagnostics) as snapshot,
               self.assertLogs("agent_companion.feishu_calls", level="DEBUG") as logs):
-            async with self._serve(_Echo()):
+            async with self._serve(_Echo(), observe_state=True) as (history, _):
                 desktop.ring(_SENDERS[0], 1)
                 await _eventually(lambda: bool(self.devices) and self.devices[0].closed)
                 self.assertEqual(len(desktop.clicks), 1)
+                self.assertEqual(history.read_after(_session(_SENDERS[0])), [])
 
         snapshot.assert_called_once_with(3)
         diagnostics = "\n".join(logs.output)
@@ -537,7 +648,7 @@ class IncomingCallTests(unittest.IsolatedAsyncioTestCase):
                 await _eventually(lambda: bool(desktop.clicks))
                 device = self.devices[0]
                 _talk(device)
-                await _eventually(lambda: bool(history.tail(_session(_SENDERS[0]), 10)))
+                await _eventually(lambda: bool(_conversation_lines(history, _session(_SENDERS[0]))))
 
                 desktop.main = (controls, foreign)
                 with patch.object(desktop, "window_exists", wraps=desktop.window_exists) as probe:
@@ -564,7 +675,7 @@ class IncomingCallTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(runner.lookups, 1)
             self.assertEqual(agents.call_count, 1)
             _talk(self.devices[-1])
-            await _eventually(lambda: bool(history.tail(_session(other), 10)))
+            await _eventually(lambda: bool(_conversation_lines(history, _session(other))))
             self.assertFalse(history.tail(_session(_SENDERS[0]), 10))
 
     async def test_cli_timeout_logs_stage_timings_without_ids(self):
@@ -714,15 +825,23 @@ class IncomingCallTests(unittest.IsolatedAsyncioTestCase):
             ]]}}])
 
     async def test_window_errors_and_fresh_redial(self):
-        async with self._serve(_Echo()) as (_, agents):
-            await self._ring_connect(_SENDERS[0], 1, 1)
+        sender = _SENDERS[0]
+
+        def endings(history):
+            return [entry.message for entry in history.read_after(_session(sender))
+                    if entry.message.kind == "state_event" and entry.message.text.startswith("通话已结束 - ")]
+
+        async with self._serve(_Echo()) as (history, agents):
+            await self._ring_connect(sender, 1, 1)
             window = self.desktop.main
             with self.assertLogs("agent_companion.feishu_calls", level="WARNING"):
                 self.desktop.error = True
                 await _eventually(lambda: self.devices[0].closed)
+                self.assertEqual(endings(history), [])
             self.desktop.error = False
             self.desktop.main = ()
-            await self._ring_connect(_SENDERS[0], 2, 2)
+            await _eventually(lambda: len(endings(history)) == 1)
+            await self._ring_connect(sender, 2, 2)
             self.assertFalse(self.devices[1].closed)
             self.assertEqual(len(self.desktop.main), len(window))
             self.desktop.main = ()
@@ -854,7 +973,7 @@ class IncomingCallTests(unittest.IsolatedAsyncioTestCase):
             await _eventually(lambda: self.runner.sent[_SENDERS[0]] == ["已播放的旧句。", "测试语音2。"])
             self.assertEqual(agents.call_count, 1)
             self.assertIn("已播放的旧句。", new_model_inputs)
-            self.assertEqual([row.message.content for row in history.tail(_session(sender), 10)],
+            self.assertEqual([message.content for message in _conversation_lines(history, _session(sender))],
                              ["测试语音1", "已播放的旧句。", "测试语音2", "测试语音2。"])
 
     async def test_hangup_before_first_handoff_keeps_running_model_and_delivers_full_text(self):
@@ -932,8 +1051,7 @@ class IncomingCallTests(unittest.IsolatedAsyncioTestCase):
                 delegation = stored_delegation(history, _session(sender), tool.id)
                 self.assertEqual(json.loads(tool.result), {"status": "accepted", "agent_id": delegation.agent_id})
                 child = history.agent_run(delegation.run_id)
-                self.assertEqual(child.status, "completed")
-                self.assertIsNotNone(child.reply_enqueued_at)
+                self.assertEqual((child.status, child.result), ("completed", "子任务结果。"))
                 notice, = notices
                 self.assertEqual(delegation.tool_call_id, "voice-child")
                 self.assertEqual(notice, {"agent_id": delegation.agent_id, "status": "completed", "result": "子任务结果。"})
@@ -974,17 +1092,17 @@ class IncomingCallTests(unittest.IsolatedAsyncioTestCase):
                     asr.release.set()
                     await asyncio.wait_for(idle_reported.wait(), 2)
                 release_model.set()
-                await _eventually(lambda: bool(history.outcomes(session)))
-                self.assertEqual(history.outcomes(session)[0].delivery_status, DeliveryStatus.ZERO)
+                await _eventually(lambda: bool(_reply_deliveries(history, session)))
+                self.assertEqual(_reply_deliveries(history, session)[0].delivery_status, DeliveryStatus.ZERO)
                 if not after_idle:
                     self.assertEqual(tts.calls, [])
                     asr.release.set()
                 await _eventually(lambda: any(self.devices[0].pull(32)))
                 await _eventually(lambda: self.runner.sent[_SENDERS[0]] == ["新话轮。"])
                 self.assertEqual(tts.calls, [("新话轮。", 16000)])
-                self.assertEqual([row.message.kind for row in history.tail(session, 10)],
+                self.assertEqual([message.kind for message in _conversation_lines(history, session)],
                                  ["user", "user", "assistant"])
-                first, second = history.outcomes(session)
+                first, second = _reply_deliveries(history, session)
                 self.assertNotEqual(first.run_id, second.run_id)
 
     async def test_voice_intercepts_first_handoff_while_user_input_is_pending(self):
@@ -1025,35 +1143,35 @@ class IncomingCallTests(unittest.IsolatedAsyncioTestCase):
                         self.assertEqual(device.pull(heard), _A * heard)
                     _talk(device)
                     await asyncio.wait_for(asr.called.wait(), 2)
-                    await _eventually(lambda: bool(history.outcomes(session)))
-                    (old,) = history.outcomes(session)
+                    await _eventually(lambda: bool(_reply_deliveries(history, session)))
+                    (old,) = _reply_deliveries(history, session)
                     confirmed = scenario not in ("not_played", "unconfirmed")
                     self.assertEqual(old.delivery_status, DeliveryStatus.PARTIAL if confirmed else DeliveryStatus.ZERO)
                     expected = (original, Message("assistant", "确认的首句。")) if confirmed else (original,)
-                    self.assertEqual(tuple(row.message for row in history.tail(session, 10)), expected)
+                    self.assertEqual(_conversation_lines(history, session), expected)
                     self.assertFalse(any(device.pull(32)))
+                    scheduler = agents.call_args.kwargs["schedulers"].get_or_create(session)
                     if scenario == "queued_text":
                         self._text(0, "已排队的文字")
-                        await _eventually(lambda: bool(history.pending_inbound(session, "feishu-private")))
+                        await _eventually(lambda: scheduler.has_pending_messages)
                         expected += (Message("user", "已排队的文字"),)
                     elif scenario == "transcript":
                         expected += (Message("user", "有效转写"),)
                     elif scenario == "hangup":
                         self.desktop.main = ()
                         await _eventually(lambda: device.closed)
-                    scheduler = agents.call_args.kwargs["schedulers"].get_or_create(session)
                     with patch.object(scheduler, "_trigger", wraps=scheduler._trigger) as trigger:
                         asr.release.set()
                         await _eventually(lambda: not scheduler._input_active)
                         if scenario not in ("not_played", "hangup"):
                             await _eventually(lambda: len(tts.calls) == 3)
                             self.assertEqual(device.pull(32)[:8], _A * 4)
-                            await _eventually(lambda: len(history.outcomes(session)) == 2)
+                            await _eventually(lambda: len(_reply_deliveries(history, session)) == 2)
                             self.assertEqual(requests, [(original,), expected])
-                            _, new = history.outcomes(session)
+                            _, new = _reply_deliveries(history, session)
                             self.assertNotEqual(old.run_id, new.run_id)
                             self.assertEqual(history.agent_run(new.run_id).status, "completed")
-                            self.assertEqual(tuple(row.message for row in history.tail(session, 10)),
+                            self.assertEqual(_conversation_lines(history, session),
                                              (*expected, Message("assistant", "新生成的回复。")))
                         else:
                             self.assertEqual(requests, [(original,)])
@@ -1074,22 +1192,26 @@ class IncomingCallTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(self.devices[0].pull(1), _A)
             _talk(self.devices[0])
             await asyncio.wait_for(asr.called.wait(), 2)
-            await _eventually(lambda: len(history.outcomes(_session(_SENDERS[0]))) == 1)
+            await _eventually(lambda: len(_reply_deliveries(history, _session(_SENDERS[0]))) == 1)
             route = binding._peer
             yield binding, asr, history, route._scheduler, route._agent[0], model, tts
 
-    async def test_empty_call_yields_to_persisted_feishu_input_before_plan_and_after_lock_retry(self):
-        for scenario in ("raw_before", "normalized_before", "raw_late", "normalized_late", "other_user", "read_error"):
+    async def test_empty_call_yields_to_raw_and_memory_queues_before_plan_and_after_lock_retry(self):
+        scenarios = ("raw_before", "raw_late", "scheduler_before", "runtime_before", "runtime_late",
+                     "other_user", "read_error")
+        for scenario in scenarios:
             with self.subTest(scenario=scenario):
                 self.setUp()
                 async with self._interrupted_call_waiting_for_empty_asr() as (_, asr, history, scheduler,
                                                                            runtime, model, tts):
                     peer = _SENDERS[1] if scenario == "other_user" else _SENDERS[0]
-                    session = _session(peer)
                     late = scenario.endswith("_late")
-                    retry = asyncio.Event()
+                    retry, input_retry = asyncio.Event(), asyncio.Event()
                     start = history.start_agent_run
+                    append = history.append_agent_inputs
                     start_attempts = []
+                    blocked = True
+                    record = MessageDelivery(Message("user", "待处理"), "record")
 
                     def start_after_lock(agent_id, run_id, *, can_start):
                         start_attempts.append(run_id)
@@ -1098,34 +1220,45 @@ class IncomingCallTests(unittest.IsolatedAsyncioTestCase):
                             raise sqlite3.OperationalError("database is locked")
                         return start(agent_id, run_id, can_start=can_start)
 
-                    def persist(target, *, normalize=False):
+                    def append_after_lock(agent_id, run_id, deliveries, *, start):
+                        if blocked and deliveries == (record,):
+                            input_retry.set()
+                            raise sqlite3.OperationalError("database is locked")
+                        return append(agent_id, run_id, deliveries, start=start)
+
+                    def persist(target):
                         history.record_feishu_window(None, now=0,
                                                      verified={target: [("synthetic-" + target, 0, "text", "待处理")]},
                                                      discarded=(), retry=())
-                        if normalize:
-                            batch, _ = history.next_feishu_raw(target)
-                            history.finish_feishu_raw(target, batch, _session(target), [Message("user", "待处理")])
-                            self.assertIsNone(history.next_feishu_raw(target))
 
-                    # 暂停收件通知，确保持久批次还未交给调度器或 Runtime。
+                    # 暂停收件通知，以便独立核对原始批次与两处内存队列。
                     with (patch.object(_Route, "notify_inbound"),
                           patch.object(scheduler, "_trigger", wraps=scheduler._trigger) as trigger,
                           patch.object(history, "start_agent_run", side_effect=start_after_lock),
+                          patch.object(history, "append_agent_inputs", side_effect=append_after_lock),
                           patch.object(history, "has_pending_feishu_input", wraps=history.has_pending_feishu_input)
                           as inbox):
                         if scenario == "read_error":
                             inbox.side_effect = sqlite3.OperationalError("database is locked")
-                        elif not late:
-                            persist(peer, normalize=scenario == "normalized_before")
-                            if scenario == "other_user":
-                                # 其他用户的原始批次及归一化批次都不应抑制本通唤醒。
-                                history.record_inbound(session, "feishu-private", 0,
-                                                       [("synthetic-normalized-elsewhere", Message("user", "别的输入"))])
+                        elif scenario in ("raw_before", "other_user"):
+                            persist(peer)
+                        elif scenario == "scheduler_before":
+                            scheduler.session_input((record,))
+                            self.assertTrue(scheduler.has_pending_messages)
+                        elif scenario == "runtime_before":
+                            runtime.submit_messages((record,))
+                            await asyncio.wait_for(input_retry.wait(), 2)
+                            self.assertTrue(runtime.has_pending_messages)
                         asr.release.set()
                         if late:
                             await asyncio.wait_for(retry.wait(), 2)
-                            persist(peer, normalize=scenario == "normalized_late")
+                            if scenario == "raw_late":
+                                persist(peer)
+                            else:
+                                runtime.submit_messages((record,))
+                                self.assertTrue(runtime.has_pending_messages)
                         await _eventually(lambda: not scheduler._input_active)
+                        blocked = False
                         if scenario == "other_user":
                             await _eventually(lambda: len(tts.calls) == 2)
                             self.assertEqual(self.devices[0].pull(4), _A * 4)
@@ -1134,10 +1267,12 @@ class IncomingCallTests(unittest.IsolatedAsyncioTestCase):
                         self.assertEqual(model.calls, [("最初输入",)] * count)
                         self.assertEqual(trigger.call_count, int(late or scenario == "other_user"))
                         if late:
-                            self.assertEqual(len(start_attempts), 2)
+                            self.assertEqual(len(start_attempts), 2 if scenario == "raw_late" else 1)
                             self.assertIsNone(history.agent_run(start_attempts[-1]))
-                        if scenario != "read_error":
-                            self.assertTrue(history.has_pending_feishu_input(peer, session))
+                        if scenario in ("raw_before", "raw_late", "other_user"):
+                            self.assertTrue(history.has_pending_feishu_input(peer))
+                        elif scenario != "read_error":
+                            self.assertEqual(history.tail(runtime.session_id, 1)[0].message, record.message)
 
     async def test_queued_empty_call_does_not_fall_back_to_text_after_window_or_io_loss(self):
         for lost in ("window", "io"):
@@ -1161,7 +1296,7 @@ class IncomingCallTests(unittest.IsolatedAsyncioTestCase):
                     if lost == "window":
                         self.assertTrue(binding.closed)  # 轮询已暂停，只有启动资格检查能发现窗口消失。
                     self.assertEqual(model.calls, [("最初输入",)])
-                    self.assertEqual(len(history.outcomes(_session(_SENDERS[0]))), 1)
+                    self.assertEqual(len(_reply_deliveries(history, _session(_SENDERS[0]))), 1)
                     self.assertFalse(self.runner.sent.get(_SENDERS[0]))
 
     async def test_feishu_and_internal_input_wait_for_last_transcript_in_fifo_order(self):
@@ -1172,22 +1307,25 @@ class IncomingCallTests(unittest.IsolatedAsyncioTestCase):
             await self._ring_connect(sender, 1, 1)
             _talk(self.devices[0])
             await asyncio.wait_for(asr.called.wait(), 2)
-            self._text(0, "飞书补充")
-            await _eventually(lambda: bool(history.pending_inbound(session, "feishu-private")))
             schedulers = agents.call_args.kwargs["schedulers"]
-            self.assertTrue(schedulers.submit_internal(session, InternalInput(Message("user", "内部结果"))))
+            scheduler = schedulers.get_or_create(session)
+            self._text(0, "飞书补充")
+            await _eventually(lambda: scheduler.has_pending_messages)
+            self.assertTrue(schedulers.submit_internal(session, _internal_result()))
             self.assertEqual(model.calls, [])
-            self.assertEqual(history.tail(session, 10), [])
+            self.assertEqual(_conversation_lines(history, session), ())
             asr.release.set()
             await _eventually(lambda: len(tts.calls) == 1)
             await _eventually(lambda: any(self.devices[0].pull(32)))
             await _eventually(lambda: self.runner.sent[_SENDERS[0]] == ["最后转写。"])
             self.assertEqual(model.calls, [("飞书补充", "内部结果", "最后转写")])
-            self.assertFalse(history.pending_inbound(session, "feishu-private"))
+            self.assertFalse(scheduler.has_pending_messages)
 
-    async def test_hangup_releases_buffered_text_and_discards_old_call_events_after_redial(self):
+    async def test_hangup_releases_buffered_text_and_late_status_does_not_change_new_call_input(self):
         sender = _SENDERS[0]
         session = _session(sender)
+        late = datetime(2026, 1, 20, 11, 14, 15, tzinfo=timezone.utc)
+        late_message = Message("state_event", "通话已结束 - 2026-01-20 11:14:15+00:00")
         old, new = _ASR("过期转写", block=True), _ASR("新通转写", block=True)
         model, old_binding = _Echo(), []
         start_call = _Route.call_started
@@ -1204,7 +1342,7 @@ class IncomingCallTests(unittest.IsolatedAsyncioTestCase):
                 _talk(self.devices[0])
                 await asyncio.wait_for(old.called.wait(), 2)
                 self._text(0, "挂断前补充")
-                await _eventually(lambda: bool(history.pending_inbound(session, "feishu-private")))
+                await _eventually(lambda: old_binding[0]._scheduler.has_pending_messages)
                 self.assertEqual(model.calls, [])
                 self.desktop.main = ()
                 await _eventually(lambda: self.runner.sent[_SENDERS[0]] == ["挂断前补充。"])
@@ -1212,10 +1350,10 @@ class IncomingCallTests(unittest.IsolatedAsyncioTestCase):
                 _talk(self.devices[1])
                 await asyncio.wait_for(new.called.wait(), 2)
                 self._text(0, "新通补充")
-                await _eventually(lambda: bool(history.pending_inbound(session, "feishu-private")))
+                await _eventually(lambda: old_binding[0]._scheduler.has_pending_messages)
                 route, old_stop = old_binding
                 route.call_input(old_stop, "过期转写", False)
-                route.call_ended(old_stop)
+                route.call_ended(old_stop, ended_at=late)
                 old_stop()
                 await asyncio.sleep(0)
                 self.assertEqual(model.calls, [("挂断前补充",)])
@@ -1224,6 +1362,9 @@ class IncomingCallTests(unittest.IsolatedAsyncioTestCase):
                 await _eventually(lambda: any(self.devices[1].pull(32)))
                 await _eventually(lambda: self.runner.sent[_SENDERS[0]] == ["挂断前补充。", "新通转写。"])
                 self.assertEqual(model.calls[-1], ("挂断前补充", "新通补充", "新通转写"))
+                self.assertEqual([row.message for row in history.tail(session, 4)],
+                                 [Message("user", "新通补充"), late_message, Message("user", "新通转写"),
+                                  Message("assistant", "新通转写。")])
                 self.assertEqual(dict(self.runner.posts), {_SENDERS[0]: [{"zh_cn": {"content": [[
                     {"tag": "text", "text": "新通转写", "style": ["bold"]}
                 ]]}}]})
@@ -1245,10 +1386,10 @@ class IncomingCallTests(unittest.IsolatedAsyncioTestCase):
                 await self._ring_connect(sender, 1, 1)
                 _talk(self.devices[0])
                 session = _session(sender)
-                await _eventually(lambda: bool(history.outcomes(session)))
-                self.assertEqual([outcome.delivery_status for outcome in history.outcomes(session)],
+                await _eventually(lambda: bool(_reply_deliveries(history, session)))
+                self.assertEqual([outcome.delivery_status for outcome in _reply_deliveries(history, session)],
                                  [DeliveryStatus.ZERO])
-                self.assertEqual([row.message.content for row in history.tail(session, 10)], ["测试语音1"])
+                self.assertEqual([message.content for message in _conversation_lines(history, session)], ["测试语音1"])
                 self.assertEqual(tts.calls, [])
                 self.assertEqual(self.runner.sent[_SENDERS[0]], [])
 
@@ -1279,7 +1420,7 @@ class IncomingCallTests(unittest.IsolatedAsyncioTestCase):
             self.assertFalse(resume.is_set())
             self.assertEqual(tts.calls, [])
             session = _session(sender)
-            self.assertEqual(history.outcomes(session)[0].delivery_status, DeliveryStatus.FULL)
+            self.assertEqual(_reply_deliveries(history, session)[0].delivery_status, DeliveryStatus.FULL)
 
             self.desktop.main = ()
             self.desktop.error = False
@@ -1294,7 +1435,7 @@ class IncomingCallTests(unittest.IsolatedAsyncioTestCase):
             _talk(self.devices[1])
             await _eventually(lambda: len(tts.calls) == 1)
             await _eventually(lambda: any(self.devices[1].pull(32)))
-            await _eventually(lambda: len(history.outcomes(session)) == 2)
+            await _eventually(lambda: len(_reply_deliveries(history, session)) == 2)
             self.assertEqual(tts.calls, [("测试语音2。", 16000)])
             self.assertEqual(model.calls, [("文字请求",), ("文字请求", "测试语音2")])
             self.assertEqual(self.runner.sent[_SENDERS[0]], ["文字请求。"])
@@ -1315,7 +1456,7 @@ class IncomingCallTests(unittest.IsolatedAsyncioTestCase):
             _talk(self.devices[0])
             await asyncio.wait_for(asr.called.wait(), 2)
             self._text(0, "挂断前补充")
-            await _eventually(lambda: bool(history.pending_inbound(_session(sender), "feishu-private")))
+            await _eventually(lambda: binding._peer._scheduler.has_pending_messages)
             self.assertEqual(model.calls, [])
             self.desktop.main = ()
             asr.release.set()
@@ -1365,8 +1506,8 @@ class IncomingCallTests(unittest.IsolatedAsyncioTestCase):
                 if capped:
                     await asyncio.wait_for(asr.finished.wait(), 2)
                 self._text(0, "飞书补充")
-                await _eventually(lambda: bool(history.pending_inbound(session, "feishu-private")))
-                self.assertTrue(schedulers.submit_internal(session, InternalInput(Message("user", "内部结果"))))
+                await _eventually(lambda: scheduler.has_pending_messages)
+                self.assertTrue(schedulers.submit_internal(session, _internal_result()))
                 self.assertTrue(scheduler._input_active)
                 self.assertEqual(model.calls, [])
                 device.check_active()
@@ -1379,7 +1520,7 @@ class IncomingCallTests(unittest.IsolatedAsyncioTestCase):
                 self.assertTrue(device.closed)
                 self.assertTrue(self.desktop.window_exists(window))
                 self.assertFalse(scheduler._input_active)
-                self.assertFalse(history.pending_inbound(session, "feishu-private"))
+                self.assertFalse(scheduler.has_pending_messages)
                 self.assertEqual(model.calls, [("飞书补充", "内部结果")])
                 self.assertEqual(len(asr.files), int(capped))
                 self.assertEqual(tts.calls, [])
@@ -1419,8 +1560,8 @@ class IncomingCallTests(unittest.IsolatedAsyncioTestCase):
                     old.frame(False, 2)  # 旧 VAD 停在会结束话轮的这批数据上。
                     await asyncio.wait_for(entered.wait(), 1)
                     self._text(0, "飞书补充")
-                    await _eventually(lambda: bool(history.pending_inbound(session, "feishu-private")))
-                    self.assertTrue(schedulers.submit_internal(session, InternalInput(Message("user", "内部结果"))))
+                    await _eventually(lambda: scheduler.has_pending_messages)
+                    self.assertTrue(schedulers.submit_internal(session, _internal_result()))
                     self.assertEqual(model.calls, [])
                     old.check_active()
 
@@ -1458,14 +1599,15 @@ class IncomingCallTests(unittest.IsolatedAsyncioTestCase):
             device = self.devices[0]
             device.frame(True, 4)  # 转写已完成/超时，但没有后续帧，也就没有可信静默。
             await asyncio.wait_for(asr.finished.wait(), 2)
-            self._text(0, "飞书补充")
-            await _eventually(lambda: bool(history.pending_inbound(session, "feishu-private")))
             schedulers = agents.call_args.kwargs["schedulers"]
-            self.assertTrue(schedulers.submit_internal(session, InternalInput(Message("user", "内部结果"))))
+            scheduler = schedulers.get_or_create(session)
+            self._text(0, "飞书补充")
+            await _eventually(lambda: scheduler.has_pending_messages)
+            self.assertTrue(schedulers.submit_internal(session, _internal_result()))
             self.assertTrue(schedulers.get_or_create(session)._input_active)
             self.assertEqual(model.calls, [])
             self.assertEqual(tts.calls, [])
-            self.assertEqual(history.tail(session, 10), [])
+            self.assertEqual(_conversation_lines(history, session), ())
             if end == "device_stop":
                 device.fault = True
             elif end == "hangup":
@@ -1476,4 +1618,4 @@ class IncomingCallTests(unittest.IsolatedAsyncioTestCase):
             expected = ("飞书补充", "内部结果") + (("封顶转写",) if end == "silence" else ())
             await _eventually(lambda: self.runner.sent[_SENDERS[0]] == [expected[-1] + "。"])
             self.assertEqual(model.calls, [expected])
-            self.assertFalse(history.pending_inbound(session, "feishu-private"))
+            self.assertFalse(scheduler.has_pending_messages)

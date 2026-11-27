@@ -6,7 +6,7 @@ import unittest
 from unittest.mock import patch
 import wave
 
-from agent_companion.protocol import DeliveryStatus, Message
+from agent_companion.protocol import DeliveryStatus, Message, MessageDelivery
 from agent_companion.session_scheduler import SessionScheduler
 from agent_companion.speech.asr import AsrError
 from agent_companion.speech.vad import INPUT_FRAMES, INPUT_RATE, SAMPLE_BYTES, silence_frames
@@ -508,11 +508,11 @@ class SegmentedVoiceTest(unittest.IsolatedAsyncioTestCase):
                 batches = []
                 scheduler.bind(batches.append)
                 scheduler.call_started(voice.stop_io)
-                message = Message("user", "暂存的会话输入")
+                pending = MessageDelivery(Message("user", "暂存的会话输入"), "trigger")
 
                 def on_input(text, active):
-                    items = (Message("user", text),) if text else ()
-                    scheduler.call_input(voice.stop_io, items, input_active=active)
+                    deliveries = (MessageDelivery(Message("user", text), "trigger"),) if text else ()
+                    scheduler.call_input(voice.stop_io, deliveries, input_active=active)
 
                 try:
                     async with voice.connected(device, on_input):
@@ -523,7 +523,7 @@ class SegmentedVoiceTest(unittest.IsolatedAsyncioTestCase):
                         frames.push(True, _LONG)
                         frames.short_pause()
                         await _until(lambda: len(asr.pcm) == 2)
-                        scheduler.session_input((message,))
+                        scheduler.session_input((pending,))
                         frames.push(True, gap=True)
                         frames.end_turn()
                         await asyncio.wait_for(cancelled.wait(), 1)
@@ -536,7 +536,8 @@ class SegmentedVoiceTest(unittest.IsolatedAsyncioTestCase):
                             self.assertEqual(batches, [])
                             frames.end_turn()
                             await _until(lambda: not voice._input_active)
-                        expected = (message, Message("user", "下一轮")) if another_turn else (message,)
+                        next_turn = MessageDelivery(Message("user", "下一轮"), "trigger")
+                        expected = (pending, next_turn) if another_turn else (pending,)
                         self.assertEqual(batches, [expected])
                 finally:
                     release.set()

@@ -14,9 +14,10 @@ import httpx
 from agent_companion.__main__ import main
 from agent_companion.app import prepare_private_feishu, run_feishu, running_agent
 from agent_companion.config import ConfigError, FeishuSettings, RuntimeSettings, Settings
-from agent_companion.models.deepseek import DeepSeek
+from agent_companion.models.deepseek import DeepSeek, build_request
 from agent_companion.models.openai_responses import OpenAIResponses
-from agent_companion.protocol import DeliveryStatus, InputUsage, Message, ModelError, Receipt, TextDelta, ToolCall, ToolReady
+from agent_companion.protocol import (DeliveryStatus, InputUsage, Message, MessageDelivery, ModelError, Receipt,
+                                      TextDelta, ToolCall, ToolReady)
 from agent_companion.runtime.context import _SUMMARIZE
 from agent_companion.runtime.instructions import MAX_ROLE_BYTES, load_roles
 from agent_companion.runtime.subtasks import DELEGATE_TOOL_NAME
@@ -162,7 +163,7 @@ class RoleFileTests(_RoleFiles, unittest.TestCase):
 
 class RoleRuntimeTests(_RoleFiles, unittest.IsolatedAsyncioTestCase):
     async def turn(self, runtime, tree, text):
-        runtime.submit_batch([Message("user", text)])
+        runtime.submit_messages([MessageDelivery(Message("user", text), "trigger")])
         await asyncio.wait_for(tree.wait_idle(), 3)
         self.assertIsNone(runtime.last_failure)
 
@@ -234,14 +235,29 @@ class RoleRuntimeTests(_RoleFiles, unittest.IsolatedAsyncioTestCase):
             self.assertIn("research：收集证据", spec["description"])
             self.assertIn("review：检查缺遗漏", spec["description"])
 
-    async def test_main_only_runs_without_delegation_or_legacy_prompt(self):
+    async def test_main_only_exposes_configured_delegation_without_empty_enum_or_legacy_prompt(self):
         self.write_role("main", "", tools=(DELEGATE_TOOL_NAME,))
-        model = Model()
+
+        def respond(messages):
+            if messages[-1].content == "运行":
+                return [_call("create", agent="missing", prompt="查找"),
+                        _call("reuse", agent_id="missing", prompt="复用")]
+            return [TextDelta("完成")]
+
+        model = Model(respond)
         with closing(History(":memory:")) as history:
             async with running_agent(Settings(), history, model, Sink(), session_id="main",
-                                     roles=load_roles(self.workdir)) as (runtime, tree):
+                                      roles=load_roles(self.workdir)) as (runtime, tree):
                 await self.turn(runtime, tree, "运行")
-        self.assertEqual(model.requests, [((Message("user", "运行"),), (), "")])
+            results = {call.id: json.loads(call.result) for call in tool_calls(row.message for row in history.tail("main", 10))}
+        self.assertEqual(results, {"create": {"error": "unknown_agent_role"}, "reuse": {"error": "unknown_child_agent"}})
+        messages, tools, instructions = model.requests[0]
+        self.assertEqual((messages, instructions), ((Message("user", "运行"),), ""))
+        (projected,) = build_request(messages, tools, thinking=False)["tools"]
+        spec = projected["function"]
+        self.assertEqual(spec["name"], DELEGATE_TOOL_NAME)
+        self.assertNotIn("enum", spec["parameters"]["properties"]["agent"])
+        self.assertIn("当前没有可用于创建子 Agent 的角色", spec["description"])
 
     async def test_role_changes_and_missing_file_take_effect_after_restart(self):
         self.write_role("main", "主提示", tools=(DELEGATE_TOOL_NAME,))
@@ -257,10 +273,6 @@ class RoleRuntimeTests(_RoleFiles, unittest.IsolatedAsyncioTestCase):
                 case "继续":
                     return [_call("reuse", agent_id=agent_id, prompt="继续审阅")]
             return [TextDelta("完成")]
-
-        def assert_hidden(model):
-            self.assertTrue(all(instructions == "主提示" and not tools
-                                for _, tools, instructions in model.requests))
 
         for phase in ("create", "change", "remove", "without_permission", "restore"):
             with self.subTest(phase=phase):
@@ -289,19 +301,28 @@ class RoleRuntimeTests(_RoleFiles, unittest.IsolatedAsyncioTestCase):
                         self.assertEqual(body, {"error": expected})
                         self.assertEqual(history._db.execute("SELECT count(*) FROM delegations").fetchone()[0],
                                          before)
-                        assert_hidden(model)
+                        expected_tools = (DELEGATE_TOOL_NAME,) if phase == "remove" else ()
+                        for _, tools, instructions in model.requests:
+                            self.assertEqual(instructions, "主提示")
+                            self.assertEqual(tuple(tool.name for tool in tools), expected_tools)
                     else:
                         self.assertEqual(body["agent_id"], agent_id)
                         expected = "修改后的提示" if phase == "change" else "恢复后的提示"
                         (messages, tools, _), = [request for request in model.requests if request[2] == expected]
                         self.assertIn("历史输入", [message.text for message in messages])
                         self.assertEqual([tool.name for tool in tools], ["cancel_timer"] if phase == "change" else [])
-                    stored = next(entry.message for entry in history.tail(child_session_id, 30)
+                    stored = next(entry for entry in history.tail(child_session_id, 30)
                                   if entry.message.text == "历史输入")
-                    self.assertEqual(stored.source.kind, "delegation")
-                    delegation = history.delegation(stored.source.delegation_id)
-                    self.assertEqual((stored.source.agent_id, delegation.agent_id),
-                                     (delegation.parent_agent_id, agent_id))
+                    self.assertEqual(stored.message.source.kind, "delegation")
+                    source, = history._db.execute("SELECT source FROM messages WHERE message_id = ?",
+                                                  (stored.message_id,)).fetchone()
+                    self.assertEqual(json.loads(source), {"kind": "delegation"})
+                    delegation_id, = history._db.execute("SELECT delegation_id FROM delegations WHERE agent_id = ?"
+                                                         " ORDER BY accepted_at LIMIT 1", (agent_id,)).fetchone()
+                    delegation = history.delegation(delegation_id)
+                    self.assertEqual((delegation.parent_agent_id, delegation.status,
+                                      history.agent_run(delegation.run_id).agent_id),
+                                     (history.agent(agent_id).parent_agent_id, "consumed", agent_id))
 
     async def test_normal_and_compaction_requests_use_same_config_snapshot(self):
         def respond(messages):

@@ -8,7 +8,7 @@ import logging
 from typing import Any
 
 from ..config import RuntimeSettings
-from ..protocol import AgentReply, Channel, DelegationTask, InternalInput, Model, ToolSpec
+from ..protocol import AgentReply, Channel, DelegatedInput, Message, MessageDelivery, Model, ToolSpec
 from ..session_scheduler import SessionScheduler, SessionSchedulers
 from ..storage.sqlite import Agent, History
 from ..workspace import Workspace
@@ -76,26 +76,31 @@ class AgentTree:
         self._bash = Bash()  # 主、子 Agent 共用关停状态，不共用执行锁。
         self._sqlite = SQLiteAccess(retry_locks=retry_sqlite_locks, stopped=lambda: self._closed)
         descriptions = {name: role.description for name, role in sorted(self._roles.items()) if name != "main"}
-        # 没有可选角色时不展示工具，但仍为白名单内的显式复用返回准确错误。
         self._delegate_tool = self._make_delegate_tool(descriptions)
 
     def _make_delegate_tool(self, descriptions: dict[str, str]) -> Tool:
-        choices = "；".join(f"{role}：{description}" for role, description in descriptions.items())
+        role_property: dict[str, Any] = {"type": "string", "description": "创建指定角色"}
+        if descriptions:
+            choices = "；".join(f"{role}：{description}" for role, description in descriptions.items())
+            role_property["enum"] = list(descriptions)
+            availability = f"创建请选择角色：{choices}。"
+        else:
+            availability = "当前没有可用于创建子 Agent 的角色。"
         return Tool(ToolSpec(
             DELEGATE_TOOL_NAME,
             "将工作异步委派给直属子 Agent。工具立即返回受理状态和 agent_id，回复随后作为内部输入送达。"
-            f"创建请选择角色：{choices}。复用请提供 agent_id。",
+            f"{availability}复用请提供 agent_id。",
             {
                 "type": "object",
                 "properties": {
                     "prompt": {"type": "string", "description": "任务与必要上下文"},
-                    "agent": {"type": "string", "enum": list(descriptions), "description": "创建指定角色"},
+                    "agent": role_property,
                     "agent_id": {"type": "string", "description": "复用已存在的直属子 Agent"},
                 },
                 "required": ["prompt"],
                 "additionalProperties": False,
             },
-        ), self._delegate, advertised=bool(descriptions))
+        ), self._delegate)
 
     def bind_root(self, channel: Channel, owner: object) -> Runtime:
         return self._bind(self._root, channel=channel, owner=owner).runtime
@@ -126,7 +131,7 @@ class AgentTree:
                                  "agent=%s run=%s parent=%s",
                                  notice.agent_id, notice.run_id, parent_id)
                     return False
-                return parent.scheduler.submit_internal(InternalInput(notice))
+                return parent.scheduler.submit_internal(MessageDelivery(notice.to_history_message(), "trigger"))
 
             model = self._models[agent.role_id]
             runtime = Runtime(agent.session_id, self._history, model.model, channel, tools=tools,
@@ -135,7 +140,7 @@ class AgentTree:
                               retry_sqlite_locks=self._retry_sqlite_locks, compactions=self._compactions,
                               workspace=self._workspace, agent=agent,
                               reply_to_parent=reply_to_parent if parent_id is not None else None)
-            revoke = scheduler.bind(runtime.submit_inputs, owner=owner,
+            revoke = scheduler.bind(runtime.submit_messages, owner=owner,
                                     trigger=runtime.trigger_run if parent_id is None else None,
                                     on_revoke=timers.close if timers is not None else None)
             binding = self._bindings[agent.agent_id] = _Binding(runtime, scheduler, owner, revoke)
@@ -148,8 +153,6 @@ class AgentTree:
     async def _delegate(self, args: dict[str, Any], context: ToolContext) -> str:
         if self._closed:
             return '{"error":"delegation_closed"}'
-        if not (context.has_user_input or context.has_agent_input):
-            return '{"error":"delegation_requires_user_or_agent_input"}'
         parent = self._bindings.get(context.agent_id) if context.agent_id is not None else None
         if parent is None or parent.runtime.session_id != context.session_id:
             return '{"error":"unknown_delegating_agent"}'
@@ -195,7 +198,8 @@ class AgentTree:
             binding = self._bindings.get(child.agent_id) or self._bind(child)
             if binding.runtime.input_retry_forbidden:
                 raise RuntimeError("agent input cannot be safely retried")
-            binding.scheduler.session_input((InternalInput(DelegationTask(delegation.delegation_id, prompt)),))
+            binding.scheduler.session_input((MessageDelivery(
+                Message("user", prompt), "trigger", delegation=DelegatedInput(delegation.delegation_id)),))
         except Exception as exc:
             _LOG.warning("delegation handoff failed; delegation=%s error_type=%s",
                          delegation.delegation_id, type(exc).__name__)

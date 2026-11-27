@@ -8,18 +8,18 @@ from unittest.mock import patch
 import httpx
 
 from agent_companion.config import RuntimeSettings
+from agent_companion.images import save_image
 from agent_companion.models.deepseek import MODEL_NAME, DeepSeek, _replay_key, build_request, parse_stream
-from agent_companion.protocol import (DeliveryStatus, Image, InputUsage, Message, ModelClosing, ModelError,
+from agent_companion.protocol import (DeliveryStatus, Image, InputUsage, Message, MessageDelivery, ModelClosing, ModelError,
                                       Receipt, PrivateData, Reasoning, AssistantPartsReady, Text, TextDelta, ToolCall, ToolReady, ToolSpec)
 from agent_companion.runtime.compaction import Compactions, Prefix
 from agent_companion.runtime.context import _SUMMARIZE
 from agent_companion.runtime.engine import Runtime
 from agent_companion.runtime.tools import Tool, Tools
 from agent_companion.storage.sqlite import History
-from test_message_support import assistant_message, reasoning_parts
+from test_message_support import PNG_BYTES, PNG_URL, assistant_message, image_workspace, reasoning_parts
 
 
-SAMPLE_IMAGE = Image("data:image/png;base64,iVBORw0KGgo=")
 SPEC = ToolSpec("test", "模拟工具", {"type": "object", "properties": {"size": {"type": "integer"}}})
 
 
@@ -117,7 +117,7 @@ class DeepSeekTest(unittest.IsolatedAsyncioTestCase):
                                   settings=RuntimeSettings(model_timeout=.3))
                 shutdown = None
                 try:
-                    runtime.submit_batch([Message("user", "one")])
+                    runtime.submit_messages([MessageDelivery(Message("user", "one"), "trigger")])
                     await asyncio.wait_for(reading.wait(), 2)
                     deadline, = deadlines
                     cutoff = deadline.when()
@@ -182,7 +182,7 @@ class DeepSeekTest(unittest.IsolatedAsyncioTestCase):
                         tools = Tools([Tool(SPEC, tool)]) if with_tools else Tools()
                         runtime = Runtime("main", history, DeepSeek(client), Voice(), thinking=thinking, tools=tools)
                         try:
-                            runtime.submit_batch((Message("user", "现有输入"),))
+                            runtime.submit_messages((MessageDelivery(Message("user", "现有输入"), "trigger"),))
                             await asyncio.wait_for(runtime.wait_idle(), 2)
                             self.assertIsNone(runtime.last_failure)
                             self.assertEqual(len(requests), 2)
@@ -245,8 +245,8 @@ class DeepSeekTest(unittest.IsolatedAsyncioTestCase):
                 runtime = Runtime("main", history, DeepSeek(client), Voice(), thinking=True,
                                   tools=Tools([Tool(SPEC, tool)]), settings=RuntimeSettings(model_timeout=.25))
                 try:
-                    runtime.submit_batch([Message("user", "one")])
-                    runtime.submit_batch([Message("user", "two")])
+                    runtime.submit_messages([MessageDelivery(Message("user", "one"), "trigger")])
+                    runtime.submit_messages([MessageDelivery(Message("user", "two"), "trigger")])
                     await asyncio.wait_for(next_reading.wait(), 2)
                     self.assertFalse(closed_wire.is_set())
                     _, next_deadline = deadlines
@@ -318,7 +318,7 @@ class DeepSeekTest(unittest.IsolatedAsyncioTestCase):
                                           tools=Tools([Tool(SPEC, tool)]), settings=RuntimeSettings(model_timeout=.15))
                         try:
                             with self.assertLogs("agent_companion.runtime.engine", level="WARNING") as logs:
-                                runtime.submit_batch([Message("user", "internal request")])
+                                runtime.submit_messages([MessageDelivery(Message("user", "internal request"), "trigger")])
                                 await asyncio.wait_for(close_started.wait(), 2)
                                 self.assertTrue(deadlines[0].cancelled())
                                 await asyncio.wait_for(runtime.wait_idle(), 2)
@@ -365,7 +365,7 @@ class DeepSeekTest(unittest.IsolatedAsyncioTestCase):
                 async with httpx.AsyncClient(transport=transport) as client:
                     runtime = Runtime("main", history, DeepSeek(client), None, thinking=True)
                     try:
-                        runtime.submit_batch([Message("user", "internal request")])
+                        runtime.submit_messages([MessageDelivery(Message("user", "internal request"), "trigger")])
                         await asyncio.wait_for(runtime.wait_idle(), 2)
                         status = "model_cancelled" if cancelled else "model_failed"
                         self.assertEqual(runtime.last_failure, status)
@@ -422,7 +422,7 @@ class DeepSeekTest(unittest.IsolatedAsyncioTestCase):
             async with httpx.AsyncClient(transport=httpx.MockTransport(endpoint)) as client:
                 runtime = Runtime("main", history, DeepSeek(client), Voice(), tools=Tools([Tool(SPEC, tool)]))
                 try:
-                    runtime.submit_batch([Message("user", "one")])
+                    runtime.submit_messages([MessageDelivery(Message("user", "one"), "trigger")])
                     run_ids = set()
                     for index, expected in enumerate(("step 0", "step 1", "final answer")):
                         await asyncio.wait_for(closing_wire[index].wait(), 2)
@@ -534,7 +534,7 @@ class DeepSeekTest(unittest.IsolatedAsyncioTestCase):
                 runtime = Runtime("diagnostics", history, DeepSeek(client), None)
                 with self.assertLogs("agent_companion.runtime.engine", level="WARNING") as logs:
                     for _ in range(2):
-                        runtime.submit_batch((Message("user", "synthetic user content"),))
+                        runtime.submit_messages((MessageDelivery(Message("user", "synthetic user content"), "trigger"),))
                         await runtime.wait_idle()
                         self.assertEqual(runtime.last_failure, "model_failed")
                 self.assertEqual([row.model_error for row in history.outcomes("diagnostics")], ["http_401", "http_429"])
@@ -546,7 +546,8 @@ class DeepSeekTest(unittest.IsolatedAsyncioTestCase):
 
     async def test_actual_prompt_usage_triggers_summary_with_original_image(self):
         requests = []
-        old = Message("user", (Text("历史图文"), Image("data:image/png;base64," + "A" * 6000)))
+        workspace = image_workspace(self)
+        old = Message("user", (Text("历史图文"), save_image(workspace, PNG_BYTES)))
         settings = RuntimeSettings(context_budget=300, tail_budget=60)
 
         def endpoint(request):
@@ -565,21 +566,21 @@ class DeepSeekTest(unittest.IsolatedAsyncioTestCase):
         with closing(History(":memory:")) as history:
             history.append("child", [old])
             async with httpx.AsyncClient(transport=httpx.MockTransport(endpoint)) as client:
-                runtime = Runtime("child", history, DeepSeek(client), None, settings=settings)
+                runtime = Runtime("child", history, DeepSeek(client), None, settings=settings, workspace=workspace)
                 try:
-                    runtime.submit_batch((Message("user", "首次请求"),))
+                    runtime.submit_messages((MessageDelivery(Message("user", "首次请求"), "trigger"),))
                     await runtime.wait_idle()
                     self.assertIsNone(runtime.last_failure)
                     self.assertIsNone(history.summary("child"))
                     self.assertEqual(history.last_input_tokens("child"), 300)
-                    runtime.submit_batch((Message("user", "新的文字"),))
+                    runtime.submit_messages((MessageDelivery(Message("user", "新的文字"), "trigger"),))
                     await runtime.wait_idle()
                     self.assertIsNone(runtime.last_failure)
                     task = runtime._compactions._generating
                     if task is not None:
                         await asyncio.wait_for(asyncio.shield(task), 2)
                     self.assertIsNone(history.summary("child"))
-                    runtime.submit_batch((Message("user", "应用摘要"),))
+                    runtime.submit_messages((MessageDelivery(Message("user", "应用摘要"), "trigger"),))
                     await runtime.wait_idle()
                     self.assertIsNone(runtime.last_failure)
                 finally:
@@ -588,6 +589,7 @@ class DeepSeekTest(unittest.IsolatedAsyncioTestCase):
             compressed = next(request["messages"] for request in requests[1:3]
                               if request["messages"][-1]["content"] == _SUMMARIZE.content)
             self.assertEqual(compressed[0], requests[0]["messages"][0])
+            self.assertEqual(compressed[0]["content"][1]["image_url"]["url"], PNG_URL)
             self.assertNotIn("新的文字", repr(compressed))
             self.assertNotIn("image_url", repr(requests[-1]))
             self.assertIn("新的文字", repr(requests[-1]))
@@ -662,10 +664,12 @@ class DeepSeekTest(unittest.IsolatedAsyncioTestCase):
         history = History(":memory:")
         self.addCleanup(history.close)
         async with httpx.AsyncClient(transport=httpx.MockTransport(endpoint)) as client:
+            workspace = image_workspace(self)
+            image = save_image(workspace, PNG_BYTES)
             runtime = Runtime("main", history, DeepSeek(client), Channel(), thinking=True,
-                              tools=Tools([Tool(SPEC, tool)]))
+                              tools=Tools([Tool(SPEC, tool)]), workspace=workspace)
             self.addAsyncCleanup(runtime.close)
-            runtime.submit_batch([Message("user", (Text("前文"), SAMPLE_IMAGE, Text("后文")))])
+            runtime.submit_messages([MessageDelivery(Message("user", (Text("前文"), image, Text("后文"))), "trigger")])
             await asyncio.wait_for(runtime.wait_idle(), 2)
             self.assertIsNone(runtime.last_failure)
         self.assertEqual(handler_calls, [({"size": 2}, "call-a")])
@@ -673,7 +677,7 @@ class DeepSeekTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(pending[0]["model"], "deepseek-flash")
         self.assertEqual(pending[0]["thinking"], {"type": "enabled"})
         self.assertEqual(pending[0]["messages"][0]["content"], [
-            {"type": "text", "text": "前文"}, {"type": "image_url", "image_url": {"url": SAMPLE_IMAGE.url}},
+            {"type": "text", "text": "前文"}, {"type": "image_url", "image_url": {"url": PNG_URL}},
             {"type": "text", "text": "后文"},
         ])
         assistant, result = pending[1]["messages"][-2:]
@@ -767,7 +771,8 @@ class DeepSeekTest(unittest.IsolatedAsyncioTestCase):
                     for tools in (None, Tools([Tool(SPEC, unused_tool)])):
                         runtime = Runtime("main", history, model, None, tools=tools, thinking=True)
                         try:
-                            runtime.submit_batch([Message("user", "next prompt" if tools else "first prompt")])
+                            message = Message("user", "next prompt" if tools else "first prompt")
+                            runtime.submit_messages((MessageDelivery(message, "trigger"),))
                             await asyncio.wait_for(runtime.wait_idle(), 2)
                             self.assertIsNone(runtime.last_failure)
                         finally:
@@ -811,7 +816,7 @@ class DeepSeekTest(unittest.IsolatedAsyncioTestCase):
                 runtime = Runtime("main", history, DeepSeek(client), None, thinking=True,
                                   tools=Tools([Tool(SPEC, tool)]))
                 try:
-                    runtime.submit_batch([Message("user", "current input")])
+                    runtime.submit_messages([MessageDelivery(Message("user", "current input"), "trigger")])
                     await asyncio.wait_for(runtime.wait_idle(), 2)
                     self.assertEqual(runtime.last_failure, "model_failed")
                 finally:

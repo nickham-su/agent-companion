@@ -7,15 +7,18 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
+from agent_companion import images
 from agent_companion.config import RuntimeSettings, load_settings
+from agent_companion.images import UNAVAILABLE_IMAGE, image_request_bytes, save_image
 from agent_companion.models.deepseek import MODEL_NAME, DeepSeek, _replay_key, build_request
-from agent_companion.protocol import (DeliveryStatus, Image, InputUsage, Message, ModelError, Receipt, PrivateData, Reasoning, AssistantPartsReady, Text, TextDelta,
+from agent_companion.protocol import (AssistantPartsReady, DeliveryStatus, Image, InputUsage, Message, MessageDelivery,
+                                      ModelError, PrivateData, Reasoning, Receipt, Text, TextDelta,
                                       ToolCall, ToolReady, ToolSpec)
 from agent_companion.runtime.context import _SUMMARIZE
 from agent_companion.runtime.engine import Runtime
 from agent_companion.runtime.tools import Tool, Tools
 from agent_companion.storage.sqlite import DatabaseFormatError, FeishuBindingError, History, ReplyOutcome, Summary
-from test_message_support import assistant_message, reasoning_parts
+from test_message_support import PNG_BYTES, PNG_URL, assistant_message, image_workspace, reasoning_parts
 
 
 SPEC = ToolSpec("test", "test tool", {"type": "object"})
@@ -31,7 +34,7 @@ class HistoryTest(unittest.TestCase):
         with tempfile.TemporaryDirectory(dir=Path.cwd()) as folder:
             path = Path(folder) / "test.sqlite"
             with closing(History(path)) as db:
-                x, = db.append("main", [Message("user", (Text("two words"), Image("data:image/png;base64,TOKEN")))])
+                x, = db.append("main", [Message("user", (Text("two words"), Image(".agent/images/" + "a" * 32)))])
                 y, = db.append("child", [Message("user", "two words child")])
                 z, = db.append("main", [assistant_message("words ending", reasoning=_replay("INTERNAL"))])
                 self.assertEqual([x, y, z], sorted({x, y, z}))
@@ -198,7 +201,7 @@ class Sink:
 
 class ProjectionTest(unittest.IsolatedAsyncioTestCase):
     async def run_turn(self, runtime, content):
-        runtime.submit_batch([Message("user", content)])
+        runtime.submit_messages([MessageDelivery(Message("user", content), "trigger")])
         await asyncio.wait_for(runtime.wait_idle(), 2)
         self.assertIsNone(runtime.last_failure)
 
@@ -255,8 +258,7 @@ class ProjectionTest(unittest.IsolatedAsyncioTestCase):
         with closing(History(":memory:")) as history:
             history.append("main", [Message("user", "old history" * 30), Message("assistant", "old reply")])
             history.finalize_reply(ReplyOutcome("prior", "main", "prior", "complete", input_tokens=240), [])
-            history.record_inbound("main", "test", 1, [("new", Message("user", "new input"))])
-            batch, = history.pending_inbound("main", "test")
+            batch = (MessageDelivery(Message("user", "new input"), "trigger"),)
             finalize = history.finalize_reply
 
             def commit(outcome, rows):
@@ -270,7 +272,7 @@ class ProjectionTest(unittest.IsolatedAsyncioTestCase):
 
                 def attempt(*args, **kwargs):
                     attempts.append(name)
-                    self.assertEqual(history.pending_inbound("main", "test"), [])
+                    self.assertFalse(runtime.has_pending_messages)
                     if faults[name]:
                         faults[name] -= 1
                         raise sqlite3.OperationalError("database is locked")
@@ -284,7 +286,7 @@ class ProjectionTest(unittest.IsolatedAsyncioTestCase):
                                   settings=RuntimeSettings(context_budget=240, tail_budget=65),
                                   tools=Tools([Tool(SPEC, tool)]))
                 try:
-                    runtime.submit_persisted_batch(batch)
+                    runtime.submit_messages(batch)
                     await asyncio.wait_for(runtime.wait_idle(), 3)
                     await self.finish_summary(runtime)
                     self.assertIsNone(runtime.last_failure)
@@ -326,9 +328,10 @@ class ProjectionTest(unittest.IsolatedAsyncioTestCase):
             last_old_id = history.append("main", older)[-1]
             runtime = Runtime("main", history, model, Sink(), settings=settings, tools=Tools([Tool(SPEC, tool)]))
             try:
-                runtime.submit_batch([Message("user", "starting request")])
+                runtime.submit_messages([MessageDelivery(Message("user", "starting request"), "trigger")])
                 await asyncio.wait_for(reached.wait(), 2)
-                runtime.submit_batch([Message("user", "new intake one"), Message("user", "new intake two")])
+                runtime.submit_messages((MessageDelivery(Message("user", "new intake one"), "trigger"),
+                                         MessageDelivery(Message("user", "new intake two"), "trigger")))
                 release.set()
                 await asyncio.wait_for(runtime.wait_idle(), 2)
                 self.assertIsNone(runtime.last_failure)
@@ -366,8 +369,8 @@ class ProjectionTest(unittest.IsolatedAsyncioTestCase):
         with closing(History(":memory:")) as history:
             runtime = Runtime("main", history, model, Sink(), settings=settings, tools=Tools([Tool(SPEC, tool)]))
             try:
-                runtime.submit_batch([Message("user", "start")])
-                runtime.submit_batch([Message("user", "queued")])
+                runtime.submit_messages([MessageDelivery(Message("user", "start"), "trigger")])
+                runtime.submit_messages([MessageDelivery(Message("user", "queued"), "trigger")])
                 await asyncio.wait_for(runtime.wait_idle(), 2)
                 self.assertIsNone(runtime.last_failure)
                 self.assertEqual(len(model.requests), 2)
@@ -412,7 +415,7 @@ class ProjectionTest(unittest.IsolatedAsyncioTestCase):
             try:
                 with self.assertLogs("agent_companion.runtime.compaction", level="WARNING") as logs:
                     for new in ("第一个输入", "第二个输入", "第三个输入"):
-                        runtime.submit_batch([Message("user", new)])
+                        runtime.submit_messages([MessageDelivery(Message("user", new), "trigger")])
                         await asyncio.wait_for(runtime.wait_idle(), 2)
                         self.assertIsNone(runtime.last_failure)
                 self.assertEqual(len(logs.records), 1)
@@ -465,7 +468,7 @@ class ProjectionTest(unittest.IsolatedAsyncioTestCase):
                                   tools=Tools([Tool(SPEC, tool)]))
 
                 async def turn(text):
-                    runtime.submit_batch([Message("user", text)])
+                    runtime.submit_messages([MessageDelivery(Message("user", text), "trigger")])
                     await asyncio.wait_for(runtime.wait_idle(), 2)
                     self.assertIsNone(runtime.last_failure)
 
@@ -542,19 +545,39 @@ class ProjectionTest(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(history.summary("main"), saved)
             self.assertEqual(history.read_after("main")[0].message, old)
 
+    async def test_normal_request_prioritizes_current_images_without_reordering_history(self):
+        workspace = image_workspace(self)
+        old_picture, current_picture = (save_image(workspace, PNG_BYTES) for _ in range(2))
+        old = Message("user", (Text("旧图前"), old_picture, Text("旧图后")))
+        current = (Text("本轮图前"), current_picture, Text("本轮图后"))
+        model = CapturingModel()
+        with (closing(History(":memory:")) as history,
+              patch.object(images, "MAX_MEDIA_BYTES", image_request_bytes(len(PNG_BYTES), "image/png"))):
+            covered, _ = history.append("main", [Message("user", "已压缩旧内容"), old])
+            history.save_summary("main", Summary(covered, "保留的摘要"))
+            await self.turn(history, model, current, workspace=workspace)
+            self.assertEqual(model.requests[0][0], [
+                Message("compaction_summary", "保留的摘要"),
+                Message("user", (Text("旧图前"), UNAVAILABLE_IMAGE, Text("旧图后"))),
+                Message("user", (Text("本轮图前"), Image(PNG_URL), Text("本轮图后"))),
+            ])
+            self.assertEqual([row.message for row in history.read_after("main")[1:3]], [old, Message("user", current)])
+
     async def test_long_requests_do_not_compact_without_reported_threshold(self):
         settings = RuntimeSettings(context_budget=100, tail_budget=70)
         fixed = "系统指令" * 800
-        old = Message("user", (Text("旧" * 800), Image("data:image/png;base64,AAAA")))
+        workspace = image_workspace(self)
+        old = Message("user", (Text("旧" * 800), save_image(workspace, PNG_BYTES)))
+        prepared = replace(old, parts=(old.parts[0], Image(PNG_URL)))
         current = "新" * 800
         model = CapturingModel(99)
         with closing(History(":memory:")) as history:
             history.append("main", [old])
-            await self.turn(history, model, current, settings=settings, instructions=fixed)
-            self.assertEqual(model.requests[0][0], [old, Message("user", current)])
+            await self.turn(history, model, current, settings=settings, instructions=fixed, workspace=workspace)
+            self.assertEqual(model.requests[0][0], [prepared, Message("user", current)])
             self.assertEqual(history.last_input_tokens("main"), 99)
-            await self.turn(history, model, current, settings=settings, instructions=fixed)
-            self.assertEqual(model.requests[1][0][0], old)
+            await self.turn(history, model, current, settings=settings, instructions=fixed, workspace=workspace)
+            self.assertEqual(model.requests[1][0][0], prepared)
             self.assertEqual(model.requests[1][0][-1], Message("user", current))
             self.assertEqual(model.summaries, [])
 

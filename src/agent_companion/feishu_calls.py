@@ -2,6 +2,7 @@
 
 import asyncio
 from collections.abc import Awaitable, Callable
+from datetime import datetime
 import logging
 from sqlite3 import OperationalError
 from typing import Protocol
@@ -33,9 +34,9 @@ class CallPeer(Protocol):
     async def prepare_agent(self, *, wait_for_lock: bool = True) -> bool: ...
     def watch_call(self, stop: Callable[[], None]) -> bool: ...
     def call_started(self, stop: Callable[[], None], voice: VoiceChannel, *, check_window: Callable[[], bool],
-                     idle_timeout: float, copy_confirmed: bool) -> bool: ...
+                     idle_timeout: float, copy_confirmed: bool, started_at: datetime) -> bool: ...
     def call_input(self, stop: Callable[[], None], text: str | None, input_active: bool | None) -> None: ...
-    def call_ended(self, stop: Callable[[], None]) -> None: ...
+    def call_ended(self, stop: Callable[[], None], *, ended_at: datetime | None = None) -> None: ...
 
 
 VoiceFactory = Callable[[], Awaitable[tuple[VoiceChannel, AudioDevice]]]
@@ -63,25 +64,38 @@ class _CallBinding:
         return self._window is not None and not self.closed and not self._voice.failed
 
     def confirm(self, window: WindowIdentity) -> bool:
-        if not self.closed and self._peer.call_started(
-                self.stop, self._voice, check_window=self.check_window, idle_timeout=self._idle_timeout,
-                copy_confirmed=self._copy_confirmed):
-            self._window = window
-            self._voice.enable_capture()
-            return True
-        return False
+        if self.closed:
+            return False
+        started_at = datetime.now().astimezone()
+        self._window = window  # 提交接通事件之前，语音回复所用的窗口也必须已经可检查。
+        if not self._peer.call_started(self.stop, self._voice, check_window=self.check_window,
+                                       idle_timeout=self._idle_timeout, copy_confirmed=self._copy_confirmed,
+                                       started_at=started_at):
+            self._window = None
+            return False
+        self._voice.enable_capture()
+        return True
 
     def check_window(self) -> bool:
         if self.closed or self._window is None:
             return False
         try:
-            if self._desktop.window_exists(self._window):
-                return True
+            return self.observe_window()
         except DesktopCallError as exc:
             _LOG.warning("Feishu auto-answer released audio after desktop error (%s)", exc)
-        else:
-            _LOG.debug("Feishu auto-answer disconnected: meeting window gone")
-        self.stop()
+            self.stop()
+            return False
+
+    def observe_window(self) -> bool:
+        """确认窗口仍存在；解绑后的观察不需要音频资源。"""
+        if self._window is None:
+            return False
+        if self._desktop.window_exists(self._window):
+            return True
+        _LOG.debug("Feishu auto-answer disconnected: meeting window gone")
+        ended_at = datetime.now().astimezone()
+        self._window = None  # 只在确认消失后发一次结束事件。
+        self.stop(ended_at=ended_at)
         return False
 
     def input(self, text: str | None, input_active: bool | None) -> None:
@@ -93,13 +107,16 @@ class _CallBinding:
         if self.check_window():
             self._peer.call_input(self.stop, text, input_active)
 
-    def stop(self) -> None:
-        if not self.closed:
-            self.closed = True
-            try:
-                self._voice.stop_io()
-            finally:
-                self._peer.call_ended(self.stop)
+    def stop(self, *, ended_at: datetime | None = None) -> None:
+        if self.closed:
+            if ended_at is not None:
+                self._peer.call_ended(self.stop, ended_at=ended_at)
+            return
+        self.closed = True
+        try:
+            self._voice.stop_io()
+        finally:
+            self._peer.call_ended(self.stop, ended_at=ended_at)
 
 
 class IncomingCalls:
@@ -227,6 +244,8 @@ class IncomingCalls:
                         binding.stop()  # 先封闸和清 PCM，再由 connected 取消请求、关闭设备。
         except VoiceSetupError as exc:
             _LOG.warning("Feishu auto-answer audio setup failed (%s)", exc)
+        if binding is not None:
+            await self._observe_end(binding)
 
     async def _confirm(self, ring: RingingWindow, binding: _CallBinding,
                        voice: VoiceChannel, device: AudioDevice) -> WindowIdentity | None:
@@ -265,4 +284,18 @@ class IncomingCalls:
 
     async def _follow(self, binding: _CallBinding) -> None:
         while binding.active() and binding.check_window():
+            await asyncio.sleep(_POLL_SECONDS)
+
+    async def _observe_end(self, binding: _CallBinding) -> None:
+        # 设备失效或桌面查询报错时先退出音频上下文，再等窗口的可证实状态。
+        last_error: str | None = None
+        while True:
+            try:
+                if not binding.observe_window():
+                    return
+                last_error = None
+            except DesktopCallError as exc:
+                if str(exc) != last_error:
+                    last_error = str(exc)
+                    _LOG.warning("Feishu auto-answer cannot verify meeting window (%s)", exc)
             await asyncio.sleep(_POLL_SECONDS)

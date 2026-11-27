@@ -9,9 +9,11 @@ from dataclasses import dataclass
 import logging
 from time import monotonic
 
+from ..images import prepare_request_images
 from ..model_diagnostics import ModelRequestDiagnostics
 from ..protocol import Message, Model, ModelError, TextDelta, ToolReady, ToolSpec
 from ..storage.sqlite import History, Summary
+from ..workspace import Workspace
 from .model_deadline import model_deadline_at
 
 
@@ -113,7 +115,7 @@ class Compactions:
 
     def start(self, session_id: str, prefix: Prefix, prompt: list[Message], tools: Sequence[ToolSpec], *,
                model: Model, thinking: bool, timeout: float, run_id: str | None = None,
-               instructions: str | None = None) -> None:
+               instructions: str | None = None, workspace: Workspace | None = None) -> None:
         # 与 can_start 之间无 await；冻结工具定义中可变的 schema。
         if self._closed or self._generating is not None:
             return
@@ -124,7 +126,7 @@ class Compactions:
             return
         self._active_model = model
         self._generating = asyncio.create_task(self._generate(
-            session_id, prefix, tuple(prompt), frozen_tools, model, thinking, timeout, run_id, instructions))
+            session_id, prefix, tuple(prompt), frozen_tools, model, thinking, timeout, run_id, instructions, workspace))
 
     def failed(self, session_id: str, prefix: Prefix, reason: str) -> None:
         if not self._closed:
@@ -133,7 +135,7 @@ class Compactions:
 
     async def _generate(self, session_id: str, prefix: Prefix, prompt: tuple[Message, ...],
                          tools: tuple[ToolSpec, ...], model: Model, thinking: bool, timeout: float, run_id: str | None,
-                         instructions: str | None) -> None:
+                         instructions: str | None, workspace: Workspace | None) -> None:
         diagnostics = ModelRequestDiagnostics("summary", timeout, run_id=run_id)
         try:
             loop = asyncio.get_running_loop()
@@ -141,7 +143,12 @@ class Compactions:
             stop_stream = getattr(model, "stop_stream", None)
             with diagnostics.activate():
                 async with model_deadline_at(expires, stop_stream) as deadline:
-                    content = await _summarize(model, prompt, tools, thinking, instructions)
+                    request = await prepare_request_images(prompt, workspace)
+                    if deadline.expired() or loop.time() >= expires:
+                        raise TimeoutError
+                    if self._closed or asyncio.current_task().cancelling():
+                        raise asyncio.CancelledError
+                    content = await _summarize(model, request, tools, thinking, instructions)
             if deadline.expired() or loop.time() >= expires:
                 raise TimeoutError
             self._remember(session_id, _Remembered(

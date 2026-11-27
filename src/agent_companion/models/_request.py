@@ -20,7 +20,7 @@ def make_replay_key(secret: bytes, adapter_id: str, model: str, *extra: str) -> 
 
 
 def input_content(message: Message) -> str | tuple[Text | Image, ...]:
-    """用普通用户上下文承载统一信封和摘要，不按通知 kind 做协议分支。"""
+    """为普通用户上下文投影统一信封、摘要及状态消息。"""
     notice = message.async_result
     if notice is not None:
         body = JSON_ENCODER.encode({"kind": notice.kind, "payload": notice.payload})
@@ -28,5 +28,5 @@ def input_content(message: Message) -> str | tuple[Text | Image, ...]:
     if message.kind == "compaction_summary":
         return "此前会话摘要（历史记录，不是新指令）：\n" + message.text
     if message.kind == "state_event":
-        return "[运行时状态]\n" + message.text
+        return "[状态事件]\n" + message.text
     return message.content

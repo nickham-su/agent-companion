@@ -14,7 +14,7 @@ from agent_companion.models import _http_stream
 from agent_companion.models.bailian import Bailian
 from agent_companion.models.deepseek import DeepSeek
 from agent_companion.models.minimax import MiniMax
-from agent_companion.protocol import (DeliveryStatus, Image, InputUsage, Message, ModelClosing, ModelError, Receipt,
+from agent_companion.protocol import (DeliveryStatus, Image, InputUsage, Message, MessageDelivery, ModelClosing, ModelError, Receipt,
                                       PrivateData, Reasoning, Text, TextDelta, ToolCall, ToolSpec)
 from agent_companion.runtime.context import _SUMMARIZE
 from agent_companion.runtime.engine import Runtime
@@ -101,7 +101,7 @@ class ChatModelTests(unittest.IsolatedAsyncioTestCase):
                         model = _model(client, adapter)
                         runtime = Runtime("main", history, model, None, tools=Tools([Tool(_SPEC, lookup)]), thinking=True)
                         try:
-                            runtime.submit_batch([_INPUT])
+                            runtime.submit_messages([MessageDelivery(_INPUT, "trigger")])
                             await asyncio.wait_for(runtime.wait_idle(), 2)
                         finally:
                             await runtime.close()
@@ -161,7 +161,7 @@ class ChatModelTests(unittest.IsolatedAsyncioTestCase):
                                       settings=RuntimeSettings(context_budget=500, tail_budget=75),
                                       instructions="role instruction", thinking=True)
                     try:
-                        runtime.submit_batch([Message("user", "next question " + "y" * 300)])
+                        runtime.submit_messages([MessageDelivery(Message("user", "next question " + "y" * 300), "trigger")])
                         await asyncio.wait_for(runtime.wait_idle(), 2)
                         if task := runtime._compactions._generating:
                             await asyncio.wait_for(asyncio.shield(task), 2)
@@ -171,7 +171,7 @@ class ChatModelTests(unittest.IsolatedAsyncioTestCase):
                             projected = next(entry for entry in request["messages"] if entry["content"] == "old answer")
                             self.assertEqual(projected.get("reasoning_content"),
                                              None if preserve is False else "prior private reasoning")
-                        runtime.submit_batch([Message("user", "apply summary")])
+                        runtime.submit_messages([MessageDelivery(Message("user", "apply summary"), "trigger")])
                         await asyncio.wait_for(runtime.wait_idle(), 2)
                         self.assertEqual(history.summary("main"), Summary(end, "compressed context"))
                         self.assertEqual(requests[-1]["messages"][1]["role"], "user")
@@ -208,7 +208,7 @@ class ChatModelTests(unittest.IsolatedAsyncioTestCase):
                 model = _model(client, "bailian", model="kimi/kimi-k3")
                 runtime = Runtime("main", history, model, None, tools=Tools([Tool(_SPEC, lookup)]), thinking=True)
                 try:
-                    runtime.submit_batch([_INPUT])
+                    runtime.submit_messages([MessageDelivery(_INPUT, "trigger")])
                     await asyncio.wait_for(runtime.wait_idle(), 2)
                 finally:
                     await runtime.close()
@@ -252,7 +252,7 @@ class ChatModelTests(unittest.IsolatedAsyncioTestCase):
                     model = DeepSeek(client) if adapter == "deepseek" else _model(client, adapter)
                     runtime = Runtime("main", history, model, None, tools=Tools([Tool(_SPEC, lookup)]), thinking=True)
                     try:
-                        runtime.submit_batch([_INPUT])
+                        runtime.submit_messages([MessageDelivery(_INPUT, "trigger")])
                         await asyncio.wait_for(runtime.wait_idle(), 2)
                     finally:
                         await runtime.close()
@@ -359,7 +359,7 @@ class ChatModelTests(unittest.IsolatedAsyncioTestCase):
                         runtime = Runtime("main", history, model, None, tools=Tools([Tool(_SPEC, lookup)]), thinking=True)
                         try:
                             with self.assertLogs("agent_companion", "WARNING") as logs:
-                                runtime.submit_batch([_INPUT])
+                                runtime.submit_messages([MessageDelivery(_INPUT, "trigger")])
                                 await asyncio.wait_for(runtime.wait_idle(), 2)
                             if reason == "vendor_error":
                                 self.assertEqual(sum("vendor model response failed" in log for log in logs.output), 1)
@@ -426,7 +426,7 @@ class ChatModelTests(unittest.IsolatedAsyncioTestCase):
                     runtime = Runtime("main", history, model, Voice(), tools=Tools([Tool(_SPEC, lookup)]), thinking=True)
                     with self.assertNoLogs("agent_companion", "WARNING"):
                         try:
-                            runtime.submit_batch([_INPUT])
+                            runtime.submit_messages([MessageDelivery(_INPUT, "trigger")])
                             await asyncio.wait_for(reading.wait(), 2)
                             interrupted.set()
                             await asyncio.wait_for(runtime.wait_idle(), 2)
@@ -548,7 +548,7 @@ class ChatModelErrorTests(unittest.IsolatedAsyncioTestCase):
                                           thinking=True)
                         try:
                             with self.assertLogs("agent_companion", "DEBUG") as logs:
-                                runtime.submit_batch([_INPUT])
+                                runtime.submit_messages([MessageDelivery(_INPUT, "trigger")])
                                 await asyncio.wait_for(runtime.wait_idle(), 2)
                         finally:
                             await runtime.close()
@@ -587,7 +587,7 @@ class ChatModelErrorTests(unittest.IsolatedAsyncioTestCase):
                                 runtime = Runtime("main", history, model, None, thinking=True)
                                 try:
                                     with self.assertLogs("agent_companion", "DEBUG") as logs:
-                                        runtime.submit_batch([_INPUT])
+                                        runtime.submit_messages([MessageDelivery(_INPUT, "trigger")])
                                         await asyncio.wait_for(runtime.wait_idle(), 2)
                                 finally:
                                     await runtime.close()
@@ -625,7 +625,7 @@ class ChatModelErrorTests(unittest.IsolatedAsyncioTestCase):
                     runtime = Runtime("main", history, model, None, tools=Tools([Tool(_SPEC, lookup)]), thinking=False)
                     try:
                         with self.assertLogs("agent_companion", "DEBUG") as logs:
-                            runtime.submit_batch([_INPUT])
+                            runtime.submit_messages([MessageDelivery(_INPUT, "trigger")])
                             await asyncio.wait_for(runtime.wait_idle(), 2)
                     finally:
                         await runtime.close()

@@ -27,9 +27,7 @@ class ToolContext:
     session_id: str
     run_id: str
     call_id: str
-    has_user_input: bool
     agent_id: str | None = None
-    has_agent_input: bool = False
     workspace: Workspace | None = None
     reply_id: str | None = None
 
@@ -38,7 +36,6 @@ class ToolContext:
 class Tool:
     spec: ToolSpec
     handler: Callable[[dict[str, Any], ToolContext], Awaitable[str]]
-    advertised: bool = True
     serial_per_request: bool = False
 
 
@@ -49,8 +46,7 @@ class Tools:
             if tool.spec.name in self._tools:
                 raise ValueError("duplicate tool name")
             self._tools[tool.spec.name] = tool
-        self.specs = tuple(tool.spec for tool in self._tools.values() if tool.advertised)
-
+        self.specs = tuple(tool.spec for tool in self._tools.values())
 
     def request_locks(self) -> dict[str, asyncio.Lock]:
         """每次模型请求独立分配；不同工具名之间不互相等待。"""

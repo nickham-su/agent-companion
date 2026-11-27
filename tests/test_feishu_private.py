@@ -8,6 +8,7 @@ import json
 from pathlib import Path
 import sqlite3
 from tempfile import TemporaryDirectory
+from threading import Event
 import unittest
 from unittest.mock import patch
 
@@ -18,10 +19,13 @@ from agent_companion.app import private_feishu_identity, run_feishu, running_age
 from agent_companion.channels.feishu.cli import CliError, CommandResult, FeishuDiscovery
 from agent_companion.config import (ASRSettings, FeishuSettings, LLMProvider, MiniMaxConnection, ModelProfile, RuntimeSettings, Settings,
                                     load_settings)
-from agent_companion.protocol import ChannelUser, Message, TextDelta, ToolCall, ToolReady
+from agent_companion.feishu_private import _Route
+from agent_companion.images import save_image
+from agent_companion.protocol import ChannelUser, Image, Message, TextDelta, ToolCall, ToolReady
 from agent_companion.runtime.subtasks import AgentTree, DELEGATE_TOOL_NAME, demo_roles
-from agent_companion.storage.sqlite import AgentReplyInput, DelegatedInput, FeishuBindingError, History, is_sqlite_lock_error
-from test_message_support import tool_calls
+from agent_companion.storage.sqlite import FeishuBindingError, History, InputRollbackFailed, is_sqlite_lock_error
+from agent_companion.workspace import Workspace
+from test_message_support import PNG_BYTES, PNG_URL, tool_calls
 
 
 _OWN = "ou_private_service"
@@ -164,7 +168,9 @@ async def _eventually(predicate):
 class FeishuPrivateTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
         self.runner = _Runner()
-        self.settings = Settings(feishu=FeishuSettings())
+        root = TemporaryDirectory(dir=Path.cwd())
+        self.addCleanup(root.cleanup)
+        self.settings = Settings(feishu=FeishuSettings(), workspace_root=Path(root.name))
 
     async def test_configuration_and_database_ownership(self):
         with TemporaryDirectory() as tmp:
@@ -366,56 +372,218 @@ class FeishuPrivateTests(unittest.IsolatedAsyncioTestCase):
                                  ["A 同批文字", "A 后续文字"])
                 media.assert_awaited_once()
 
-    async def test_busy_user_registration_does_not_block_another_user(self):
+    async def test_slow_image_save_does_not_block_other_users_or_confirm_on_shutdown(self):
+        runner, clock = self.runner, [100.25]
+        a, b, c = _CHATS
+        sa, sb, sc = _SENDERS
+        writing, ask_shutdown, stopping_a = asyncio.Event(), asyncio.Event(), asyncio.Event()
+        release = Event()
+        loop = asyncio.get_running_loop()
+        stop = _Route.stop_accepting
+
+        def slow_save(workspace, data):
+            loop.call_soon_threadsafe(writing.set)
+            if not release.wait(3):
+                raise AssertionError("image write blocked the event loop")
+            return save_image(workspace, data)
+
+        def observe_stop(route):
+            if route._user.key == sa:
+                stopping_a.set()
+            stop(route)
+
+        with (closing(History(":memory:")) as history,
+              patch("agent_companion.channels.feishu.channel._MAX_MEDIA_WORKERS", 1),
+              patch("agent_companion.channels.feishu.messages.save_image", side_effect=slow_save),
+              patch.object(FeishuDiscovery, "download", return_value=PNG_BYTES) as media,
+              patch.object(_Route, "stop_accepting", observe_stop)):
+            async def serve():
+                async with _serve_private(self.settings, history, _Model(), runner, clock):
+                    await runner.verified.wait()
+                    runner.messages[a].append(_message("image", a, sa, {"image_key": "img_a"}, kind="image"))
+                    clock[0] = 101
+                    await ask_shutdown.wait()
+
+            service = asyncio.create_task(serve())
+            try:
+                await asyncio.wait_for(writing.wait(), 1)
+                runner.messages[b].append(_message("text", b, sb, "不等待图片", stamp=101_500))
+                runner.messages[c].append(_message("image", c, sc, {"image_key": "img_c"}, kind="image", stamp=101_510))
+                clock[0] = 102
+                await _eventually(lambda: runner.sent[sb] == ["reply: 不等待图片"] and history.next_feishu_raw(sc))
+                media.assert_awaited_once()  # C 的图片不能抢在尚未结束的写入前获得媒体槽。
+                ask_shutdown.set()
+                await asyncio.wait_for(stopping_a.wait(), 1)
+                self.assertFalse(service.done())
+            finally:
+                release.set()
+                ask_shutdown.set()
+                await asyncio.wait_for(service, 2)
+            media.assert_awaited_once()
+            self.assertIsNotNone(history.next_feishu_raw(sa))
+            self.assertEqual(history.read_after("feishu-private:" + sha256(sa.encode()).hexdigest()), [])
+
+    async def test_registration_and_confirmation_retries_reuse_media_and_handoff_without_yielding(self):
         runner, clock = self.runner, [100.25]
         a, b = _CHATS[:2]
         sa, sb = _SENDERS[:2]
         session_a = "feishu-private:" + sha256(sa.encode()).hexdigest()
-        blocked = True
+        blocked = {"register", "confirm"}
+        events = []
+        pictures = Workspace.for_user(self.settings.workspace_root, sa).directory / ".agent/images"
         with closing(History(":memory:")) as history:
             register = history.ensure_main_agent
+            confirm = history.finish_feishu_raw
+            submit = _Route._submit_messages
+
+            async def download(*args, **kwargs):
+                events.append("media")
+                return PNG_BYTES
 
             def ensure(session):
-                if blocked and session == session_a:
-                    raise sqlite3.OperationalError("database is locked")
+                if session == session_a:
+                    saved, = pictures.iterdir()
+                    self.assertEqual(saved.read_bytes(), PNG_BYTES)
+                    events.append("register")
+                    if "register" in blocked:
+                        raise sqlite3.OperationalError("database is locked")
                 return register(session)
 
-            with patch.object(history, "ensure_main_agent", side_effect=ensure):
+            def finish(peer, batch_id):
+                if peer == sa:
+                    self.assertEqual(events[0], "media")
+                    events.append("confirm")
+                    if "confirm" in blocked:
+                        raise sqlite3.OperationalError("database is locked")
+                result = confirm(peer, batch_id)
+                if peer == sa:
+                    events.append("confirmed")
+                    asyncio.get_running_loop().call_soon(events.append, "yielded")
+                return result
+
+            def handoff(route, deliveries):
+                if route._session_id == session_a:
+                    self.assertIsNotNone(route._scheduler)
+                    self.assertEqual(events[-1], "confirmed")
+                    self.assertFalse(history.has_pending_feishu_input(sa))
+                    self.assertEqual([item.intent for item in deliveries], ["trigger", "trigger"])
+                    events.append("submitted")
+                return submit(route, deliveries)
+
+            with (patch.object(history, "ensure_main_agent", side_effect=ensure),
+                  patch.object(history, "finish_feishu_raw", side_effect=finish),
+                  patch.object(FeishuDiscovery, "download", side_effect=download) as media,
+                  patch.object(_Route, "_submit_messages", handoff),
+                  patch("agent_companion.channels.feishu.channel._STORAGE_RETRY_SECONDS", .02)):
                 async with _serve_private(self.settings, history, _Model(), runner, clock):
                     await runner.verified.wait()
-                    runner.messages[a].append(_message("a", a, sa, "等待 A"))
+                    runner.messages[a].extend([
+                        _message("media", a, sa, {"image_key": "img_synthetic"}, kind="image"),
+                        _message("a", a, sa, "等待 A", stamp=100_300),
+                    ])
                     runner.messages[b].append(_message("b", b, sb, "独立 B"))
                     clock[0] = 102
-                    await _eventually(lambda: runner.sent[sb] == ["reply: 独立 B"])
+                    await _eventually(lambda: events.count("register") >= 2 and runner.sent[sb] == ["reply: 独立 B"])
                     self.assertEqual(runner.sent[sa], [])
                     self.assertEqual(history.feishu_inbound_window(0), (100, 102))
                     self.assertEqual(history.pending_feishu_users(), [sa])
-                    blocked = False
+                    self.assertNotIn("confirm", events)
+                    blocked.remove("register")
+                    await _eventually(lambda: events.count("confirm") >= 2)
+                    media.assert_awaited_once()
+                    self.assertTrue(history.has_pending_feishu_input(sa))
+                    self.assertEqual(history.read_after(session_a), [])
+                    blocked.remove("confirm")
                     await _eventually(lambda: runner.sent[sa] == ["reply: 等待 A"])
+                    self.assertEqual(events[-3:], ["confirmed", "submitted", "yielded"])
+                    self.assertEqual(events.count("media"), 1)
                     self.assertEqual(len(runner.details), 1)
+                    stored, = history.read_after(session_a)[0].message.parts
+                    self.assertIsInstance(stored, Image)
+                    self.assertEqual(list(pictures.iterdir()), [pictures.parent.parent / stored.url])
 
-    async def test_runtime_consumes_pending_batches_in_order_while_other_route_progresses(self):
+    async def test_two_users_save_and_load_in_their_own_workspaces(self):
+        runner, clock = self.runner, [100.25]
+
+        class ImageModel:
+            async def stream(self, messages, tools, *, thinking, instructions=None):
+                picture, = messages[0].parts
+                self_test.assertEqual(picture, Image(PNG_URL))
+                yield TextDelta(messages[-1].text)
+
+        self_test = self
+        with (closing(History(":memory:")) as history,
+              patch.object(FeishuDiscovery, "download", return_value=PNG_BYTES)):
+            async with _serve_private(self.settings, history, ImageModel(), runner, clock):
+                await runner.verified.wait()
+                peers = tuple(zip(_CHATS[:2], _SENDERS[:2]))
+                for chat, peer in peers:
+                    runner.messages[chat].extend([_message(f"media_{peer}", chat, peer, {"image_key": "img_external"}, kind="image"),
+                                                  _message(f"text_{peer}", chat, peer, peer, stamp=100_310)])
+                clock[0] = 102
+                await _eventually(lambda: all(runner.sent[peer] == [peer] for _, peer in peers))
+                workspaces = [Workspace.for_user(self.settings.workspace_root, peer) for _, peer in peers]
+                for index, (_, peer) in enumerate(peers):
+                    session = "feishu-private:" + sha256(peer.encode()).hexdigest()
+                    picture, = history.read_after(session)[0].message.parts
+                    self.assertEqual((workspaces[index].directory / picture.url).read_bytes(), PNG_BYTES)
+                    self.assertFalse((workspaces[1 - index].directory / picture.url).exists())
+
+    async def test_unsaved_image_does_not_create_an_agent(self):
+        runner, clock = self.runner, [100.25]
+        chat, peer = _CHATS[0], _SENDERS[0]
+        workspace = Workspace.for_user(self.settings.workspace_root, peer)
+        workspace.directory.mkdir()
+        (workspace.directory / ".agent").write_text("synthetic obstruction")
+        raw = _message("unsaved", chat, peer, {"image_key": "img_external"}, kind="image")
+        with (closing(History(":memory:")) as history,
+              patch.object(FeishuDiscovery, "download", return_value=PNG_BYTES) as media):
+            async with _serve_private(self.settings, history, _Model(), runner, clock) as agents:
+                await runner.verified.wait()
+                runner.messages[chat].append(raw)
+                clock[0] = 102
+                await _eventually(lambda: history.feishu_inbound_seen(raw["message_id"])
+                                  and not history.has_pending_feishu_input(peer))
+                media.assert_awaited_once()
+                agents.assert_not_called()
+                self.assertEqual(runner.sent[peer], [])
+
+    async def test_empty_prepared_batch_is_confirmed_without_creating_an_agent(self):
+        runner, clock = self.runner, [100.25]
+        chat, peer = _CHATS[0], _SENDERS[0]
+        with closing(History(":memory:")) as history:
+            async with _serve_private(self.settings, history, _Model(), runner, clock) as agents:
+                await runner.verified.wait()
+                runner.messages[chat].append(_message("empty", chat, peer, ""))
+                clock[0] = 102
+                await _eventually(lambda: history.feishu_inbound_seen(f"om_{chat}_empty")
+                                  and not history.has_pending_feishu_input(peer))
+                agents.assert_not_called()
+                self.assertEqual(runner.sent[peer], [])
+
+    async def test_runtime_records_direct_batches_in_order_while_other_route_progresses(self):
         a, b, _ = _CHATS
         sa, sb, _ = _SENDERS
         session_a = "feishu-private:" + sha256(sa.encode()).hexdigest()
         runner, model, clock = self.runner, _Model(), [100.25]
         blocked, attempts, committed = True, [], []
         with closing(History(":memory:")) as history:
-            consume = history._consume_inbound
+            append = history.append_agent_inputs
 
-            def consume_batch(session, batch):
-                if session != session_a:
-                    return consume(session, batch)
-                attempts.append(batch)
+            def append_batch(agent_id, run_id, deliveries, *, start):
+                if history.agent(agent_id).session_id != session_a:
+                    return append(agent_id, run_id, deliveries, start=start)
+                texts = tuple(item.message.text for item in deliveries)
+                attempts.append(texts)
                 if blocked:
                     error = sqlite3.OperationalError("synthetic contention")
                     error.sqlite_errorcode = sqlite3.SQLITE_BUSY_SNAPSHOT
                     raise error
-                ids = consume(session, batch)
-                committed.append(batch)
-                return ids
+                output = append(agent_id, run_id, deliveries, start=start)
+                committed.append(texts)
+                return output
 
-            with patch.object(history, "_consume_inbound", side_effect=consume_batch):
+            with patch.object(history, "append_agent_inputs", side_effect=append_batch):
                 async with _serve_private(self.settings, history, model, runner, clock):
                     await runner.verified.wait()
                     runner.messages[a] = [_message("a1", a, sa, "queued A1")]
@@ -426,9 +594,8 @@ class FeishuPrivateTests(unittest.IsolatedAsyncioTestCase):
                     runner.messages[b] = [_message("b1", b, sb, "independent B", stamp=101_100)]
                     clock[0] = 102.0
                     await _eventually(lambda: len(attempts) >= 2 and runner.sent[sb] == ["reply: independent B"])
-                    pending = history.pending_inbound(session_a, "feishu-private")
-                    self.assertEqual(len(pending), 2)
-                    self.assertEqual(pending[0], first)
+                    await _eventually(lambda: not history.has_pending_feishu_input(sa))
+                    self.assertEqual(first, ("queued A1",))
                     self.assertEqual(set(attempts), {first})
                     self.assertEqual(history.read_after(session_a), [])
                     self.assertEqual(runner.sent[sa], [])
@@ -436,13 +603,179 @@ class FeishuPrivateTests(unittest.IsolatedAsyncioTestCase):
                     blocked = False
                     await _eventually(lambda: len(runner.sent[sa]) >= 2)
                     self.assertEqual(runner.sent[sa], ["reply: queued A1", "reply: queued A2"])
-                    self.assertEqual(committed, pending)
-                    self.assertEqual(history.pending_inbound(session_a, "feishu-private"), [])
+                    self.assertEqual(committed, [("queued A1",), ("queued A2",)])
+                    self.assertFalse(history.has_pending_feishu_input(sa))
                     self.assertEqual(history.feishu_inbound_window(100), (100, 102))
                     self.assertEqual([e.message.content for e in history.read_after(session_a)],
                                      ["queued A1", "reply: queued A1", "queued A2", "reply: queued A2"])
                     self.assertEqual([inputs for _, inputs in model.calls if inputs[0] == "queued A1"],
                                      [("queued A1",), ("queued A1", "queued A2")])
+
+    async def test_uncertain_input_commit_retains_later_feishu_batches_for_the_same_user(self):
+        a, b = _CHATS[:2]
+        sa, sb = _SENDERS[:2]
+        session_a = "feishu-private:" + sha256(sa.encode()).hexdigest()
+        for during_confirmation_backoff in (False, True):
+            with (self.subTest(during_confirmation_backoff=during_confirmation_backoff),
+                  closing(History(":memory:")) as history):
+                runner, model, clock = _Runner(), _Model(), [100.25]
+                first = _message("first", a, sa, "first input")
+                later = _message("later", a, sa, "later input", stamp=101_100)
+                later_image = _message("image", a, sa, {"image_key": "img_synthetic"}, stamp=101_200, kind="image")
+                confirm_attempts, commit_attempts, handoffs = [], [], []
+                append = history.append_agent_inputs
+                confirm = history.finish_feishu_raw
+                submit = _Route._submit_messages
+
+                def append_with_fault(agent_id, run_id, deliveries, *, start):
+                    if history.agent(agent_id).session_id != session_a:
+                        return append(agent_id, run_id, deliveries, start=start)
+                    if during_confirmation_backoff and not confirm_attempts:
+                        raise sqlite3.OperationalError("database is locked")
+                    connection = history._db
+
+                    def commit_with_unknown_outcome():
+                        connection.commit()
+                        commit_attempts.append(run_id)
+                        error = sqlite3.OperationalError("synthetic commit failure")
+                        error.sqlite_errorcode = sqlite3.SQLITE_IOERR
+                        raise error
+
+                    with patch.object(history, "_connection", wraps=connection) as wrapped:
+                        wrapped.commit.side_effect = commit_with_unknown_outcome
+                        return append(agent_id, run_id, deliveries, start=start)
+
+                def finish(peer, batch_id):
+                    if peer == sa and history.read_feishu_raw(peer, batch_id)[0][0] == later["message_id"]:
+                        confirm_attempts.append(batch_id)
+                        if during_confirmation_backoff and len(confirm_attempts) == 1:
+                            raise sqlite3.OperationalError("database is locked")
+                    return confirm(peer, batch_id)
+
+                def handoff(route, deliveries):
+                    if route._user.key == sa:
+                        handoffs.append((route._agent[0], deliveries))
+                    return submit(route, deliveries)
+
+                with (patch.object(history, "append_agent_inputs", side_effect=append_with_fault),
+                      patch.object(history, "finish_feishu_raw", side_effect=finish),
+                      patch.object(history, "pending_feishu_users", wraps=history.pending_feishu_users) as polls,
+                      patch.object(_Route, "_submit_messages", handoff),
+                      patch.object(FeishuDiscovery, "download", side_effect=CliError("synthetic_media_unavailable")) as media,
+                      patch("agent_companion.runtime.sqlite_access._LOCK_RETRY_SECONDS", .005),
+                      patch("agent_companion.channels.feishu.channel._STORAGE_RETRY_SECONDS", .1),
+                      self.assertLogs("agent_companion.runtime.engine", "ERROR")):
+                    async with _serve_private(self.settings, history, model, runner, clock):
+                        await runner.verified.wait()
+                        runner.messages[a] = [first]
+                        clock[0] = 101
+                        await _eventually(lambda: bool(handoffs))
+                        runtime, first_batch = handoffs[0]
+                        if not during_confirmation_backoff:
+                            await _eventually(lambda: runtime.input_retry_forbidden)
+
+                        runner.messages[a].extend([later, later_image])
+                        runner.messages[b] = [_message("other", b, sb, "other user's input", stamp=101_100)]
+                        clock[0] = 102
+                        await _eventually(lambda: runtime.input_retry_forbidden and bool(runner.sent[sb]))
+                        polls_after_failure = polls.call_count
+                        await _eventually(lambda: polls.call_count >= polls_after_failure + 6)
+
+                        self.assertEqual(runner.sent[sb], ["reply: other user's input"])
+                        self.assertEqual(runner.sent[sa], [])
+                        raw = history.next_feishu_raw(sa)
+                        self.assertIsNotNone(raw)
+                        raw_id, _ = raw
+                        self.assertEqual([row[0] for row in history.read_feishu_raw(sa, raw_id)],
+                                         [later["message_id"], later_image["message_id"]])
+                        self.assertEqual(confirm_attempts, [raw_id] if during_confirmation_backoff else [])
+                        self.assertEqual(media.await_count, int(during_confirmation_backoff))
+                        self.assertEqual(handoffs, [(runtime, first_batch)])
+                        self.assertEqual(list(runtime._pending), [first_batch])
+                        self.assertEqual(len(commit_attempts), 1)
+                        self.assertEqual([row.message.text for row in history.read_after(session_a)], ["first input"])
+
+    async def test_feishu_raw_commit_outcome_is_verified_without_replaying_it(self):
+        a, b = _CHATS[:2]
+        sa, sb = _SENDERS[:2]
+        for outcome in ("deleted", "retained", "lookup_error"):
+            with self.subTest(outcome=outcome), closing(History(":memory:")) as history:
+                runner, model, clock = _Runner(), _Model(), [100.25]
+                confirm, submit = history.finish_feishu_raw, _Route._submit_messages
+                commit_attempts, lookups, handoffs = [], [], []
+                turn_yielded = asyncio.Event()
+
+                def finish(peer, batch_id):
+                    if peer != sa:
+                        return confirm(peer, batch_id)
+                    connection = history._db
+
+                    def commit_with_fault():
+                        commit_attempts.append(batch_id)
+                        if outcome == "deleted":
+                            connection.commit()
+                        error = sqlite3.OperationalError("synthetic raw commit failure")
+                        error.sqlite_errorcode = sqlite3.SQLITE_IOERR
+                        raise error
+
+                    def execute(sql, params):
+                        if sql.startswith("SELECT 1 FROM feishu_raw_batches"):
+                            lookups.append(params)
+                            self.assertFalse(connection.in_transaction)
+                            asyncio.get_running_loop().call_soon(turn_yielded.set)
+                            if outcome == "lookup_error":
+                                raise sqlite3.OperationalError("synthetic raw lookup failure")
+                        return connection.execute(sql, params)
+
+                    with patch.object(history, "_connection", wraps=connection) as wrapped:
+                        wrapped.commit.side_effect = commit_with_fault
+                        wrapped.execute.side_effect = execute
+                        return confirm(peer, batch_id)
+
+                def handoff(route, deliveries):
+                    if route._user.key == sa:
+                        self.assertFalse(turn_yielded.is_set())
+                        self.assertFalse(history.has_pending_feishu_input(sa))
+                        handoffs.extend(item.message.text for item in deliveries)
+                    return submit(route, deliveries)
+
+                with (patch.object(history, "finish_feishu_raw", side_effect=finish),
+                      patch.object(history, "pending_feishu_users", wraps=history.pending_feishu_users) as polls,
+                      patch.object(_Route, "_submit_messages", handoff)):
+                    async with _serve_private(self.settings, history, model, runner, clock):
+                        await runner.verified.wait()
+                        first = _message("first", a, sa, "first input")
+                        runner.messages[a] = [first]
+                        runner.messages[b] = [_message("other", b, sb, "other input")]
+                        clock[0] = 102
+                        await _eventually(lambda: bool(lookups and runner.sent[sb]))
+                        poll_count = polls.call_count
+                        await _eventually(lambda: polls.call_count >= poll_count + 3)
+                        self.assertEqual(runner.sent[sb], ["reply: other input"])
+                        batch_id, = commit_attempts
+                        self.assertEqual(lookups, [(batch_id, sa)])
+                        if outcome == "deleted":
+                            self.assertEqual(handoffs, ["first input"])
+                            self.assertEqual(runner.sent[sa], ["reply: first input"])
+                        else:
+                            self.assertEqual(handoffs, [])
+                            self.assertEqual(runner.sent[sa], [])
+                            self.assertEqual(history.read_feishu_raw(sa, batch_id)[0][0], first["message_id"])
+
+    def test_raw_confirmation_rollback_failure_invalidates_the_shared_connection(self):
+        peer = _SENDERS[0]
+        with closing(History(":memory:")) as history:
+            history.record_feishu_window(None, now=100, verified={peer: [("om_example", 100_100, "text", "{}")]},
+                                         discarded=[], retry=[])
+            batch_id, _ = history.next_feishu_raw(peer)
+            with patch.object(history, "_connection", wraps=history._db) as wrapped:
+                wrapped.commit.side_effect = sqlite3.OperationalError("synthetic commit error")
+                wrapped.rollback.side_effect = sqlite3.Error("synthetic rollback error")
+                with self.assertRaises(InputRollbackFailed):
+                    history.finish_feishu_raw(peer, batch_id)
+                with self.assertRaises(sqlite3.ProgrammingError):
+                    history.next_feishu_raw(peer)
+                self.assertEqual(wrapped.execute.call_count, 1)  # 只发出了 DELETE，没有核验。
 
     async def test_runtime_retries_reply_and_subtask_transactions_without_repeating_work(self):
         class Model(_Model):
@@ -455,7 +788,7 @@ class FeishuPrivateTests(unittest.IsolatedAsyncioTestCase):
         b, sb = _CHATS[1], _SENDERS[1]
         session_b = "feishu-private:" + sha256(sb.encode()).hexdigest()
         runner, model, clock = self.runner, Model(), [100.25]
-        blocked = {"accept", "start", "tool_reply", "tool_input", "finish", "mark", "result_input"}
+        blocked = {"accept", "start", "tool_reply", "tool_input", "finish", "result_input"}
         attempts, committed = defaultdict(list), defaultdict(list)
         with closing(History(":memory:")) as history, ExitStack() as patches:
             def intercept(method, stage_for):
@@ -475,9 +808,10 @@ class FeishuPrivateTests(unittest.IsolatedAsyncioTestCase):
                 patches.enter_context(patch.object(history, method, side_effect=attempt))
 
             def input_stage(agent_id, run_id, rows, *, start):
-                if any(isinstance(row, DelegatedInput) for row in rows):
+                if any(delivery.delegation is not None for delivery in rows):
                     return "start"
-                if any(isinstance(row, AgentReplyInput) for row in rows):
+                if any(delivery.message.async_result is not None
+                       and delivery.message.async_result.kind == "agent_reply" for delivery in rows):
                     return "result_input"
                 return "tool_input" if not start else None
 
@@ -487,7 +821,6 @@ class FeishuPrivateTests(unittest.IsolatedAsyncioTestCase):
             intercept("accept_delegation", lambda *args, **kwargs: "accept")
             intercept("append_agent_inputs", input_stage)
             intercept("finish_agent_run", finish_stage)
-            intercept("mark_agent_reply_enqueued", lambda _: "mark")
             intercept("finalize_reply", lambda outcome, rows: "tool_reply" if rows and rows[0].tool_calls else None)
             delegate = patches.enter_context(patch.object(AgentTree, "_delegate", autospec=True,
                                                            side_effect=AgentTree._delegate))
@@ -508,7 +841,8 @@ class FeishuPrivateTests(unittest.IsolatedAsyncioTestCase):
                 # 工具轮次之间吸收排队的用户输入时也只等当前事务。
                 runner.messages[b].append(_message("during_tool", b, sb, "during tool B", stamp=101_100))
                 clock[0] = 102.0
-                await _eventually(lambda: history.pending_inbound(session_b, "feishu-private"))
+                await _eventually(lambda: history.feishu_inbound_seen(f"om_{b}_during_tool")
+                                  and not history.has_pending_feishu_input(sb))
                 blocked.remove("tool_reply")
                 await _eventually(lambda: len(attempts["tool_input"]) >= 2)
                 self.assertEqual(model.calls, [(True, ("first B",))])
@@ -527,16 +861,11 @@ class FeishuPrivateTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(history.agent_run(run_id).status, "running")
                 self.assertEqual(attempts["result_input"], [])
                 blocked.remove("finish")
-                await _eventually(lambda: len(attempts["result_input"]) >= 2 and len(attempts["mark"]) >= 2)
+                await _eventually(lambda: len(attempts["result_input"]) >= 2)
                 self.assertEqual(history.agent_run(run_id).status, "completed")
-                self.assertIsNone(history.agent_run(run_id).reply_enqueued_at)
                 self.assertEqual(runner.sent[sb], ["tool-stage B", "reply: during tool B"])
                 blocked.remove("result_input")
                 await _eventually(lambda: "returned B" in runner.sent[sb])
-                # 标记仍锁住时，主 Runtime 已能消费回投；释放标记不能重复回投。
-                self.assertIsNone(history.agent_run(run_id).reply_enqueued_at)
-                blocked.remove("mark")
-                await _eventually(lambda: history.agent_run(run_id).reply_enqueued_at is not None)
 
                 delegate.assert_awaited_once()
                 self.assertEqual(len(model.calls), 4)  # 主会话三轮、子会话一轮
@@ -611,8 +940,7 @@ class FeishuPrivateTests(unittest.IsolatedAsyncioTestCase):
                         run = history.agent_run(run_id)
                         self.assertEqual(payloads, [{"agent_id": accepted["agent_id"],
                                                      "status": "completed", "result": "reply: child B"}])
-                        self.assertEqual(run.status, "completed")
-                        self.assertIsNotNone(run.reply_enqueued_at)
+                        self.assertEqual((run.status, run.result), ("completed", "reply: child B"))
 
     async def test_runtime_retries_real_sqlite_commit_contention_after_rollback(self):
         a, sa = _CHATS[0], _SENDERS[0]

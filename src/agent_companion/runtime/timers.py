@@ -9,7 +9,7 @@ from math import isfinite
 from secrets import token_hex
 from typing import Any
 
-from ..protocol import InternalInput, TimerFired, ToolSpec
+from ..protocol import MessageDelivery, TimerFired, ToolSpec
 from .tools import Tool, ToolContext
 
 
@@ -23,7 +23,7 @@ _MAX_ACTIVE_TIMERS = 8
 _SET_TIMER = ToolSpec(
     SET_TIMER_TOOL_NAME,
     "登记会话定时器，立即返回 timer_id，不等待到期。到期后模型会收到内部定时器事件，"
-    f"可稍晚处理；只有纳入真实用户输入的运行可以登记。同一会话最多 {_MAX_ACTIVE_TIMERS} 个活跃定时器。",
+    f"可稍晚处理。同一会话最多 {_MAX_ACTIVE_TIMERS} 个活跃定时器。",
     {
         "type": "object",
         "properties": {
@@ -66,7 +66,7 @@ class _Timer:
 class Timers:
     """一条会话绑定下的工具和回调，仅由同一个事件循环驱动。"""
 
-    def __init__(self, session_id: str, submit: Callable[[InternalInput], bool]) -> None:
+    def __init__(self, session_id: str, submit: Callable[[MessageDelivery], bool]) -> None:
         self._session_id = session_id
         self._submit = submit
         self._loop = get_running_loop()
@@ -81,8 +81,6 @@ class Timers:
             return '{"error":"not_parent_session"}'
         if self._closed:
             return '{"error":"timers_closed"}'
-        if not context.has_user_input:
-            return '{"error":"timer_requires_user_input"}'
 
         interval = args.get("interval_seconds")
         mode = args.get("mode", "once")
@@ -126,7 +124,7 @@ class Timers:
         count = timer.fire_count + 1
         event = TimerFired(timer_id, count, timer.max_fires, timer.repeat, timer.message)
         try:
-            accepted = self._submit(InternalInput(event))
+            accepted = self._submit(MessageDelivery(event.to_history_message(), "trigger"))
         except Exception as exc:
             _LOG.warning("timer event submission failed; error_type=%s", type(exc).__name__)
             accepted = False

@@ -3,6 +3,7 @@
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
+from hashlib import sha256
 import os
 from pathlib import Path
 import stat
@@ -52,6 +53,11 @@ def _check_package_copy(fd: int) -> None:
 @dataclass(frozen=True, slots=True)
 class Workspace:
     directory: Path
+
+    @classmethod
+    def for_user(cls, root: Path, user_key: str) -> "Workspace":
+        """计算已核验用户的工作区，不创建目录或会话。"""
+        return cls(root.absolute() / sha256(user_key.encode("utf-8")).hexdigest())
 
     def resolved_directory(self) -> Path:
         """按文件系统语义解析配置中的祖先（含 link/..），不解析工作区末级。"""

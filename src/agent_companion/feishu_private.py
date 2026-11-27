@@ -5,19 +5,21 @@ from __future__ import annotations
 import asyncio
 from collections.abc import Callable
 from contextlib import AbstractAsyncContextManager, AsyncExitStack
+from datetime import datetime
 import logging
+from pathlib import Path
 from sqlite3 import DatabaseError, OperationalError
 from time import time
 from typing import TYPE_CHECKING
 
 from .channels.feishu.channel import FeishuChannel, FeishuInput, FeishuPoller, private_session_id
 from .channels.feishu.cli import FeishuDiscovery
-from .protocol import ChannelUser, Message, PersistedInput, ReplyDelivery, ReplyStream
+from .protocol import ChannelUser, Message, MessageDelivery, ReplyDelivery, ReplyStream
 from .runtime.engine import Runtime
 from .runtime.subtasks import AgentTree
 from .session_scheduler import SessionScheduler, SessionSchedulers
 from .speech.asr import FileASR
-from .storage.sqlite import Agent, History, is_sqlite_lock_error
+from .storage.sqlite import Agent, FeishuRawConfirmationUnresolved, History, is_sqlite_lock_error
 
 if TYPE_CHECKING:
     from .feishu_calls import IncomingCalls
@@ -25,7 +27,6 @@ if TYPE_CHECKING:
 
 
 _LOG = logging.getLogger(__name__)
-_INBOUND_SOURCE = "feishu-private"
 _OpenAgent = Callable[[Agent, FeishuChannel, ChannelUser], AbstractAsyncContextManager[tuple[Runtime, AgentTree]]]
 
 
@@ -43,16 +44,22 @@ class _Route:
         self._agent: tuple[Runtime, AgentTree] | None = None
         self._agent_lock = asyncio.Lock()
         self._closed = False
+        self._inbound_paused = False
         self._stop_call: Callable[[], None] | None = None
         self._select_call: Callable[[ReplyStream], ReplyDelivery | None] | None = None
         self._can_wake_call: Callable[[], bool] | None = None
         self._open_agent = open_agent
         self._inbound = asyncio.Event()
-        self._last_submitted = 0
         self.channel = FeishuChannel(discovery.for_user(user), select_voice=self._select_voice)
 
+    def _inbound_stopped(self) -> bool:
+        # 不确认再也无法从该 Runtime 队列消费的原始批次。
+        return (self._closed or self._inbound_paused
+                or (self._agent is not None and self._agent[0].input_retry_forbidden))
+
     def notify_inbound(self) -> None:
-        self._inbound.set()
+        if not self._inbound_stopped():
+            self._inbound.set()
 
     async def prepare_agent(self, *, wait_for_lock: bool = True) -> bool:
         if not wait_for_lock and self._agent_lock.locked():
@@ -72,21 +79,11 @@ class _Route:
                     self._revoke_input = self._scheduler.input_revoker()
             return not self._closed
 
-    def _dispatch_pending(self) -> None:
+    def _submit_messages(self, deliveries: tuple[MessageDelivery, ...]) -> None:
         scheduler = self._scheduler
         if scheduler is None:
-            return
-        try:
-            pending = self._history.pending_inbound(self._session_id, _INBOUND_SOURCE)
-        except OperationalError as exc:
-            if not is_sqlite_lock_error(exc):
-                raise
-            _LOG.warning("Feishu user inbox storage busy; retrying pending input on next poll")
-            return
-        for batch_id in pending:
-            if batch_id > self._last_submitted:
-                scheduler.session_input((PersistedInput(batch_id),))
-                self._last_submitted = batch_id
+            raise RuntimeError("Feishu session scheduler is not bound")
+        scheduler.session_input(deliveries)
 
     def watch_call(self, stop: Callable[[], None]) -> bool:
         if self._closed or self._stop_call is not None:
@@ -95,7 +92,7 @@ class _Route:
         return True
 
     def call_started(self, stop: Callable[[], None], voice: VoiceChannel, *, check_window: Callable[[], bool],
-                     idle_timeout: float, copy_confirmed: bool) -> bool:
+                     idle_timeout: float, copy_confirmed: bool, started_at: datetime) -> bool:
         scheduler = self._scheduler
         if (self._closed or self._stop_call != stop or self._select_call is not None
                 or scheduler is None or voice.failed):
@@ -115,32 +112,41 @@ class _Route:
         scheduler.call_started(stop)
         self._select_call = select
         self._can_wake_call = can_wake
+        event = Message("state_event", f"通话已接通 - {started_at.isoformat(sep=' ', timespec='seconds')}")
+        self._submit_messages((MessageDelivery(event, "trigger"),))
         return True
 
     def call_input(self, stop: Callable[[], None], text: str | None, input_active: bool | None) -> None:
         scheduler = self._scheduler
         if self._closed or self._stop_call != stop or scheduler is None:
             return
-        items = (Message("user", text),) if text else ()
+        deliveries = (MessageDelivery(Message("user", text), "trigger"),) if text else ()
         can_wake = self._can_wake_call
         empty = text == "" and input_active is False and can_wake is not None and self._inbox_empty()
-        if scheduler.call_input(stop, items, input_active=input_active, empty_transcript=empty,
+        if scheduler.call_input(stop, deliveries, input_active=input_active, empty_transcript=empty,
                                 can_wake=can_wake if empty else None) and text:
             self.channel.enqueue_transcript(text)
 
     def _inbox_empty(self) -> bool:
+        scheduler = self._scheduler
+        if (scheduler is None or self._agent is None or scheduler.has_pending_messages
+                or self._agent[0].has_pending_messages):
+            return False
         try:
-            return not self._history.has_pending_feishu_input(self._user.key, self._session_id)
+            return not self._history.has_pending_feishu_input(self._user.key)
         except DatabaseError as exc:
             _LOG.warning("Feishu call wake skipped: inbox lookup failed (%s)", type(exc).__name__)
             return False
 
-    def call_ended(self, stop: Callable[[], None]) -> None:
-        if self._stop_call != stop:
-            return
-        self._stop_call = self._select_call = self._can_wake_call = None
+    def call_ended(self, stop: Callable[[], None], *, ended_at: datetime | None = None) -> None:
+        if self._stop_call == stop:
+            self._stop_call = self._select_call = self._can_wake_call = None
         if self._scheduler is not None:
-            self._scheduler.call_ended(stop)
+            deliveries = ()
+            if ended_at is not None:
+                event = Message("state_event", f"通话已结束 - {ended_at.isoformat(sep=' ', timespec='seconds')}")
+                deliveries = (MessageDelivery(event, "record"),)
+            self._scheduler.call_ended(stop, deliveries)
 
     def _select_voice(self, reply: ReplyStream) -> ReplyDelivery | None:
         select = self._select_call
@@ -170,11 +176,14 @@ class _Route:
                         await self._inbound.wait()
                         self._inbound.clear()
                         try:
-                            await self._submit_inbound()
-                            while await self._inputs.process_next(self._user, self.channel, self._dispatch_pending):
-                                if self._scheduler is None:
-                                    await self._submit_inbound()
+                            while not self._inbound_stopped() and await self._inputs.process_next(
+                                    self._user, self.channel, prepare=self.prepare_agent, submit=self._submit_messages,
+                                    stopped=self._inbound_stopped):
                                 await asyncio.sleep(0)
+                        except FeishuRawConfirmationUnresolved:
+                            self._inbound_paused = True
+                            _LOG.warning("Feishu raw batch confirmation not verified; pausing this user's input"
+                                         " until restart")
                         except OperationalError as exc:
                             if not is_sqlite_lock_error(exc):
                                 raise
@@ -190,17 +199,10 @@ class _Route:
             _LOG.warning("Feishu user session cleanup storage busy; deferred agent recovery")
 
 
-    async def _submit_inbound(self) -> None:
-        if self._scheduler is None and self._history.pending_inbound(self._session_id, _INBOUND_SOURCE):
-            await self.prepare_agent()
-        if self._scheduler is not None:
-            self._dispatch_pending()
-
-
 async def run_private_chats(discovery: FeishuDiscovery, history: History, asr: FileASR, *, account: ChannelUser,
-                            started_ms: int, open_agent: _OpenAgent, schedulers: SessionSchedulers,
+                            started_ms: int, open_agent: _OpenAgent, schedulers: SessionSchedulers, workspace_root: Path,
                             incoming: IncomingCalls | None = None) -> None:
-    inputs = FeishuInput(discovery, asr, history)
+    inputs = FeishuInput(discovery, asr, history, workspace_root=workspace_root)
     routes: dict[ChannelUser, _Route] = {}
     tasks: list[asyncio.Task[None]] = []
     stopping = False

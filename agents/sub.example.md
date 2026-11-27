@@ -2,6 +2,7 @@
 description = "适合审阅方案、检查遗漏和边界条件"
 # 显式共用 [models.llm.chat]；也可改为已配置可用的 "review" 等其他 ID。
 model_id = "chat"
+# 只提供 tools 列表中的工具，不按本轮输入来源另行授权。
 # 可用工具：
 # - delegate_subtask：将任务异步委派给子 Agent。
 # - set_timer：登记定时器，到期时唤醒会话。

@@ -7,9 +7,9 @@ from unittest.mock import patch
 
 from agent_companion.app import running_agent
 from agent_companion.config import Settings
-from agent_companion.protocol import (DeliveryStatus, InternalInput, Message, Receipt,
+from agent_companion.protocol import (DeliveryStatus, Message, MessageDelivery, Receipt,
                                       TextDelta, ToolCall, ToolReady)
-from agent_companion.runtime.subtasks import demo_roles
+from agent_companion.runtime.subtasks import DELEGATE_TOOL_NAME, demo_roles
 from agent_companion.runtime.timers import CANCEL_TIMER_TOOL_NAME, SET_TIMER_TOOL_NAME, Timers
 from agent_companion.runtime.tools import ToolContext, Tools
 from agent_companion.session_scheduler import SessionScheduler, SessionSchedulers
@@ -48,15 +48,16 @@ class _Clock:
 
 
 def _event(item):
-    if isinstance(item, InternalInput):
-        item = item.to_history_message()
+    if isinstance(item, MessageDelivery):
+        assert item.intent == "trigger"
+        item = item.message
     assert item.kind == "async_tool_result" and item.async_result.kind == "timer_fired"
     return {"event": item.async_result.kind, **item.async_result.payload}
 
 
-async def _execute(tools, name, args, *, session="main", has_user_input=True):
+async def _execute(tools, name, args, *, session="main"):
     call = ToolCall("call", name, args if isinstance(args, str) else json.dumps(args))
-    return json.loads(await tools.execute(call, ToolContext(session, "run", call.id, has_user_input)))
+    return json.loads(await tools.execute(call, ToolContext(session, "run", call.id)))
 
 
 class _Model:
@@ -235,8 +236,7 @@ class TimerTest(unittest.IsolatedAsyncioTestCase):
                          {"status": "not_active"})
         self.assertEqual(await _execute(tools, CANCEL_TIMER_TOOL_NAME, args, session="other"),
                          {"status": "not_active"})
-        self.assertEqual(await _execute(tools, CANCEL_TIMER_TOOL_NAME, args, has_user_input=False),
-                         {"status": "cancelled"})
+        self.assertEqual(await _execute(tools, CANCEL_TIMER_TOOL_NAME, args), {"status": "cancelled"})
         self.assertEqual(await _execute(tools, CANCEL_TIMER_TOOL_NAME, args), {"status": "not_active"})
         self.clock.advance(10)
         scheduler.session_input(input_active=False)
@@ -290,8 +290,7 @@ class TimerTest(unittest.IsolatedAsyncioTestCase):
         def answer(step, messages):
             if step == 3:
                 event = _event(messages[-1])
-                return (ToolReady(ToolCall("auto-register", SET_TIMER_TOOL_NAME, '{"interval_seconds":2}')),
-                        ToolReady(ToolCall("stop", CANCEL_TIMER_TOOL_NAME, json.dumps({"timer_id": event["timer_id"]}))))
+                return (ToolReady(ToolCall("stop", CANCEL_TIMER_TOOL_NAME, json.dumps({"timer_id": event["timer_id"]}))),)
             return _register_then_finish(step, messages)
 
         schedulers = SessionSchedulers()
@@ -300,7 +299,7 @@ class TimerTest(unittest.IsolatedAsyncioTestCase):
         with closing(History(":memory:")) as history:
             async with running_agent(Settings(), history, model, channel, session_id="main",
                                      schedulers=schedulers, roles=demo_roles()) as (runtime, _):
-                scheduler.session_input((Message("user", "synthetic registration"),))
+                scheduler.session_input((MessageDelivery(Message("user", "synthetic registration"), "trigger"),))
                 await asyncio.wait_for(runtime.wait_idle(), 2)
                 self.assertIsNone(runtime._worker)
                 self.assertIsNone(runtime.last_failure)
@@ -314,12 +313,57 @@ class TimerTest(unittest.IsolatedAsyncioTestCase):
                 self.assertIsNone(runtime.last_failure)
                 self.assertEqual(len(model.requests), 4)
                 tool_results = {call.id: json.loads(call.result) for call in tool_calls(model.requests[-1])}
-                self.assertEqual(tool_results["auto-register"], {"error": "timer_requires_user_input"})
                 self.assertEqual(tool_results["stop"], {"status": "cancelled"})
                 self.assertEqual(_event(model.requests[2][-1])["timer_id"], tool_results["register"]["timer_id"])
                 self.assertNotEqual(channel.replies[0][0], channel.replies[1][0])
                 self.clock.advance(10)
                 self.assertEqual(len(model.requests), 4)
+
+    async def test_two_timer_wakes_can_delegate_and_rearm_without_new_user_input(self):
+        def answer(step, messages):
+            last = messages[-1]
+            if last.kind == "user" and last.text == "安排任务":
+                return (ToolReady(ToolCall("register", SET_TIMER_TOOL_NAME,
+                                           '{"interval_seconds":2,"message":"work"}')),)
+            if last.async_result is not None and last.async_result.kind == "timer_fired":
+                stage = _event(last)["message"]
+                delegate = ToolReady(ToolCall(f"delegate-{stage}", DELEGATE_TOOL_NAME,
+                                               json.dumps({"agent": "general", "prompt": stage})))
+                if stage == "work":
+                    return (delegate, ToolReady(ToolCall("rearm", SET_TIMER_TOOL_NAME,
+                                                         '{"interval_seconds":3,"message":"review"}')))
+                return (delegate,)
+            if last.kind == "user" and last.text in ("work", "review"):
+                return (TextDelta(f"finished {last.text}"),)
+            return (TextDelta("done"),)
+
+        def parent_state(history):
+            messages = [entry.message for entry in history.read_after("main")]
+            results = {call.id: json.loads(call.result) for call in tool_calls(messages)}
+            pending_events = [message.async_result for message in messages if message.async_result is not None]
+            return results, pending_events
+
+        with closing(History(":memory:")) as history:
+            async with running_agent(Settings(), history, _Model(answer), _Channel(), session_id="main",
+                                     roles=demo_roles()) as (runtime, tree):
+                runtime.submit_messages((MessageDelivery(Message("user", "安排任务"), "trigger"),))
+                await asyncio.wait_for(tree.wait_idle(), 2)
+                self.assertEqual(set(parent_state(history)[0]), {"register"})
+
+                self.clock.advance(2)
+                await asyncio.wait_for(tree.wait_idle(), 2)
+                results, _ = parent_state(history)
+                self.assertEqual(set(results), {"register", "delegate-work", "rearm"})
+                self.assertEqual(results["delegate-work"]["status"], "accepted")
+                self.assertEqual(results["rearm"]["status"], "accepted")
+
+                self.clock.advance(3)
+                await asyncio.wait_for(tree.wait_idle(), 2)
+                results, events = parent_state(history)
+                self.assertEqual(results["delegate-review"]["status"], "accepted")
+                self.assertEqual([(event.kind, event.payload.get("message", event.payload.get("result")))
+                                  for event in events], [("timer_fired", "work"), ("agent_reply", "finished work"),
+                                                         ("timer_fired", "review"), ("agent_reply", "finished review")])
 
     async def test_running_runtime_can_receive_timer_in_its_tool_continuation(self):
         def answer(step, messages):
@@ -335,10 +379,10 @@ class TimerTest(unittest.IsolatedAsyncioTestCase):
         with closing(History(":memory:")) as history:
             async with running_agent(Settings(), history, model, channel, session_id="main",
                                      schedulers=schedulers, roles=demo_roles()) as (runtime, _):
-                scheduler.session_input((Message("user", "synthetic registration"),))
+                scheduler.session_input((MessageDelivery(Message("user", "synthetic registration"), "trigger"),))
                 await asyncio.wait_for(runtime.wait_idle(), 2)
                 timer_id = json.loads(model.requests[-1][-1].tool_calls[-1].result)["timer_id"]
-                scheduler.session_input((Message("user", "synthetic follow-up"),))
+                scheduler.session_input((MessageDelivery(Message("user", "synthetic follow-up"), "trigger"),))
                 await asyncio.wait_for(runtime.wait_idle(), 2)
                 self.assertIsNone(runtime.last_failure)
                 self.assertEqual(len(model.requests), 4)
@@ -355,7 +399,7 @@ class TimerTest(unittest.IsolatedAsyncioTestCase):
                 scheduler = schedulers.get_or_create("main")
                 async with running_agent(Settings(), history, model, _Channel(), session_id="main",
                                          schedulers=schedulers, roles=demo_roles()) as (runtime, _):
-                    scheduler.session_input((Message("user", "synthetic registration"),))
+                    scheduler.session_input((MessageDelivery(Message("user", "synthetic registration"), "trigger"),))
                     await asyncio.wait_for(runtime.wait_idle(), 2)
                     handle, = self.clock.handles
                     self.assertFalse(handle.cancelled)

@@ -2,6 +2,7 @@
 description = "负责与用户对话并协调子 Agent"
 # 引用 config.toml 中 [models.llm.chat]，不是服务商模型名。
 model_id = "chat"
+# 只提供 tools 列表中的工具，不按本轮输入来源另行授权。
 # 可用工具：
 # - delegate_subtask：将任务异步委派给子 Agent。
 # - set_timer：登记定时器，到期时唤醒会话。

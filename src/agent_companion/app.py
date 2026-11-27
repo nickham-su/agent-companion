@@ -82,8 +82,7 @@ async def running_agent(
             compactions = Compactions(history)
         workspace = None
         if user is not None:
-            directory_name = sha256(user.key.encode("utf-8")).hexdigest()
-            workspace = Workspace(settings.workspace_root.absolute() / directory_name)
+            workspace = Workspace.for_user(settings.workspace_root, user.key)
         tree = AgentTree(agent, history, models, roles=roles,
                          schedulers=schedulers,
                          retry_sqlite_locks=retry_sqlite_locks, compactions=compactions, workspace=workspace)
@@ -163,7 +162,7 @@ async def prepare_private_feishu(
             try:
                 await run_private_chats(
                     discovery, db, file_asr, account=account, started_ms=started_ms, incoming=incoming,
-                    schedulers=schedulers,
+                    schedulers=schedulers, workspace_root=settings.workspace_root,
                     open_agent=lambda agent, channel, user: running_agent(
                         settings, db, model, channel, session_id=agent.session_id, agent=agent, roles=roles, user=user,
                         retry_sqlite_locks=True, compactions=compactions, schedulers=schedulers))

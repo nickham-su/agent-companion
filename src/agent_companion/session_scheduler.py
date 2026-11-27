@@ -4,12 +4,11 @@ import asyncio
 from collections.abc import Callable, Sequence
 import logging
 
-from .protocol import (DeliveryStatus, InputItem, InternalInput, PersistedInput, Receipt, ReplyDelivery, ReplyStream,
-                       validate_input_items)
+from .protocol import DeliveryStatus, MessageDelivery, Receipt, ReplyDelivery, ReplyStream, validate_deliveries
 
 
 _LOG = logging.getLogger(__name__)
-_Submit = Callable[[tuple[InputItem, ...]], None]
+_Submit = Callable[[tuple[MessageDelivery, ...]], None]
 _Trigger = Callable[[Callable[[], bool]], None]
 
 
@@ -28,8 +27,11 @@ class SessionScheduler:
         self._input_active = False
         self._input_epoch = 0
         self._obsolete_until = -float("inf")
-        self._pending: list[InputItem] = []
-        self._pending_inbound: set[int] = set()
+        self._pending: list[MessageDelivery] = []
+
+    @property
+    def has_pending_messages(self) -> bool:
+        return bool(self._pending)
 
     def _ensure_unbound(self, owner: object | None = None) -> None:
         if self._agent_owner is not owner or self._submit is not None:
@@ -65,7 +67,6 @@ class SessionScheduler:
                 self._input_active = False
                 self._obsolete_until = -float("inf")
                 self._pending.clear()
-                self._pending_inbound.clear()
                 if on_revoke is not None:
                     on_revoke()
 
@@ -84,14 +85,14 @@ class SessionScheduler:
             raise RuntimeError("session scheduler cannot bind call")
         self._call = stop
 
-    def call_input(self, stop: Callable[[], None], items: Sequence[InputItem], *,
+    def call_input(self, stop: Callable[[], None], deliveries: Sequence[MessageDelivery], *,
                    input_active: bool | None, empty_transcript: bool = False,
                    can_wake: Callable[[], bool] | None = None) -> bool:
         """返回本通输入是否被接收（也可能暂存在队列中）。"""
         if self._call != stop:
             return False
-        may_trigger = empty_transcript and input_active is False and not (items or self._pending)
-        self.session_input(items, input_active=input_active)
+        may_trigger = empty_transcript and input_active is False and not (deliveries or self._pending)
+        self.session_input(deliveries, input_active=input_active)
         if may_trigger and self._trigger is not None:
             epoch = self._input_epoch
 
@@ -102,35 +103,30 @@ class SessionScheduler:
             self._trigger(lambda: current() and (can_wake is None or can_wake()) and current())
         return True
 
-    def call_ended(self, stop: Callable[[], None]) -> None:
+    def call_ended(self, stop: Callable[[], None], deliveries: Sequence[MessageDelivery] = ()) -> None:
         if self._call == stop:
             self._call = None
-            self.session_input(input_active=False)
+            self.session_input(deliveries, input_active=False)
+        elif deliveries:
+            # 身份只约束语音状态；迟到的生命周期消息仍按到达顺序加入队列。
+            self.session_input(deliveries)
 
-    def session_input(self, items: Sequence[InputItem] = (), *, input_active: bool | None = None) -> None:
+    def session_input(self, deliveries: Sequence[MessageDelivery] = (), *, input_active: bool | None = None) -> None:
         """同步追加内容、更新状态并放行，不在这三步之间让出事件循环。"""
         submit = self._submit
         if submit is None:
             raise RuntimeError("session scheduler is not bound")
-        items = tuple(items)
-        validate_input_items(items)
+        deliveries = tuple(deliveries)
+        validate_deliveries(deliveries)
         if input_active is not None and not isinstance(input_active, bool):
             raise ValueError("input state must be a bool or None")
-        self._append_inputs(items)
+        self._pending.extend(deliveries)
         if input_active is not None:
             if input_active or self._input_active:
                 self._input_epoch += 1
                 self._obsolete_until = asyncio.get_running_loop().time()
             self._input_active = input_active
         self._flush_pending(submit)
-
-    def _append_inputs(self, items: tuple[InputItem, ...]) -> None:
-        for item in items:
-            if isinstance(item, PersistedInput):
-                if item.batch_id in self._pending_inbound:
-                    continue
-                self._pending_inbound.add(item.batch_id)
-            self._pending.append(item)
 
     def _flush_pending(self, submit: _Submit, *, internal: bool = False) -> None:
         if self._input_active or not self._pending:
@@ -144,7 +140,6 @@ class SessionScheduler:
             _LOG.warning("runtime input handoff failed; batch retained; error_type=%s", type(exc).__name__)
             return
         self._pending.clear()
-        self._pending_inbound.clear()
 
     def select_voice(self, reply: ReplyStream, target: ReplyDelivery) -> ReplyDelivery:
         """语音选路后同步决定是否拦截，不在转写结束后恢复过期回复。"""
@@ -153,14 +148,13 @@ class SessionScheduler:
             return ReplyDelivery(_reject_voice)
         return target
 
-    def submit_internal(self, item: InternalInput) -> bool:
+    def submit_internal(self, delivery: MessageDelivery) -> bool:
         """绑定有效且消息已加入调度器即视为接纳，不等待 Runtime 接手。"""
         submit = self._submit
         if submit is None:
             return False
-        items = (item,)
-        validate_input_items(items)
-        self._append_inputs(items)
+        validate_deliveries((delivery,))
+        self._pending.append(delivery)
         self._flush_pending(submit, internal=True)
         return True
 
@@ -183,6 +177,6 @@ class SessionSchedulers:
         if self._sessions.get(session_id) is scheduler and scheduler.release_agent(owner):
             del self._sessions[session_id]
 
-    def submit_internal(self, session_id: str, item: InternalInput) -> bool:
+    def submit_internal(self, session_id: str, delivery: MessageDelivery) -> bool:
         scheduler = self._sessions.get(session_id)
-        return scheduler is not None and scheduler.submit_internal(item)
+        return scheduler is not None and scheduler.submit_internal(delivery)

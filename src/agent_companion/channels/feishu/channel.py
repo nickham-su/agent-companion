@@ -2,23 +2,25 @@
 
 import asyncio
 from collections import Counter, defaultdict, deque
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from contextlib import nullcontext
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from hashlib import sha256
 import logging
+from pathlib import Path
 from sqlite3 import OperationalError
 from time import time
 from typing import Literal
 
-from ...protocol import ChannelUser, DeliveryStatus, Receipt, ReplyDelivery, ReplyInfo, ReplyStream
+from ...images import MAX_MEDIA_BYTES
+from ...protocol import ChannelUser, DeliveryStatus, MessageDelivery, Receipt, ReplyDelivery, ReplyInfo, ReplyStream
 from ...speech.asr import FileASR
 from ...storage.sqlite import FeishuCandidate, FeishuRaw, History, is_sqlite_lock_error
+from ...workspace import Workspace
 from .cli import (DEFAULT_SEARCH_PAGE_SIZE, MAX_MGET_SIZE, MIN_PAGE_SIZE, CliError, CliStdoutLimit, FeishuCLI,
                   FeishuDiscovery, _valid_id, parse_open_id)
-from .messages import (MAX_BATCH_BYTES, NORMALIZE_ERRORS, SUPPORTED_TYPES, BatchMediaBudget, IncomingMessage,
-                       MessageNormalizer, incoming)
+from .messages import NORMALIZE_ERRORS, SUPPORTED_TYPES, IncomingMessage, MessageNormalizer, incoming
 
 
 _LOG = logging.getLogger(__name__)
@@ -232,40 +234,57 @@ class FeishuInput:
     """每个用户的顺序工作任务调用；媒体并发受限，纯文字不占媒体槽。"""
 
     def __init__(self, discovery: FeishuDiscovery, asr: FileASR, history: History, *,
-                 batch_budget: int = MAX_BATCH_BYTES) -> None:
+                 workspace_root: Path, batch_budget: int = MAX_MEDIA_BYTES) -> None:
         self._normalizer = MessageNormalizer(discovery, asr)
         self._history = history
+        self._workspace_root = workspace_root
         self._batch_budget = batch_budget
         self._media_slots = asyncio.Semaphore(_MAX_MEDIA_WORKERS)
 
-    async def process_next(self, user: ChannelUser, channel: FeishuChannel, dispatch: Callable[[], None]) -> bool:
+    async def _prepare_batch(self, user: ChannelUser, batch_id: int) -> tuple[tuple[MessageDelivery, ...], list[str | None]]:
+        received = []
+        audio = []
+        for row in self._history.read_feishu_raw(user.key, batch_id):
+            raw = IncomingMessage(*row)
+            normalized = None
+            try:
+                normalized = await self._normalizer.normalize(raw)
+            except NORMALIZE_ERRORS:
+                if raw.kind != "audio":
+                    _LOG.warning("Feishu input could not be normalized")
+            if raw.kind == "audio":
+                audio.append(normalized if isinstance(normalized, str) else None)
+            if normalized is not None:
+                received.append(normalized)
+        workspace = Workspace.for_user(self._workspace_root, user.key)
+        messages = await self._normalizer.finish(received, workspace, budget=self._batch_budget)
+        deliveries = tuple(MessageDelivery(message, "trigger") for message in messages)
+        # 只保留已保存的引用，不在确认退避期间保留媒体原始字节。
+        return deliveries, audio
+
+    async def process_next(self, user: ChannelUser, channel: FeishuChannel, *, prepare: Callable[[], Awaitable[bool]],
+                           submit: Callable[[tuple[MessageDelivery, ...]], None], stopped: Callable[[], bool]) -> bool:
         pending = self._history.next_feishu_raw(user.key)
         if pending is None:
             return False
         batch_id, has_media = pending
         # 持有媒体槽直到提交，避免 SQLite 争用期间积累过多已展开的批次。
         async with self._media_slots if has_media else nullcontext():
-            budget = BatchMediaBudget(self._batch_budget)
-            received = []
-            audio = []
-            for row in self._history.read_feishu_raw(user.key, batch_id):
-                raw = IncomingMessage(*row)
-                normalized = None
-                try:
-                    normalized = await self._normalizer.normalize(raw, budget)
-                except NORMALIZE_ERRORS:
-                    if raw.kind != "audio":
-                        _LOG.warning("Feishu input could not be normalized")
-                if raw.kind == "audio":
-                    text = normalized.content if normalized is not None else None
-                    audio.append(text if isinstance(text, str) else None)
-                received.append((raw.message_id, normalized))
-            messages = [msg for _, msg in budget.finish(received) if msg is not None]
+            if stopped():
+                return False
+            deliveries, audio = await self._prepare_batch(user, batch_id)
+            ready = not deliveries  # 空批只确认原始记录，不为它注册 Agent。
             warned = False
-            while True:
+            while not stopped():
                 try:
-                    self._history.finish_feishu_raw(user.key, batch_id, private_session_id(user), messages)
-                    break
+                    if not ready:
+                        if not await prepare():
+                            return False
+                        ready = True
+                    # 注册，以及上次确认遇锁后的等待，都可能让目标 Runtime 不再接收消息。
+                    if stopped():
+                        return False
+                    self._history.finish_feishu_raw(user.key, batch_id)
                 except OperationalError as exc:
                     if not is_sqlite_lock_error(exc):
                         raise
@@ -273,12 +292,18 @@ class FeishuInput:
                         _LOG.warning("Feishu user input storage busy; retrying prepared batch")
                         warned = True
                     await asyncio.sleep(_STORAGE_RETRY_SECONDS)
+                else:
+                    # 确认后直接交接，不 yield，也不因为下游异常回到原始批次的重试循环。
+                    if deliveries:
+                        submit(deliveries)
+                    break
+            else:
+                return False
             for text in audio:
                 if text is None:
                     channel.enqueue_audio_failure()
                 else:
                     channel.enqueue_transcript(text)
-            dispatch()  # 已就绪 Session 在提交归一化输入的同一事件循环刻度交接。
         return True
 
 

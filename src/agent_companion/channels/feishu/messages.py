@@ -1,20 +1,21 @@
 """将飞书 OpenAPI 原始消息规范化为有序文本和图片。"""
 
-from base64 import b64encode
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, field
 import json
+import logging
 import re
-from typing import Any, Protocol
+from typing import Any, Protocol, TypeAlias
 
-from ...protocol import OMITTED_INPUT_IMAGE, ChannelUser, Image, Message, Part, Text
+from ...images import MAX_IMAGE_BYTES, UNAVAILABLE_IMAGE, image_media_type, image_request_bytes, run_image_io, save_image
+from ...protocol import OMITTED_INPUT_IMAGE, ChannelUser, Message, Part, Text
 from ...speech.asr import AsrError, AudioFile, FileASR, MAX_AUDIO_BYTES
+from ...workspace import Workspace
 from .cli import CliError, parse_open_id
 
 
 SUPPORTED_TYPES = {"audio", "image", "post", "text"}
-MAX_IMAGE_BYTES = 8 * 1024 * 1024
-MAX_BATCH_BYTES = 32 * 1024 * 1024  # 给模型工具声明和协议封装留余量。
 _MAX_POST_NODES = 1000
+_LOG = logging.getLogger(__name__)
 
 
 class MessageFormatError(Exception):
@@ -82,64 +83,18 @@ def _post_body(content: dict[str, Any]) -> dict[str, Any]:
     raise MessageFormatError("invalid_post_content")
 
 
-def _image_media_type(data: bytes) -> str:
-    if (len(data) >= 45 and data.startswith(b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR")
-            and data.endswith(b"\x00\x00\x00\x00IEND\xaeB`\x82")):
-        return "image/png"
-    if len(data) >= 12 and data.startswith(b"\xff\xd8\xff") and data.endswith(b"\xff\xd9"):
-        return "image/jpeg"
-    if len(data) >= 14 and data.startswith((b"GIF87a", b"GIF89a")) and data.endswith(b";"):
-        return "image/gif"
-    if len(data) >= 20 and data.startswith(b"RIFF") and data[8:12] == b"WEBP" and data[12:16] in (
-        b"VP8 ", b"VP8L", b"VP8X"
-    ) and int.from_bytes(data[4:8], "little") + 8 == len(data):
-        return "image/webp"
-    raise MessageFormatError("unsupported_image_format")
-
-
 def _text_bytes(value: str) -> int:
     return len(json.dumps(value, ensure_ascii=False).encode("utf-8"))
 
 
-def _image_bytes(encoded_length: int) -> int:
-    return encoded_length + 64  # 含 data URL 及图片内容块的 JSON 包装。
+@dataclass(frozen=True, slots=True)
+class _ImageResource:
+    message_id: str = field(repr=False)
+    key: str = field(repr=False)
 
 
-class BatchMediaBudget:
-    def __init__(self, limit: int) -> None:
-        self._limit = limit
-        self.remaining = limit
-
-    def reserve_image(self, encoded_length: int) -> bool:
-        cost = _image_bytes(encoded_length)
-        if cost > self.remaining:
-            return False
-        self.remaining -= cost
-        return True
-
-    def finish(self, items: list[tuple[str, Message | None]]) -> list[tuple[str, Message | None]]:
-        # 先为同批所有文字与占位留空间，再按原顺序保留可装下的图片。
-        placeholder_cost = _text_bytes(OMITTED_INPUT_IMAGE.text) + 32
-        body = sum(64 + (_text_bytes(message.content) if isinstance(message.content, str) else
-                        sum(_text_bytes(part.text) + 32 if isinstance(part, Text) else placeholder_cost
-                            for part in message.content))
-                   for _, message in items if message is not None)
-        remaining = self._limit - body
-        final = []
-        for external_id, message in items:
-            if message is not None and not isinstance(message.content, str):
-                parts: list[Part] = []
-                for part in message.content:
-                    if isinstance(part, Image):
-                        cost = _image_bytes(len(part.url)) - placeholder_cost
-                        if cost > remaining:
-                            part = OMITTED_INPUT_IMAGE
-                        else:
-                            remaining -= cost
-                    parts.append(part)
-                message = replace(message, parts=tuple(parts))
-            final.append((external_id, message))
-        return final
+_PostPart: TypeAlias = Text | _ImageResource
+NormalizedContent: TypeAlias = str | _ImageResource | tuple[_PostPart, ...]
 
 
 class ResourceDownloader(Protocol):
@@ -151,30 +106,73 @@ class MessageNormalizer:
         self._cli = cli
         self._asr = asr
 
-    async def normalize(self, raw: IncomingMessage, budget: BatchMediaBudget) -> Message:
+    async def normalize(self, raw: IncomingMessage) -> NormalizedContent:
         content = _read_content(raw.content)
         if raw.kind == "text":
-            return Message("user", _required(content.get("text")))
+            return _required(content.get("text"))
         if raw.kind == "image":
-            image = await self._image(raw.message_id, _required(content.get("image_key")), budget)
-            return Message("user", (image,))
+            return _ImageResource(raw.message_id, _required(content.get("image_key")))
         if raw.kind == "audio":
             data = await self._cli.download(raw.message_id, _required(content.get("file_key")), "file",
                                             limit=MAX_AUDIO_BYTES)
-            return Message("user", _required(await self._asr.transcribe(AudioFile(data))))
-        return Message("user", await self._post(raw.message_id, _post_body(content), budget))
+            return _required(await self._asr.transcribe(AudioFile(data)))
+        return self._post(raw.message_id, _post_body(content))
 
-    async def _image(self, message_id: str, key: str, budget: BatchMediaBudget) -> Part:
-        if budget.remaining <= _image_bytes(23):
-            return OMITTED_INPUT_IMAGE
-        data = await self._cli.download(message_id, key, "image", limit=MAX_IMAGE_BYTES)
-        mime = _image_media_type(data)
-        if not budget.reserve_image(len(f"data:{mime};base64,") + 4 * ((len(data) + 2) // 3)):
-            return OMITTED_INPUT_IMAGE
-        return Image(f"data:{mime};base64,{b64encode(data).decode('ascii')}")
+    async def finish(self, items: list[NormalizedContent], workspace: Workspace, *, budget: int) -> list[Message]:
+        # 先为整批文字与图片占位留空间。按原序下载和保存，一张成功才扣它的编码增量。
+        placeholder_cost = _text_bytes(OMITTED_INPUT_IMAGE.text) + 32
 
-    async def _post(self, message_id: str, post: dict[str, Any], budget: BatchMediaBudget) -> tuple[Part, ...]:
-        parts: list[Part] = []
+        def body_bytes(content: NormalizedContent) -> int:
+            if isinstance(content, str):
+                return _text_bytes(content)
+            if isinstance(content, _ImageResource):
+                return placeholder_cost
+            if len(content) == 1 and isinstance(content[0], Text):
+                return _text_bytes(content[0].text)
+            return sum(_text_bytes(part.text) + 32 if isinstance(part, Text) else placeholder_cost for part in content)
+
+        remaining = budget - sum(64 + body_bytes(content) for content in items)
+        final = []
+        failed = False
+        for content in items:
+            if isinstance(content, str):
+                final.append(Message("user", content))
+                continue
+            standalone = isinstance(content, _ImageResource)
+            parts: list[Part] = []
+            for part in (content,) if standalone else content:
+                if isinstance(part, Text):
+                    parts.append(part)
+                    continue
+                if image_request_bytes(0, "image/jpeg") - placeholder_cost >= remaining:
+                    parts.append(OMITTED_INPUT_IMAGE)
+                    continue
+                try:
+                    data = await self._cli.download(part.message_id, part.key, "image", limit=MAX_IMAGE_BYTES)
+                    mime = image_media_type(data)
+                    if mime is None:
+                        raise MessageFormatError("unsupported_image_format")
+                    cost = image_request_bytes(len(data), mime) - placeholder_cost
+                    if cost > remaining:
+                        parts.append(OMITTED_INPUT_IMAGE)
+                        continue
+                    image = await run_image_io(lambda: save_image(workspace, data), settle_write=True)
+                except (MessageFormatError, CliError, TimeoutError, OSError):
+                    failed = True
+                    parts.append(UNAVAILABLE_IMAGE)
+                else:
+                    parts.append(image)
+                    remaining -= cost
+            if standalone and parts[0] is UNAVAILABLE_IMAGE:
+                remaining += 64 + placeholder_cost  # 未交付的单图不保留占位预算。
+            else:
+                final.append(Message("user", tuple(parts)))
+        if failed:
+            _LOG.warning("Feishu input image could not be downloaded, validated or saved")
+        return final
+
+    def _post(self, message_id: str, post: dict[str, Any]) -> tuple[_PostPart, ...]:
+        parts: list[_PostPart] = []
         title = post.get("title")
         if isinstance(title, str) and title.strip():
             parts.append(Text(_required(title)))
@@ -185,13 +183,18 @@ class MessageNormalizer:
             count += len(paragraph)
             if count > _MAX_POST_NODES:
                 raise MessageFormatError("post_node_limit")
-            line: list[Part] = []
+            line: list[_PostPart] = []
             for node in paragraph:
                 if not isinstance(node, dict):
                     raise MessageFormatError("invalid_post_node")
                 tag = node.get("tag")
                 if tag == "img":
-                    line.append(await self._image(message_id, _required(node.get("image_key")), budget))
+                    try:
+                        key = _required(node.get("image_key"))
+                    except MessageFormatError:
+                        line.append(UNAVAILABLE_IMAGE)
+                    else:
+                        line.append(_ImageResource(message_id, key))
                 elif tag == "a":
                     label, target = node.get("text"), node.get("href")
                     label = _required(label) if isinstance(label, str) and label.strip() else ""

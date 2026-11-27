@@ -1,5 +1,5 @@
 from base64 import b64encode
-from test_message_support import reasoning_parts
+from test_message_support import PNG_BYTES, PNG_URL, image_workspace, reasoning_parts
 
 import asyncio
 from contextlib import asynccontextmanager, closing
@@ -18,9 +18,10 @@ from feishu_test_support import private_discovery
 from agent_companion.__main__ import _serve
 from agent_companion.app import prepare_private_feishu, running_agent
 from agent_companion.config import LLMProvider, RuntimeSettings, load_settings
+from agent_companion.images import save_image
 from agent_companion.models.deepseek import CHAT_COMPLETIONS, DeepSeek
 from agent_companion.models.openai_responses import OpenAIResponses
-from agent_companion.protocol import (DeliveryStatus, Image, InputUsage, Message, ModelError, Receipt,
+from agent_companion.protocol import (DeliveryStatus, Image, InputUsage, Message, MessageDelivery, ModelError, Receipt,
                                       AssistantPartsReady, PrivateData, Reasoning, Text, ToolCall, ToolSpec)
 from agent_companion.runtime.context import _SUMMARIZE
 from agent_companion.runtime.engine import Runtime
@@ -142,18 +143,18 @@ def _model(client, *, api_key=_KEY, model="fixture-model", effort="custom-effort
 
 
 async def _complete(fixture, history, *, prompt=None, channel=None, tools=None, settings=None, session_id="main",
-                    instructions=None, followup=None, **model_settings):
+                    instructions=None, followup=None, workspace=None, **model_settings):
     async with httpx.AsyncClient(transport=fixture.transport) as client:
         runtime = Runtime(session_id, history, _model(client, **model_settings), channel or _Channel(),
-                          tools=tools, settings=settings, instructions=instructions)
+                          tools=tools, settings=settings, instructions=instructions, workspace=workspace)
         try:
-            runtime.submit_batch([prompt or Message("user", "synthetic prompt")])
+            runtime.submit_messages([MessageDelivery(prompt or Message("user", "synthetic prompt"), "trigger")])
             await asyncio.wait_for(runtime.wait_idle(), 2)
             if followup is not None and runtime.last_failure is None:
                 task = runtime._compactions._generating
                 if task is not None:
                     await asyncio.wait_for(asyncio.shield(task), 2)
-                runtime.submit_batch([followup])
+                runtime.submit_messages([MessageDelivery(followup, "trigger")])
                 await asyncio.wait_for(runtime.wait_idle(), 2)
             return runtime.last_failure
         finally:
@@ -215,12 +216,13 @@ class OpenAIResponsesTests(unittest.IsolatedAsyncioTestCase):
         )], block_before_end=gate)
         fixture = _Fixture(self, first, [_delta("已完成。"), _completed(_answer("已完成。", "msg_done"))])
         tools = Tools([Tool(_SPEC, tool)])
-        prompt = Message("user", (Text("读图"), Image(_IMAGE), Text("使用工具")))
+        workspace = image_workspace(self)
+        prompt = Message("user", (Text("读图"), save_image(workspace, PNG_BYTES), Text("使用工具")))
         with closing(History(":memory:")) as history:
             async with httpx.AsyncClient(transport=fixture.transport) as client:
-                runtime = Runtime("main", history, _model(client), channel, tools=tools)
+                runtime = Runtime("main", history, _model(client), channel, tools=tools, workspace=workspace)
                 try:
-                    runtime.submit_batch([prompt])
+                    runtime.submit_messages([MessageDelivery(prompt, "trigger")])
                     await asyncio.wait_for(channel.first_text.wait(), 1)
                     self.assertEqual(counts, [])
                     self.assertEqual(history.outcomes("main"), [])
@@ -246,7 +248,7 @@ class OpenAIResponsesTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(initial["tools"], [{"type": "function", "name": _SPEC.name, "description": _SPEC.description,
                                              "parameters": {"type": "object"}, "strict": False}])
         self.assertEqual(initial["input"], [{"role": "user", "content": [
-            {"type": "input_text", "text": "读图"}, {"type": "input_image", "image_url": _IMAGE, "detail": "auto"},
+            {"type": "input_text", "text": "读图"}, {"type": "input_image", "image_url": PNG_URL, "detail": "auto"},
             {"type": "input_text", "text": "使用工具"},
         ]}])
         expected_calls = [{k: v for k, v in call.items() if k != "status"}
@@ -349,7 +351,7 @@ class OpenAIResponsesTests(unittest.IsolatedAsyncioTestCase):
                         with closing(History(path)) as history:
                             runtime = Runtime("main", history, DeepSeek(client), _Channel())
                             try:
-                                runtime.submit_batch([Message("user", "切换")])
+                                runtime.submit_messages([MessageDelivery(Message("user", "切换"), "trigger")])
                                 await asyncio.wait_for(runtime.wait_idle(), 2)
                                 self.assertIsNone(runtime.last_failure)
                             finally:
@@ -498,8 +500,8 @@ class OpenAIResponsesTests(unittest.IsolatedAsyncioTestCase):
             async with httpx.AsyncClient(transport=fixture.transport) as client:
                 runtime = Runtime("main", history, _model(client), Voice(), tools=Tools([Tool(_SPEC, tool)]))
                 try:
-                    runtime.submit_batch([Message("user", "one")])
-                    runtime.submit_batch([Message("user", "two")])
+                    runtime.submit_messages([MessageDelivery(Message("user", "one"), "trigger")])
+                    runtime.submit_messages([MessageDelivery(Message("user", "two"), "trigger")])
                     await asyncio.wait_for(runtime.wait_idle(), 2)
                     self.assertFalse(closed_wire.is_set())
                     old, new = history.outcomes("main")
@@ -523,8 +525,10 @@ class OpenAIResponsesTests(unittest.IsolatedAsyncioTestCase):
         fixture = _Fixture(self, [_completed(_reason(), _call())], [_completed(_answer("ended", "msg_done"))],
                            [_completed(_answer("next", "msg_next"))])
         with closing(History(":memory:")) as history:
-            prompt = Message("user", (Text("initial"), Image(_IMAGE)))
-            self.assertIsNone(await _complete(fixture, history, prompt=prompt, tools=Tools([Tool(_SPEC, tool)])))
+            workspace = image_workspace(self)
+            prompt = Message("user", (Text("initial"), save_image(workspace, PNG_BYTES)))
+            self.assertIsNone(await _complete(fixture, history, prompt=prompt, workspace=workspace,
+                                              tools=Tools([Tool(_SPEC, tool)])))
             first = history.read_after("main")[0].message_id
             # 摘要覆盖的是旧输入，不覆盖其后的工具组。
             history.save_summary("main", Summary(first, "previous input compacted"))
@@ -549,7 +553,8 @@ class OpenAIResponsesTests(unittest.IsolatedAsyncioTestCase):
         with closing(History(":memory:")) as history:
             async def receive_at_tool_boundary(_arguments, _ctx):
                 tools.specs = (ToolSpec(_SPEC.name, "updated tool", _SPEC.parameters),)
-                runtime.submit_batch([Message("user", "queued"), Message("user", "same batch")])
+                runtime.submit_messages((MessageDelivery(Message("user", "queued"), "trigger"),
+                                         MessageDelivery(Message("user", "same batch"), "trigger")))
                 return result
 
             tool = AsyncMock(side_effect=receive_at_tool_boundary)
@@ -558,7 +563,7 @@ class OpenAIResponsesTests(unittest.IsolatedAsyncioTestCase):
                 runtime = Runtime("main", history, _model(client), channel,
                                   settings=settings, tools=tools)
                 try:
-                    runtime.submit_batch([Message("user", "prompt")])
+                    runtime.submit_messages([MessageDelivery(Message("user", "prompt"), "trigger")])
                     await asyncio.wait_for(runtime.wait_idle(), 2)
                     self.assertIsNone(runtime.last_failure)
                 finally:
@@ -602,12 +607,13 @@ class OpenAIResponsesTests(unittest.IsolatedAsyncioTestCase):
                                         if payload["input"][-1].get("type") == "function_call_output")
                     self.assertIn("x" * 360, json.dumps(continuation))
                 else:
-                    image = Image("data:image/png;base64," + "YQAA" * 100)
+                    workspace = image_workspace(self)
+                    image = save_image(workspace, PNG_BYTES)
                     prompt = Message("user", (Text("image"), image))
                     fixture = _Fixture(self, initial, final)
-                    self.assertIsNone(await _complete(fixture, history, prompt=prompt,
+                    self.assertIsNone(await _complete(fixture, history, prompt=prompt, workspace=workspace,
                                                       tools=Tools([Tool(_SPEC, tool)])))
-                    self.assertEqual(fixture.requests[0]["input"][0]["content"][1]["image_url"], image.url)
+                    self.assertEqual(fixture.requests[0]["input"][0]["content"][1]["image_url"], PNG_URL)
                     self.assertEqual(fixture.requests[1]["input"][0], fixture.requests[0]["input"][0])
                     self.assertEqual(history.read_after("main")[0].message, prompt)
                     continuation = fixture.requests[-1]
@@ -618,7 +624,8 @@ class OpenAIResponsesTests(unittest.IsolatedAsyncioTestCase):
                 ])
 
     async def test_images_remain_in_replay_with_queued_input(self):
-        image = Image("data:image/png;base64," + "YQAA" * 225)
+        workspace = image_workspace(self)
+        image = save_image(workspace, PNG_BYTES)
         prompt = Message("user", (Text("image"), image))
         first_result, second_result = "r" * 285, "second result"
         fixture = _Fixture(self, [_completed(_call())],
@@ -629,16 +636,16 @@ class OpenAIResponsesTests(unittest.IsolatedAsyncioTestCase):
         async def execute(_arguments, ctx):
             if ctx.call_id == "call_1":
                 return first_result
-            runtime.submit_batch([Message("user", "queued")])
+            runtime.submit_messages([MessageDelivery(Message("user", "queued"), "trigger")])
             return second_result
 
         tool = AsyncMock(side_effect=execute)
         with closing(History(":memory:")) as history:
             async with httpx.AsyncClient(transport=fixture.transport) as client:
                 runtime = Runtime("main", history, _model(client), channel,
-                                  tools=Tools([Tool(_SPEC, tool)]))
+                                  tools=Tools([Tool(_SPEC, tool)]), workspace=workspace)
                 try:
-                    runtime.submit_batch([prompt])
+                    runtime.submit_messages([MessageDelivery(prompt, "trigger")])
                     await asyncio.wait_for(runtime.wait_idle(), 2)
                     self.assertIsNone(runtime.last_failure)
                 finally:
@@ -647,7 +654,7 @@ class OpenAIResponsesTests(unittest.IsolatedAsyncioTestCase):
                               if row.message.kind == "assistant"], ["", "ABC", "done"])
         self.assertEqual([call.args[1].call_id for call in tool.await_args_list], ["call_1", "call_2"])
         first, intermediate, continued = (request["input"] for request in fixture.requests)
-        self.assertEqual(first[0]["content"][1]["image_url"], image.url)
+        self.assertEqual(first[0]["content"][1]["image_url"], PNG_URL)
         calls = [{k: v for k, v in _call(n).items() if k != "status"} for n in (1, 2)]
         self.assertEqual(intermediate, [
             first[0],
@@ -739,23 +746,24 @@ class OpenAIResponsesTests(unittest.IsolatedAsyncioTestCase):
         with closing(History(":memory:")) as history:
             covered, = history.append("main", [Message("user", "prior seed")])
             history.save_summary("main", Summary(covered, "same existing summary"))
-            image = Message("user", (Text("historical image"), Image(_IMAGE)))
+            workspace = image_workspace(self)
+            image = Message("user", (Text("historical image"), save_image(workspace, PNG_BYTES)))
             current = "current " + "y" * 1400
             # 尾窗仍保留最近正文，包括其原生 message 元数据的额外开销。
             settings = RuntimeSettings(context_budget=2500, tail_budget=580)
             async with httpx.AsyncClient(transport=fixture.transport) as client:
                 runtime = Runtime("main", history, _model(client), channel, tools=registry,
-                                  settings=settings, instructions="fixed synthetic instructions")
+                                  settings=settings, instructions="fixed synthetic instructions", workspace=workspace)
                 try:
                     for prompt in (image, Message("user", current)):
-                        runtime.submit_batch([prompt])
+                        runtime.submit_messages([MessageDelivery(prompt, "trigger")])
                         await asyncio.wait_for(runtime.wait_idle(), 2)
                         self.assertIsNone(runtime.last_failure)
                     task = runtime._compactions._generating
                     if task is not None:
                         await asyncio.wait_for(asyncio.shield(task), 2)
                     self.assertEqual(history.summary("main").text, "same existing summary")
-                    runtime.submit_batch([Message("user", "apply summary")])
+                    runtime.submit_messages([MessageDelivery(Message("user", "apply summary"), "trigger")])
                     await asyncio.wait_for(runtime.wait_idle(), 2)
                     self.assertIsNone(runtime.last_failure)
                 finally:
@@ -953,7 +961,7 @@ max_audio_seconds = 500
             async with running_agent(settings, history, model, _Channel(), session_id="test-openai",
                                      roles=roles) as (runtime, _):
                 self.assertEqual(runtime._settings.model_timeout, 0.75)
-                runtime.submit_batch([Message("user", "synthetic prompt")])
+                runtime.submit_messages([MessageDelivery(Message("user", "synthetic prompt"), "trigger")])
                 await asyncio.wait_for(runtime.wait_idle(), 2)
                 self.assertIsNone(runtime.last_failure)
 
