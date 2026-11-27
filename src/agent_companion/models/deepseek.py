@@ -12,7 +12,7 @@ import httpx
 from ..model_diagnostics import adapter_started, failure_category
 from ..protocol import (InputUsage, Message, ModelClosing, ModelError, ModelEvent, PrivateData, TextDelta,
                         ToolCall, ToolReady, ToolSpec)
-from ._chat_completions import ChatOutput, chat_messages, chat_reasoning
+from ._chat_completions import ChatOutput, chat_messages, chat_reasoning, chat_tool_call_order
 from ._http_stream import ResponseStreams
 from ._request import make_replay_key, request_body
 
@@ -184,6 +184,9 @@ class DeepSeek:
             return 0
         reasoning = chat_reasoning(message, self._replay_key)
         return len(reasoning.encode("utf-8")) if reasoning is not None else 0
+
+    def tool_call_order(self, calls: tuple[ToolCall, ...]) -> tuple[str, ...]:
+        return chat_tool_call_order(calls, self._replay_key)
 
     async def stream(self, messages: Sequence[Message], tools: Sequence[ToolSpec], *,
                      thinking: bool, instructions: str | None = None) -> AsyncGenerator[ModelEvent, None]:

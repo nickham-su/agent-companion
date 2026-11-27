@@ -1,7 +1,6 @@
 import asyncio
 from dataclasses import replace
 import sqlite3
-from threading import Event
 import unittest
 from unittest.mock import patch
 
@@ -10,8 +9,9 @@ from agent_companion.images import save_image
 from agent_companion.models.deepseek import MODEL_NAME, DeepSeek, _replay_key, build_request
 from agent_companion.protocol import (AssistantPartsReady, DeliveryStatus, Message, MessageDelivery, ModelError,
                                       PrivateData, Reasoning, Receipt,
-                                      ReplyDelivery, TextDelta, ToolCall,
+                                      ReplyDelivery, Text, TextDelta, ToolCall,
                                       ToolReady, ToolSpec)
+from agent_companion.runtime.context import PreparedContext
 from agent_companion.runtime.engine import Runtime
 from agent_companion.runtime.tools import Tool, Tools
 from agent_companion.storage.sqlite import History, Summary
@@ -134,7 +134,7 @@ class RuntimeTest(unittest.IsolatedAsyncioTestCase):
         ((info, _),) = channel.replies
         self.assertEqual(history.agent_run(info.run_id).status, "completed")
 
-    async def test_empty_wake_yields_after_waiting_for_images(self):
+    async def test_empty_wake_rechecks_binding_and_real_input_after_context_assembly(self):
         for incoming in (False, True):
             with self.subTest(incoming=incoming):
                 workspace = image_workspace(self)
@@ -146,21 +146,22 @@ class RuntimeTest(unittest.IsolatedAsyncioTestCase):
                 history.append("main", [Message("user", (picture,))])
                 runtime = Runtime("main", history, model, Channel(), agent=agent, workspace=workspace)
                 self.addAsyncCleanup(runtime.close)
-                reading, release = asyncio.Event(), Event()
-                loop = asyncio.get_running_loop()
+                assembling, release = asyncio.Event(), asyncio.Event()
                 call_binding = original_call = object()
+                assemble = PreparedContext.assemble
 
-                def slow_read(*args):
-                    loop.call_soon_threadsafe(reading.set)
-                    if not release.wait(3):
-                        raise AssertionError("image read was not released")
-                    return PNG_BYTES
+                async def pause_assembly(context, workspace):
+                    if not assembling.is_set():
+                        assembling.set()
+                        await release.wait()
+                    return await assemble(context, workspace)
 
-                with (patch("agent_companion.images._read_image", side_effect=slow_read),
+                with (patch.object(PreparedContext, "assemble", pause_assembly),
+                      patch("agent_companion.images._read_image") as read,
                       self.assertLogs("agent_companion.runtime.engine", level="DEBUG") as logs):
                     runtime.trigger_run(lambda: call_binding is original_call)
                     try:
-                        await asyncio.wait_for(reading.wait(), 2)
+                        await asyncio.wait_for(assembling.wait(), 2)
                         pending_run, = history._db.execute("SELECT run_id FROM agent_runs").fetchone()
                         real = Message("user", "真正输入")
                         if incoming:
@@ -174,8 +175,10 @@ class RuntimeTest(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(len(history.outcomes("main")), int(incoming))
                 self.assertEqual(len(model.requests), int(incoming))
                 self.assertEqual(sum("model request started" in line for line in logs.output), int(incoming))
+                read.assert_not_called()
                 if incoming:
                     self.assertEqual(model.requests[0][0][-1], real)
+                    self.assertEqual(model.requests[0][0][0].parts, (Text(f"图片路径：\n{picture.url}"),))
 
     async def test_reentrant_trigger_guard_does_not_steal_queued_input(self):
         model = ScriptModel(events(TextDelta("处理真实输入")))

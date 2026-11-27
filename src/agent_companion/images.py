@@ -7,20 +7,23 @@ from concurrent.futures import CancelledError as WorkCancelled, ThreadPoolExecut
 from contextlib import contextmanager, suppress
 from contextvars import copy_context
 from dataclasses import replace
+import json
 import os
 import re
 import stat
 from threading import BoundedSemaphore, Event, Lock
-from typing import TypeVar
+from typing import Any, TypeVar
 from uuid import uuid4
 
-from .protocol import Image, Message, Part, Text
+from .protocol import Image, Message, Part, Text, ToolCall
 from .workspace import Workspace, open_child_directory
 
 
 MAX_IMAGE_BYTES = 8 * 1024 * 1024
 MAX_MEDIA_BYTES = 32 * 1024 * 1024  # 给模型工具声明和协议封装留余量。
 UNAVAILABLE_IMAGE = Text("图片不可用")
+VIEW_IMAGE_TOOL_NAME = "view_image"
+VIEW_IMAGE_OK = '{"status":"ok"}'
 _IMAGE_PREFIX = ".agent/images/"
 _IMAGE_NAME = re.compile(r"[a-f0-9]{32}")
 _IMAGE_WORKERS = 4
@@ -30,6 +33,7 @@ _IMAGE_SLOTS = BoundedSemaphore(_IMAGE_WORKERS)
 _IMAGE_GATE_LOCK = Lock()
 _IMAGE_WAITERS: set[tuple[asyncio.AbstractEventLoop, asyncio.Event]] = set()
 _Result = TypeVar("_Result")
+ToolCallOrder = Callable[[tuple[ToolCall, ...]], Sequence[str]]  # 同一批调用的出站 ID 顺序。
 
 
 async def _acquire_image_slot() -> None:
@@ -161,25 +165,77 @@ def save_image(workspace: Workspace, data: bytes) -> Image:
     return Image(_IMAGE_PREFIX + name)
 
 
+def _read_regular_image(directory: int, name: str, remaining: int) -> bytes | None:
+    # 先筛除特殊文件；打开后再查 FD，且即使换成 FIFO 也不会阻塞打开。
+    if not stat.S_ISREG(os.stat(name, dir_fd=directory, follow_symlinks=False).st_mode):
+        return None
+    fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=directory)
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1 or not 0 < info.st_size <= MAX_IMAGE_BYTES:
+            return None
+        # 最短 MIME 前缀也放不下就不读；文件在打开后增长也不能突破读取上限。
+        if image_request_bytes(info.st_size, "image/png") > remaining:
+            return None
+        with os.fdopen(fd, "rb", closefd=False) as source:
+            data = source.read(info.st_size + 1)
+        return data if len(data) == info.st_size else None
+    finally:
+        os.close(fd)
+
+
 def _read_image(workspace: Workspace, name: str, remaining: int) -> bytes | None:
     with _image_directory(workspace, create=False) as directory:
-        # 先筛除特殊文件，打开后仍检查 FD，防止目录项在两次操作之间被替换。
-        if not stat.S_ISREG(os.stat(name, dir_fd=directory, follow_symlinks=False).st_mode):
-            return None
-        flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK
-        fd = os.open(name, flags, dir_fd=directory)
+        return _read_regular_image(directory, name, remaining)
+
+
+def view_image_path(args: dict[str, Any]) -> str | None:
+    path = args.get("path")
+    return path if len(args) == 1 and isinstance(path, str) and path else None
+
+
+def _read_workspace_image(workspace: Workspace, path: str, remaining: int) -> bytes | None:
+    # 先实际打开每一级再处理 `..`，不能让文本归一化掩盖软链接或不存在的目录。
+    components = path.split("/")
+    if path.startswith("/") or "\0" in path or components[-1] in ("", ".", ".."):
+        return None
+    with workspace.open_directory(create=False, search_only=True) as (_, root):
+        directories = [root]
         try:
-            info = os.fstat(fd)
-            if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1 or not 0 < info.st_size <= MAX_IMAGE_BYTES:
-                return None
-            # 最短 MIME 前缀也放不下就不读；文件在打开后增长也不能突破读取上限。
-            if image_request_bytes(info.st_size, "image/png") > remaining:
-                return None
-            with os.fdopen(fd, "rb", closefd=False) as source:
-                data = source.read(info.st_size + 1)
-            return data if len(data) == info.st_size else None
+            for component in components[:-1]:
+                if component in ("", "."):
+                    continue
+                if component == "..":
+                    if len(directories) == 1:
+                        return None
+                    os.close(directories.pop())
+                else:
+                    directories.append(open_child_directory(directories[-1], component, create=False, search_only=True))
+            return _read_regular_image(directories[-1], components[-1], remaining)
         finally:
-            os.close(fd)
+            for directory in reversed(directories[1:]):
+                os.close(directory)
+
+
+def _workspace_image_data(workspace: Workspace, path: str, remaining: int) -> tuple[bytes, str] | None:
+    try:
+        data = _read_workspace_image(workspace, path, remaining)
+    except (OSError, UnicodeError):
+        return None
+    if data is not None and (media_type := image_media_type(data)) is not None:
+        return data, media_type
+    return None
+
+
+async def validate_workspace_image(workspace: Workspace, path: str) -> bool:
+    return await run_image_io(lambda: _workspace_image_data(workspace, path, MAX_MEDIA_BYTES) is not None)
+
+
+def _request_image(data: bytes, media_type: str, remaining: int) -> tuple[Image, int] | None:
+    cost = image_request_bytes(len(data), media_type)
+    if cost <= remaining:
+        return Image(f"data:{media_type};base64,{b64encode(data).decode('ascii')}"), cost
+    return None
 
 
 def _load_image(part: Image, workspace: Workspace | None, remaining: int) -> tuple[Image | Text, int]:
@@ -191,35 +247,67 @@ def _load_image(part: Image, workspace: Workspace | None, remaining: int) -> tup
             pass
         else:
             if data is not None and (media_type := image_media_type(data)) is not None:
-                cost = image_request_bytes(len(data), media_type)
-                if cost <= remaining:
-                    return Image(f"data:{media_type};base64,{b64encode(data).decode('ascii')}"), cost
+                if loaded := _request_image(data, media_type, remaining):
+                    return loaded
     return UNAVAILABLE_IMAGE, 0
 
 
+def _successful_view_image(part: Part) -> bool:
+    return isinstance(part, ToolCall) and part.name == VIEW_IMAGE_TOOL_NAME and part.result == VIEW_IMAGE_OK
+
+
+def _load_view_image(call: ToolCall, workspace: Workspace, remaining: int) -> tuple[Image, int] | None:
+    try:
+        args = json.loads(call.arguments)
+    except (ValueError, RecursionError):
+        return None
+    if isinstance(args, dict) and (path := view_image_path(args)) is not None:
+        if image := _workspace_image_data(workspace, path, remaining):
+            return _request_image(*image, remaining)
+    return None
+
+
+def _image_part_order(message: Message, tool_call_order: ToolCallOrder | None) -> Iterator[int]:
+    calls = message.tool_calls if tool_call_order is not None else ()
+    if tool_call_order is None or len(calls) < 2:
+        yield from range(len(message.parts))
+        return
+    positions = {part.id: i for i, part in enumerate(message.parts) if isinstance(part, ToolCall)}
+    ordered_ids = iter(tool_call_order(calls))
+    # 只调整读取工具图片的顺序；通过调用 ID 找回原位置，不改正文、推理或工具顺序。
+    for i, part in enumerate(message.parts):
+        yield positions[next(ordered_ids)] if isinstance(part, ToolCall) else i
+
+
 def prepare_images(messages: Sequence[Message], workspace: Workspace | None, *,
-                   protected_start: int = 0) -> Sequence[Message]:
-    """只处理本次入选的消息；请求副本不携带路径，历史不做改写。"""
+                   current_start: int = 0, tool_call_order: ToolCallOrder | None = None) -> Sequence[Message]:
+    """仅加载本 Run 图片；上传与工具查看按消息顺序共用媒体预算。"""
     remaining = MAX_MEDIA_BYTES
     prepared = list(messages)
-    # 分配预算先看本轮；替换仍写到原位置，每组内部也按原序处理。
-    for indexes in (range(protected_start, len(messages)), range(protected_start)):
-        for index in indexes:
-            message = messages[index]
-            if not any(isinstance(part, Image) for part in message.parts):
-                continue
-            parts: list[Part] = []
-            for part in message.parts:
-                if isinstance(part, Image):
-                    part, cost = _load_image(part, workspace, remaining)
+    for index in range(current_start, len(messages)):
+        message = messages[index]
+        if not any(isinstance(part, Image) or _successful_view_image(part) for part in message.parts):
+            continue
+        parts = list(message.parts)
+        for position in _image_part_order(message, tool_call_order):
+            part = message.parts[position]
+            if isinstance(part, Image):
+                part, cost = _load_image(part, workspace, remaining)
+                remaining -= cost
+            elif isinstance(part, ToolCall) and workspace is not None and _successful_view_image(part):
+                if loaded := _load_view_image(part, workspace, remaining):
+                    image, cost = loaded
+                    part = replace(part, result_image=image)
                     remaining -= cost
-                parts.append(part)
-            prepared[index] = replace(message, parts=tuple(parts))
+            parts[position] = part
+        prepared[index] = replace(message, parts=tuple(parts))
     return prepared
 
 
 async def prepare_request_images(messages: Sequence[Message], workspace: Workspace | None, *,
-                                 protected_start: int = 0) -> Sequence[Message]:
-    if not any(isinstance(part, Image) for message in messages for part in message.parts):
+                                 current_start: int = 0, tool_call_order: ToolCallOrder | None = None) -> Sequence[Message]:
+    if not any(isinstance(part, Image) or _successful_view_image(part)
+               for message in messages[current_start:] for part in message.parts):
         return messages
-    return await run_image_io(lambda: prepare_images(messages, workspace, protected_start=protected_start))
+    return await run_image_io(lambda: prepare_images(messages, workspace, current_start=current_start,
+                                                      tool_call_order=tool_call_order))

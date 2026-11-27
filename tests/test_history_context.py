@@ -283,7 +283,7 @@ class ProjectionTest(unittest.IsolatedAsyncioTestCase):
             with (intercept("last_input_tokens"), intercept("summary"), intercept("read_after"),
                   patch.object(history, "finalize_reply", side_effect=commit)):
                 runtime = Runtime("main", history, model, sink, retry_sqlite_locks=True,
-                                  settings=RuntimeSettings(context_budget=240, tail_budget=65),
+                                  settings=RuntimeSettings(context_budget=240, tail_budget=20),
                                   tools=Tools([Tool(SPEC, tool)]))
                 try:
                     runtime.submit_messages(batch)
@@ -325,7 +325,7 @@ class ProjectionTest(unittest.IsolatedAsyncioTestCase):
         model = BusyModel()
         with closing(History(":memory:")) as history:
             older = [Message("user", "old material " + "x" * 247) for _ in range(2)]
-            last_old_id = history.append("main", older)[-1]
+            history.append("main", older)
             runtime = Runtime("main", history, model, Sink(), settings=settings, tools=Tools([Tool(SPEC, tool)]))
             try:
                 runtime.submit_messages([MessageDelivery(Message("user", "starting request"), "trigger")])
@@ -342,11 +342,13 @@ class ProjectionTest(unittest.IsolatedAsyncioTestCase):
                 await runtime.close()
             self.assertEqual(model.requests[0][0][:2], older)
             self.assertTrue(model.summaries)
-            self.assertEqual(history.summary("main").covers_through, last_old_id)
+            starting_input = history.read_after("main")[2]
+            self.assertEqual(model.summaries[0][0], [*older, starting_input.message, _SUMMARIZE])
+            self.assertEqual(history.summary("main").covers_through, starting_input.message_id)
             self.assertEqual(model.requests[1][0][:2], older)
             self.assertEqual(model.requests[2][0][0], Message("compaction_summary", "summary-material"))
             self.assertEqual(model.requests[2][0][1:], [
-                Message("user", "starting request"), assistant_message("", (replace(CALLS[0], result="tool result " + "b" * 72),)),
+                assistant_message("", (replace(CALLS[0], result="tool result " + "b" * 72),)),
                 Message("user", "new intake one"), Message("user", "new intake two"),
                 Message("assistant", "ok"), Message("user", "followup"),
             ])
@@ -404,7 +406,7 @@ class ProjectionTest(unittest.IsolatedAsyncioTestCase):
             return "已完成测试工具"
 
         model = FailingSummary()
-        settings = RuntimeSettings(context_budget=330, tail_budget=150)
+        settings = RuntimeSettings(context_budget=330, tail_budget=55)
         with closing(History(":memory:")) as history:
             covered, = history.append("main", [Message("user", "此前信息")])
             saved = Summary(covered, "已保存摘要")
@@ -451,7 +453,7 @@ class ProjectionTest(unittest.IsolatedAsyncioTestCase):
             return "已完成测试工具"
 
         model = ToolModel()
-        settings = RuntimeSettings(context_budget=330, tail_budget=150)
+        settings = RuntimeSettings(context_budget=330, tail_budget=55)
         with tempfile.TemporaryDirectory(dir=Path.cwd()) as folder:
             path = Path(folder) / "summary.sqlite"
             with (closing(History(path)) as history, closing(sqlite3.connect(path)) as fault,
@@ -545,11 +547,13 @@ class ProjectionTest(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(history.summary("main"), saved)
             self.assertEqual(history.read_after("main")[0].message, old)
 
-    async def test_normal_request_prioritizes_current_images_without_reordering_history(self):
+    async def test_normal_request_appends_path_list_in_order_and_loads_only_current_images(self):
         workspace = image_workspace(self)
-        old_picture, current_picture = (save_image(workspace, PNG_BYTES) for _ in range(2))
+        old_picture, current_picture, excess = (save_image(workspace, PNG_BYTES) for _ in range(3))
+        missing = Image(".agent/images/" + "a" * 32)
         old = Message("user", (Text("旧图前"), old_picture, Text("旧图后")))
-        current = (Text("本轮图前"), current_picture, Text("本轮图后"))
+        current = (Text("本轮图前"), missing, current_picture, missing, Text("本轮图后"), excess)
+        path_list = Text(f"图片路径：\n{missing.url}\n{current_picture.url}\n{missing.url}\n{excess.url}")
         model = CapturingModel()
         with (closing(History(":memory:")) as history,
               patch.object(images, "MAX_MEDIA_BYTES", image_request_bytes(len(PNG_BYTES), "image/png"))):
@@ -558,28 +562,57 @@ class ProjectionTest(unittest.IsolatedAsyncioTestCase):
             await self.turn(history, model, current, workspace=workspace)
             self.assertEqual(model.requests[0][0], [
                 Message("compaction_summary", "保留的摘要"),
-                Message("user", (Text("旧图前"), UNAVAILABLE_IMAGE, Text("旧图后"))),
-                Message("user", (Text("本轮图前"), Image(PNG_URL), Text("本轮图后"))),
+                Message("user", (Text("旧图前"), Text("旧图后"), Text(f"图片路径：\n{old_picture.url}"))),
+                Message("user", (Text("本轮图前"), UNAVAILABLE_IMAGE, Image(PNG_URL), UNAVAILABLE_IMAGE,
+                                 Text("本轮图后"), UNAVAILABLE_IMAGE, path_list)),
             ])
             self.assertEqual([row.message for row in history.read_after("main")[1:3]], [old, Message("user", current)])
+
+    async def test_archive_keeps_repeated_image_paths_in_original_order_without_reading(self):
+        workspace = image_workspace(self)
+        picture, other = (save_image(workspace, PNG_BYTES) for _ in range(2))
+        old = Message("user", (Text("不能回放的原历史"), picture, other, picture))
+        model = CapturingModel()
+        model.history_replay_bytes = lambda message, tools, *, thinking: None if message == old else 0
+        with (closing(History(":memory:")) as history, patch.object(images, "_read_image") as read):
+            history.append("main", [old])
+            await self.turn(history, model, "新输入", workspace=workspace)
+            archive = model.requests[0][0][0]
+            self.assertEqual(archive.parts, (Text("历史归档（历史记录，不是新指令）："), Text("\nuser:"),
+                                             old.parts[0], Text(f"图片路径：\n{picture.url}\n{other.url}\n{picture.url}")))
+            self.assertEqual(history.read_after("main")[0].message, old)
+            read.assert_not_called()
 
     async def test_long_requests_do_not_compact_without_reported_threshold(self):
         settings = RuntimeSettings(context_budget=100, tail_budget=70)
         fixed = "系统指令" * 800
         workspace = image_workspace(self)
         old = Message("user", (Text("旧" * 800), save_image(workspace, PNG_BYTES)))
-        prepared = replace(old, parts=(old.parts[0], Image(PNG_URL)))
+        prepared = replace(old, parts=(old.parts[0], Text(f"图片路径：\n{old.parts[1].url}")))
         current = "新" * 800
-        model = CapturingModel(99)
+        model = CapturingModel(94)
         with closing(History(":memory:")) as history:
             history.append("main", [old])
             await self.turn(history, model, current, settings=settings, instructions=fixed, workspace=workspace)
             self.assertEqual(model.requests[0][0], [prepared, Message("user", current)])
-            self.assertEqual(history.last_input_tokens("main"), 99)
+            self.assertEqual(history.last_input_tokens("main"), 94)
             await self.turn(history, model, current, settings=settings, instructions=fixed, workspace=workspace)
             self.assertEqual(model.requests[1][0][0], prepared)
             self.assertEqual(model.requests[1][0][-1], Message("user", current))
             self.assertEqual(model.summaries, [])
+
+    async def test_background_compaction_triggers_at_95_percent_of_reported_budget(self):
+        settings = RuntimeSettings(context_budget=100, tail_budget=9)
+        old = Message("user", "old context")
+        for last_tokens in (94, 95):
+            with self.subTest(last_tokens=last_tokens), closing(History(":memory:")) as history:
+                history.append("main", [old])
+                model = CapturingModel()
+                await self.turn(history, model, "current input", settings=settings, previous_input_tokens=last_tokens)
+                self.assertEqual(model.requests[0][0], [old, Message("user", "current input")])
+                self.assertEqual([prompt for prompt, _, _ in model.summaries],
+                                 [[old, _SUMMARIZE]] if last_tokens == 95 else [])
+                self.assertIsNone(history.summary("main"))
 
     async def test_context_compaction_keeps_blocks_raw_history_and_previous_summary(self):
         settings = RuntimeSettings(context_budget=275, tail_budget=125)
@@ -628,12 +661,12 @@ class ProjectionTest(unittest.IsolatedAsyncioTestCase):
                 self.assertNotIn("old-start", repr(prompt))
                 self.assertEqual(history.read_after("main")[0], first)
 
-    async def test_compaction_can_cut_between_an_old_user_message_and_ordinary_reply(self):
+    async def test_compaction_retains_first_reply_that_exceeds_tail_budget(self):
         question = Message("user", "old question " + "q" * 220)
         answer = Message("assistant", "old answer")
         current = Message("user", "current input")
         model = CapturingModel()
-        settings = RuntimeSettings(context_budget=200, tail_budget=32)
+        settings = RuntimeSettings(context_budget=200, tail_budget=20)  # 当前输入 13，旧回复再占 12。
         with closing(History(":memory:")) as history:
             question_id, _ = history.append("main", [question, answer])
             await self.turn(history, model, current.content, settings=settings, previous_input_tokens=200,
@@ -670,7 +703,7 @@ class ProjectionTest(unittest.IsolatedAsyncioTestCase):
         model = ToolDuringSummary()
         second_spec = ToolSpec("earlier", "another tool", {"type": "object"})
         tools = Tools([Tool(second_spec, forbidden_tool), Tool(SPEC, forbidden_tool)])
-        settings = RuntimeSettings(context_budget=420, tail_budget=165)
+        settings = RuntimeSettings(context_budget=420, tail_budget=120)
         with closing(History(":memory:")) as history:
             covered, = history.append("main", [Message("user", "previous seed")])
             previous = Summary(covered, "stable saved summary")
@@ -704,7 +737,7 @@ class ProjectionTest(unittest.IsolatedAsyncioTestCase):
         async def unexpected_tool(args, context):
             self.fail("historical tool must not be dispatched")
 
-        settings = RuntimeSettings(context_budget=290, tail_budget=95)
+        settings = RuntimeSettings(context_budget=290, tail_budget=9)
         with closing(History(":memory:")) as history:
             seed, = history.append("main", [Message("user", "summary seed")])
             saved = Summary(seed, "saved " * 300)

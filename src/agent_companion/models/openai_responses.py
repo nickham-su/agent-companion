@@ -134,7 +134,10 @@ def _response_items(message: Message, key: bytes | None) -> list[dict[str, Any]]
                 native = None
             projected = _function(part, native["id"] if native is not None else None)
             if part.result is not None:
-                outputs.append({"type": "function_call_output", "call_id": part.id, "output": part.result})
+                output: str | list[dict[str, Any]] = part.result
+                if part.result_image is not None:
+                    output = [_input_part(Text(part.result)), _input_part(part.result_image)]
+                outputs.append({"type": "function_call_output", "call_id": part.id, "output": output})
         if projected is not None:
             if "id" in projected:
                 ids.add(projected["id"])

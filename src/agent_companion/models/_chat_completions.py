@@ -350,6 +350,15 @@ def _ordered_calls(calls: tuple[ToolCall, ...], key: bytes) -> list[tuple[int, T
     return list(enumerate(calls))
 
 
+def chat_tool_call_order(calls: tuple[ToolCall, ...], key: bytes) -> tuple[str, ...]:
+    """请求准备只需要 ID；与出站工具消息使用同一排序规则。"""
+    return tuple(call.id for _, call in _ordered_calls(calls, key))
+
+
+def _chat_image(image: Image) -> dict[str, Any]:
+    return {"type": "image_url", "image_url": {"url": image.url}}
+
+
 def chat_messages(messages: Sequence[Message], reasoning_for: Callable[[Message], str | None], *,
                   key: bytes, include_tool_index: bool = False, instructions: str | None = None) -> list[dict[str, Any]]:
     projected: list[dict[str, Any]] = []
@@ -363,7 +372,7 @@ def chat_messages(messages: Sequence[Message], reasoning_for: Callable[[Message]
         if assistant and not (content or calls or reasoning):
             continue
         if not isinstance(content, str):
-            content = [{"type": "image_url", "image_url": {"url": part.url}} if isinstance(part, Image)
+            content = [_chat_image(part) if isinstance(part, Image)
                        else {"type": "text", "text": part.text} for part in content]
         item = {"role": "assistant" if assistant else "user", "content": content}
         if calls:
@@ -377,6 +386,10 @@ def chat_messages(messages: Sequence[Message], reasoning_for: Callable[[Message]
         projected.append(item)
         projected.extend({"role": "tool", "content": call.result, "tool_call_id": call.id}
                          for _, call in calls if call.result is not None)
+        images = [_chat_image(call.result_image) for _, call in calls
+                  if call.result is not None and call.result_image is not None]
+        if images:
+            projected.append({"role": "user", "content": images})
     return projected
 
 
@@ -420,6 +433,9 @@ class ChatCompletions(ABC):
     def history_replay_bytes(self, message: Message, tools: Sequence[ToolSpec], *, thinking: bool) -> int:
         reasoning = self._reasoning(message)
         return len(reasoning.encode("utf-8")) if reasoning is not None else 0
+
+    def tool_call_order(self, calls: tuple[ToolCall, ...]) -> tuple[str, ...]:
+        return chat_tool_call_order(calls, self._replay_key)
 
     def _request(self, messages: Sequence[Message], tools: Sequence[ToolSpec], *,
                  instructions: str | None = None) -> dict[str, Any]:

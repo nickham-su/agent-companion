@@ -11,7 +11,6 @@ from typing import Literal
 from uuid import uuid4
 
 from ..config import RuntimeSettings
-from ..images import prepare_request_images
 from ..model_diagnostics import ModelRequestDiagnostics, failure_category
 from ..protocol import (AgentReply, AssistantPartsReady, Channel, DeliveryStatus, InputUsage, Message, MessageDelivery,
                         Model, ModelClosing, ModelError, Part, Receipt, Reasoning, ReplyDelivery, ReplyInfo, ReplyStream,
@@ -19,7 +18,7 @@ from ..protocol import (AgentReply, AssistantPartsReady, Channel, DeliveryStatus
 from ..storage.sqlite import Agent, History, ReplyOutcome, RetryableInputWrite, is_sqlite_lock_error
 from ..workspace import Workspace
 from .compaction import Compactions
-from .context import Context, PreparedContext
+from .context import Context, PreparedContext, RunStart
 from .model_deadline import ModelDeadline, model_deadline_at
 from .sqlite_access import SQLiteAccess
 from .tools import TOOL_CANCELLED, ToolContext, Tools
@@ -118,8 +117,7 @@ class Runtime:
         self._owns_compactions = compactions is None
         self._compactions = compactions if compactions is not None else Compactions(history)
         self._compactions.check_owner(history)
-        self._context = Context(history, self._settings, self._compactions, model=model, sqlite=self._sqlite,
-                                workspace=workspace)
+        self._context = Context(history, self._settings, self._compactions, model=model, sqlite=self._sqlite)
         self._idle = asyncio.Event()
         self._idle.set()
         self.last_failure: str | None = None
@@ -357,15 +355,15 @@ class Runtime:
         return prepared if await self._sqlite(start) else None
 
     async def _prepare_run(self, run_id: str, protected_from: int | None, *,
-                           can_send: Callable[[], bool]) -> PreparedContext | None:
+                           can_send: Callable[[], bool], run_start: RunStart | None = None) -> PreparedContext | None:
         try:
             # 无消息首轮在确认提交运行前不启动额外的摘要请求。
             last_input_tokens = (await self._sqlite(self.history.last_input_tokens, self.session_id,
                                                    **self._origin_options) if protected_from is not None else None)
             return await self._context.prepare(self.session_id, thinking=self._thinking,
-                                               tools=self._tools.specs, instructions=self._instructions,
+                                               tools=self._tools.specs,
                                                protected_from=protected_from, can_send=can_send,
-                                               last_input_tokens=last_input_tokens, run_id=run_id)
+                                               last_input_tokens=last_input_tokens, run_start=run_start)
         except OperationalError as exc:
             if not is_sqlite_lock_error(exc):
                 raise
@@ -380,22 +378,26 @@ class Runtime:
         def can_send() -> bool:
             return not self._closed
 
+        run_start = None
         for index in range(self._settings.max_tool_rounds):
             if not can_send():
                 return None
             prepared = first_context if index == 0 else None
             if prepared is None:
-                prepared = await self._prepare_run(run_id, protected_from, can_send=can_send)
+                prepared = await self._prepare_run(run_id, protected_from, can_send=can_send, run_start=run_start)
             if prepared is None:
                 return None
-            model_status, continue_tools, final_text = await self._reply(
+            run_start = prepared.run_start
+            model_status, tool_group_id, final_text = await self._reply(
                 run_id, prepared, can_dispatch=can_dispatch_first if index == 0 else None)
             if model_status != "complete":
                 if model_status != "model_interrupted" or self._reply_to_parent is not None:
                     self.last_failure = model_status
                 return None
-            if not continue_tools:
+            if tool_group_id is None:
                 return final_text
+            # 用结算后仍指向整批调用及结果的同一个消息 ID，而不是后来入队的用户输入。
+            protected_from = tool_group_id
             if index + 1 == self._settings.max_tool_rounds:
                 self.last_failure = "tool_round_limit"
                 return None
@@ -409,8 +411,7 @@ class Runtime:
         return None
 
     async def _reply(self, run_id: str, prepared: PreparedContext, *,
-                     can_dispatch: Callable[[], bool] | None) -> tuple[str, bool, str | None]:
-        messages = prepared.messages
+                     can_dispatch: Callable[[], bool] | None) -> tuple[str, int | None, str | None]:
         self._reply_commit_failed = False  # 新回复有自己的结算，不沿用上一条的失败。
         trigger_preempted = False
         loop = asyncio.get_running_loop()
@@ -514,8 +515,8 @@ class Runtime:
             expires = loop.time() + self._settings.model_timeout
             async with model_deadline_at(expires, stop_stream) as deadline:
                 read_deadline = deadline
-                request = await prepare_request_images(messages, self._workspace,
-                                                       protected_start=prepared.protected_start)
+                assembled = await prepared.assemble(self._workspace)
+                request = assembled.messages()
                 # 即使截止回调还没被调度，也不能发出已经超时的请求。
                 if deadline.expired() or loop.time() >= expires:
                     raise TimeoutError
@@ -531,10 +532,41 @@ class Runtime:
                         raise TimeoutError
                     if asyncio.current_task().cancelling() or owner.cancelling():
                         raise asyncio.CancelledError
+                tools = self._tools.specs
                 _LOG.debug("model request started; run=%s reply=%s messages=%d tools=%d thinking=%s",
-                           run_id, info.reply_id, len(request), len(self._tools.specs), self._thinking)
-                async with aclosing(self._model.stream(request, self._tools.specs, thinking=self._thinking,
+                           run_id, info.reply_id, len(request), len(tools), self._thinking)
+                async with aclosing(self._model.stream(request, tools, thinking=self._thinking,
                                                        instructions=self._instructions)) as events:
+                    if prepared.compactable_groups:
+                        reader = asyncio.current_task()
+                        assert reader is not None
+
+                        def can_send_summary() -> bool:
+                            if (self._closed or not accept_model_events or voice_interrupted() or deadline.expired()
+                                    or reader.cancelled() or reader.cancelling() or owner.cancelling()):
+                                return False
+                            if reader.done():
+                                return reader.exception() is None and reader.result()
+                            # 成功终态已解除生成截止；此时可能还在关闭模型传输。
+                            return model_complete or loop.time() < expires
+
+                        def prepare_summary() -> None:
+                            if not can_send_summary():
+                                return
+                            try:
+                                summary = self._context.summary_request(self.session_id, prepared, assembled)
+                            except Exception:
+                                _LOG.warning("model summary preparation failed; preserving original context")
+                                return
+                            if summary is not None and can_send_summary():
+                                prefix, prompt = summary
+                                self._compactions.start(self.session_id, prefix, prompt, tools, model=self._model,
+                                                        thinking=self._thinking, timeout=self._settings.model_timeout,
+                                                        run_id=run_id, instructions=self._instructions,
+                                                        can_send=can_send_summary)
+
+                        # 这里只排回调，不让出事件循环；先进入普通生成器，再计算摘要的尾窗和冻结 schema。
+                        loop.call_soon(prepare_summary)
                     async for event in events:
                         # 即使回执与这一帧同时就绪，也不能发布它或启动新的工具。
                         # 适配器在收到取消后吐出的迟到帧也一律丢弃。
@@ -668,7 +700,7 @@ class Runtime:
             try:
                 model_status = await complete_model()
                 if trigger_preempted:
-                    return "model_interrupted", False, None  # 尚未派发，无回复可结算。
+                    return "model_interrupted", None, None  # 尚未派发，无回复可结算。
                 if model_status == "model_interrupted":
                     reply.abandon()
             except _ToolCallWriteFailed:
@@ -733,7 +765,8 @@ class Runtime:
                                    receipt.status if receipt else None, model_error=model_error,
                                    input_tokens=input_tokens if model_status == "complete" else None)
             try:
-                await self._sqlite.write_input(lambda: self.history.finalize_reply(outcome, rows, **self._origin_options))
+                ids = await self._sqlite.write_input(
+                    lambda: self.history.finalize_reply(outcome, rows, **self._origin_options))
             except Exception:
                 reply_write_failed()
                 raise
@@ -749,7 +782,8 @@ class Runtime:
                 _LOG.warning("background reply could not be queued; reply=%s", info.reply_id)
             if not all(written):
                 raise _ToolResultWriteFailed
-            return model_status, bool(scheduled) and not voice_incomplete, generated_text or confirmed_text or None
+            tool_group_id = ids[0] if scheduled and not voice_incomplete else None
+            return model_status, tool_group_id, generated_text or confirmed_text or None
         finally:
             # 异常退出时先撤销工具（含还在等锁的调用），再等待可能延迟的模型收尾。
             for task in scheduled.values():

@@ -49,8 +49,13 @@ def _context(history, model=None, settings=None):
 
 
 async def _prepare(context, *, protected_from=None, last_input_tokens=None):
-    return await context.prepare("main", thinking=False, tools=(_SPEC,), protected_from=protected_from,
-                                 can_send=lambda: True, last_input_tokens=last_input_tokens)
+    prepared = await context.prepare("main", thinking=False, tools=(_SPEC,), protected_from=protected_from,
+                                    can_send=lambda: True, last_input_tokens=last_input_tokens)
+    assembled = await prepared.assemble(None)
+    if (summary := context.summary_request("main", prepared, assembled)) is not None:
+        prefix, prompt = summary
+        context._compactions.start("main", prefix, prompt, (_SPEC,), model=context._model, thinking=False, timeout=2)
+    return assembled.messages()
 
 
 async def _wait_summary(compactions, covered):
@@ -229,7 +234,7 @@ class ToolHistoryTest(unittest.IsolatedAsyncioTestCase):
                         self.assertEqual(staged.message.tool_calls[0].private.payload, b"native-call")
                         self.assertIsNone(staged.message.tool_calls[0].result)
                         context, _ = _context(other)
-                        projected = (await _prepare(context)).messages
+                        projected = await _prepare(context)
                         self.assertEqual([message.kind for message in projected], ["user"])
                         later, = other.append("main", [Message("user", "later input")])
                         self.assertFalse(other.try_save_summary("main", Summary(staged.message_id, "must wait"),
@@ -301,12 +306,12 @@ class ToolHistoryTest(unittest.IsolatedAsyncioTestCase):
                         self.assertEqual([(c.id, c.result) for c in entries[-1].message.tool_calls],
                                          [("first", None), ("second", "")])
                         context, _ = _context(other)
-                        projected = (await _prepare(context)).messages
+                        projected = await _prepare(context)
                         self.assertEqual([message.kind for message in projected], ["user"])
                 finally:
                     await runtime.close()
                 self.assertEqual(other.outcomes("main"), [])
-                projected = (await _prepare(context)).messages
+                projected = await _prepare(context)
                 first, second = projected[-1].tool_calls
                 self.assertEqual(json.loads(first.result)["status"], "unknown")
                 self.assertEqual(second.result, "")
@@ -323,7 +328,7 @@ class ToolHistoryTest(unittest.IsolatedAsyncioTestCase):
                 history.record_tool_result("main", "working", _SECOND.id, "true result")
                 active = history.read_after("main")[-1].message_id
                 later, latest = history.append("main", [Message("user", "later"), Message("user", "latest")])
-                projected = (await _prepare(context, protected_from=latest, last_input_tokens=1000)).messages
+                projected = await _prepare(context, protected_from=latest, last_input_tokens=1000)
                 self.assertEqual([message.text for message in projected], ["old words " * 50, "later", "latest"])
                 self.assertFalse(history.try_save_summary("main", Summary(later, "skip over active"),
                                                           covered=0, protected_from=latest))
@@ -335,7 +340,7 @@ class ToolHistoryTest(unittest.IsolatedAsyncioTestCase):
                 await _prepare(context, protected_from=latest, last_input_tokens=1000)
                 self.assertEqual(history.summary("main").covers_through, old)
             # 所有者退出后，同一组在普通续轮和摘要请求中使用相同的缺失占位与已有结果。
-            projected = (await _prepare(context, protected_from=latest, last_input_tokens=1000)).messages
+            projected = await _prepare(context, protected_from=latest, last_input_tokens=1000)
             assistant = projected[1]
             self.assertEqual(json.loads(assistant.tool_calls[0].result)["status"], "unknown")
             self.assertEqual(assistant.tool_calls[1].result, "true result")
@@ -627,7 +632,7 @@ class ToolHistoryTest(unittest.IsolatedAsyncioTestCase):
                     self.assertEqual(outcome.model_status, "complete")
                     context, compactions = _context(history)
                     try:
-                        projected = (await _prepare(context)).messages
+                        projected = await _prepare(context)
                         result = projected[-1].tool_calls[0].result
                         if committed:
                             self.assertEqual(result, "unsettled result")

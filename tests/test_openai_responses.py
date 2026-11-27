@@ -250,6 +250,7 @@ class OpenAIResponsesTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(initial["input"], [{"role": "user", "content": [
             {"type": "input_text", "text": "读图"}, {"type": "input_image", "image_url": PNG_URL, "detail": "auto"},
             {"type": "input_text", "text": "使用工具"},
+            {"type": "input_text", "text": f"图片路径：\n{prompt.parts[1].url}"},
         ]}])
         expected_calls = [{k: v for k, v in call.items() if k != "status"}
                           for call in (_call(), _call(2, arguments='{"value":2}'))]
@@ -670,12 +671,22 @@ class OpenAIResponsesTests(unittest.IsolatedAsyncioTestCase):
         settings = RuntimeSettings(context_budget=240, tail_budget=75)
         result = "r" * 1500
         tool = AsyncMock(return_value=result)
-        fixture = _Fixture(self, [_completed(_reason(), _call(), input_tokens=240)], [_completed(_answer("done"))])
+        summary_prompt = {"role": "user", "content": _SUMMARIZE.content}
+
+        def generation_or_reply(payload):
+            text = "compacted" if payload["input"][-1] == summary_prompt else "done"
+            return [_completed(_answer(text))]
+
+        fixture = _Fixture(self, [_completed(_reason(), _call(), input_tokens=240)],
+                           generation_or_reply, generation_or_reply)
         with closing(History(":memory:")) as history:
             self.assertIsNone(await _complete(fixture, history, settings=settings, tools=Tools([Tool(_SPEC, tool)])))
-            self.assertEqual(len(fixture.requests), 2)
+            original, *following = (payload["input"] for payload in fixture.requests)
+            summary, = (request for request in following if request[-1] == summary_prompt)
+            continued, = (request for request in following if request[-1] != summary_prompt)
+            self.assertEqual(summary, original + [summary_prompt])
             self.assertIsNone(history.summary("main"))
-            self.assertEqual(fixture.requests[-1]["input"][-1],
+            self.assertEqual(continued[-1],
                              {"type": "function_call_output", "call_id": "call_1", "output": result})
             self.assertEqual(history.outcomes("main")[0].input_tokens, 240)
         tool.assert_awaited_once()
@@ -688,7 +699,7 @@ class OpenAIResponsesTests(unittest.IsolatedAsyncioTestCase):
                 finalize = history.finalize_reply
 
                 def damage_after_commit(outcome, rows):
-                    finalize(outcome, rows)
+                    message_ids = finalize(outcome, rows)
                     if rows and rows[0].tool_calls:
                         with history._db:
                             parts = _stored_parts(history._db)
@@ -703,6 +714,7 @@ class OpenAIResponsesTests(unittest.IsolatedAsyncioTestCase):
                                 damaged = json.dumps({"id": "rs_1", "encrypted_content": "\udfff", "summary": []})
                                 parts[0]["private"][1] = b64encode(damaged.encode()).decode()
                             _replace_parts(history._db, parts)
+                    return message_ids
 
                 with patch.object(history, "finalize_reply", side_effect=damage_after_commit):
                     self.assertIsNone(await _complete(fixture, history, tools=Tools([Tool(_SPEC, tool)])))
@@ -750,7 +762,7 @@ class OpenAIResponsesTests(unittest.IsolatedAsyncioTestCase):
             image = Message("user", (Text("historical image"), save_image(workspace, PNG_BYTES)))
             current = "current " + "y" * 1400
             # 尾窗仍保留最近正文，包括其原生 message 元数据的额外开销。
-            settings = RuntimeSettings(context_budget=2500, tail_budget=580)
+            settings = RuntimeSettings(context_budget=2500, tail_budget=480)
             async with httpx.AsyncClient(transport=fixture.transport) as client:
                 runtime = Runtime("main", history, _model(client), channel, tools=registry,
                                   settings=settings, instructions="fixed synthetic instructions", workspace=workspace)
@@ -771,7 +783,12 @@ class OpenAIResponsesTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(len(fixture.requests), 5)
             previous_reply, current_reply = fixture.requests[1], fixture.requests[-1]
             compressed = next(payload for payload in fixture.requests[2:4] if payload["input"][-1] == summary_prompt)
-            self.assertEqual(compressed, {**previous_reply, "input": previous_reply["input"] + [
+            old_picture = {"role": "user", "content": [
+                {"type": "input_text", "text": "historical image"},
+                {"type": "input_text", "text": f"图片路径：\n{image.parts[1].url}"},
+            ]}
+            summary_input, _, *native_prefix = previous_reply["input"]
+            self.assertEqual(compressed, {**previous_reply, "input": [summary_input, old_picture, *native_prefix,
                 {"role": "user", "content": _SUMMARIZE.content},
             ]})
             self.assertIn(private, compressed["input"])

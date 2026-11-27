@@ -225,6 +225,7 @@ def _encode_parts(parts: Sequence[Part]) -> str:
             item = ({"type": "image", "url": part.url} if image_filename(part.url) is not None else
                     {"type": "text", "text": UNAVAILABLE_IMAGE.text})
         elif isinstance(part, ToolCall):
+            # result_image 是出站请求副本中的字段，不进入历史。
             item = {"type": "tool_call", "id": part.id, "name": part.name, "arguments": part.arguments}
         else:
             item = {"type": "reasoning"}

@@ -507,8 +507,9 @@ class FeishuPrivateTests(unittest.IsolatedAsyncioTestCase):
 
         class ImageModel:
             async def stream(self, messages, tools, *, thinking, instructions=None):
-                picture, = messages[0].parts
+                picture, paths = messages[0].parts
                 self_test.assertEqual(picture, Image(PNG_URL))
+                self_test.assertRegex(paths.text, r"^图片路径：\n\.agent/images/[0-9a-f]{32}$")
                 yield TextDelta(messages[-1].text)
 
         self_test = self

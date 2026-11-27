@@ -1,4 +1,5 @@
 import asyncio
+from base64 import b64decode
 from contextlib import aclosing, closing
 from dataclasses import replace
 import json
@@ -8,7 +9,9 @@ from unittest.mock import patch
 
 import httpx
 
+from agent_companion import images
 from agent_companion.config import RuntimeSettings, bailian_llm_base_url
+from agent_companion.images import VIEW_IMAGE_OK, VIEW_IMAGE_TOOL_NAME, image_request_bytes, save_image
 from agent_companion.model_diagnostics import ModelRequestDiagnostics
 from agent_companion.models import _http_stream
 from agent_companion.models.bailian import Bailian
@@ -19,9 +22,10 @@ from agent_companion.protocol import (DeliveryStatus, Image, InputUsage, Message
 from agent_companion.runtime.context import _SUMMARIZE
 from agent_companion.runtime.engine import Runtime
 from agent_companion.runtime.tools import Tool, Tools
+from agent_companion.runtime.view_image import VIEW_IMAGE_TOOL
 from agent_companion.storage.sqlite import History, ReplyOutcome, Summary
 from test_model_http_reuse import _HTTP11, _sse
-from test_message_support import assistant_message, reasoning_parts
+from test_message_support import PNG_BYTES, PNG_URL, assistant_message, image_workspace, reasoning_parts
 
 
 _SPEC = ToolSpec("lookup", "Look up a fixture", {"type": "object"})
@@ -269,6 +273,65 @@ class ChatModelTests(unittest.IsolatedAsyncioTestCase):
                                   ("call-later", 3 if adapter == "bailian" else None)])
                 self.assertEqual([(item["tool_call_id"], item["content"]) for item in results],
                                  [("call-earlier", "Oslo"), ("call-later", "Tokyo")])
+
+    async def test_interleaved_view_image_reserves_media_for_first_outbound_call(self):
+        workspace = image_workspace(self)
+        first = save_image(workspace, PNG_BYTES)
+        gif = b64decode("R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7")
+        later = save_image(workspace, gif)
+        one_image = image_request_bytes(len(PNG_BYTES), "image/png")
+        self.assertLessEqual(image_request_bytes(len(gif), "image/gif"), one_image)
+
+        def delta(index, call_id, image):
+            return {"index": index, "id": call_id, "function": {
+                "name": VIEW_IMAGE_TOOL_NAME, "arguments": json.dumps({"path": image.url}),
+            }}
+
+        for adapter in ("minimax", "bailian", "deepseek"):
+            with self.subTest(adapter=adapter), closing(History(":memory:")) as history:
+                requests = []
+
+                def wire(request):
+                    requests.append(json.loads(request.content))
+                    if len(requests) == 1:
+                        return _response(_choice({"tool_calls": [delta(1, "call-one", later)]}),
+                                         _choice({"content": "between"}),
+                                         _choice({"reasoning_content": "fixture reasoning"}),
+                                         _choice({"tool_calls": [delta(0, "call-zero", first)]}, finish="tool_calls"),
+                                         b"[DONE]")
+                    return httpx.Response(200, content=_answer())
+
+                async with httpx.AsyncClient(transport=httpx.MockTransport(wire)) as client:
+                    model = DeepSeek(client) if adapter == "deepseek" else _model(client, adapter)
+                    runtime = Runtime("main", history, model, None, tools=Tools([VIEW_IMAGE_TOOL]),
+                                      workspace=workspace, thinking=True)
+                    try:
+                        with (patch.object(images, "MAX_MEDIA_BYTES", one_image),
+                              patch.object(model, "_payload", wraps=model._payload) as payload):
+                            runtime.submit_messages([MessageDelivery(_INPUT, "trigger")])
+                            await asyncio.wait_for(runtime.wait_idle(), 2)
+                        self.assertIsNone(runtime.last_failure)
+                    finally:
+                        await runtime.close()
+                        await model.aclose()
+
+                stored = history.read_after("main")[1].message
+                self.assertEqual(tuple(type(part) for part in stored.parts), (ToolCall, Text, Reasoning, ToolCall))
+                self.assertEqual([(call.id, call.result, call.result_image) for call in stored.tool_calls],
+                                 [("call-one", VIEW_IMAGE_OK, None), ("call-zero", VIEW_IMAGE_OK, None)])
+                projection = payload.call_args_list[1].args[0][1]
+                self.assertEqual(tuple(type(part) for part in projection.parts), (ToolCall, Text, Reasoning, ToolCall))
+                self.assertEqual(projection.parts[1:3], stored.parts[1:3])
+                self.assertEqual([(call.id, call.result_image) for call in projection.tool_calls],
+                                 [("call-one", None), ("call-zero", Image(PNG_URL))])
+                assistant, *results, visual = requests[1]["messages"][1:]
+                self.assertEqual(assistant["content"], "between")
+                self.assertEqual(assistant["reasoning_content"], "fixture reasoning")
+                self.assertEqual([call["id"] for call in assistant["tool_calls"]], ["call-zero", "call-one"])
+                self.assertEqual(results, [{"role": "tool", "tool_call_id": call_id, "content": VIEW_IMAGE_OK}
+                                           for call_id in ("call-zero", "call-one")])
+                self.assertEqual(visual, {"role": "user", "content": [{"type": "image_url",
+                                                                     "image_url": {"url": PNG_URL}}]})
 
     async def test_conflicting_missing_or_incompatible_indexes_fall_back_to_part_order(self):
         async with httpx.AsyncClient() as client:

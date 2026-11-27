@@ -48,6 +48,8 @@ class ToolCall:
     arguments: str = field(repr=False)
     result: str | None = field(default=None, repr=False)
     private: PrivateData | None = field(default=None, repr=False)
+    # 仅供模型请求投影；历史只记录工具调用和文本结果。
+    result_image: Image | None = field(default=None, repr=False)
 
 
 @dataclass(frozen=True, slots=True)

@@ -18,11 +18,14 @@ from .engine import Runtime
 from .sqlite_access import SQLiteAccess
 from .timers import CANCEL_TIMER_TOOL_NAME, SET_TIMER_TOOL_NAME, Timers
 from .tools import Tool, ToolContext, Tools
+from .view_image import VIEW_IMAGE_TOOL
 
 
 _LOG = logging.getLogger(__name__)
 DELEGATE_TOOL_NAME = "delegate_subtask"
-AGENT_TOOL_NAMES = frozenset({DELEGATE_TOOL_NAME, SET_TIMER_TOOL_NAME, CANCEL_TIMER_TOOL_NAME, BASH_TOOL_NAME})
+AGENT_TOOL_NAMES = frozenset({
+    DELEGATE_TOOL_NAME, SET_TIMER_TOOL_NAME, CANCEL_TIMER_TOOL_NAME, BASH_TOOL_NAME, VIEW_IMAGE_TOOL.spec.name,
+})
 
 
 @dataclass(frozen=True, slots=True)
@@ -115,7 +118,8 @@ class AgentTree:
         try:
             role = self._roles[agent.role_id]
             timers = None
-            available = {DELEGATE_TOOL_NAME: self._delegate_tool, BASH_TOOL_NAME: self._bash.tool}
+            available = {DELEGATE_TOOL_NAME: self._delegate_tool, BASH_TOOL_NAME: self._bash.tool,
+                         VIEW_IMAGE_TOOL.spec.name: VIEW_IMAGE_TOOL}
             if SET_TIMER_TOOL_NAME in role.tools or CANCEL_TIMER_TOOL_NAME in role.tools:
                 timers = Timers(agent.session_id, scheduler.submit_internal)
                 available.update((tool.spec.name, tool) for tool in timers.tools)

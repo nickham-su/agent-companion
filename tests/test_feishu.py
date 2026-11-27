@@ -1168,8 +1168,8 @@ class FeishuPollingTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(len(model.calls), 1)
                 text, voice, post, image = model.calls[0][-4:]
                 self.assertEqual((text.content, voice.content), ("先到", "模拟转写"))
-                self.assertEqual(post.content, (Text("标题"), Text("\n"), Text("前"), image.content[0],
-                                                Text("后 (https://example.invalid/link)"), Text("\n"), Text("次行")))
+                self.assertEqual(post.content[:-1], (Text("标题"), Text("\n"), Text("前"), image.content[0],
+                                                     Text("后 (https://example.invalid/link)"), Text("\n"), Text("次行")))
                 self.assertIsInstance(image.content[0], Image)
                 self.assertEqual(b64decode(image.content[0].url.split(",", 1)[1]), _PNG)
                 directory = Workspace.for_user(settings.workspace_root, _PEER).directory
@@ -1177,6 +1177,8 @@ class FeishuPollingTests(unittest.IsolatedAsyncioTestCase):
                           if isinstance(part, Image)]
                 self.assertEqual(len(stored), 2)
                 self.assertNotEqual(stored[0], stored[1])
+                self.assertEqual(post.content[-1], Text(f"图片路径：\n{stored[0].url}"))
+                self.assertEqual(image.content[1:], (Text(f"图片路径：\n{stored[1].url}"),))
                 for part in stored:
                     self.assertRegex(part.url, r"^\.agent/images/[0-9a-f]{32}$")
                     self.assertEqual((directory / part.url).read_bytes(), _PNG)
@@ -1546,12 +1548,13 @@ class FeishuPollingTests(unittest.IsolatedAsyncioTestCase):
                 await main.wait_idle()
             self.assertEqual(len(model.calls), 1)
             self.assertEqual(model.calls[0][0].content, "同批文字")
-            before, image, omitted, after = model.calls[0][1].content
+            before, image, omitted, after, paths = model.calls[0][1].content
             self.assertEqual((before, omitted, after), (Text("前"), OMITTED_INPUT_IMAGE, Text("后")))
             self.assertIsInstance(image, Image)
             directory = Workspace.for_user(settings.workspace_root, _PEER).directory
             saved = list((directory / ".agent/images").iterdir())
             self.assertEqual(len(saved), 1)
+            self.assertEqual(paths, Text(f"图片路径：\n{saved[0].relative_to(directory).as_posix()}"))
             self.assertEqual(saved[0].read_bytes(), _PNG)
 
     async def test_bad_post_image_does_not_drop_text_or_use_next_images_budget(self):

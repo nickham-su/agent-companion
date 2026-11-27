@@ -209,7 +209,8 @@ class ProfileRuntimeTests(_Files, unittest.IsolatedAsyncioTestCase):
                 completed = _completed(_answer("child reuse answer"), input_tokens=30)
             else:
                 call = _call(len(child_requests), arguments='{"agent":"missing","prompt":"fixture"}')
-                completed = _completed(call, input_tokens=30)
+                # 本用例在恢复的 Run 验证摘要；第一工具续轮的用量保持在触发线以下。
+                completed = _completed(call, input_tokens=18 if len(child_requests) == 1 else 30)
             return httpx.Response(200, headers={"Content-Type": "text/event-stream"}, stream=_Wire([completed]))
 
         async def drive(settings, history, models, roles):

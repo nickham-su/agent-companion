@@ -548,7 +548,7 @@ class DeepSeekTest(unittest.IsolatedAsyncioTestCase):
         requests = []
         workspace = image_workspace(self)
         old = Message("user", (Text("历史图文"), save_image(workspace, PNG_BYTES)))
-        settings = RuntimeSettings(context_budget=300, tail_budget=60)
+        settings = RuntimeSettings(context_budget=300, tail_budget=30)
 
         def endpoint(request):
             payload = json.loads(request.content)
@@ -589,7 +589,11 @@ class DeepSeekTest(unittest.IsolatedAsyncioTestCase):
             compressed = next(request["messages"] for request in requests[1:3]
                               if request["messages"][-1]["content"] == _SUMMARIZE.content)
             self.assertEqual(compressed[0], requests[0]["messages"][0])
-            self.assertEqual(compressed[0]["content"][1]["image_url"]["url"], PNG_URL)
+            self.assertEqual(compressed[0], {
+                "role": "user", "content": [
+                    {"type": "text", "text": "历史图文"}, {"type": "text", "text": f"图片路径：\n{old.parts[1].url}"},
+                ],
+            })
             self.assertNotIn("新的文字", repr(compressed))
             self.assertNotIn("image_url", repr(requests[-1]))
             self.assertIn("新的文字", repr(requests[-1]))
@@ -618,8 +622,8 @@ class DeepSeekTest(unittest.IsolatedAsyncioTestCase):
                     try:
                         async for _ in model.stream([*old, Message("user", "new question")], tools, thinking=thinking):
                             pass
-                        compactions.start("main", Prefix(0, 1, 2), [*old, _SUMMARIZE], tools, model=model,
-                                          thinking=thinking, timeout=2)
+                        compactions.start("main", Prefix(0, 1, 2), [*old, _SUMMARIZE], tools,
+                                          model=model, thinking=thinking, timeout=2)
                         await asyncio.wait_for(asyncio.shield(compactions._generating), 2)
                         self.assertIsNotNone(compactions.ready("main", 0))
                     finally:
@@ -679,6 +683,7 @@ class DeepSeekTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(pending[0]["messages"][0]["content"], [
             {"type": "text", "text": "前文"}, {"type": "image_url", "image_url": {"url": PNG_URL}},
             {"type": "text", "text": "后文"},
+            {"type": "text", "text": f"图片路径：\n{image.url}"},
         ])
         assistant, result = pending[1]["messages"][-2:]
         self.assertEqual(assistant["reasoning_content"], "原始推理")

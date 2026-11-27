@@ -1,6 +1,7 @@
 import asyncio
 from collections import Counter
 from contextlib import closing
+from copy import deepcopy
 from dataclasses import replace
 from pathlib import Path
 import json
@@ -17,7 +18,7 @@ import httpx
 from agent_companion import images
 from agent_companion.app import prepare_private_feishu, running_agent
 from agent_companion.config import FeishuSettings, RuntimeSettings, Settings
-from agent_companion.images import UNAVAILABLE_IMAGE, image_filename, save_image
+from agent_companion.images import image_filename, save_image
 from agent_companion.models import _http_stream
 from agent_companion.models.deepseek import DeepSeek
 from agent_companion.protocol import (ChannelUser, Image, InputUsage, Message, MessageDelivery, PrivateData,
@@ -33,7 +34,8 @@ from test_history_context import Sink, SPEC
 from test_message_support import PNG_BYTES, PNG_URL, assistant_message, image_workspace
 
 
-_SETTINGS = RuntimeSettings(context_budget=240, tail_budget=60)
+# 这些调度测试让任意非空最新消息越过尾窗，避免因输入长度改变待摘要前缀。
+_SETTINGS = RuntimeSettings(context_budget=240, tail_budget=8)
 _SUMMARY = Message("compaction_summary", "background result")
 _OLD = Message("user", "old history " + "a" * 500)
 
@@ -160,7 +162,123 @@ class BackgroundCompactionTest(unittest.IsolatedAsyncioTestCase):
                 model.release.set()
                 await runtime.close()
 
-    async def test_each_request_loads_only_its_selected_images_after_planning(self):
+    async def test_normal_stream_enters_before_summary_tail_and_tool_schema_preparation(self):
+        order = []
+        release_normal = asyncio.Event()
+        copied_tools = []
+
+        async def reply(_messages):
+            order.append("normal")
+            await release_normal.wait()
+            yield TextDelta("normal response")
+
+        async def tool(_args, _ctx):
+            return "not called"
+
+        def freeze_tools(tools):
+            order.append("schema")
+            frozen = deepcopy(tools)
+            copied_tools.extend(frozen)
+            return frozen
+
+        model = _GatedModel(reply)
+        with closing(History(":memory:")) as history:
+            history.append("main", [_OLD])
+            _report_high_usage(history, "main")
+            runtime = Runtime("main", history, model, Sink(), settings=_SETTINGS, tools=Tools([Tool(SPEC, tool)]))
+            tail_cut = runtime._context._tail_cut
+
+            def cut(*args):
+                order.append("tail")
+                return tail_cut(*args)
+
+            try:
+                with (patch.object(runtime._context, "_tail_cut", side_effect=cut),
+                      patch("agent_companion.runtime.compaction.deepcopy", side_effect=freeze_tools)):
+                    task = await self._begin(runtime, model)
+                    self.assertEqual(order, ["normal", "tail", "schema"])
+                    (copied,) = copied_tools
+                    self.assertEqual(copied, SPEC)
+                    self.assertIsNot(copied.parameters, SPEC.parameters)
+                    release_normal.set()
+                    await _idle(runtime)
+                    self.assertFalse(task.done())
+                    await self._finish(model, task)
+            finally:
+                release_normal.set()
+                model.release.set()
+                await runtime.close()
+
+    async def test_invalid_normal_stream_does_not_send_summary_before_or_after_freezing(self):
+        loop = asyncio.get_running_loop()
+        clock = loop.time
+        for failure in ("cancel_before_prepare", "expire_before_prepare", "expire_during_freeze"):
+            with self.subTest(failure=failure), closing(History(":memory:")) as history:
+                offset = 0
+
+                async def reply(_messages):
+                    nonlocal offset
+                    if failure == "cancel_before_prepare":
+                        asyncio.current_task().cancel()
+                    elif failure == "expire_before_prepare":
+                        offset = 2
+                    await asyncio.Future()
+                    yield TextDelta("unreachable")
+
+                def freeze_tools(tools):
+                    nonlocal offset
+                    offset = 2
+                    return deepcopy(tools)
+
+                model = _GatedModel(reply)
+                history.append("main", [_OLD])
+                _report_high_usage(history, "main")
+                runtime = Runtime("main", history, model, Sink(), settings=replace(_SETTINGS, model_timeout=1))
+                try:
+                    with (patch.object(loop, "time", side_effect=lambda: clock() + offset),
+                          patch.object(runtime._context, "summary_request", wraps=runtime._context.summary_request) as plan,
+                          patch("agent_companion.runtime.compaction.deepcopy", side_effect=freeze_tools) as freeze):
+                        runtime.submit_messages([MessageDelivery(Message("user", "current input"), "trigger")])
+                        await asyncio.wait_for(runtime.wait_idle(), 5)
+                        if failure == "expire_during_freeze":
+                            plan.assert_called_once()
+                            freeze.assert_called_once()
+                        else:
+                            plan.assert_not_called()
+                            freeze.assert_not_called()
+                        self.assertEqual(len(model.requests), 1)
+                        self.assertEqual(model.summary_requests, [])
+                        self.assertIsNone(runtime._compactions._generating)
+                        expected = "model_cancelled" if failure == "cancel_before_prepare" else "model_timeout"
+                        self.assertEqual(runtime.last_failure, expected)
+                finally:
+                    await runtime.close()
+
+    async def test_summary_schema_freeze_failure_does_not_fail_reply_and_starts_cooldown(self):
+        async def reply(_messages):
+            yield TextDelta("normal reply")
+            yield InputUsage(240)
+
+        model = _GatedModel(reply)
+        with closing(History(":memory:")) as history:
+            history.append("main", [_OLD])
+            _report_high_usage(history, "main")
+            runtime = Runtime("main", history, model, Sink(), settings=_SETTINGS)
+            try:
+                with (patch("agent_companion.runtime.compaction.deepcopy", side_effect=ValueError) as freeze,
+                      self.assertLogs("agent_companion.runtime.compaction", "WARNING") as logs):
+                    for text in ("first request", "second request"):
+                        runtime.submit_messages([MessageDelivery(Message("user", text), "trigger")])
+                        await _idle(runtime)
+                        self.assertIsNone(runtime.last_failure)
+                    freeze.assert_called_once()
+                self.assertIn("summary_freeze_failed", logs.output[0])
+                self.assertEqual(len(model.requests), 2)
+                self.assertEqual(model.summary_requests, [])
+            finally:
+                await runtime.close()
+
+    async def test_summary_uses_single_loaded_projection_and_does_not_delay_normal_reply(self):
         workspace = image_workspace(self)
         covered, old, recent = (save_image(workspace, PNG_BYTES) for _ in range(3))
         missing = Image(".agent/images/" + "a" * 32)
@@ -177,120 +295,162 @@ class BackgroundCompactionTest(unittest.IsolatedAsyncioTestCase):
                 runtime.submit_messages([MessageDelivery(recent_message, "trigger")])
                 await _wait(model.generating)
                 await _idle(runtime)
+                summary_task = runtime._compactions._generating
+                self.assertIsNotNone(summary_task)
+                self.assertFalse(summary_task.done())
                 plain, = model.requests
                 compressed, = model.summary_requests
-                sent_old = (Text("前"), Image(PNG_URL), UNAVAILABLE_IMAGE, Text("后"))
+                sent_old = (Text("前"), Text("后"), Text(f"图片路径：\n{old.url}\n{missing.url}"))
                 self.assertEqual(plain[1].parts, sent_old)
-                self.assertEqual(plain[2].parts, (Image(PNG_URL),))
+                self.assertEqual(plain[2].parts, (Image(PNG_URL), Text(f"图片路径：\n{recent.url}")))
                 self.assertEqual(compressed[1].parts, sent_old)
                 self.assertEqual(compressed[2], _SUMMARIZE)
-                self.assertEqual(Counter(call.args[1] for call in read.call_args_list), {
-                    image_filename(old.url): 2, image_filename(missing.url): 2, image_filename(recent.url): 1,
-                })
-                await self._finish(model, runtime._compactions._generating)
+                self.assertIs(compressed[1], plain[1])
+                # 本次 Run 的图在尾部，只随普通请求加载一次；旧的可用或缺失图片均不读盘。
+                self.assertEqual([call.args[1] for call in read.call_args_list], [image_filename(recent.url)])
+                await self._finish(model, summary_task)
                 read.reset_mock()
                 runtime.submit_messages([MessageDelivery(Message("user", "第二轮"), "trigger")])
                 await _idle(runtime)
                 self.assertEqual(history.summary("main").covers_through, old_id)
-                self.assertEqual([call.args[1] for call in read.call_args_list], [image_filename(recent.url)])
+                read.assert_not_called()
+                self.assertIn(Message("user", (Text(f"图片路径：\n{recent.url}"),)), model.requests[1])
+                self.assertFalse(any(isinstance(part, Image) for message in model.requests[1] for part in message.parts))
                 self.assertEqual([row.message for row in history.read_after("main")[:3]],
                                  [Message("user", (covered,)), old_message, recent_message])
             finally:
                 model.release.set()
                 await runtime.close()
 
-    async def test_slow_image_wait_is_interruptible_without_dispatching_model(self):
+    async def test_old_image_paths_count_as_text_in_summary_tail(self):
+        workspace = image_workspace(self)
+        old_picture = save_image(workspace, PNG_BYTES)
+        crossing = Message("user", "older crossing group")
+        next_input = Message("user", "next")
+        model = _GatedModel()
+        with (closing(History(":memory:")) as history,
+              patch.object(images, "_read_image", wraps=images._read_image) as read):
+            history.append("main", [_OLD, crossing, Message("user", (old_picture,))])
+            _report_high_usage(history, "main")
+            runtime = Runtime("main", history, model, Sink(), settings=replace(_SETTINGS, tail_budget=42),
+                              workspace=workspace)
+            try:
+                runtime.submit_messages([MessageDelivery(next_input, "trigger")])
+                await _wait(model.generating)
+                await _idle(runtime)
+                self.assertEqual(model.summary_requests, [(_OLD, _SUMMARIZE)])
+                self.assertEqual(model.requests[0], (_OLD, crossing,
+                                                     Message("user", f"图片路径：\n{old_picture.url}"), next_input))
+                read.assert_not_called()
+                await self._finish(model, runtime._compactions._generating)
+            finally:
+                await runtime.close()
+
+    async def test_no_summary_prefix_does_not_start_task_or_read_images_twice(self):
+        workspace = image_workspace(self)
+        picture = save_image(workspace, PNG_BYTES)
+        settings = RuntimeSettings(context_budget=3000, tail_budget=2200)
+        model = _GatedModel()
+        with (closing(History(":memory:")) as history,
+              patch.object(images, "_read_image", wraps=images._read_image) as read):
+            history.append("main", [Message("user", "kept text")])
+            history.finalize_reply(ReplyOutcome("previous", "main", "seed", "complete", input_tokens=3000), [])
+            runtime = Runtime("main", history, model, Sink(), settings=settings, workspace=workspace)
+            try:
+                with patch.object(runtime._compactions, "start", wraps=runtime._compactions.start) as start:
+                    runtime.submit_messages([MessageDelivery(Message("user", (picture,)), "trigger")])
+                    await _idle(runtime)
+                    start.assert_not_called()
+                self.assertEqual([call.args[1] for call in read.call_args_list], [image_filename(picture.url)])
+                self.assertEqual(model.requests[0][-1].parts, (Image(PNG_URL), Text(f"图片路径：\n{picture.url}")))
+                self.assertEqual(model.summary_requests, [])
+                self.assertIsNone(runtime._compactions._generating)
+            finally:
+                await runtime.close()
+
+    async def test_slow_image_wait_can_be_interrupted_without_starting_either_model_request(self):
         workspace = image_workspace(self)
         picture = Message("user", (save_image(workspace, PNG_BYTES),))
         loop = asyncio.get_running_loop()
         actual_read = images._read_image
-        for summary in (False, True):
-            for cancel in (False, True):
-                with self.subTest(summary=summary, cancel=cancel), closing(History(":memory:")) as history:
-                    started, finished = asyncio.Event(), asyncio.Event()
-                    release = Event()
+        for cancel in (False, True):
+            with self.subTest(cancel=cancel), closing(History(":memory:")) as history:
+                history.append("main", [_OLD])
+                _report_high_usage(history, "main")
+                started, finished = asyncio.Event(), asyncio.Event()
+                release = Event()
 
-                    def slow_read(*args):
-                        loop.call_soon_threadsafe(started.set)
-                        try:
-                            if not release.wait(3):
-                                raise AssertionError("image read blocked the event loop")
-                            return actual_read(*args)
-                        finally:
-                            loop.call_soon_threadsafe(finished.set)
-
-                    model = Mock()  # 具有原生 stop_stream，但图片准备时还没有可关闭的请求。
-                    model.stop_stream.return_value = False
-                    other_model = _GatedModel()
-                    settings = replace(_SETTINGS, model_timeout=5 if cancel else 0.15)
-                    runtime = Runtime("main", history, model, Sink(), settings=settings, workspace=workspace)
-                    other = Runtime("other", history, other_model, Sink())
+                def slow_read(*args):
+                    loop.call_soon_threadsafe(started.set)
                     try:
-                        with patch.object(images, "_read_image", side_effect=slow_read):
-                            if summary:
-                                runtime._compactions.start("main", Prefix(0, 1, 1), [picture, _SUMMARIZE], (),
-                                                           model=model, thinking=False, timeout=settings.model_timeout,
-                                                           workspace=workspace)
-                                summary_task = runtime._compactions._generating
-                            else:
-                                runtime.submit_messages([MessageDelivery(picture, "trigger")])
-                            await _wait(started)
-                            other.submit_messages([MessageDelivery(Message("user", "另一个用户"), "trigger")])
-                            await _idle(other)
-                            self.assertEqual(len(other_model.requests), 1)
-                            if cancel:
-                                await asyncio.wait_for(runtime.close(), 1)
-                            elif summary:
-                                await asyncio.wait_for(asyncio.shield(summary_task), 1)
-                                self.assertIsNone(runtime._compactions.ready("main", 0))
-                                self.assertFalse(runtime._compactions.can_start("main", 0, 1))
-                            else:
-                                await _idle(runtime)
-                                self.assertEqual(runtime.last_failure, "model_timeout")
-                            self.assertFalse(finished.is_set())  # 取消等待不等于中止同步读取。
-                            model.stream.assert_not_called()
+                        if not release.wait(3):
+                            raise AssertionError("image read blocked the event loop")
+                        return actual_read(*args)
                     finally:
-                        release.set()
-                        await runtime.close()
-                        await other.close()
-                        if started.is_set():
-                            await _wait(finished)
-                    model.stream.assert_not_called()
+                        loop.call_soon_threadsafe(finished.set)
 
-    async def test_already_expired_picture_request_does_not_race_deadline_callback(self):
+                model = Mock(spec=["stream", "stop_stream"])  # 图片准备时还没有可关闭的请求。
+                model.stop_stream.return_value = False
+                other_model = _GatedModel()
+                settings = replace(_SETTINGS, model_timeout=5 if cancel else 0.15)
+                runtime = Runtime("main", history, model, Sink(), settings=settings, workspace=workspace)
+                other = Runtime("other", history, other_model, Sink())
+                try:
+                    with (patch.object(images, "_read_image", side_effect=slow_read) as read,
+                          patch.object(runtime._compactions, "start", wraps=runtime._compactions.start) as start):
+                        runtime.submit_messages([MessageDelivery(picture, "trigger")])
+                        await _wait(started)
+                        other.submit_messages([MessageDelivery(Message("user", "另一个用户"), "trigger")])
+                        await _idle(other)
+                        self.assertEqual(len(other_model.requests), 1)
+                        if cancel:
+                            await asyncio.wait_for(runtime.close(), 1)
+                        else:
+                            await _idle(runtime)
+                            self.assertEqual(runtime.last_failure, "model_timeout")
+                        self.assertFalse(finished.is_set())  # 取消等待不等于中止同步读取。
+                        read.assert_called_once()
+                        start.assert_not_called()
+                        model.stream.assert_not_called()
+                finally:
+                    release.set()
+                    await runtime.close()
+                    await other.close()
+                    if started.is_set():
+                        await _wait(finished)
+                model.stream.assert_not_called()
+
+    async def test_already_expired_picture_request_does_not_start_either_model_request(self):
         workspace = image_workspace(self)
         picture = Message("user", (save_image(workspace, PNG_BYTES),))
         loop = asyncio.get_running_loop()
         clock = loop.time
-        for summary, module in ((False, "engine"), (True, "compaction")):
-            with self.subTest(summary=summary), closing(History(":memory:")) as history:
-                offset = 0
+        offset = 0
 
-                async def prepare(messages, *_args, **_kwargs):
-                    nonlocal offset
-                    # 返回与检查间无让步，让单调时间先越过截止，而定时器还未运行。
-                    offset = 2
-                    return messages
+        async def prepare(messages, *_args, **_kwargs):
+            nonlocal offset
+            # 返回与检查间无让步，让单调时间先越过截止，而定时器还未运行。
+            offset = 2
+            return messages
 
-                model = Mock()
-                model.stop_stream.return_value = False
-                runtime = Runtime("main", history, model, Sink(), settings=replace(_SETTINGS, model_timeout=1))
-                try:
-                    with (patch(f"agent_companion.runtime.{module}.prepare_request_images", side_effect=prepare),
-                          patch.object(loop, "time", side_effect=lambda: clock() + offset)):
-                        if summary:
-                            runtime._compactions.start("main", Prefix(0, 1, 1), [picture, _SUMMARIZE], (),
-                                                       model=model, thinking=False, timeout=1)
-                            await runtime._compactions._generating
-                            self.assertFalse(runtime._compactions.can_start("main", 0, 1))
-                        else:
-                            runtime.submit_messages([MessageDelivery(picture, "trigger")])
-                            await runtime.wait_idle()
-                            self.assertEqual(runtime.last_failure, "model_timeout")
-                    model.stream.assert_not_called()
-                    model.stop_stream.assert_not_called()
-                finally:
-                    await runtime.close()
+        with closing(History(":memory:")) as history:
+            history.append("main", [_OLD])
+            _report_high_usage(history, "main")
+            model = Mock(spec=["stream", "stop_stream"])
+            model.stop_stream.return_value = False
+            runtime = Runtime("main", history, model, Sink(), settings=replace(_SETTINGS, model_timeout=1))
+            try:
+                with (patch("agent_companion.runtime.context.prepare_request_images", side_effect=prepare),
+                      patch.object(loop, "time", side_effect=lambda: clock() + offset),
+                      patch.object(runtime._compactions, "start", wraps=runtime._compactions.start) as start):
+                    runtime.submit_messages([MessageDelivery(picture, "trigger")])
+                    await runtime.wait_idle()
+                    self.assertEqual(runtime.last_failure, "model_timeout")
+                    start.assert_not_called()
+                model.stream.assert_not_called()
+                model.stop_stream.assert_not_called()
+            finally:
+                await runtime.close()
 
     async def test_first_and_tool_continuation_do_not_wait_and_apply_only_after_full_batch(self):
         calls = [ToolCall(f"call{i}", SPEC.name, json.dumps({"i": i})) for i in range(3)]
@@ -351,6 +511,122 @@ class BackgroundCompactionTest(unittest.IsolatedAsyncioTestCase):
                 self.assertCountEqual(tools_run, [call.id for call in calls])
                 self.assertEqual(len(model.summary_requests), 1)  # 本次提交不使用旧 usage 再生成。
                 self.assertEqual(history.read_after("main")[0].message, _OLD)
+            finally:
+                await runtime.close()
+
+    async def test_long_run_compacts_earlier_tool_group_but_not_latest_group_before_queued_input(self):
+        workspace = image_workspace(self)
+        initial_image, tail_image = (save_image(workspace, PNG_BYTES) for _ in range(2))
+        calls = [ToolCall(f"long{i}", SPEC.name, json.dumps({"i": i})) for i in range(6)]
+        batches = (calls[:2], calls[2:4], calls[4:5], calls[5:])
+        reached, release = [asyncio.Event() for _ in calls], [asyncio.Event() for _ in calls]
+        for i in (0, 1, 2, 5):
+            release[i].set()
+        executed = []
+
+        async def tool(args, context):
+            i = args["i"]
+            executed.append((context.run_id, context.call_id))
+            reached[i].set()
+            await release[i].wait()
+            return f"result{i}"
+
+        async def reply(messages):
+            round_no = len(model.requests)
+            if round_no <= len(batches):
+                for call in batches[round_no - 1]:
+                    yield ToolReady(call)
+                # 第一轮不触发；第二轮在 95% 线上，摘要前缀应包含同 Run 的第一批工具。
+                yield InputUsage(228 if round_no == 2 else 227)
+            else:
+                yield TextDelta("finished")
+
+        model = _GatedModel(reply)
+        first = Message("user", (Text("start long run"), initial_image))
+        queued = Message("user", (Text("queued after latest tool group " + "q" * 90), tail_image))
+        sent_first = replace(first, parts=(first.parts[0], Image(PNG_URL), Text(f"图片路径：\n{initial_image.url}")))
+        sent_queued = replace(queued, parts=(queued.parts[0], Image(PNG_URL), Text(f"图片路径：\n{tail_image.url}")))
+        initial_name, tail_name = (image_filename(picture.url) for picture in (initial_image, tail_image))
+        result_calls = tuple(replace(call, result=f"result{i}") for i, call in enumerate(calls))
+        first_group = assistant_message(calls=result_calls[:2])
+        second_group = assistant_message(calls=result_calls[2:4])
+        third_group = assistant_message(calls=result_calls[4:5])
+        fourth_group = assistant_message(calls=result_calls[5:])
+        with (closing(History(":memory:")) as history,
+              patch.object(images, "_read_image", wraps=images._read_image) as read):
+            settings = replace(_SETTINGS, tail_budget=25)
+            runtime = Runtime("main", history, model, Sink(), settings=settings, tools=Tools([Tool(SPEC, tool)]),
+                              workspace=workspace)
+            try:
+                runtime.submit_messages([MessageDelivery(first, "trigger")])
+                await _wait(reached[3])
+                runtime.submit_messages([MessageDelivery(queued, "trigger")])
+                release[3].set()
+                await _wait(reached[4])
+                await _wait(model.generating)
+                self.assertEqual(model.summary_requests, [(sent_first, first_group, _SUMMARIZE)])
+                self.assertEqual(model.requests[2], (sent_first, first_group, second_group, sent_queued))
+                self.assertIs(model.summary_requests[0][0], model.requests[2][0])
+                self.assertEqual(Counter(call.args[1] for call in read.call_args_list), {initial_name: 3, tail_name: 1})
+                await self._finish(model, runtime._compactions._generating)
+                self.assertIsNone(history.summary("main"))
+                release[4].set()
+                await _idle(runtime)
+                self.assertIsNone(runtime.last_failure)
+                self.assertEqual(model.requests[3], (_SUMMARY, second_group, sent_queued, third_group))
+                self.assertEqual(model.requests[4], (_SUMMARY, second_group, sent_queued, third_group, fourth_group))
+                self.assertEqual(Counter(call.args[1] for call in read.call_args_list), {initial_name: 3, tail_name: 3})
+                entries = history.read_after("main")
+                self.assertEqual(history.summary("main"), Summary(entries[1].message_id, "background result"))
+                self.assertEqual([row.message for row in entries[:6]],
+                                 [first, first_group, second_group, queued, third_group, fourth_group])
+                self.assertEqual(len({run_id for run_id, _ in executed}), 1)
+                self.assertCountEqual([call_id for _, call_id in executed], [call.id for call in calls])
+            finally:
+                await runtime.close()
+
+    async def test_empty_wake_uses_separate_run_start_and_skips_first_summary_trigger(self):
+        workspace = image_workspace(self)
+        picture = save_image(workspace, PNG_BYTES)
+        call = ToolCall("wake", SPEC.name, "{}")
+
+        async def tool(args, context):
+            return "wake result"
+
+        async def reply(messages):
+            yield ToolReady(call) if len(model.requests) == 1 else TextDelta("done")
+
+        model = _GatedModel(reply)
+        latest = Message("user", (Text("latest old input"), picture))
+        sent_latest = replace(latest, parts=(latest.parts[0], Text(f"图片路径：\n{picture.url}")))
+        with (closing(History(":memory:")) as history,
+              patch.object(images, "_read_image", wraps=images._read_image) as read):
+            _, latest_id, blank_id = history.append("main", [_OLD, latest, Message("assistant", ())])
+            _report_high_usage(history, "main")
+            runtime = Runtime("main", history, model, Sink(), settings=_SETTINGS, tools=Tools([Tool(SPEC, tool)]),
+                              workspace=workspace)
+            prepare = runtime._context.prepare
+            contexts = []
+
+            async def capture(*args, **kwargs):
+                prepared = await prepare(*args, **kwargs)
+                contexts.append(prepared)
+                return prepared
+
+            try:
+                with patch.object(runtime._context, "prepare", side_effect=capture):
+                    runtime.trigger_run()
+                    await _idle(runtime)
+                self.assertIsNone(runtime.last_failure)
+                self.assertEqual(model.summary_requests, [])
+                self.assertEqual(model.requests[0], (_OLD, sent_latest))
+                self.assertEqual(model.requests[1][1], sent_latest)
+                read.assert_not_called()
+                first, followup = contexts
+                self.assertEqual(first.protected_from, latest_id)
+                self.assertEqual(first.run_start.message_id, blank_id + 1)
+                self.assertEqual(followup.run_start, first.run_start)
+                self.assertEqual(followup.protected_from, history.read_after("main")[-2].message_id)
             finally:
                 await runtime.close()
 

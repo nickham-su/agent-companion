@@ -8,6 +8,7 @@ model_id = "chat"
 # - set_timer：登记定时器，到期时唤醒会话。
 # - cancel_timer：取消当前会话的定时器。
 # - bash：执行 Bash 命令并等待结果。
+# - view_image：查看工作区相对路径指定的图片。
 tools = []
 # Bash 以服务账号权限执行，工作目录不是沙箱；按需用下一行替换上面的 tools：
 # tools = ["bash"]
