@@ -39,10 +39,10 @@ python -m venv .venv
 
 应用日志只写标准输出，不创建日志文件。在配置顶层设置 `log_level`，修改后重启。默认 `WARNING`，只显示警告和错误，同模块同类警告每 30 秒最多打印一次；`INFO` 另显示启停，`ERROR` 和 `CRITICAL` 可进一步收紧输出。启动配置错误写到标准错误，不受日志级别影响。
 
-排查时改为 `log_level = "DEBUG"`。用 `run` 和 `reply` ID 串起输入、模型、工具与投递；另外记录上下文压缩、子任务和实时语音的阶段状态。日志只有计数、耗时、状态等诊断信息，不包含消息正文、语音转写、工具参数、原始请求或密钥；不逐 token 或逐音频帧输出。
+排查时改为 `log_level = "DEBUG"`。用 `run` 和 `reply` ID 串起输入、模型、工具与投递；另外记录上下文压缩、子任务和实时语音的阶段状态。消息正文只在下面两条投递日志中以 `content=` 输出，可能包含用户原文、子任务结果或语音转写；只在本机排查时启用 `DEBUG`，日志勿外传。工具参数、原始请求和密钥仍不记录，也不逐 token 或逐音频帧输出。
 
-- `scheduler input submitted`：按提交给 Runtime 的顺序逐条记录，包含主/子 Agent、批内位置、消息类型、投递意图、正文字符数和图片数。
-- `Feishu text receipt confirmed` 表示通道收齐文字，不表示已发送；CLI 确认发送另有 `Feishu text send confirmed`。语音看 `voice playback finished`，其中 `confirmed_chars` 只统计回执已确认的文字。
+- `scheduler input submitted`：按提交给 Runtime 的顺序逐条记录，包含主/子 Agent、批内位置、消息类型、投递意图和 `content=` 全文；子任务结果与定时器事件展开为结果信封。
+- `Feishu text receipt confirmed` 表示通道收齐文字并打印全文，不表示已发送；CLI 确认发送另有 `Feishu text send confirmed` 并打印实际发出内容。语音看 `voice playback finished`，`content=` 是回执已确认的文字，未播完的部分不包含在内。
 
 模型调用失败时看 `model request failure`：`purpose` 区分回复和后台摘要，`stage`、`reason`、`category` 帮助判断出错阶段和类别；已知时还会记录 HTTP 状态和请求字节数。不会输出请求地址、响应内容或打开第三方 HTTP 库的调试日志。
 

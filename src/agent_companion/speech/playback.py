@@ -5,6 +5,7 @@ from collections import deque
 from collections.abc import AsyncGenerator, Callable
 from contextlib import aclosing
 from dataclasses import dataclass, field
+import json
 import logging
 from threading import Lock
 from unicodedata import category
@@ -309,8 +310,8 @@ class VoiceOutput:
             prefix = state.confirmed_prefix(state.played_bytes, cutoff)
         if not prefix and status in (DeliveryStatus.PARTIAL, DeliveryStatus.FULL):
             status = DeliveryStatus.ZERO
-        _LOG.debug("voice playback finished; reply=%s status=%s confirmed_chars=%d elapsed_ms=%.0f",
-                   reply_id, status, len(prefix), (loop.time() - started) * 1000)
+        _LOG.debug("voice playback finished; reply=%s status=%s content=%s elapsed_ms=%.0f",
+                   reply_id, status, json.dumps(prefix, ensure_ascii=False), (loop.time() - started) * 1000)
         return Receipt(reply_id, status, prefix)
 
     async def _produce(self, reply: ReplyStream, state: _PlaybackReply) -> None:

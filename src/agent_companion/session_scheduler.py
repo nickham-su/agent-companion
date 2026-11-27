@@ -2,16 +2,29 @@
 
 import asyncio
 from collections.abc import Callable, Sequence
+import json
 import logging
 from typing import Literal
 
-from .protocol import (DeliveryStatus, Image, MessageDelivery, Receipt, ReplyDelivery, ReplyStream, Text,
+from .protocol import (DeliveryStatus, Image, Message, MessageDelivery, Receipt, ReplyDelivery, ReplyStream, Text,
                        validate_deliveries)
 
 
 _LOG = logging.getLogger(__name__)
 _Submit = Callable[[tuple[MessageDelivery, ...]], None]
 _Trigger = Callable[[Callable[[], bool]], None]
+
+
+def _content(message: Message) -> str:
+    """DEBUG 日志用的单行全文；结果信封同样展开，换行交给日志转义。"""
+    if message.async_result is not None:
+        return json.dumps(message.async_result.payload, ensure_ascii=False, sort_keys=True,
+                          default=str)
+    text = "".join(part.text for part in message.parts if isinstance(part, Text))
+    images = sum(isinstance(part, Image) for part in message.parts)
+    if images:
+        text = f"{text}[图片 {images} 张]"
+    return json.dumps(text, ensure_ascii=False)
 
 
 async def _reject_voice(reply: ReplyStream) -> Receipt:
@@ -156,12 +169,10 @@ class SessionScheduler:
                 if result_kind not in (None, "agent_reply", "timer_fired"):
                     result_kind = "other"
                 _LOG.debug("scheduler input submitted; agent=%s agent_kind=%s position=%d/%d kind=%s "
-                           "intent=%s source=%s delegated=%s async_kind=%s text_chars=%d images=%d",
+                           "intent=%s source=%s delegated=%s async_kind=%s content=%s",
                            self._agent_id or "-", self._agent_kind or "-", position, len(batch), message.kind,
                            item.intent, message.source.kind if message.source is not None else "-",
-                           item.delegation is not None, result_kind or "-",
-                           sum(len(part.text) for part in message.parts if isinstance(part, Text)),
-                           sum(isinstance(part, Image) for part in message.parts))
+                           item.delegation is not None, result_kind or "-", _content(message))
 
     def select_voice(self, reply: ReplyStream, target: ReplyDelivery) -> ReplyDelivery:
         """语音选路后同步决定是否拦截，不在转写结束后恢复过期回复。"""

@@ -54,7 +54,7 @@ class LoggingTests(unittest.TestCase):
         self.assertIn("synthetic warning 2", output)
         self.assertEqual(output.count("synthetic error"), 3)
 
-    def test_debug_traces_runtime_without_demo_content(self):
+    def test_debug_traces_runtime_with_delivered_content(self):
         self.path.write_text('log_level = "DEBUG"\n', encoding="utf-8")
         output = self.run_cli("--demo-subtasks")
         debug = "\n".join(line for line in output.splitlines() if " DEBUG " in line)
@@ -68,9 +68,10 @@ class LoggingTests(unittest.TestCase):
         self.assertIn("delegated=True", submissions[1])
         self.assertIn("agent_kind=main position=1/1 kind=async_tool_result", submissions[2])
         self.assertIn("async_kind=agent_reply", submissions[2])
+        self.assertIn('content="离线模拟：委派一个后台任务"', submissions[0])
+        self.assertIn('content="给出一个模拟子任务结果"', submissions[1])
+        self.assertIn('"result": "模拟子任务已完成。"', submissions[2])
         self.assertIn("INFO agent_companion.__main__ agent companion started", output)
         self.assertIn("output_chars=", debug)
         self.assertIn("elapsed_ms=", debug)
-        self.assertNotIn("离线模拟", debug)
         self.assertNotIn("模拟协议字段", debug)
-        self.assertNotIn("给出一个模拟子任务结果", debug)

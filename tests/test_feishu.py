@@ -349,7 +349,7 @@ print(json.dumps({"ok": True, "identity": "user", "data": {"size_bytes": peak}})
 
 
 class FeishuBackgroundDeliveryTests(unittest.IsolatedAsyncioTestCase):
-    async def test_receipt_and_successful_send_are_logged_separately_without_text(self):
+    async def test_receipt_and_successful_send_are_logged_separately_with_content(self):
         sent, finished = [], asyncio.Event()
 
         class CLI:
@@ -373,17 +373,17 @@ class FeishuBackgroundDeliveryTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(receipt, Receipt(info.reply_id, DeliveryStatus.FULL, text))
             self.assertEqual(sent, [])
             self.assertEqual([record.getMessage() for record in logs.records], [
-                "Feishu text receipt confirmed; reply=first status=full confirmed_chars=5",
+                'Feishu text receipt confirmed; reply=first status=full content="模拟回复。"',
             ])
             channel.enqueue(info, receipt.confirmed)
             channel.enqueue(ReplyInfo("second", "main", "run", 0), unconfirmed)
             await asyncio.wait_for(finished.wait(), 1)
 
         output = "\n".join(logs.output)
-        self.assertIn("Feishu text send confirmed; reply=first sent_chars=5", output)
+        self.assertIn('Feishu text send confirmed; reply=first content="模拟回复。"', output)
         self.assertIn("Feishu text send not confirmed; reply=second", output)
         self.assertNotIn("Feishu text send confirmed; reply=second", output)
-        self.assertNotIn(text, output)
+        self.assertIn(text, output)
         self.assertNotIn(unconfirmed, output)
 
     async def test_rejected_transcripts_do_not_take_queue_slots(self):

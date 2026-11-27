@@ -275,8 +275,7 @@ class VoiceOutputTest(unittest.IsolatedAsyncioTestCase):
                 receipt = await task
             self.assertEqual((receipt.status, receipt.confirmed), (DeliveryStatus.FAILED, "已确认。"))
             debug = "\n".join(logs.output)
-            self.assertIn("voice playback finished; reply=limit status=failed confirmed_chars=4", debug)
-            self.assertNotIn(receipt.confirmed, debug)
+            self.assertIn('voice playback finished; reply=limit status=failed content="已确认。"', debug)
             self.assertNotIn("未发送", debug)
             self.assertEqual(len(tts.calls), 1)
         finally:
