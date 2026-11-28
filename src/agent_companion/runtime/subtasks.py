@@ -15,6 +15,7 @@ from ..workspace import Workspace
 from .bash import BASH_TOOL_NAME, Bash
 from .compaction import Compactions
 from .engine import Runtime
+from .send_text import SEND_TEXT_TOOL_NAME, TextSendBinding, make_send_text_tool
 from .sqlite_access import SQLiteAccess
 from .timers import CANCEL_TIMER_TOOL_NAME, SET_TIMER_TOOL_NAME, Timers
 from .tools import Tool, ToolContext, Tools
@@ -24,6 +25,7 @@ from .view_image import VIEW_IMAGE_TOOL
 _LOG = logging.getLogger(__name__)
 DELEGATE_TOOL_NAME = "delegate_subtask"
 AGENT_TOOL_NAMES = frozenset({
+    SEND_TEXT_TOOL_NAME,
     DELEGATE_TOOL_NAME, SET_TIMER_TOOL_NAME, CANCEL_TIMER_TOOL_NAME, BASH_TOOL_NAME, VIEW_IMAGE_TOOL.spec.name,
 })
 
@@ -65,7 +67,8 @@ class AgentTree:
 
     def __init__(self, root: Agent, history: History, models: Mapping[str, ModelBinding], *, roles: Mapping[str, AgentRole],
                  schedulers: SessionSchedulers,
-                 retry_sqlite_locks: bool, compactions: Compactions, workspace: Workspace | None = None) -> None:
+                 retry_sqlite_locks: bool, compactions: Compactions, workspace: Workspace | None = None,
+                 text_binding: TextSendBinding | None = None) -> None:
         self._root = root
         self._history = history
         self._models = dict(models)
@@ -76,6 +79,8 @@ class AgentTree:
         self._bindings: dict[str, _Binding] = {}
         self._closed = False
         self._workspace = workspace
+        self._text_binding = text_binding
+        self._send_text_tool = make_send_text_tool(text_binding)
         self._bash = Bash()  # 主、子 Agent 共用关停状态，不共用执行锁。
         self._sqlite = SQLiteAccess(retry_locks=retry_sqlite_locks, stopped=lambda: self._closed)
         descriptions = {name: role.description for name, role in sorted(self._roles.items()) if name != "main"}
@@ -119,7 +124,7 @@ class AgentTree:
             role = self._roles[agent.role_id]
             timers = None
             available = {DELEGATE_TOOL_NAME: self._delegate_tool, BASH_TOOL_NAME: self._bash.tool,
-                         VIEW_IMAGE_TOOL.spec.name: VIEW_IMAGE_TOOL}
+                         VIEW_IMAGE_TOOL.spec.name: VIEW_IMAGE_TOOL, SEND_TEXT_TOOL_NAME: self._send_text_tool}
             if SET_TIMER_TOOL_NAME in role.tools or CANCEL_TIMER_TOOL_NAME in role.tools:
                 timers = Timers(agent.session_id, scheduler.submit_internal)
                 available.update((tool.spec.name, tool) for tool in timers.tools)
@@ -225,6 +230,8 @@ class AgentTree:
 
     def stop_accepting(self) -> None:
         self._closed = True
+        if self._text_binding is not None:
+            self._text_binding.revoke()
         self._bash.stop_accepting()
         for binding in self._bindings.values():
             binding.runtime.stop_accepting()

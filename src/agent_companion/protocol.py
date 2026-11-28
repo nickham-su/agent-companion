@@ -429,6 +429,24 @@ class ChannelUser:
     key: str = field(repr=False)
 
 
+class TextSendResult(StrEnum):
+    """主动文字发送的终态，不是回复流的收取回执。"""
+
+    SENT = "sent"
+    UNAVAILABLE = "unavailable"
+    INVALID_TEXT = "invalid_text"
+    TEXT_TOO_LONG = "text_too_long"
+    REJECTED = "send_rejected"
+    UNCONFIRMED = "send_unconfirmed"
+    TIMEOUT_UNCONFIRMED = "send_timeout_unconfirmed"
+
+
+class TextSender(Protocol):
+    async def __call__(self, text: str) -> TextSendResult:
+        """向已绑定的收件人发送纯文本，等待结果；不经回复流。"""
+        ...
+
+
 class Channel(Protocol):
     async def deliver(self, reply: ReplyStream) -> Receipt:
         """消费一个回复并给出唯一终态，允许在模型流结束前返回。

@@ -15,7 +15,8 @@ from time import time
 from typing import Literal
 
 from ...images import MAX_MEDIA_BYTES
-from ...protocol import ChannelUser, DeliveryStatus, MessageDelivery, Receipt, ReplyDelivery, ReplyInfo, ReplyStream
+from ...protocol import (ChannelUser, DeliveryStatus, MessageDelivery, Receipt, ReplyDelivery, ReplyInfo, ReplyStream,
+                         TextSendResult)
 from ...speech.asr import FileASR
 from ...storage.sqlite import FeishuCandidate, FeishuRaw, History, is_sqlite_lock_error
 from ...workspace import Workspace
@@ -56,6 +57,12 @@ class FeishuChannel:
         self._pending_notices = 0
         self._notice_sender: asyncio.Task[None] | None = None
         self._closed = False
+
+    async def send_plain_text(self, text: str) -> TextSendResult:
+        """主动文字发送直接等待 CLI，不进入普通回复队列或语音通道。"""
+        if self._closed:
+            return TextSendResult.UNAVAILABLE
+        return await self._cli.send_text_result(text)
 
     def select_delivery(self, reply: ReplyStream) -> ReplyDelivery:
         if not self._closed and self._select_voice is not None:

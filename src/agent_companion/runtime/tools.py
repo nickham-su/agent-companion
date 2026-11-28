@@ -37,6 +37,8 @@ class Tool:
     spec: ToolSpec
     handler: Callable[[dict[str, Any], ToolContext], Awaitable[str]]
     serial_per_request: bool = False
+    reject_duplicate_keys: bool = False
+    record_result_on_shutdown: bool = False
 
 
 class Tools:
@@ -51,6 +53,11 @@ class Tools:
     def request_locks(self) -> dict[str, asyncio.Lock]:
         """每次模型请求独立分配；不同工具名之间不互相等待。"""
         return {name: asyncio.Lock() for name, tool in self._tools.items() if tool.serial_per_request}
+
+    def records_result_on_shutdown(self, name: str) -> bool:
+        """只保留显式启用的工具已返回的结果，不改变工具任务的取消方式。"""
+        tool = self._tools.get(name)
+        return tool is not None and tool.record_result_on_shutdown
 
     async def execute(self, call: ToolCall, context: ToolContext, *,
                       request_locks: Mapping[str, asyncio.Lock] | None = None,
@@ -72,7 +79,8 @@ class Tools:
     @staticmethod
     async def _invoke(tool: Tool, call: ToolCall, context: ToolContext) -> str:
         try:
-            args = json.loads(call.arguments, parse_constant=_invalid_constant)
+            args = json.loads(call.arguments, parse_constant=_invalid_constant,
+                              object_pairs_hook=_unique_object if tool.reject_duplicate_keys else None)
             if not isinstance(args, dict):
                 raise ValueError
         except (ValueError, RecursionError):
@@ -90,3 +98,12 @@ class Tools:
 
 def _invalid_constant(_: str) -> None:
     raise ValueError("invalid JSON constant")
+
+
+def _unique_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    result: dict[str, Any] = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError("duplicate JSON key")
+        result[key] = value
+    return result

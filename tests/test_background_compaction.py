@@ -708,14 +708,18 @@ class BackgroundCompactionTest(unittest.IsolatedAsyncioTestCase):
             async def account_user(self):
                 return ChannelUser("ou_fixture")
 
+        class PrivateSink(Sink):
+            async def send_plain_text(self, text):
+                raise AssertionError("unexpected explicit text send")
+
         async def run_groups(_discovery, shared_history, _asr, *, open_agent, **kwargs):
             self.assertIs(shared_history, history)
             for session_id in ("main-a", "main-b"):
                 history.append(session_id, [_OLD])
                 _report_high_usage(history, session_id)
 
-            async with open_agent(history.ensure_main_agent("main-b"), Sink(), ChannelUser("ou_b")) as (second, _):
-                async with open_agent(history.ensure_main_agent("main-a"), Sink(), ChannelUser("ou_a")) as (first, _):
+            async with open_agent(history.ensure_main_agent("main-b"), PrivateSink(), ChannelUser("ou_b")) as (second, _):
+                async with open_agent(history.ensure_main_agent("main-a"), PrivateSink(), ChannelUser("ou_a")) as (first, _):
                     first_task = await self._begin(first, model, "first group input")
                     await _idle(first)
                     second.submit_messages([MessageDelivery(Message("user", "second group while occupied"), "trigger")])

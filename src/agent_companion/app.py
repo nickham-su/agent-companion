@@ -14,9 +14,10 @@ from typing import TYPE_CHECKING
 from .channels.feishu.cli import FeishuDiscovery
 from .config import FeishuSettings, Settings
 from .feishu_private import run_private_chats
-from .protocol import Channel, ChannelUser, Model
+from .protocol import Channel, ChannelUser, Model, TextSender
 from .runtime.compaction import Compactions
 from .runtime.engine import Runtime
+from .runtime.send_text import TextSendBinding
 from .runtime.sqlite_access import SQLiteAccess
 from .runtime.subtasks import AgentRole, AgentTree, ModelBinding
 from .session_scheduler import SessionSchedulers
@@ -54,7 +55,7 @@ async def _finish_agent_cleanup(cleanups: list[Awaitable[None]]) -> None:
 async def running_agent(
     settings: Settings, history: History, model: ModelSource, channel: Channel, *,
     session_id: str, roles: Mapping[str, AgentRole], agent: Agent | None = None,
-    user: ChannelUser | None = None,
+    user: ChannelUser | None = None, text_sender: TextSender | None = None,
     retry_sqlite_locks: bool = False, compactions: Compactions | None = None,
     schedulers: SessionSchedulers | None = None,
 ) -> AsyncIterator[tuple[Runtime, AgentTree]]:
@@ -63,6 +64,7 @@ async def running_agent(
         schedulers = SessionSchedulers()
     scheduler = schedulers.get_or_create(session_id)
     owner = scheduler.reserve_agent()
+    text_binding = TextSendBinding(text_sender)
     tree = None
     owns_compactions = compactions is None
     try:
@@ -84,14 +86,16 @@ async def running_agent(
         if user is not None:
             workspace = Workspace.for_user(settings.workspace_root, user.key)
         tree = AgentTree(agent, history, models, roles=roles,
-                         schedulers=schedulers,
+                         schedulers=schedulers, text_binding=text_binding,
                          retry_sqlite_locks=retry_sqlite_locks, compactions=compactions, workspace=workspace)
         yield tree.bind_root(channel, owner), tree
     finally:
         try:
             # 首次让出循环前关停全部入口；异步收尾完成前保留会话所有权。
             cleanups = []
-            if tree is not None:
+            if tree is None:
+                text_binding.revoke()
+            else:
                 tree.stop_accepting()
                 cleanups.append(tree.close())
             if owns_compactions and compactions is not None:
@@ -165,7 +169,8 @@ async def prepare_private_feishu(
                     schedulers=schedulers, workspace_root=settings.workspace_root,
                     open_agent=lambda agent, channel, user: running_agent(
                         settings, db, model, channel, session_id=agent.session_id, agent=agent, roles=roles, user=user,
-                        retry_sqlite_locks=True, compactions=compactions, schedulers=schedulers))
+                        text_sender=channel.send_plain_text, retry_sqlite_locks=True,
+                        compactions=compactions, schedulers=schedulers))
             finally:
                 await compactions.close()
 

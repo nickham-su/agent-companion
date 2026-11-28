@@ -114,6 +114,7 @@ class Runtime:
         self._retired_models: set[asyncio.Task[bool]] = set()
         self._closed = False
         self._sqlite = SQLiteAccess(retry_locks=retry_sqlite_locks, stopped=lambda: self._closed)
+        self._shutdown_sqlite = SQLiteAccess(retry_locks=retry_sqlite_locks, stopped=lambda: False)
         self._owns_compactions = compactions is None
         self._compactions = compactions if compactions is not None else Compactions(history)
         self._compactions.check_owner(history)
@@ -497,11 +498,20 @@ class Runtime:
                                                    can_start_serial=can_start_serial_tool)
             except asyncio.CancelledError:
                 if asyncio.current_task().cancelling():
-                    raise  # Runtime 清理不伪造工具结果。
+                    raise  # 未返回结果的工具维持原有取消行为。
                 result = TOOL_CANCELLED
+
+            def persist_result() -> None:
+                self.history.record_tool_result(self.session_id, info.reply_id, call.id, result)
+
             try:
-                await self._sqlite.write_input(
-                    lambda: self.history.record_tool_result(self.session_id, info.reply_id, call.id, result))
+                try:
+                    await self._sqlite.write_input(persist_result)
+                except asyncio.CancelledError:
+                    if not self._closed or not self._tools.records_result_on_shutdown(call.name):
+                        raise
+                    # 只补写工具已返回的结果；取消可能发生在等待 SQLite 锁时，不能重跑工具。
+                    await self._shutdown_sqlite.write_input(persist_result)
             except Exception as exc:
                 reply_write_failed()
                 _LOG.error("tool result write failed; reply=%s error_type=%s sqlite_code=%s",

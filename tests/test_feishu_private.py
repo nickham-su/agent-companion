@@ -22,6 +22,7 @@ from agent_companion.config import (ASRSettings, FeishuSettings, LLMProvider, Mi
 from agent_companion.feishu_private import _Route
 from agent_companion.images import save_image
 from agent_companion.protocol import ChannelUser, Image, Message, TextDelta, ToolCall, ToolReady
+from agent_companion.runtime.send_text import SEND_TEXT_TOOL_NAME
 from agent_companion.runtime.subtasks import AgentTree, DELEGATE_TOOL_NAME, demo_roles
 from agent_companion.storage.sqlite import FeishuBindingError, History, InputRollbackFailed, is_sqlite_lock_error
 from agent_companion.workspace import Workspace
@@ -140,13 +141,14 @@ class _Model:
 
 
 @asynccontextmanager
-async def _serve_private(settings, history, model, runner, clock):
+async def _serve_private(settings, history, model, runner, clock, *, roles=None, use_configured_discovery=False):
     with (patch("agent_companion.app.time", side_effect=lambda: clock[0]),
           patch("agent_companion.feishu_private.time", side_effect=lambda: clock[0]),
           patch("agent_companion.channels.feishu.channel._POLL_SECONDS", 0.02),
           patch("agent_companion.app.running_agent", wraps=running_agent) as agents):
-        task = asyncio.create_task(run_feishu(settings, history, model, object(), discovery=runner.discovery(),
-                                              roles=demo_roles()))
+        discovery = None if use_configured_discovery else runner.discovery()
+        task = asyncio.create_task(run_feishu(settings, history, model, object(), discovery=discovery,
+                                              roles=demo_roles() if roles is None else roles))
         try:
             yield agents
         finally:
@@ -201,6 +203,72 @@ class FeishuPrivateTests(unittest.IsolatedAsyncioTestCase):
             with self.assertRaisesRegex(FeishuBindingError, "现有数据库有历史"):
                 History(unbound, feishu_private_owner=owner)
             self.assertEqual(unbound.read_bytes(), original)
+
+    async def test_send_text_uses_configured_cli_timeout_and_private_recipient_with_terminal_results(self):
+        sends = []
+        send_op = ("api", "POST", "/open-apis/im/v1/messages")
+        required_timeout = 0.125
+        fake_cli_detail = "synthetic CLI detail must not reach the result"
+
+        class Runner(_Runner):
+            async def __call__(self, argv, data, timeout):
+                if argv[1:4] == send_op:
+                    request = json.loads(data)
+                    body = json.loads(request["content"])["text"]
+                    sends.append((request["receive_id"], body, timeout))
+                    if body == "拒绝正文":
+                        return CommandResult(1, b"", json.dumps({"ok": False, "error": {
+                            "type": "authorization", "message": fake_cli_detail}}).encode())
+                    if body == "超时正文":
+                        raise CliError("cli_timeout")
+                    if body == "缺回执正文":
+                        return CommandResult(0, b'{"ok":true,"identity":"user","data":{}}', b"")
+                return await super().__call__(argv, data, timeout)
+
+        groups = (("确认正文", "拒绝正文", "超时正文", "缺回执正文"), ("其他会话正文",))
+
+        class Model:
+            async def stream(self, messages, tools, *, thinking, instructions=None):
+                if messages[-1].kind == "user":
+                    for index, body in enumerate(groups[int(messages[-1].content)]):
+                        yield ToolReady(ToolCall(f"send-{index}", SEND_TEXT_TOOL_NAME, json.dumps({"text": body})))
+                else:
+                    yield TextDelta("正常回复")
+
+        roles = demo_roles()
+        roles["main"] = replace(roles["main"], tools=(SEND_TEXT_TOOL_NAME,))
+        runner = Runner()
+        settings = replace(self.settings, feishu=FeishuSettings(cli_timeout=required_timeout))
+        peers = _SENDERS[:2]
+        clock = [101.0]
+        for index, (chat, peer) in enumerate(zip(_CHATS, peers)):
+            runner.messages[chat].append(_message(str(index), chat, peer, str(index), stamp=101_001 + index))
+
+        def discovery(executable, *, timeout):
+            # 保留应用构造和每用户绑定的真实超时传递，只替换子进程。
+            return FeishuDiscovery(executable, timeout=timeout, runner=runner)
+
+        with (closing(History(":memory:")) as history,
+              patch("agent_companion.app.FeishuDiscovery", side_effect=discovery)):
+            async with _serve_private(settings, history, Model(), runner, clock, roles=roles,
+                                      use_configured_discovery=True):
+                await asyncio.wait_for(runner.verified.wait(), 3)
+                clock[0] = 102.0
+                await _eventually(lambda: all("正常回复" in runner.sent[peer] for peer in peers))
+                self.assertCountEqual(sends, [(peer, body, required_timeout)
+                                              for peer, bodies in zip(peers, groups)
+                                              for body in (*bodies, "正常回复")])
+                expected = {"确认正文": {"ok": True}, "其他会话正文": {"ok": True},
+                            "拒绝正文": {"ok": False, "reason": "send_rejected"},
+                            "超时正文": {"ok": False, "reason": "send_timeout_unconfirmed"},
+                            "缺回执正文": {"ok": False, "reason": "send_unconfirmed"}}
+                for peer, bodies in zip(peers, groups):
+                    session = "feishu-private:" + sha256(peer.encode("ascii")).hexdigest()
+                    messages = [row.message for row in history.read_after(session)]
+                    calls = tool_calls(messages)
+                    self.assertEqual([json.loads(call.arguments) for call in calls], [{"text": body} for body in bodies])
+                    self.assertEqual([json.loads(call.result) for call in calls], [expected[body] for body in bodies])
+                    self.assertEqual(messages[-1].content, "正常回复")
 
     async def test_shutdown_awaits_outbound_closure_in_every_route(self):
         a, b, _ = _CHATS

@@ -20,6 +20,7 @@ from agent_companion.feishu_calls import IncomingCalls
 from agent_companion.feishu_private import _Route
 from agent_companion.protocol import (ChannelUser, DeliveryStatus, Message, MessageDelivery,
                                       TextDelta, ToolCall, ToolReady, UserSource)
+from agent_companion.runtime.send_text import SEND_TEXT_TOOL_NAME
 from agent_companion.runtime.subtasks import DELEGATE_TOOL_NAME, demo_roles
 from agent_companion.speech.asr import AsrError
 from agent_companion.speech.vad import INPUT_FRAMES, INPUT_RATE
@@ -315,7 +316,7 @@ class IncomingCallTests(unittest.IsolatedAsyncioTestCase):
 
     @asynccontextmanager
     async def _serve(self, model, *, make_asr=lambda i: _ASR(f"测试语音{i}"), make_device=_Device,
-                     tts=None, copy=True, max_audio_seconds=30, asr_timeout=2, observe_state=False):
+                     tts=None, copy=True, max_audio_seconds=30, asr_timeout=2, observe_state=False, roles=None):
         stream = model.stream
 
         async def test_stream(messages, tools, *, thinking, instructions=None):
@@ -352,7 +353,8 @@ class IncomingCallTests(unittest.IsolatedAsyncioTestCase):
               patch("agent_companion.feishu_calls._POLL_SECONDS", 0.005),
               patch("agent_companion.feishu_calls._CONNECT_SECONDS", 0.12)):
             task = asyncio.create_task(run_feishu(settings, history, model, object(), tts=tts,
-                                                discovery=self.runner.discovery(), roles=demo_roles()))
+                                                discovery=self.runner.discovery(),
+                                                roles=demo_roles() if roles is None else roles))
             try:
                 yield history, agents
             finally:
@@ -997,6 +999,37 @@ class IncomingCallTests(unittest.IsolatedAsyncioTestCase):
             self.assertFalse(finished.is_set())
             resume.set()
             await _eventually(lambda: self.runner.sent[_SENDERS[0]] == ["文字仍可回复。"])
+
+    async def test_send_text_survives_hangup_with_voice_copy_off(self):
+        started, resume = asyncio.Event(), asyncio.Event()
+        sender, tts = _SENDERS[0], _TTS()
+        body = "https://example.invalid/synthetic"
+        call = ToolCall("send-link", SEND_TEXT_TOOL_NAME, json.dumps({"text": body}))
+
+        class Model(_Echo):
+            async def stream(self, messages, tools, *, thinking, instructions=None):
+                if messages[-1].kind == "user":
+                    started.set()
+                    await resume.wait()
+                    yield ToolReady(call)
+
+        roles = demo_roles()
+        roles["main"] = replace(roles["main"], tools=(SEND_TEXT_TOOL_NAME,))
+        async with self._serve(Model(), tts=tts, copy=False, roles=roles) as (history, _):
+            await self._ring_connect(sender, 1, 1)
+            _talk(self.devices[0])
+            await asyncio.wait_for(started.wait(), 2)
+            self.desktop.main = ()
+            await _eventually(lambda: self.devices[0].closed)
+            resume.set()
+            await _eventually(lambda: any(
+                stored.id == call.id and stored.result is not None
+                for stored in tool_calls(_conversation_lines(history, _session(sender)))))
+            self.assertEqual(self.runner.sent[sender], [body])
+            stored, = tool_calls(_conversation_lines(history, _session(sender)))
+            self.assertEqual(stored.arguments, call.arguments)
+            self.assertEqual(json.loads(stored.result), {"ok": True})
+            self.assertEqual(tts.calls, [])
 
     async def test_queued_voice_and_delayed_child_survive_ordinary_hangup(self):
         parent_wait, parent_release = asyncio.Event(), asyncio.Event()

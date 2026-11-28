@@ -14,7 +14,7 @@ import sys
 from tempfile import TemporaryDirectory
 from typing import Any
 
-from ...protocol import ChannelUser, DeliveryStatus
+from ...protocol import ChannelUser, DeliveryStatus, TextSendResult
 
 
 _LOG = logging.getLogger(__name__)
@@ -329,15 +329,19 @@ class FeishuCLI(_UserCLI):
         self._open_id = user.key
 
     async def send_text(self, text: str) -> DeliveryStatus:
+        return _delivery_status(await self.send_text_result(text))
+
+    async def send_text_result(self, text: str) -> TextSendResult:
+        """使用绑定账号发送正文，并保留不含原始 CLI 数据的失败原因。"""
         content = json.dumps({"text": text}, ensure_ascii=False, separators=(",", ":"))
         try:
             oversized = len(content.encode("utf-8")) > _TEXT_LIMIT
         except UnicodeError:
-            return DeliveryStatus.FAILED
+            return TextSendResult.INVALID_TEXT
         if oversized:
-            return DeliveryStatus.FAILED
+            return TextSendResult.TEXT_TOO_LONG
         payload = _json_bytes({"receive_id": self._open_id, "msg_type": "text", "content": content})
-        return await self._send_message(payload)
+        return await self._send_message_result(payload)
 
     def prepare_transcript(self, text: str) -> bytes | None:
         """将正文作为字面富文本编码，并按最终发送的请求大小校验。"""
@@ -354,16 +358,28 @@ class FeishuCLI(_UserCLI):
 
     async def send_prepared_transcript(self, payload: bytes) -> DeliveryStatus:
         """直接发送已校验的回显请求，不重复编码。"""
-        return await self._send_message(payload)
+        return _delivery_status(await self._send_message_result(payload))
 
-    async def _send_message(self, payload: bytes) -> DeliveryStatus:
+    async def _send_message_result(self, payload: bytes) -> TextSendResult:
         try:
             result = await self._run(("api", "POST", _MESSAGES, "--params", '{"receive_id_type":"open_id"}',
                                       "--data", "-"), data=payload)
             data = _success_data(result)
             message_id = data.get("message_id")
             if not _valid_id(message_id, "om") or ("chat_id" in data and not _valid_id(data["chat_id"], "oc")):
-                return DeliveryStatus.UNKNOWN
+                return TextSendResult.UNCONFIRMED
         except CliError as exc:
-            return DeliveryStatus.FAILED if exc.definite else DeliveryStatus.UNKNOWN
+            if exc.definite:
+                return TextSendResult.REJECTED
+            if str(exc) == "cli_timeout":
+                return TextSendResult.TIMEOUT_UNCONFIRMED
+            return TextSendResult.UNCONFIRMED
+        return TextSendResult.SENT
+
+
+def _delivery_status(result: TextSendResult) -> DeliveryStatus:
+    if result is TextSendResult.SENT:
         return DeliveryStatus.FULL
+    if result in (TextSendResult.UNCONFIRMED, TextSendResult.TIMEOUT_UNCONFIRMED):
+        return DeliveryStatus.UNKNOWN
+    return DeliveryStatus.FAILED
