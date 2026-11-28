@@ -854,20 +854,23 @@ class OpenAIResponsesTests(unittest.IsolatedAsyncioTestCase):
                 self.assertIn(long_cipher, repr(summary))
                 self.assertNotIn(generated, [entry.message.content for entry in history.read_after("main")])
 
-    async def test_http_rejection_does_not_retry_or_rerun_tools(self):
+    async def test_http_rejection_retries_current_round_without_rerunning_tools(self):
         base = "https://responses.example.invalid/fixture"
         tool = AsyncMock(return_value="accepted")
         fixture = _Fixture(self, [_completed(_reason(), _call())], httpx.Response(400, json={
             "error": {"message": f"synthetic upstream error {_KEY} {base} {_CIPHER}"},
-        }), endpoint=base + "/responses")
+        }), [_delta("recovered"), _completed(_answer("recovered"))], endpoint=base + "/responses")
         with (closing(History(":memory:")) as history,
-              self.assertLogs("agent_companion.runtime.engine", logging.WARNING) as logs):
-            self.assertEqual(await _complete(fixture, history, effort="none", base_url=base,
-                                             tools=Tools([Tool(_SPEC, tool)])), "model_failed")
-            self.assertEqual(history.outcomes("main")[-1].model_error, "http_400")
-            self.assertEqual(history.read_after("main")[-1].message.tool_calls[0].id, "call_1")
+              patch("agent_companion.runtime.engine.sleep", new_callable=AsyncMock) as wait,
+              self.assertLogs("agent_companion.runtime.engine", logging.DEBUG) as logs):
+            self.assertIsNone(await _complete(fixture, history, effort="none", base_url=base,
+                                              tools=Tools([Tool(_SPEC, tool)])))
+            self.assertEqual([outcome.model_status for outcome in history.outcomes("main")], ["complete", "complete"])
+            self.assertEqual(history.read_after("main")[-2].message.tool_calls[0].id, "call_1")
+        wait.assert_awaited_once_with(1)
         tool.assert_awaited_once()
-        self.assertEqual([request["reasoning"] for request in fixture.requests], [{"effort": "none"}] * 2)
+        self.assertEqual([request["reasoning"] for request in fixture.requests], [{"effort": "none"}] * 3)
+        self.assertEqual(fixture.requests[-2], fixture.requests[-1])
         self.assertIn(_reason(), fixture.requests[-1]["input"])
         self.assertTrue(all(value not in "".join(logs.output) for value in (_KEY, base, _CIPHER)))
 

@@ -90,6 +90,7 @@ class ProviderConfigTests(unittest.TestCase):
     def test_example_contains_switchable_llms_and_shared_speech_provider(self):
         example = Path("config.example.toml").read_text(encoding="utf-8")
         example = example.replace('[timeouts]\nllm = 60', '[timeouts]\nllm = 12.5')
+        example = example.replace('llm_idle = 180', 'llm_idle = 240')
         self.path.write_text(example + _FEISHU.replace('"text"', '"voice"'), encoding="utf-8")
         with (patch("sys.argv", ["agent-companion", "--run", "--config", str(self.path)]),
               patch("agent_companion.__main__._serve", new_callable=AsyncMock) as serve,
@@ -101,6 +102,8 @@ class ProviderConfigTests(unittest.TestCase):
                          {"chat": "deepseek", "review": "openai_responses",
                           "minimax_chat": "minimax", "bailian_chat": "bailian"})
         self.assertEqual(settings.models["chat"].runtime.model_timeout, 12.5)
+        self.assertEqual({profile.runtime.model_idle_timeout for profile in settings.models.values()}, {240})
+        self.assertEqual(settings.runtime.model_idle_timeout, 240)
         self.assertEqual(settings.models["review"].runtime.max_tool_rounds, 8)
         self.assertEqual(settings.asr_timeout, 30)
         self.assertEqual(settings.tts_timeout, 25)
@@ -413,12 +416,13 @@ api_key = 123
                 settings = load_settings(self.path, for_run=True)
                 self.assertEqual((settings.runtime.model_timeout, settings.asr_timeout, settings.tts_timeout),
                                  (60, 30, 25))
+                self.assertEqual(settings.runtime.model_idle_timeout, 180)
 
     def test_shared_timeouts_validate_table_and_active_values_without_leaking_input(self):
         self.assert_startup_error('timeouts = false\n' + _CONFIG, 'timeouts 必须是 TOML 表')
         self.assert_startup_error(_CONFIG + f'\n[timeouts]\n{_KEY} = true\n', 'timeouts 配置字段无效')
         invalid = {'bool': 'false', 'zero': '0', 'negative': '-1', 'nan': 'nan', 'inf': 'inf', 'string': f'"{_KEY}"'}
-        for ability in ('llm', 'asr', 'tts'):
+        for ability in ('llm', 'llm_idle', 'asr', 'tts'):
             for kind, value in invalid.items():
                 with self.subTest(ability=ability, kind=kind):
                     config = _CONFIG + f'\n[timeouts]\n{ability} = {value}\n'

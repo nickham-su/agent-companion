@@ -236,6 +236,7 @@ class BackgroundCompactionTest(unittest.IsolatedAsyncioTestCase):
                 runtime = Runtime("main", history, model, Sink(), settings=replace(_SETTINGS, model_timeout=1))
                 try:
                     with (patch.object(loop, "time", side_effect=lambda: clock() + offset),
+                          patch("agent_companion.runtime.engine._MODEL_RETRY_BUDGET", 1),
                           patch.object(runtime._context, "summary_request", wraps=runtime._context.summary_request) as plan,
                           patch("agent_companion.runtime.compaction.deepcopy", side_effect=freeze_tools) as freeze):
                         runtime.submit_messages([MessageDelivery(Message("user", "current input"), "trigger")])
@@ -948,6 +949,7 @@ class BackgroundCompactionTest(unittest.IsolatedAsyncioTestCase):
                         compactions = runtime._compactions
                         try:
                             with (patch.object(_http_stream, "_RESPONSE_CLOSE_TIMEOUT", 0.02),
+                                  patch("agent_companion.runtime.engine._MODEL_RETRY_BUDGET", 0.05),
                                   self.assertLogs("agent_companion", "WARNING") as logged):
                                 if summary:
                                     compactions.start("main", Prefix(0, 1, 1), [_SUMMARIZE], (), model=model, thinking=False,

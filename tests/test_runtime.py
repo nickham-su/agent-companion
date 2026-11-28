@@ -1333,7 +1333,8 @@ class RuntimeTest(unittest.IsolatedAsyncioTestCase):
                     raise ModelError("truncated_stream")
 
                 model = ScriptModel(incomplete, events())
-                runtime, history = self.setup_runtime(model, Channel(), settings=RuntimeSettings(model_timeout=.01))
+                runtime, history = self.setup_runtime(model, Channel(),
+                                                      settings=RuntimeSettings(model_idle_timeout=.01))
                 runtime.submit_messages([MessageDelivery(Message("user", "one"), "trigger")])
                 runtime.submit_messages([MessageDelivery(Message("user", "two"), "trigger")])
                 await self.idle(runtime)

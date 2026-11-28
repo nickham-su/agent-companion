@@ -18,6 +18,7 @@ from agent_companion.runtime.engine import Runtime
 from agent_companion.runtime.tools import Tool, Tools
 from agent_companion.storage.sqlite import History
 from test_message_support import PNG_BYTES, PNG_URL, assistant_message, image_workspace, reasoning_parts
+from test_model_diagnostics import single_attempt_runtime
 
 
 SPEC = ToolSpec("test", "模拟工具", {"type": "object", "properties": {"size": {"type": "integer"}}})
@@ -114,19 +115,20 @@ class DeepSeekTest(unittest.IsolatedAsyncioTestCase):
         with _record_model_timers() as deadlines, closing(History(":memory:")) as history:
             async with httpx.AsyncClient(transport=transport) as client:
                 runtime = Runtime("main", history, DeepSeek(client), Voice(), thinking=True,
-                                  settings=RuntimeSettings(model_timeout=.3))
+                                  settings=RuntimeSettings(model_idle_timeout=.3))
                 shutdown = None
                 try:
                     runtime.submit_messages([MessageDelivery(Message("user", "one"), "trigger")])
                     await asyncio.wait_for(reading.wait(), 2)
-                    deadline, = deadlines
-                    cutoff = deadline.when()
+                    active_deadlines = [deadline for deadline in deadlines if not deadline.cancelled()]
+                    self.assertEqual(len(active_deadlines), 2)
+                    cutoff = min(deadline.when() for deadline in active_deadlines)
                     interrupt.set()
                     await asyncio.wait_for(closing_wire.wait(), 2)
                     await asyncio.wait_for(runtime.wait_idle(), 2)
                     self.assertEqual(history.outcomes("main")[0].model_status, "model_interrupted")
                     self.assertEqual(history.read_after("main")[-1].message, Message("assistant", "confirmed"))
-                    self.assertTrue(deadline.cancelled())  # 已撤销旧计时 handle，而不是只清引用。
+                    self.assertTrue(all(deadline.cancelled() for deadline in active_deadlines))
                     shutdown = asyncio.create_task(runtime.close())
                     await asyncio.sleep(max(0, cutoff - asyncio.get_running_loop().time()) + .01)
                     self.assertFalse(close_cancelled.is_set())
@@ -243,19 +245,19 @@ class DeepSeekTest(unittest.IsolatedAsyncioTestCase):
         with _record_model_timers() as deadlines, closing(History(":memory:")) as history:
             async with httpx.AsyncClient(transport=httpx.MockTransport(endpoint)) as client:
                 runtime = Runtime("main", history, DeepSeek(client), Voice(), thinking=True,
-                                  tools=Tools([Tool(SPEC, tool)]), settings=RuntimeSettings(model_timeout=.25))
+                                  tools=Tools([Tool(SPEC, tool)]), settings=RuntimeSettings(model_idle_timeout=.25))
                 try:
                     runtime.submit_messages([MessageDelivery(Message("user", "one"), "trigger")])
                     runtime.submit_messages([MessageDelivery(Message("user", "two"), "trigger")])
                     await asyncio.wait_for(next_reading.wait(), 2)
                     self.assertFalse(closed_wire.is_set())
-                    _, next_deadline = deadlines
-                    cutoff = next_deadline.when()
-                    self.assertFalse(next_deadline.cancelled())
+                    next_deadlines = [deadline for deadline in deadlines if not deadline.cancelled()]
+                    self.assertEqual(len(next_deadlines), 2)
+                    cutoffs = [deadline.when() for deadline in next_deadlines]
                     release_close.set()
                     await asyncio.wait_for(closed_wire.wait(), 2)
-                    self.assertEqual(next_deadline.when(), cutoff)
-                    self.assertFalse(next_deadline.cancelled())
+                    self.assertEqual([deadline.when() for deadline in next_deadlines], cutoffs)
+                    self.assertFalse(any(deadline.cancelled() for deadline in next_deadlines))
                     release_next.set()
                     await asyncio.wait_for(runtime.wait_idle(), 2)
                     self.assertIsNone(runtime.last_failure)
@@ -315,12 +317,12 @@ class DeepSeekTest(unittest.IsolatedAsyncioTestCase):
                       _record_model_timers() as deadlines):
                     async with httpx.AsyncClient(transport=httpx.MockTransport(endpoint)) as client:
                         runtime = Runtime("main", history, DeepSeek(client), None, thinking=True,
-                                          tools=Tools([Tool(SPEC, tool)]), settings=RuntimeSettings(model_timeout=.15))
+                                          tools=Tools([Tool(SPEC, tool)]), settings=RuntimeSettings(model_idle_timeout=.15))
                         try:
                             with self.assertLogs("agent_companion.runtime.engine", level="WARNING") as logs:
                                 runtime.submit_messages([MessageDelivery(Message("user", "internal request"), "trigger")])
                                 await asyncio.wait_for(close_started.wait(), 2)
-                                self.assertTrue(deadlines[0].cancelled())
+                                self.assertTrue(all(deadline.cancelled() for deadline in deadlines))
                                 await asyncio.wait_for(runtime.wait_idle(), 2)
                             expected = "transport_close_timeout" if blocked else "transport_error"
                             self.assertIn(f"model cleanup failed ({expected})", "\n".join(logs.output))
@@ -531,13 +533,13 @@ class DeepSeekTest(unittest.IsolatedAsyncioTestCase):
 
         with closing(History(":memory:")) as history:
             async with httpx.AsyncClient(transport=httpx.MockTransport(endpoint)) as client:
-                runtime = Runtime("diagnostics", history, DeepSeek(client), None)
+                runtime = single_attempt_runtime(history, DeepSeek(client))
                 with self.assertLogs("agent_companion.runtime.engine", level="WARNING") as logs:
                     for _ in range(2):
                         runtime.submit_messages((MessageDelivery(Message("user", "synthetic user content"), "trigger"),))
                         await runtime.wait_idle()
                         self.assertEqual(runtime.last_failure, "model_failed")
-                self.assertEqual([row.model_error for row in history.outcomes("diagnostics")], ["http_401", "http_429"])
+                self.assertEqual([row.model_error for row in history.outcomes(runtime.session_id)], ["http_401", "http_429"])
                 lines = " ".join(logs.output)
                 self.assertIn("http_401", lines)
                 self.assertIn("http_429", lines)
@@ -818,8 +820,8 @@ class DeepSeekTest(unittest.IsolatedAsyncioTestCase):
 
         with closing(History(":memory:")) as history:
             async with httpx.AsyncClient(transport=httpx.MockTransport(response)) as client:
-                runtime = Runtime("main", history, DeepSeek(client), None, thinking=True,
-                                  tools=Tools([Tool(SPEC, tool)]))
+                runtime = single_attempt_runtime(history, DeepSeek(client), thinking=True,
+                                                 tools=Tools([Tool(SPEC, tool)]))
                 try:
                     runtime.submit_messages([MessageDelivery(Message("user", "current input"), "trigger")])
                     await asyncio.wait_for(runtime.wait_idle(), 2)
@@ -831,7 +833,7 @@ class DeepSeekTest(unittest.IsolatedAsyncioTestCase):
             self.assertNotIn("reasoning_content", assistant)
             self.assertEqual(assistant["tool_calls"][0]["id"], result["tool_call_id"])
             self.assertEqual(calls, ["protected"])
-            self.assertEqual([row.message for row in history.read_after("main")][1:], [
+            self.assertEqual([row.message for row in history.read_after(runtime.session_id)][1:], [
                 assistant_message("", (ToolCall("protected", "test", "{}", "finished tool",
                                                 PrivateData(_replay_key(MODEL_NAME), b"0")),)),
             ])

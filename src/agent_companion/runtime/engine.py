@@ -1,6 +1,7 @@
 """单 Session 的运行循环；网络、通道和工具运行在同一 asyncio 事件循环。"""
 
 import asyncio
+from asyncio import sleep
 from collections import deque
 from collections.abc import Callable, Sequence
 from contextlib import ExitStack, aclosing
@@ -28,6 +29,9 @@ from .tools import TOOL_CANCELLED, ToolContext, Tools
 _LOG = logging.getLogger(__name__)
 _DELIVERY_TIMEOUT = 120  # 无播放进展语义的回执通道（例如离线控制台）
 _MAX_RETIRED_MODELS = 2
+_MODEL_RETRY_BUDGET = 600
+_MODEL_RETRY_INITIAL_DELAY = 1
+_MODEL_RETRY_MAX_DELAY = 30
 _MODEL_CLOSE_GRACE = 1.0  # 关停只等待已退役的模型任务自行完成，不再次取消。
 
 
@@ -120,6 +124,7 @@ class Runtime:
         self._origin_options = {"model_origin": model_origin} if model_origin is not None else {}
         self._pending: deque[tuple[MessageDelivery, ...]] = deque()
         self._trigger: Callable[[], bool] | None = None
+        self._trigger_retry_wake: asyncio.Event | None = None
         self._reply_commit_failed = False
         self._input_blocked: Literal["retryable", "unsafe"] | None = None
         self._input_retry_requested = False
@@ -151,6 +156,8 @@ class Runtime:
         loop = asyncio.get_running_loop()
         self._trigger = None  # 已经收到的消息优先于尚未运行的空转写唤醒。
         self._pending.append(batch)
+        if self._trigger_retry_wake is not None:
+            self._trigger_retry_wake.set()
         self._input_retry_requested = True
         if self._input_blocked == "retryable":
             self._input_blocked = None
@@ -441,7 +448,10 @@ class Runtime:
         owner = asyncio.current_task()
         assert owner is not None
         info = ReplyInfo(uuid4().hex, self.session_id, run_id, loop.time())
+        # 真实 Agent 以父子关系为准；独立构造的 Runtime 视作主 Session。
+        retry_model = self.agent is None or self.agent.parent_agent_id is None
         diagnostics = ModelRequestDiagnostics("reply", self._settings.model_timeout, run_id, info.reply_id)
+        tools = self._tools.specs
         text: list[str] = []
         output_parts: tuple[Part, ...] | None = None
         request_locks = self._tools.request_locks()
@@ -490,6 +500,8 @@ class Runtime:
         accept_model_events = True
         reader_closing = False
         read_deadline: ModelDeadline | None = None
+        round_deadline: ModelDeadline | None = None
+        made_progress = False
         stop_stream = getattr(self._model, "stop_stream", None)
 
         def finish_reply_stream() -> None:
@@ -556,156 +568,293 @@ class Runtime:
                 return False
             return True
 
+        def disarm_model_deadlines() -> None:
+            for deadline in (read_deadline, round_deadline):
+                if deadline is not None:
+                    deadline.disarm()
+
+        def model_deadline_reached() -> bool:
+            return any(deadline is not None and deadline.expired() for deadline in (read_deadline, round_deadline))
+
+        async def read_attempt(request: list[Message], schedule_summary: Callable[[], None] | None,
+                               renew_idle: Callable[[], None] | None = None) -> bool | ModelError:
+            nonlocal delivery, input_tokens, output_parts, reader_closing, model_complete, made_progress
+            nonlocal selected, idle_timeout, owns_reply
+            reader = asyncio.current_task()
+            assert reader is not None
+            if model_deadline_reached():
+                raise TimeoutError
+            _LOG.debug("model request started; run=%s reply=%s messages=%d tools=%d thinking=%s",
+                       run_id, info.reply_id, len(request), len(tools), self._thinking)
+            try:
+                stream = self._model.stream(request, tools, thinking=self._thinking, instructions=self._instructions)
+            except ModelError as error:
+                return error
+            async with aclosing(stream) as events:
+                if schedule_summary is not None:
+                    schedule_summary()
+                while True:
+                    # 只标记模型读取错误；下面的投递、事件处理和持久化不进入重试。
+                    try:
+                        event = await anext(events)
+                    except ModelError as error:
+                        return error
+                    except StopAsyncIteration:
+                        if model_deadline_reached():
+                            raise TimeoutError
+                        return True
+                    # 即使回执与这一帧同时就绪，也不能发布它或启动新的工具。
+                    # 适配器在收到取消后吐出的迟到帧也一律丢弃。
+                    if not accept_model_events or voice_interrupted():
+                        reader_closing = True
+                        disarm_model_deadlines()
+                        return False
+                    if owner.cancelling() or reader.cancelling():
+                        raise asyncio.CancelledError
+                    if model_deadline_reached():
+                        # 已在传输收尾的适配器仍可能吐出缓存的终态；超时后不启动工具。
+                        raise TimeoutError
+                    if ((isinstance(event, TextDelta) and event.text) or isinstance(event, ToolReady)):
+                        made_progress = True
+                        if renew_idle is not None:
+                            renew_idle()
+                    if isinstance(event, ModelClosing):
+                        reader_closing = True
+                        if event.complete:
+                            disarm_model_deadlines()
+                            model_complete = True
+                            if has_user_channel:
+                                # 回执可先于连接关闭结算；完整投递仍等连接收尾。
+                                finish_reply_stream()
+                            return True
+                    elif isinstance(event, TextDelta) and event.text:
+                        if not text:
+                            first_text_at = loop.time()
+                            reply.first_text_at = first_text_at
+                            _LOG.debug("model first text; reply=%s elapsed_ms=%.0f", info.reply_id,
+                                       (first_text_at - info.started_at) * 1000)
+                        text.append(event.text)
+                        if channel is not None:
+                            first_handoff = delivery is None
+                            if first_handoff and hold_blank_prefix and not event.text.strip():
+                                # 首段非空白正文抵达前不选路；直到收尾都只有空白时不补投。
+                                # 收尾补投无法保留首段语音拒收与相邻工具派发的顺序。
+                                continue
+                            if delivery is None:
+                                # 首段交接同步选路；随后挂断或重拨不能改变已选通道。
+                                if isinstance(channel, SelectableChannel):
+                                    selected = channel.select_delivery(reply)
+                                else:
+                                    selected = ReplyDelivery(channel.deliver, idle_timeout)
+                                idle_timeout = selected.idle_timeout
+                                delivery = loop.create_task(deliver(selected))
+                            if not delivery.done():
+                                reply.publish("".join(text) if first_handoff and hold_blank_prefix else event.text)
+                            if first_handoff and reply.voice_delivery:
+                                # 先让语音投递进入同一回执接口，以便拒收先于相邻工具帧。
+                                await delivery_started
+                    elif isinstance(event, InputUsage):
+                        input_tokens = event.input_tokens
+                    elif isinstance(event, AssistantPartsReady):
+                        if output_parts is not None:
+                            raise ModelError("invalid_sse_event")
+                        output_parts = event.parts
+                    elif isinstance(event, ToolReady):
+                        call = event.call
+                        if call.id in accepted_calls:
+                            raise ModelError("duplicate_tool_id")
+                        staged = Message("assistant", _settled_parts(
+                            "", (*accepted_calls.values(), call), {}, output_parts))
+
+                        def persist_call() -> bool:
+                            nonlocal owns_reply
+                            # SQLite 锁重试会让出事件循环。每次真正写入前都重新核对路由。
+                            if not can_dispatch_tool() or model_deadline_reached():
+                                return False
+                            if not owns_reply:
+                                ownership.enter_context(self.history.own_reply(info.reply_id))
+                                owns_reply = True
+                            self.history.stage_tool_calls(self.session_id, info.reply_id, staged)
+                            return True
+
+                        try:
+                            persisted = await self._sqlite.write_input(persist_call)
+                        except asyncio.CancelledError:
+                            # 到点不代表取消来自截止；外部取消不能按本地中断保留私有元数据。
+                            if not owner.cancelling() and any(deadline is not None and deadline.owns_cancellation()
+                                                             for deadline in (read_deadline, round_deadline)):
+                                raise _ToolDispatchTimeout from None
+                            raise
+                        except Exception:
+                            reply_write_failed()
+                            raise _ToolCallWriteFailed from None
+                        if persisted:
+                            accepted_calls[call.id] = call
+                        if not can_dispatch_tool():
+                            reader_closing = True
+                            disarm_model_deadlines()
+                            return False
+                        if not persisted or model_deadline_reached():
+                            raise _ToolDispatchTimeout
+                        context = ToolContext(self.session_id, run_id, call.id,
+                                              agent_id=self.agent.agent_id if self.agent is not None else None,
+                                              workspace=self._workspace, reply_id=info.reply_id)
+                        scheduled[call.id] = loop.create_task(run_tool(call, context))
+
         async def read_model() -> bool:
-            nonlocal delivery, input_tokens, output_parts, read_deadline, reader_closing, model_complete
-            nonlocal selected, idle_timeout, owns_reply, trigger_preempted
-            expires = loop.time() + self._settings.model_timeout
-            async with model_deadline_at(expires, stop_stream) as deadline:
-                read_deadline = deadline
-                assembled = await prepared.assemble(self._workspace)
-                request = assembled.messages()
-                # 即使截止回调还没被调度，也不能发出已经超时的请求。
-                if deadline.expired() or loop.time() >= expires:
-                    raise TimeoutError
+            nonlocal diagnostics, input_tokens, output_parts, read_deadline, round_deadline
+            nonlocal reader_closing, trigger_preempted
+            reader = asyncio.current_task()
+            assert reader is not None
+            summary_deadline: ModelDeadline | None = None
+
+            def can_start_attempt() -> bool:
+                nonlocal trigger_preempted
+                if reader.cancelling() or owner.cancelling():
+                    raise asyncio.CancelledError
                 if not accept_model_events or self._closed or voice_interrupted():
                     return False
-                if asyncio.current_task().cancelling() or owner.cancelling():
-                    raise asyncio.CancelledError
                 if can_dispatch is not None:
                     trigger_preempted = not can_dispatch()
+                    if reader.cancelling() or owner.cancelling():
+                        raise asyncio.CancelledError
                     if trigger_preempted:
                         return False
-                    if deadline.expired() or loop.time() >= expires:
-                        raise TimeoutError
-                    if asyncio.current_task().cancelling() or owner.cancelling():
-                        raise asyncio.CancelledError
-                tools = self._tools.specs
-                _LOG.debug("model request started; run=%s reply=%s messages=%d tools=%d thinking=%s",
-                           run_id, info.reply_id, len(request), len(tools), self._thinking)
-                async with aclosing(self._model.stream(request, tools, thinking=self._thinking,
-                                                       instructions=self._instructions)) as events:
-                    if prepared.compactable_groups:
-                        reader = asyncio.current_task()
-                        assert reader is not None
+                return True
 
-                        def can_send_summary() -> bool:
-                            if (self._closed or not accept_model_events or voice_interrupted() or deadline.expired()
-                                    or reader.cancelled() or reader.cancelling() or owner.cancelling()):
-                                return False
-                            if reader.done():
-                                return reader.exception() is None and reader.result()
-                            # 成功终态已解除生成截止；此时可能还在关闭模型传输。
-                            return model_complete or loop.time() < expires
+            def can_send_summary() -> bool:
+                if (self._closed or not accept_model_events or voice_interrupted()
+                        or (summary_deadline is not None and summary_deadline.expired())
+                        or (round_deadline is not None and round_deadline.expired())
+                        or reader.cancelled() or reader.cancelling() or owner.cancelling()):
+                    return False
+                if reader.done():
+                    return reader.exception() is None and reader.result()
+                return True
 
-                        def prepare_summary() -> None:
-                            if not can_send_summary():
-                                return
-                            try:
-                                summary = self._context.summary_request(self.session_id, prepared, assembled)
-                            except Exception:
-                                _LOG.warning("model summary preparation failed; preserving original context")
-                                return
-                            if summary is not None and can_send_summary():
-                                prefix, prompt = summary
-                                self._compactions.start(self.session_id, prefix, prompt, tools, model=self._model,
-                                                        thinking=self._thinking, timeout=self._settings.model_timeout,
-                                                        run_id=run_id, instructions=self._instructions,
-                                                        can_send=can_send_summary)
+            def prepare_summary() -> None:
+                if not can_send_summary():
+                    return
+                try:
+                    summary = self._context.summary_request(self.session_id, prepared, assembled)
+                except Exception:
+                    _LOG.warning("model summary preparation failed; preserving original context")
+                    return
+                if summary is not None and can_send_summary():
+                    prefix, prompt = summary
+                    self._compactions.start(self.session_id, prefix, prompt, tools, model=self._model,
+                                            thinking=self._thinking, timeout=self._settings.model_timeout,
+                                            run_id=run_id, instructions=self._instructions,
+                                            can_send=can_send_summary)
 
-                        # 这里只排回调，不让出事件循环；先进入普通生成器，再计算摘要的尾窗和冻结 schema。
-                        loop.call_soon(prepare_summary)
-                    async for event in events:
-                        # 即使回执与这一帧同时就绪，也不能发布它或启动新的工具。
-                        # 适配器在收到取消后吐出的迟到帧也一律丢弃。
-                        if not accept_model_events or voice_interrupted():
-                            reader_closing = True
-                            deadline.disarm()
-                            return False
-                        if stop_stream is not None and deadline.expired():
-                            # 已在传输收尾的适配器仍可能吐出缓存的终态；超时后不启动工具。
+            def schedule_summary() -> None:
+                nonlocal summary_deadline
+                # 单轮只排一次，不阻塞首个请求；后台摘要仍用自己的固定时限。
+                if prepared.compactable_groups:
+                    summary_deadline = read_deadline
+                    loop.call_soon(prepare_summary)
+
+            async with model_deadline_at(loop.time() + self._settings.model_timeout, stop_stream) as read_deadline:
+                assembled = await prepared.assemble(self._workspace)
+                request = assembled.messages()
+                if read_deadline.expired():
+                    raise TimeoutError
+                if not can_start_attempt():
+                    return False
+                if read_deadline.expired():
+                    raise TimeoutError
+                if not retry_model:
+                    result = await read_attempt(request, schedule_summary)
+                    if isinstance(result, ModelError):
+                        raise result
+                    return result
+            read_deadline = None
+
+            # 主 Agent 的预算从第一次发模型请求开始，本地准备不计入。
+            total_at = loop.time() + _MODEL_RETRY_BUDGET
+
+            def next_idle_at() -> float | None:
+                at = loop.time() + self._settings.model_idle_timeout
+                # 更早的总截止已足够，不重复取消同一读取任务。
+                return at if at < total_at else None
+
+            attempt, delay = 1, _MODEL_RETRY_INITIAL_DELAY
+            retrying = False
+            outcome = "cancelled"
+            try:
+                async with model_deadline_at(total_at, stop_stream) as round_deadline:
+                    while True:
+                        if round_deadline.expired():
                             raise TimeoutError
-                        if isinstance(event, ModelClosing):
-                            reader_closing = True
-                            if event.complete:
-                                deadline.disarm()
-                                model_complete = True
-                                if has_user_channel:
-                                    # 回执可先于连接关闭结算；完整投递仍等连接收尾。
-                                    finish_reply_stream()
-                                return True
-                        elif isinstance(event, TextDelta) and event.text:
-                            if not text:
-                                first_text_at = loop.time()
-                                reply.first_text_at = first_text_at
-                                _LOG.debug("model first text; reply=%s elapsed_ms=%.0f", info.reply_id,
-                                           (first_text_at - info.started_at) * 1000)
-                            text.append(event.text)
-                            if channel is not None:
-                                first_handoff = delivery is None
-                                if first_handoff and hold_blank_prefix and not event.text.strip():
-                                    # 首段非空白正文抵达前不选路；直到收尾都只有空白时不补投。
-                                    # 收尾补投无法保留首段语音拒收与相邻工具派发的顺序。
-                                    continue
-                                if delivery is None:
-                                    # 首段交接同步选路；随后挂断或重拨不能改变已选通道。
-                                    if isinstance(channel, SelectableChannel):
-                                        selected = channel.select_delivery(reply)
-                                    else:
-                                        selected = ReplyDelivery(channel.deliver, idle_timeout)
-                                    idle_timeout = selected.idle_timeout
-                                    delivery = loop.create_task(deliver(selected))
-                                if not delivery.done():
-                                    reply.publish("".join(text) if first_handoff and hold_blank_prefix else event.text)
-                                if first_handoff and reply.voice_delivery:
-                                    # 先让语音投递进入同一回执接口，以便拒收先于相邻工具帧。
-                                    await delivery_started
-                        elif isinstance(event, InputUsage):
-                            input_tokens = event.input_tokens
-                        elif isinstance(event, AssistantPartsReady):
-                            if output_parts is not None:
-                                raise ModelError("invalid_sse_event")
-                            output_parts = event.parts
-                        elif isinstance(event, ToolReady):
-                            call = event.call
-                            if call.id in accepted_calls:
-                                raise ModelError("duplicate_tool_id")
-                            staged = Message("assistant", _settled_parts(
-                                "", (*accepted_calls.values(), call), {}, output_parts))
-
-                            def persist_call() -> bool:
-                                nonlocal owns_reply
-                                # SQLite 锁重试会让出事件循环。每次真正写入前都重新核对路由。
-                                if not can_dispatch_tool() or deadline.expired():
-                                    return False
-                                if not owns_reply:
-                                    ownership.enter_context(self.history.own_reply(info.reply_id))
-                                    owns_reply = True
-                                self.history.stage_tool_calls(self.session_id, info.reply_id, staged)
-                                return True
-
-                            try:
-                                persisted = await self._sqlite.write_input(persist_call)
-                            except asyncio.CancelledError:
-                                # 截止也可能直接取消 SQLite 的等待，来不及走下面的检查。
-                                if deadline.expired():
-                                    raise _ToolDispatchTimeout from None
+                        diagnostics = ModelRequestDiagnostics(
+                            "reply", self._settings.model_idle_timeout, run_id, info.reply_id)
+                        try:
+                            async with model_deadline_at(next_idle_at(), stop_stream) as attempt_deadline:
+                                read_deadline = attempt_deadline
+                                with diagnostics.activate():
+                                    result = await read_attempt(
+                                        request, schedule_summary if attempt == 1 else None,
+                                        lambda: attempt_deadline.reschedule(next_idle_at()))
+                        except TimeoutError:
+                            if (made_progress or round_deadline.expired() or not attempt_deadline.expired()
+                                    or diagnostics.close_failure is not None):
                                 raise
-                            except Exception:
-                                reply_write_failed()
-                                raise _ToolCallWriteFailed from None
-                            if persisted:
-                                accepted_calls[call.id] = call
-                            if not can_dispatch_tool():
-                                reader_closing = True
-                                deadline.disarm()
-                                return False
-                            if not persisted or deadline.expired():
-                                raise _ToolDispatchTimeout
-                            context = ToolContext(self.session_id, run_id, call.id,
-                                                  agent_id=self.agent.agent_id if self.agent is not None else None,
-                                                  workspace=self._workspace, reply_id=info.reply_id)
-                            scheduled[call.id] = loop.create_task(run_tool(call, context))
-            return True
+                            reason = "model_idle_timeout"
+                        else:
+                            if isinstance(result, bool):
+                                outcome = "complete" if result else "interrupted"
+                                return result
+                            if round_deadline.expired():
+                                raise TimeoutError
+                            # 原生适配器在首次读取里序列化请求；未进入传输的本地错误不重试。
+                            if (made_progress or model_complete or diagnostics.stage == "request_build"
+                                    or diagnostics.close_failure is not None):
+                                raise result
+                            reason = result.diagnostic
+
+                        # 走到这里时旧流已退出；尚未发布的元数据不能带入下一次。
+                        input_tokens = output_parts = None
+                        read_deadline = None
+                        reader_closing = False
+                        if not can_start_attempt():
+                            outcome = "interrupted"
+                            return False
+                        remaining = total_at - loop.time()
+                        if remaining <= 0:
+                            raise TimeoutError
+                        wait = min(delay, remaining)
+                        _LOG.debug("model retry scheduled; run=%s reply=%s attempt=%d reason=%s delay_s=%g",
+                                   run_id, info.reply_id, attempt, reason, wait)
+                        retrying = True
+                        if can_dispatch is None:
+                            await sleep(wait)
+                        else:
+                            # 只有空唤醒的退避让位，已开始的普通回复与实际读流不受影响。
+                            wake = self._trigger_retry_wake = asyncio.Event()
+                            try:
+                                async with asyncio.timeout(wait):
+                                    await wake.wait()
+                            except TimeoutError:
+                                pass
+                            finally:
+                                self._trigger_retry_wake = None
+                        if round_deadline.expired():
+                            raise TimeoutError
+                        if not can_start_attempt():
+                            outcome = "interrupted"
+                            return False
+                        delay = min(delay * 2, _MODEL_RETRY_MAX_DELAY)
+                        attempt += 1
+            except TimeoutError:
+                outcome = "timeout"
+                raise
+            except Exception:
+                outcome = "failed"
+                raise
+            finally:
+                if retrying:
+                    _LOG.debug("model retry finished; run=%s reply=%s attempts=%d result=%s",
+                               run_id, info.reply_id, attempt, "complete" if model_complete else outcome)
 
         model_task: asyncio.Task[bool] | None = None
         interrupted_locally = False
@@ -713,8 +862,7 @@ class Runtime:
         def retire_reader(task: asyncio.Task[bool]) -> None:
             nonlocal accept_model_events
             accept_model_events = False
-            if read_deadline is not None:
-                read_deadline.disarm()
+            disarm_model_deadlines()
             self._retired_models.add(task)
             task.add_done_callback(self._model_cleanup_finished)
             if not reader_closing or not has_user_channel:

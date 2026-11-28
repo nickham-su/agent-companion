@@ -28,6 +28,15 @@ _WIRE = "synthetic-hidden-wire-data"
 _MARKER = "model request failure; "
 
 
+def single_attempt_runtime(history, model, **kwargs):
+    # 用真实子 Agent 验证单次请求的终态诊断，不关闭主 Agent 的重试。
+    parent = history.ensure_main_agent(_SESSION)
+    run = uuid4().hex
+    history.start_agent_run(parent.agent_id, run, can_start=lambda: True)
+    child, _ = history.accept_delegation(parent.agent_id, run, "test-call", role_id="review")
+    return Runtime(child.session_id, history, model, None, agent=child, reply_to_parent=lambda _: True, **kwargs)
+
+
 class Wire(httpx.AsyncByteStream):
     def __init__(self, *, frame=b"", error=None, close_error=None, stall_close=False):
         self.frame = frame
@@ -73,12 +82,12 @@ class ModelDiagnosticTests(unittest.IsolatedAsyncioTestCase):
         async with httpx.AsyncClient(transport=httpx.MockTransport(endpoint)) as client:
             model = self.model(adapter, client)
             with closing(History(":memory:")) as history:
-                runtime = Runtime(_SESSION, history, model, None, settings=RuntimeSettings(model_timeout=timeout))
+                runtime = single_attempt_runtime(history, model, settings=RuntimeSettings(model_timeout=timeout))
                 try:
                     if prepare_error is None:
-                        return await self.submit(runtime, history)
+                        return await self.submit(runtime, history, runtime.session_id)
                     with patch.object(model, "_payload", side_effect=prepare_error):
-                        return await self.submit(runtime, history)
+                        return await self.submit(runtime, history, runtime.session_id)
                 finally:
                     await model.aclose()
 
@@ -221,8 +230,8 @@ class ModelDiagnosticTests(unittest.IsolatedAsyncioTestCase):
                 try:
                     compactions.start(_SESSION, Prefix(0, 1, 1), [Message("user", summary_text)], (),
                                       model=model, thinking=False, timeout=2, run_id=summary_run)
-                    runtime = Runtime(_SESSION, history, model, None, compactions=compactions)
-                    outcome = await self.submit(runtime, history)
+                    runtime = single_attempt_runtime(history, model, compactions=compactions)
+                    outcome = await self.submit(runtime, history, runtime.session_id)
                     if compactions._generating is not None:
                         await asyncio.wait_for(compactions._generating, 2)
                 finally:

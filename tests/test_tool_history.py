@@ -523,7 +523,7 @@ class ToolHistoryTest(unittest.IsolatedAsyncioTestCase):
                     if cause == "cancelled_await":
                         # 没有协作停止时，同一截止会直接取消 SQLite 锁重试中的 await。
                         model.stop_stream = None
-                    settings = RuntimeSettings() if by_voice else RuntimeSettings(model_timeout=.3)
+                    settings = RuntimeSettings() if by_voice else RuntimeSettings(model_idle_timeout=.3)
                     runtime = Runtime("main", history, model, Voice(), thinking=True, settings=settings,
                                       retry_sqlite_locks=True, tools=Tools((Tool(_SPEC, tool),)))
                     cancelled_during_write = False

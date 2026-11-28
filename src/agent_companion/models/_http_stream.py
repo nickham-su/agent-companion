@@ -37,6 +37,7 @@ class _RequestOwner:
         self.settled = task.get_loop().create_future()  # 请求退出或关闭预算耗尽。
         self._scope: CancelScope | None = None
         self._timer: asyncio.TimerHandle | None = None
+        self._forced_cancel = False
 
     @property
     def stopping(self) -> bool:
@@ -64,10 +65,17 @@ class _RequestOwner:
         _LOG.warning("native HTTP request close deadline reached (transport_close_timeout)")
         if self._scope is not None:
             # 仅在预算耗尽后中断仍在 I/O 中的请求，不取消调用方的其他工作。
-            self.task.cancel()
+            self._forced_cancel = self.task.cancel()
         self.settled.set_result(None)
 
     def finish(self) -> None:
+        if self._forced_cancel:
+            # 强制打断读操作可能中断 httpcore 内部的连接关闭，即使没有显式响应关闭异常。
+            diagnostics = current_request()
+            if diagnostics is not None and diagnostics.close_failure is None:
+                diagnostics.close_failure = "close_unconfirmed"
+            # 向外传播取消，但只归还本传输发出的那一次；外部取消仍有独立计数。
+            self.task.uncancel()
         if self._timer is not None:
             self._timer.cancel()
         if not self.settled.done():
@@ -235,6 +243,12 @@ class ResponseStreams:
                             await stream.aclose()
                         else:
                             await response.aclose()
+                    except asyncio.CancelledError:
+                        # 停止等待不等于底层关闭已确认；外层截止可能将取消转换成超时。
+                        diagnostics = current_request()
+                        if diagnostics is not None:
+                            diagnostics.close_failure = "close_unconfirmed"
+                        raise
                     except Exception as error:
                         diagnostics = current_request()
                         if diagnostics is not None:

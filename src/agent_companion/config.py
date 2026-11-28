@@ -23,6 +23,7 @@ BAILIAN_TTS_MODEL = "qwen-audio-3.1-tts-flash"
 BAILIAN_TTS_VOICE = "longanhuan_v3.1"
 DEFAULT_ASR_TIMEOUT = 30
 DEFAULT_MODEL_TIMEOUT = 60
+DEFAULT_MODEL_IDLE_TIMEOUT = 180
 DEFAULT_MAX_TOOL_ROUNDS = 8
 DEFAULT_TTS_TIMEOUT = 25
 _DEFAULT_WORKSPACE_ROOT = "workspaces"
@@ -105,9 +106,11 @@ class RuntimeSettings:
     context_budget: int = 64_000
     tail_budget: int = 16_000
     max_tool_rounds: int = DEFAULT_MAX_TOOL_ROUNDS
+    model_idle_timeout: float = DEFAULT_MODEL_IDLE_TIMEOUT
 
     def __post_init__(self) -> None:
         _config_seconds(self.model_timeout, "timeouts.llm")
+        _config_seconds(self.model_idle_timeout, "timeouts.llm_idle")
         for name in ("context_budget", "tail_budget", "max_tool_rounds"):
             value = getattr(self, name)
             if type(value) is not int or value <= 0:
@@ -392,7 +395,7 @@ def _speech_connection(provider: dict[str, Any], selector: str, llm: LLMProvider
         raise ConfigError("百炼 Provider 须设置有效的 workspace_id，region 为 cn-beijing 或 ap-southeast-1") from None
 
 
-def _load_llm_profiles(data: Any, providers: dict[str, Any], model_timeout: float,
+def _load_llm_profiles(data: Any, providers: dict[str, Any], defaults: RuntimeSettings,
                        ) -> tuple[dict[str, ModelProfile], dict[str, LLMProvider]]:
     if not isinstance(data, dict):
         raise ConfigError("models.llm 必须是命名模型配置表")
@@ -428,7 +431,8 @@ def _load_llm_profiles(data: Any, providers: dict[str, Any], model_timeout: floa
             if key not in options:
                 raise ConfigError(f"{location} 的 {key} 必须显式设置")
         try:
-            runtime = RuntimeSettings(model_timeout=model_timeout, context_budget=options["context_budget"],
+            runtime = RuntimeSettings(model_timeout=defaults.model_timeout, model_idle_timeout=defaults.model_idle_timeout,
+                                      context_budget=options["context_budget"],
                                       tail_budget=options["tail_budget"],
                                       max_tool_rounds=options.get("max_tool_rounds", DEFAULT_MAX_TOOL_ROUNDS))
             provider_id = options["provider"]
@@ -515,8 +519,9 @@ def _parse_settings(data: dict[str, Any], path: Path, *, for_run: bool) -> Setti
     workspace_root = data.get("workspace_root", _DEFAULT_WORKSPACE_ROOT)
     if not isinstance(workspace_root, str) or not workspace_root.strip() or "\x00" in workspace_root:
         raise ConfigError("workspace_root 必须是非空且不含 NUL 字符的路径")
-    timeouts = _table(data.get("timeouts", {}), {"llm", "asr", "tts"}, "timeouts")
-    runtime = RuntimeSettings(model_timeout=timeouts.get("llm", DEFAULT_MODEL_TIMEOUT))
+    timeouts = _table(data.get("timeouts", {}), {"llm", "llm_idle", "asr", "tts"}, "timeouts")
+    runtime = RuntimeSettings(model_timeout=timeouts.get("llm", DEFAULT_MODEL_TIMEOUT),
+                              model_idle_timeout=timeouts.get("llm_idle", DEFAULT_MODEL_IDLE_TIMEOUT))
     models, llm_providers = {}, {}
     feishu_data = data.get("feishu")
     feishu = FeishuSettings(**_section(feishu_data, FeishuSettings, "feishu")) if feishu_data is not None else None
@@ -531,7 +536,7 @@ def _parse_settings(data: dict[str, Any], path: Path, *, for_run: bool) -> Setti
         if not isinstance(providers, dict):
             raise ConfigError("providers 必须是命名 Provider 配置表")
         model_groups = _table(data.get("models", {}), {"llm", "asr", "tts"}, "models")
-        models, llm_providers = _load_llm_profiles(model_groups.get("llm", {}), providers, runtime.model_timeout)
+        models, llm_providers = _load_llm_profiles(model_groups.get("llm", {}), providers, runtime)
         asr, tts = _load_speech(data, model_groups, providers, llm_providers, voice=use_voice)
     return Settings(
         database=Path(database),

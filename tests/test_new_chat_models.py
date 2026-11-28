@@ -24,6 +24,7 @@ from agent_companion.runtime.engine import Runtime
 from agent_companion.runtime.tools import Tool, Tools
 from agent_companion.runtime.view_image import VIEW_IMAGE_TOOL
 from agent_companion.storage.sqlite import History, ReplyOutcome, Summary
+from test_model_diagnostics import single_attempt_runtime
 from test_model_http_reuse import _HTTP11, _sse
 from test_message_support import PNG_BYTES, PNG_URL, assistant_message, image_workspace, reasoning_parts
 
@@ -419,7 +420,7 @@ class ChatModelTests(unittest.IsolatedAsyncioTestCase):
                         _choice({"reasoning_content": "partial thought"}), _tool_start(), _tool_end(), *terminal))
                     async with httpx.AsyncClient(transport=wire) as client:
                         model = _model(client, adapter)
-                        runtime = Runtime("main", history, model, None, tools=Tools([Tool(_SPEC, lookup)]), thinking=True)
+                        runtime = single_attempt_runtime(history, model, tools=Tools([Tool(_SPEC, lookup)]), thinking=True)
                         try:
                             with self.assertLogs("agent_companion", "WARNING") as logs:
                                 runtime.submit_messages([MessageDelivery(_INPUT, "trigger")])
@@ -430,8 +431,8 @@ class ChatModelTests(unittest.IsolatedAsyncioTestCase):
                             await runtime.close()
                             await model.aclose()
                     self.assertEqual(calls, [])
-                    self.assertEqual([row.message for row in history.read_after("main")], [_INPUT])
-                    self.assertEqual([row.model_error for row in history.outcomes("main")], [reason])
+                    self.assertEqual([row.message for row in history.read_after(runtime.session_id)], [_INPUT])
+                    self.assertEqual([row.model_error for row in history.outcomes(runtime.session_id)], [reason])
 
     async def test_bad_finishes_and_incomplete_arguments_never_publish_terminal_events(self):
         for adapter in ("minimax", "bailian"):
@@ -607,7 +608,7 @@ class ChatModelErrorTests(unittest.IsolatedAsyncioTestCase):
 
                     async with httpx.AsyncClient(transport=httpx.MockTransport(wire)) as client:
                         model = _model(client, adapter)
-                        runtime = Runtime("main", history, model, None, tools=Tools([Tool(_SPEC, lookup)]),
+                        runtime = single_attempt_runtime(history, model, tools=Tools([Tool(_SPEC, lookup)]),
                                           thinking=True)
                         try:
                             with self.assertLogs("agent_companion", "DEBUG") as logs:
@@ -647,7 +648,7 @@ class ChatModelErrorTests(unittest.IsolatedAsyncioTestCase):
                         with closing(History(":memory:")) as history:
                             async with httpx.AsyncClient(transport=httpx.MockTransport(wire)) as client:
                                 model = _model(client, adapter)
-                                runtime = Runtime("main", history, model, None, thinking=True)
+                                runtime = single_attempt_runtime(history, model, thinking=True)
                                 try:
                                     with self.assertLogs("agent_companion", "DEBUG") as logs:
                                         runtime.submit_messages([MessageDelivery(_INPUT, "trigger")])
@@ -655,8 +656,8 @@ class ChatModelErrorTests(unittest.IsolatedAsyncioTestCase):
                                 finally:
                                     await runtime.close()
                                     await model.aclose()
-                            self.assertEqual([row.model_error for row in history.outcomes("main")], ["vendor_error"])
-                            self.assertEqual([row.message for row in history.read_after("main")], [_INPUT])
+                            self.assertEqual([row.model_error for row in history.outcomes(runtime.session_id)], ["vendor_error"])
+                            self.assertEqual([row.message for row in history.read_after(runtime.session_id)], [_INPUT])
                         self._assert_only_local_failure(logs, "vendor_error", 200, request_id, code, message)
 
     async def test_bailian_native_tool_index_suppresses_error_echo_without_reasoning(self):
@@ -685,7 +686,7 @@ class ChatModelErrorTests(unittest.IsolatedAsyncioTestCase):
 
                 async with httpx.AsyncClient(transport=httpx.MockTransport(wire)) as client:
                     model = _model(client, "bailian", preserve_thinking=False)
-                    runtime = Runtime("main", history, model, None, tools=Tools([Tool(_SPEC, lookup)]), thinking=False)
+                    runtime = single_attempt_runtime(history, model, tools=Tools([Tool(_SPEC, lookup)]), thinking=False)
                     try:
                         with self.assertLogs("agent_companion", "DEBUG") as logs:
                             runtime.submit_messages([MessageDelivery(_INPUT, "trigger")])
@@ -697,7 +698,7 @@ class ChatModelErrorTests(unittest.IsolatedAsyncioTestCase):
                 assistant = requests[1]["messages"][-2]
                 self.assertEqual(assistant["tool_calls"][0]["index"], index)
                 self.assertFalse(any("reasoning_content" in item for item in requests[1]["messages"]))
-                self.assertEqual(history.outcomes("main")[-1].model_error, reason)
+                self.assertEqual(history.outcomes(runtime.session_id)[-1].model_error, reason)
                 self._assert_only_local_failure(logs, reason, status, request_id, code, message)
 
     def _assert_only_local_failure(self, logs, reason, status, *remote_fields):
