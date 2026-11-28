@@ -65,6 +65,17 @@ class _RoleFiles:
 
 
 class RoleFileTests(_RoleFiles, unittest.TestCase):
+    def test_silent_end_requires_each_role_to_opt_in(self):
+        self.write_role("main", "主角色")
+        self.write_role("review", "子角色", tools=("silent_end",), description="审阅")
+        roles = load_roles(self.workdir)
+        self.assertEqual(roles["main"].tools, ())
+        self.assertEqual(roles["review"].tools, ("silent_end",))
+
+        self.write_role("main", "主角色", tools=("silent_end",))
+        self.write_role("review", "子角色", description="审阅")
+        roles = load_roles(self.workdir)
+        self.assertEqual((roles["main"].tools, roles["review"].tools), (("silent_end",), ()))
     def test_application_entry_points_require_keyword_roles(self):
         for entry in (prepare_private_feishu, run_feishu, running_agent):
             with self.subTest(entry=entry.__name__):

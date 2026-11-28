@@ -20,6 +20,7 @@ from agent_companion.models import _http_stream
 from agent_companion.models.deepseek import DeepSeek
 from agent_companion.protocol import (AgentReply, DeliveryStatus, Message, MessageDelivery, ModelError,
                                       Receipt, TextDelta, ToolCall, ToolReady, UserSource)
+from agent_companion.runtime.silent_end import SILENT_END_TOOL_NAME
 from agent_companion.runtime.subtasks import AgentRole, DELEGATE_TOOL_NAME, demo_roles
 from agent_companion.runtime.timers import CANCEL_TIMER_TOOL_NAME, SET_TIMER_TOOL_NAME, Timers
 from agent_companion.runtime.tools import ToolContext
@@ -660,6 +661,49 @@ class SubtaskTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(cases[run.agent_id], {"agent_id": run.agent_id, "status": "failed", "error": error})
         empty = self._acceptances()["empty"]
         self.assertIn("tool text only", [row.content for row in self._messages(self._session(empty))])
+
+    async def test_opted_in_child_can_finish_silently_without_parent_wakeup(self):
+        roles = demo_roles()
+        roles["review"] = AgentRole("审阅任务", (SILENT_END_TOOL_NAME,), "支持静默的子角色")
+
+        async def answer(messages, tools):
+            last = messages[-1]
+            if last.content in ("请求静默任务", "请求正文任务"):
+                self.assertNotIn(SILENT_END_TOOL_NAME, tools)
+                call_id, prompt = ("silent-job", "静默任务") if last.content == "请求静默任务" else ("text-job", "正文任务")
+                yield ToolReady(_call(call_id, prompt, agent="review"))
+            elif last.content in ("静默任务", "正文任务"):
+                self.assertEqual(tools, (SILENT_END_TOOL_NAME,))
+                yield ToolReady(ToolCall("finish-child", SILENT_END_TOOL_NAME, "{}"))
+                if last.content == "正文任务":
+                    yield TextDelta("需要汇报的子结果")
+            elif _result_inputs([last]):
+                yield TextDelta("父级收到结果")
+            elif last.tool_calls:
+                yield TextDelta("父级已派发")
+
+        model = _Model(answer, tool_names=True)
+        async with running_agent(self.settings, self.history, model, self.channel,
+                                 session_id="main", roles=roles) as (main, tree):
+            main.submit_messages((MessageDelivery(Message("user", "请求静默任务"), "trigger"),))
+            await _wait(tree.wait_idle())
+            run = self._run("silent-job")
+            self.assertEqual((run.status, run.result, run.error), ("completed", None, None))
+            self.assertEqual(_result_inputs(self._messages("main")), [])
+            self.assertEqual(len(self._agent_runs(main.agent.agent_id)), 1)
+            self.assertEqual(len(model.requests), 3)
+            child_session = self._session(self._acceptances()["silent-job"])
+            self.assertEqual(self._acceptances(child_session)["finish-child"], {"status": "accepted"})
+
+            main.submit_messages((MessageDelivery(Message("user", "请求正文任务"), "trigger"),))
+            await _wait(tree.wait_idle())
+            run = self._run("text-job")
+            self.assertEqual((run.status, run.result, run.error), ("completed", "需要汇报的子结果", None))
+            self.assertEqual(_result_inputs(self._messages("main")),
+                             [{"agent_id": run.agent_id, "status": "completed", "result": "需要汇报的子结果"}])
+            child_session = self._session(self._acceptances()["text-job"])
+            self.assertEqual(self._acceptances(child_session)["finish-child"],
+                             {"status": "ignored", "reason": "text_present"})
 
     async def test_round_budget_is_per_run_and_late_results_survive_exhaustion(self):
         release_children, failed = asyncio.Event(), asyncio.Event()

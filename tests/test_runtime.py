@@ -1,5 +1,6 @@
 import asyncio
 from dataclasses import replace
+import json
 import sqlite3
 import unittest
 from unittest.mock import patch
@@ -13,13 +14,15 @@ from agent_companion.protocol import (AssistantPartsReady, DeliveryStatus, Messa
                                       ToolReady, ToolSpec)
 from agent_companion.runtime.context import PreparedContext
 from agent_companion.runtime.engine import Runtime
+from agent_companion.runtime.silent_end import SILENT_END_TOOL, SILENT_END_TOOL_NAME
 from agent_companion.runtime.tools import Tool, Tools
 from agent_companion.storage.sqlite import History, Summary
-from test_message_support import PNG_BYTES, assistant_message, image_workspace, reasoning_parts
+from test_message_support import PNG_BYTES, assistant_message, image_workspace, reasoning_parts, tool_calls
 
 
 SPEC = ToolSpec("test", "模拟工具", {"type": "object", "properties": {}})
 CALL = ToolCall("call-1", "test", "{}")
+SILENT_END_CALL = ToolCall("silent", SILENT_END_TOOL_NAME, "{}")
 
 
 class ScriptModel:
@@ -64,6 +67,211 @@ class RuntimeTest(unittest.IsolatedAsyncioTestCase):
     async def idle(self, runtime):
         await asyncio.wait_for(runtime.wait_idle(), 2)
         self.assertIsNone(runtime.last_failure)
+
+    async def test_silent_end_settles_batch_at_round_limit_and_leaves_input_for_new_run(self):
+        started, release = asyncio.Event(), asyncio.Event()
+        executed = []
+
+        async def tool(args, context):
+            executed.append((context.call_id, context.run_id))
+            started.set()
+            await release.wait()
+            return '{"error":"not_active"}'
+
+        again = replace(SILENT_END_CALL, id="silent-again")
+        model = ScriptModel(events(ToolReady(SILENT_END_CALL), ToolReady(CALL), ToolReady(again)),
+                            events(TextDelta("下一轮正文")))
+        channel = Channel()
+        runtime, history = self.setup_runtime(model, channel, tools=Tools([SILENT_END_TOOL, Tool(SPEC, tool)]),
+                                              settings=RuntimeSettings(max_tool_rounds=1))
+        runtime.submit_messages([MessageDelivery(Message("user", "首轮输入"), "trigger")])
+        await asyncio.wait_for(started.wait(), 2)
+        self.assertEqual(channel.replies, [])
+        runtime.submit_messages([MessageDelivery(Message("user", "排队输入"), "trigger")])
+        release.set()
+        await self.idle(runtime)
+
+        first, second = history.outcomes("main")
+        self.assertNotEqual(first.run_id, second.run_id)
+        self.assertEqual(executed, [(CALL.id, first.run_id)])
+        self.assertEqual((first.model_status, first.delivery_status), ("complete", None))
+        self.assertEqual([(info.run_id, text) for info, text in channel.replies], [(second.run_id, "下一轮正文")])
+        first_input, settled, queued_input = model.requests[1][0]
+        self.assertEqual([first_input.content, queued_input.content], ["首轮输入", "排队输入"])
+        self.assertEqual([(call.id, json.loads(call.result)) for call in settled.tool_calls],
+                         [(SILENT_END_CALL.id, {"status": "accepted"}), (CALL.id, {"error": "not_active"}),
+                          (again.id, {"status": "accepted"})])
+
+    async def test_silent_end_with_only_whitespace_never_selects_delivery(self):
+        class VoicePossible(Channel):
+            selections = 0
+
+            def select_delivery(self, reply):
+                self.selections += 1
+                reply.select_voice_delivery()
+                return ReplyDelivery(self.deliver)
+
+        model = ScriptModel(events(TextDelta(" \t"), ToolReady(SILENT_END_CALL), TextDelta("\n\u3000")))
+        channel = VoicePossible()
+        runtime, history = self.setup_runtime(model, channel, tools=Tools([SILENT_END_TOOL]))
+        runtime.submit_messages([MessageDelivery(Message("user", "输入"), "trigger")])
+        await self.idle(runtime)
+
+        self.assertEqual((len(model.requests), channel.selections, channel.replies), (1, 0, []))
+        outcome, = history.outcomes("main")
+        self.assertEqual((outcome.model_status, outcome.delivery_status), ("complete", None))
+        _, settled = history.read_after("main")
+        self.assertEqual(settled.message.content, "")
+        self.assertEqual(json.loads(settled.message.tool_calls[0].result), {"status": "accepted"})
+
+    async def test_whitespace_only_delivery_depends_on_silent_end_permission(self):
+        for enabled in (False, True):
+            with self.subTest(enabled=enabled):
+                model = ScriptModel(events(TextDelta(" \n")))
+                channel = Channel()
+                tools = Tools([SILENT_END_TOOL] if enabled else [])
+                runtime, history = self.setup_runtime(model, channel, tools=tools)
+                runtime.submit_messages([MessageDelivery(Message("user", "输入"), "trigger")])
+                await self.idle(runtime)
+                self.assertEqual([text for _, text in channel.replies], [] if enabled else [" \n"])
+                outcome, = history.outcomes("main")
+                self.assertEqual(outcome.delivery_status, None if enabled else DeliveryStatus.FULL)
+
+    async def test_whitespace_prefix_streams_with_first_visible_text_and_keeps_voice_progress(self):
+        handoffs = []
+        first_chunk = "\n\t流式正文"
+        full_text = first_chunk + "\n后续"
+
+        class Voice(Channel):
+            def select_delivery(self, reply):
+                reply.select_voice_delivery()
+                return ReplyDelivery(self.deliver)
+
+            async def deliver(self, reply):
+                first = await anext(reply)
+                reply.report_progress(reply.info.reply_id, 2, first)
+                handoffs.append((first, reply.progress))
+                rest = "".join([chunk async for chunk in reply])
+                self.replies.append((reply.info, first + rest))
+                return Receipt(reply.info.reply_id, DeliveryStatus.FULL, first + rest)
+
+        async def stream():
+            yield ToolReady(SILENT_END_CALL)
+            yield TextDelta("\n")
+            yield TextDelta("\t")
+            self.assertEqual(handoffs, [])
+            yield TextDelta("流式正文")
+            # 首段必须已进入语音通道，且进度验证接收的是原始模型文本前缀。
+            self.assertEqual(handoffs, [(first_chunk, (2, first_chunk))])
+            yield TextDelta("\n后续")
+
+        model = ScriptModel(stream)
+        channel = Voice()
+        runtime, history = self.setup_runtime(model, channel, tools=Tools([SILENT_END_TOOL]))
+        runtime.submit_messages([MessageDelivery(Message("user", "输入"), "trigger")])
+        await self.idle(runtime)
+
+        self.assertEqual([text for _, text in channel.replies], [full_text])
+        _, settled = history.read_after("main")
+        self.assertEqual(settled.message.content, full_text)
+        self.assertEqual(json.loads(settled.message.tool_calls[0].result),
+                         {"status": "ignored", "reason": "text_present"})
+
+    async def test_text_wins_in_either_frame_order_without_buffering_or_follow_up(self):
+        for silent_first in (True, False):
+            with self.subTest(silent_first=silent_first):
+                streamed = asyncio.Event()
+
+                class ObservingChannel:
+                    async def deliver(self, reply):
+                        self.text = ""
+                        async for chunk in reply:
+                            self.text += chunk
+                            streamed.set()
+                        return Receipt(reply.info.reply_id, DeliveryStatus.ZERO)
+
+                async def stream():
+                    if silent_first:
+                        yield ToolReady(SILENT_END_CALL)
+                    yield TextDelta("流式正文")
+                    await asyncio.wait_for(streamed.wait(), 1)
+                    if not silent_first:
+                        yield ToolReady(SILENT_END_CALL)
+
+                channel = ObservingChannel()
+                model = ScriptModel(stream)
+                runtime, history = self.setup_runtime(model, channel, tools=Tools([SILENT_END_TOOL]))
+                runtime.submit_messages([MessageDelivery(Message("user", "输入"), "trigger")])
+                await self.idle(runtime)
+                self.assertEqual(channel.text, "流式正文")
+                self.assertEqual(len(model.requests), 1)
+                self.assertEqual(history.outcomes("main")[0].delivery_status, DeliveryStatus.ZERO)
+                settled, = tool_calls(row.message for row in history.read_after("main"))
+                self.assertEqual(json.loads(settled.result), {"status": "ignored", "reason": "text_present"})
+
+    async def test_ignored_silent_end_preserves_other_tool_follow_up(self):
+        async def tool(args, context):
+            return "普通工具结果"
+
+        model = ScriptModel(events(ToolReady(SILENT_END_CALL), TextDelta("实时正文"), ToolReady(CALL)),
+                            events(TextDelta("续轮正文")))
+        channel = Channel()
+        runtime, history = self.setup_runtime(model, channel, tools=Tools([SILENT_END_TOOL, Tool(SPEC, tool)]))
+        runtime.submit_messages([MessageDelivery(Message("user", "输入"), "trigger")])
+        await self.idle(runtime)
+        self.assertEqual([text for _, text in channel.replies], ["实时正文", "续轮正文"])
+        self.assertEqual(len({outcome.run_id for outcome in history.outcomes("main")}), 1)
+        ignored, ordinary = model.requests[1][0][-1].tool_calls
+        self.assertEqual(json.loads(ignored.result), {"status": "ignored", "reason": "text_present"})
+        self.assertEqual(ordinary.result, "普通工具结果")
+
+    async def test_invalid_or_unregistered_silent_end_does_not_end_run(self):
+        for tools, arguments, error in (([], "{}", "unknown_tool"), ([SILENT_END_TOOL], "[]", "invalid_arguments"),
+                                        ([SILENT_END_TOOL], '{"extra":null}', "invalid_arguments")):
+            with self.subTest(arguments=arguments, error=error):
+                call = replace(SILENT_END_CALL, arguments=arguments)
+                model = ScriptModel(events(ToolReady(call)), events(TextDelta("正常后续")))
+                channel = Channel()
+                runtime, _ = self.setup_runtime(model, channel, tools=Tools(tools))
+                runtime.submit_messages([MessageDelivery(Message("user", "输入"), "trigger")])
+                await self.idle(runtime)
+                self.assertEqual([text for _, text in channel.replies], ["正常后续"])
+                settled, = model.requests[1][0][-1].tool_calls
+                self.assertEqual(json.loads(settled.result), {"error": error})
+
+    async def test_silent_end_does_not_hide_model_failure(self):
+        async def broken_stream():
+            yield ToolReady(SILENT_END_CALL)
+            raise ModelError("truncated_stream")
+
+        model = ScriptModel(broken_stream)
+        runtime, history = self.setup_runtime(model, Channel(), tools=Tools([SILENT_END_TOOL]))
+        runtime.submit_messages([MessageDelivery(Message("user", "输入"), "trigger")])
+        await asyncio.wait_for(runtime.wait_idle(), 2)
+        self.assertEqual(runtime.last_failure, "model_failed")
+        self.assertEqual(history.outcomes("main")[0].model_status, "model_failed")
+        settled, = tool_calls(row.message for row in history.read_after("main"))
+        self.assertEqual(json.loads(settled.result), {"status": "ignored", "reason": "model_incomplete"})
+
+    async def test_silent_end_does_not_hide_a_batch_result_write_failure(self):
+        async def tool(args, context):
+            return "写入失败的工具结果"
+
+        model = ScriptModel(events(ToolReady(SILENT_END_CALL), ToolReady(CALL)))
+        channel = Channel()
+        runtime, history = self.setup_runtime(model, channel, tools=Tools([SILENT_END_TOOL, Tool(SPEC, tool)]))
+        persist = history.record_tool_result
+
+        def fail_one_result(session_id, reply_id, call_id, result):
+            if call_id == CALL.id:
+                raise sqlite3.OperationalError("synthetic write failure")
+            persist(session_id, reply_id, call_id, result)
+
+        with patch.object(history, "record_tool_result", side_effect=fail_one_result):
+            runtime.submit_messages([MessageDelivery(Message("user", "输入"), "trigger")])
+            await asyncio.wait_for(runtime.wait_idle(), 2)
+        self.assertEqual(runtime.last_failure, "runtime_failed")
+        self.assertEqual((len(model.requests), channel.replies), (1, []))
 
     async def test_trigger_run_can_use_configured_tool_and_protects_summary_only_context(self):
         usage = []

@@ -10,6 +10,7 @@ model_id = "chat"
 # - bash：执行 Bash 命令并等待结果。
 # - view_image：查看工作区相对路径指定的图片。
 # - send_text：向当前会话绑定的飞书私聊发送纯文本；按需加入 tools，默认不启用。
+# - silent_end：没有新信息需要告知时静默结束当前轮；同请求有非空白正文则不生效，默认不启用。
 tools = ["delegate_subtask", "set_timer", "cancel_timer"]
 # Bash 以服务账号权限执行，工作目录不是沙箱；按需用下一行替换上面的 tools：
 # tools = ["delegate_subtask", "set_timer", "cancel_timer", "bash"]

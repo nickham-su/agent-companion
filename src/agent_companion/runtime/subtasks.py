@@ -16,6 +16,7 @@ from .bash import BASH_TOOL_NAME, Bash
 from .compaction import Compactions
 from .engine import Runtime
 from .send_text import SEND_TEXT_TOOL_NAME, TextSendBinding, make_send_text_tool
+from .silent_end import SILENT_END_TOOL, SILENT_END_TOOL_NAME
 from .sqlite_access import SQLiteAccess
 from .timers import CANCEL_TIMER_TOOL_NAME, SET_TIMER_TOOL_NAME, Timers
 from .tools import Tool, ToolContext, Tools
@@ -25,7 +26,7 @@ from .view_image import VIEW_IMAGE_TOOL
 _LOG = logging.getLogger(__name__)
 DELEGATE_TOOL_NAME = "delegate_subtask"
 AGENT_TOOL_NAMES = frozenset({
-    SEND_TEXT_TOOL_NAME,
+    SEND_TEXT_TOOL_NAME, SILENT_END_TOOL_NAME,
     DELEGATE_TOOL_NAME, SET_TIMER_TOOL_NAME, CANCEL_TIMER_TOOL_NAME, BASH_TOOL_NAME, VIEW_IMAGE_TOOL.spec.name,
 })
 
@@ -124,7 +125,8 @@ class AgentTree:
             role = self._roles[agent.role_id]
             timers = None
             available = {DELEGATE_TOOL_NAME: self._delegate_tool, BASH_TOOL_NAME: self._bash.tool,
-                         VIEW_IMAGE_TOOL.spec.name: VIEW_IMAGE_TOOL, SEND_TEXT_TOOL_NAME: self._send_text_tool}
+                         VIEW_IMAGE_TOOL.spec.name: VIEW_IMAGE_TOOL, SEND_TEXT_TOOL_NAME: self._send_text_tool,
+                         SILENT_END_TOOL_NAME: SILENT_END_TOOL}
             if SET_TIMER_TOOL_NAME in role.tools or CANCEL_TIMER_TOOL_NAME in role.tools:
                 timers = Timers(agent.session_id, scheduler.submit_internal)
                 available.update((tool.spec.name, tool) for tool in timers.tools)

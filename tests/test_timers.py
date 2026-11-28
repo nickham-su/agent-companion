@@ -1,6 +1,6 @@
 import asyncio
 from contextlib import closing
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import json
 import unittest
 from unittest.mock import patch
@@ -9,6 +9,7 @@ from agent_companion.app import running_agent
 from agent_companion.config import Settings
 from agent_companion.protocol import (DeliveryStatus, Message, MessageDelivery, Receipt,
                                       TextDelta, ToolCall, ToolReady)
+from agent_companion.runtime.silent_end import SILENT_END_TOOL_NAME
 from agent_companion.runtime.subtasks import DELEGATE_TOOL_NAME, demo_roles
 from agent_companion.runtime.timers import CANCEL_TIMER_TOOL_NAME, SET_TIMER_TOOL_NAME, Timers
 from agent_companion.runtime.tools import ToolContext, Tools
@@ -318,6 +319,36 @@ class TimerTest(unittest.IsolatedAsyncioTestCase):
                 self.assertNotEqual(channel.replies[0][0], channel.replies[1][0])
                 self.clock.advance(10)
                 self.assertEqual(len(model.requests), 4)
+
+    async def test_silent_end_settles_timer_and_allows_later_wakeup(self):
+        def answer(step, messages):
+            if step == 1:
+                return (ToolReady(ToolCall("silent", SILENT_END_TOOL_NAME, "{}")),
+                        ToolReady(ToolCall("register", SET_TIMER_TOOL_NAME, '{"interval_seconds":2}')))
+            self.assertEqual(_event(messages[-1])["timer_id"], registered["timer_id"])
+            return (TextDelta("定时器已唤醒新一轮"),)
+
+        roles = demo_roles()
+        roles["main"] = replace(roles["main"], tools=(SET_TIMER_TOOL_NAME, SILENT_END_TOOL_NAME))
+        model, channel = _Model(answer), _Channel()
+        with closing(History(":memory:")) as history:
+            async with running_agent(Settings(), history, model, channel, session_id="main", roles=roles) as (runtime, _):
+                runtime.submit_messages((MessageDelivery(Message("user", "启动定时器"), "trigger"),))
+                await asyncio.wait_for(runtime.wait_idle(), 2)
+                self.assertEqual((len(model.requests), channel.replies, runtime.last_failure), (1, [], None))
+                first, = history.outcomes("main")
+                run = history.agent_run(first.run_id)
+                self.assertEqual((run.status, run.result, run.error), ("completed", None, None))
+                stored = tool_calls(row.message for row in history.read_after("main"))
+                registered = json.loads(next(call.result for call in stored if call.id == "register"))
+                self.assertEqual(registered["status"], "accepted")
+
+                self.clock.advance(2)
+                await asyncio.wait_for(runtime.wait_idle(), 2)
+                self.assertIsNone(runtime.last_failure)
+                (_, second) = history.outcomes("main")
+                self.assertNotEqual(first.run_id, second.run_id)
+                self.assertEqual(channel.replies, [(second.run_id, "定时器已唤醒新一轮")])
 
     async def test_two_timer_wakes_can_delegate_and_rearm_without_new_user_input(self):
         def answer(step, messages):

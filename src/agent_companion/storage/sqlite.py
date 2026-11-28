@@ -864,8 +864,11 @@ class History:
                 ))
         return ids
 
-    def finish_agent_run(self, run_id: str, *, result: str | None = None, error: str | None = None) -> None:
-        """持久化整轮终态；子 Agent 必须有正文或错误，提交成功后才能回投。"""
+    def finish_agent_run(self, run_id: str, *, result: str | None = None, error: str | None = None,
+                         silent: bool = False) -> None:
+        """持久化整轮终态；除显式静默外，子 Agent 必须有正文或错误。"""
+        if silent and (result is not None or error is not None):
+            raise ValueError("a silent run cannot finish with a result or error")
         if result is not None and error is not None:
             raise ValueError("a run cannot finish with both result and error")
         if result is not None and not isinstance(result, str):
@@ -879,7 +882,7 @@ class History:
                                       " AND (? OR EXISTS (SELECT 1 FROM agents AS a"
                                       " WHERE a.agent_id = agent_runs.agent_id AND a.parent_agent_id IS NULL))",
                                       ("failed" if error is not None else "completed", time(), result, error, run_id,
-                                       has_reply))
+                                       has_reply or silent))
             if cursor.rowcount != 1:
                 raise ValueError("invalid agent run state transition or missing child reply")
 

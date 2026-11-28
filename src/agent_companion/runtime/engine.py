@@ -4,7 +4,7 @@ import asyncio
 from collections import deque
 from collections.abc import Callable, Sequence
 from contextlib import ExitStack, aclosing
-from dataclasses import replace
+from dataclasses import dataclass, replace
 import logging
 from sqlite3 import OperationalError
 from typing import Literal
@@ -20,6 +20,7 @@ from ..workspace import Workspace
 from .compaction import Compactions
 from .context import Context, PreparedContext, RunStart
 from .model_deadline import ModelDeadline, model_deadline_at
+from .silent_end import SILENT_END_ACCEPTED, SILENT_END_TOOL_NAME
 from .sqlite_access import SQLiteAccess
 from .tools import TOOL_CANCELLED, ToolContext, Tools
 
@@ -71,6 +72,20 @@ class _ToolDispatchTimeout(TimeoutError):
 
 class _ToolResultWriteFailed(Exception):
     """确认正文已结算，但工具结果写入失败，不自动续轮。"""
+
+
+@dataclass(frozen=True, slots=True)
+class _ReplyResult:
+    model_status: str
+    tool_group_id: int | None = None
+    text: str | None = None
+    silent: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class _RunResult:
+    text: str | None = None
+    silent: bool = False
 
 
 class Runtime:
@@ -315,19 +330,24 @@ class Runtime:
         _LOG.debug("runtime run finished; run=%s status=%s elapsed_ms=%.0f",
                    run_id, self.last_failure or "complete", (clock() - started) * 1000)
 
-    async def _finish_agent_run(self, run_id: str, result: str | None) -> None:
+    async def _finish_agent_run(self, run_id: str, outcome: _RunResult | None) -> None:
         error = self.last_failure
-        if self._reply_to_parent is not None and error is None and (not result or not result.strip()):
+        silent = error is None and outcome is not None and outcome.silent
+        result = outcome.text if outcome is not None else None
+        if self._reply_to_parent is not None and not silent and error is None and (not result or not result.strip()):
             error = self.last_failure = "empty_result"
         if error is not None:
             result = None
         try:
-            await self._sqlite.write_input(lambda: self.history.finish_agent_run(run_id, result=result, error=error))
+            if silent:
+                await self._sqlite.write_input(lambda: self.history.finish_agent_run(run_id, silent=True))
+            else:
+                await self._sqlite.write_input(lambda: self.history.finish_agent_run(run_id, result=result, error=error))
         except Exception as exc:
             self.last_failure = "run_terminal_write_failed"
             _LOG.error("agent terminal write failed; run=%s error_type=%s", run_id, type(exc).__name__)
             return
-        if self._reply_to_parent is None or self._closed:
+        if silent or self._reply_to_parent is None or self._closed:
             return
         assert self.agent is not None
         notice = AgentReply(self.agent.agent_id, run_id, result=result, error=error)
@@ -375,7 +395,7 @@ class Runtime:
 
     async def _run(self, run_id: str, protected_from: int, *,
                    first_context: PreparedContext | None = None,
-                   can_dispatch_first: Callable[[], bool] | None = None) -> str | None:
+                   can_dispatch_first: Callable[[], bool] | None = None) -> _RunResult | None:
         def can_send() -> bool:
             return not self._closed
 
@@ -389,16 +409,18 @@ class Runtime:
             if prepared is None:
                 return None
             run_start = prepared.run_start
-            model_status, tool_group_id, final_text = await self._reply(
+            result = await self._reply(
                 run_id, prepared, can_dispatch=can_dispatch_first if index == 0 else None)
-            if model_status != "complete":
-                if model_status != "model_interrupted" or self._reply_to_parent is not None:
-                    self.last_failure = model_status
+            if result.model_status != "complete":
+                if result.model_status != "model_interrupted" or self._reply_to_parent is not None:
+                    self.last_failure = result.model_status
                 return None
-            if tool_group_id is None:
-                return final_text
+            if result.silent:
+                return _RunResult(silent=True)
+            if result.tool_group_id is None:
+                return _RunResult(text=result.text)
             # 用结算后仍指向整批调用及结果的同一个消息 ID，而不是后来入队的用户输入。
-            protected_from = tool_group_id
+            protected_from = result.tool_group_id
             if index + 1 == self._settings.max_tool_rounds:
                 self.last_failure = "tool_round_limit"
                 return None
@@ -412,7 +434,7 @@ class Runtime:
         return None
 
     async def _reply(self, run_id: str, prepared: PreparedContext, *,
-                     can_dispatch: Callable[[], bool] | None) -> tuple[str, int | None, str | None]:
+                     can_dispatch: Callable[[], bool] | None) -> _ReplyResult:
         self._reply_commit_failed = False  # 新回复有自己的结算，不沿用上一条的失败。
         trigger_preempted = False
         loop = asyncio.get_running_loop()
@@ -425,6 +447,10 @@ class Runtime:
         request_locks = self._tools.request_locks()
         accepted_calls: dict[str, ToolCall] = {}
         scheduled: dict[str, asyncio.Task[bool]] = {}
+        # 仅通过授权及参数验证的控制调用等待请求终态；普通工具和正文仍实时处理。
+        silent_end_decision: asyncio.Future[Literal["text_present", "model_incomplete"] | None] = loop.create_future()
+        silent_end_requested = False
+        ignored_silent_ends: set[str] = set()
         ownership = ExitStack()
         owns_reply = False
 
@@ -442,6 +468,8 @@ class Runtime:
         idle_timeout = self._delivery_idle_timeout
         reply = ReplyStream(info, validate_progress=is_generated_prefix if self._channel is not None else None)
         channel = self._channel
+        hold_blank_prefix = channel is not None and any(
+            spec.name == SILENT_END_TOOL_NAME for spec in self._tools.specs)
         selected: ReplyDelivery | None = None
         delivery_started: asyncio.Future[None] = loop.create_future()
 
@@ -493,6 +521,7 @@ class Runtime:
             return accept_model_events and not self._closed and not voice_interrupted()
 
         async def run_tool(call: ToolCall, context: ToolContext) -> bool:
+            nonlocal silent_end_requested
             try:
                 result = await self._tools.execute(call, context, request_locks=request_locks,
                                                    can_start_serial=can_start_serial_tool)
@@ -500,6 +529,14 @@ class Runtime:
                 if asyncio.current_task().cancelling():
                     raise  # 未返回结果的工具维持原有取消行为。
                 result = TOOL_CANCELLED
+
+            if call.name == SILENT_END_TOOL_NAME and result == SILENT_END_ACCEPTED:
+                ignored_reason = await silent_end_decision
+                if ignored_reason is None:
+                    silent_end_requested = True
+                else:
+                    result = f'{{"status":"ignored","reason":"{ignored_reason}"}}'
+                    ignored_silent_ends.add(call.id)
 
             def persist_result() -> None:
                 self.history.record_tool_result(self.session_id, info.reply_id, call.id, result)
@@ -605,6 +642,10 @@ class Runtime:
                             text.append(event.text)
                             if channel is not None:
                                 first_handoff = delivery is None
+                                if first_handoff and hold_blank_prefix and not event.text.strip():
+                                    # 首段非空白正文抵达前不选路；直到收尾都只有空白时不补投。
+                                    # 收尾补投无法保留首段语音拒收与相邻工具派发的顺序。
+                                    continue
                                 if delivery is None:
                                     # 首段交接同步选路；随后挂断或重拨不能改变已选通道。
                                     if isinstance(channel, SelectableChannel):
@@ -614,7 +655,7 @@ class Runtime:
                                     idle_timeout = selected.idle_timeout
                                     delivery = loop.create_task(deliver(selected))
                                 if not delivery.done():
-                                    reply.publish(event.text)
+                                    reply.publish("".join(text) if first_handoff and hold_blank_prefix else event.text)
                                 if first_handoff and reply.voice_delivery:
                                     # 先让语音投递进入同一回执接口，以便拒收先于相邻工具帧。
                                     await delivery_started
@@ -710,7 +751,7 @@ class Runtime:
             try:
                 model_status = await complete_model()
                 if trigger_preempted:
-                    return "model_interrupted", None, None  # 尚未派发，无回复可结算。
+                    return _ReplyResult("model_interrupted")  # 尚未派发，无回复可结算。
                 if model_status == "model_interrupted":
                     reply.abandon()
             except _ToolCallWriteFailed:
@@ -748,6 +789,14 @@ class Runtime:
             if model_status == "model_cancelled" and voice_interrupted():
                 interrupted_locally = True
                 model_status = "model_interrupted"
+            # 以本次请求生成的正文为准，不以投递回执判断；等待请求终态消除帧顺序差异。
+            if generated.strip():
+                silent_end_decision.set_result("text_present")
+            elif model_status != "complete" or voice_incomplete:
+                silent_end_decision.set_result("model_incomplete")
+            else:
+                silent_end_decision.set_result(None)
+
             # 内部会话不经过用户投递，只保留完整模型正文。
             generated_text = generated if not has_user_channel and model_status == "complete" else ""
             confirmed_text = receipt.confirmed if receipt else ""
@@ -792,8 +841,10 @@ class Runtime:
                 _LOG.warning("background reply could not be queued; reply=%s", info.reply_id)
             if not all(written):
                 raise _ToolResultWriteFailed
-            tool_group_id = ids[0] if scheduled and not voice_incomplete else None
-            return model_status, tool_group_id, generated_text or confirmed_text or None
+            needs_follow_up = any(call_id not in ignored_silent_ends for call_id in scheduled)
+            tool_group_id = ids[0] if needs_follow_up and not voice_incomplete else None
+            return _ReplyResult(model_status, tool_group_id, generated_text or confirmed_text or None,
+                                silent=silent_end_requested)
         finally:
             # 异常退出时先撤销工具（含还在等锁的调用），再等待可能延迟的模型收尾。
             for task in scheduled.values():
